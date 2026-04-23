@@ -110,18 +110,38 @@ def _display_source(source: str) -> str:
     return source.split(":", 1)[1] if source.startswith("manual:") else source
 
 
+def _exhausted_label(entry) -> str:
+    code = getattr(entry, "last_error_code", None)
+    reason = str(getattr(entry, "last_error_reason", "") or "").strip().lower()
+    message = str(getattr(entry, "last_error_message", "") or "").strip().lower()
+
+    if code == 429 or any(token in reason for token in ("rate_limit", "usage_limit", "quota", "exhausted")) or any(
+        token in message for token in ("rate limit", "usage limit", "quota", "too many requests")
+    ):
+        return "rate-limited"
+
+    if code in {401, 403} or any(token in reason for token in ("invalid_token", "invalid_grant", "unauthorized", "forbidden", "auth")) or any(
+        token in message for token in ("unauthorized", "forbidden", "expired", "revoked", "invalid token", "authentication")
+    ):
+        return "auth failed"
+
+    return "exhausted"
+
+
+
 def _format_exhausted_status(entry) -> str:
     if entry.last_status != STATUS_EXHAUSTED:
         return ""
+    label = _exhausted_label(entry)
     reason = getattr(entry, "last_error_reason", None)
     reason_text = f" {reason}" if isinstance(reason, str) and reason.strip() else ""
     code = f" ({entry.last_error_code})" if entry.last_error_code else ""
     exhausted_until = _exhausted_until(entry)
     if exhausted_until is None:
-        return f" exhausted{reason_text}{code}"
+        return f" {label}{reason_text}{code}"
     remaining = max(0, int(math.ceil(exhausted_until - time.time())))
     if remaining <= 0:
-        return f" exhausted{reason_text}{code} (ready to retry)"
+        return f" {label}{reason_text}{code} (ready to retry)"
     minutes, seconds = divmod(remaining, 60)
     hours, minutes = divmod(minutes, 60)
     days, hours = divmod(hours, 24)
@@ -133,7 +153,7 @@ def _format_exhausted_status(entry) -> str:
         wait = f"{minutes}m {seconds}s"
     else:
         wait = f"{seconds}s"
-    return f" exhausted{reason_text}{code} ({wait} left)"
+    return f" {label}{reason_text}{code} ({wait} left)"
 
 
 def auth_add_command(args) -> None:
