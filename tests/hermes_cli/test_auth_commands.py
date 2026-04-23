@@ -626,7 +626,7 @@ def test_auth_list_does_not_call_mutating_select(monkeypatch, capsys):
     assert "primary" in out
 
 
-def test_auth_list_shows_exhausted_cooldown(monkeypatch, capsys):
+def test_auth_list_shows_rate_limited_cooldown(monkeypatch, capsys):
     from hermes_cli.auth_commands import auth_list_command
 
     class _Entry:
