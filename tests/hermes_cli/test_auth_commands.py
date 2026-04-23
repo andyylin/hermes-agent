@@ -541,7 +541,7 @@ def test_auth_list_does_not_call_mutating_select(monkeypatch, capsys):
     assert "primary" in out
 
 
-def test_auth_list_shows_exhausted_cooldown(monkeypatch, capsys):
+def test_auth_list_shows_rate_limited_cooldown(monkeypatch, capsys):
     from hermes_cli.auth_commands import auth_list_command
 
     class _Entry:
@@ -569,7 +569,41 @@ def test_auth_list_shows_exhausted_cooldown(monkeypatch, capsys):
     auth_list_command(_Args())
 
     out = capsys.readouterr().out
-    assert "exhausted (429)" in out
+    assert "rate-limited (429)" in out
+    assert "59m 30s left" in out
+
+
+def test_auth_list_shows_auth_failure_when_exhausted_entry_is_unauthorized(monkeypatch, capsys):
+    from hermes_cli.auth_commands import auth_list_command
+
+    class _Entry:
+        id = "cred-1"
+        label = "primary"
+        auth_type = "oauth"
+        source = "manual:device_code"
+        last_status = "exhausted"
+        last_error_code = 401
+        last_error_reason = "invalid_token"
+        last_error_message = "Access token expired or revoked."
+        last_status_at = 1000.0
+
+    class _Pool:
+        def entries(self):
+            return [_Entry()]
+
+        def peek(self):
+            return None
+
+    monkeypatch.setattr("hermes_cli.auth_commands.load_pool", lambda provider: _Pool())
+    monkeypatch.setattr("hermes_cli.auth_commands.time.time", lambda: 1030.0)
+
+    class _Args:
+        provider = "openai-codex"
+
+    auth_list_command(_Args())
+
+    out = capsys.readouterr().out
+    assert "auth failed invalid_token (401)" in out
     assert "59m 30s left" in out
 
 
