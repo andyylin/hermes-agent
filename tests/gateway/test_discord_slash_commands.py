@@ -43,6 +43,35 @@ def _ensure_discord_mock():
                 self.callback = callback
                 self.parent = parent
 
+        class _FakeInstallScope:
+            def __init__(self, *, guild=False, user=False):
+                self.guild = guild
+                self.user = user
+
+            def to_array(self):
+                result = []
+                if self.guild:
+                    result.append(0)
+                if self.user:
+                    result.append(1)
+                return result
+
+        class _FakeContextScope:
+            def __init__(self, *, guild=False, dm_channel=False, private_channel=False):
+                self.guild = guild
+                self.dm_channel = dm_channel
+                self.private_channel = private_channel
+
+            def to_array(self):
+                result = []
+                if self.guild:
+                    result.append(0)
+                if self.dm_channel:
+                    result.append(1)
+                if self.private_channel:
+                    result.append(2)
+                return result
+
         discord_mod.app_commands = SimpleNamespace(
             describe=lambda **kwargs: (lambda fn: fn),
             choices=lambda **kwargs: (lambda fn: fn),
@@ -50,6 +79,8 @@ def _ensure_discord_mock():
             Choice=lambda **kwargs: SimpleNamespace(**kwargs),
             Group=_FakeGroup,
             Command=_FakeCommand,
+            AppInstallationType=_FakeInstallScope,
+            AppCommandContext=_FakeContextScope,
         )
 
         ext_mod = MagicMock()
@@ -61,16 +92,53 @@ def _ensure_discord_mock():
         sys.modules.setdefault("discord.ext", ext_mod)
         sys.modules.setdefault("discord.ext.commands", commands_mod)
 
+    def _install_scope_fakes(app_commands_obj):
+        class _FakeInstallScope:
+            def __init__(self, *, guild=False, user=False):
+                self.guild = guild
+                self.user = user
+
+            def to_array(self):
+                result = []
+                if self.guild:
+                    result.append(0)
+                if self.user:
+                    result.append(1)
+                return result
+
+        class _FakeContextScope:
+            def __init__(self, *, guild=False, dm_channel=False, private_channel=False):
+                self.guild = guild
+                self.dm_channel = dm_channel
+                self.private_channel = private_channel
+
+            def to_array(self):
+                result = []
+                if self.guild:
+                    result.append(0)
+                if self.dm_channel:
+                    result.append(1)
+                if self.private_channel:
+                    result.append(2)
+                return result
+
+        if not hasattr(app_commands_obj, "AppInstallationType"):
+            app_commands_obj.AppInstallationType = _FakeInstallScope
+        if not hasattr(app_commands_obj, "AppCommandContext"):
+            app_commands_obj.AppCommandContext = _FakeContextScope
+
     # Whether we just installed the mock OR another test module installed
     # it first via its own _ensure_discord_mock, force the decorators we
     # need onto discord.app_commands — the flat /skill command uses
     # @app_commands.autocomplete and not every other mock stub exposes it.
     _app = getattr(sys.modules["discord"], "app_commands", None)
-    if _app is not None and not hasattr(_app, "autocomplete"):
-        try:
-            _app.autocomplete = lambda **kwargs: (lambda fn: fn)
-        except Exception:
-            pass
+    if _app is not None:
+        if not hasattr(_app, "autocomplete"):
+            try:
+                _app.autocomplete = lambda **kwargs: (lambda fn: fn)
+            except Exception:
+                pass
+        _install_scope_fakes(_app)
 
 
 _ensure_discord_mock()
@@ -116,6 +184,18 @@ def adapter(monkeypatch):
     )
     adapter._text_batch_delay_seconds = 0  # disable batching for tests
     return adapter
+
+
+# ------------------------------------------------------------------
+# Discord app-command install/context metadata
+# ------------------------------------------------------------------
+
+
+def test_native_slash_commands_scope_guild_install_and_all_contexts(adapter):
+    """Slash commands must be visible to guild-installed bots, not just user installs."""
+    kwargs = adapter._discord_app_command_scope_kwargs()
+    assert kwargs["allowed_installs"].to_array() == [0, 1]
+    assert kwargs["allowed_contexts"].to_array() == [0, 1, 2]
 
 
 # ------------------------------------------------------------------

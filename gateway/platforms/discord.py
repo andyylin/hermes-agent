@@ -530,6 +530,20 @@ class DiscordAdapter(BasePlatformAdapter):
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
 
+    def _discord_app_command_scope_kwargs(self) -> Dict[str, Any]:
+        """Return Discord app-command install/context defaults for Hermes slash commands."""
+        return {
+            "allowed_installs": discord.app_commands.AppInstallationType(
+                guild=True,
+                user=True,
+            ),
+            "allowed_contexts": discord.app_commands.AppCommandContext(
+                guild=True,
+                dm_channel=True,
+                private_channel=True,
+            ),
+        }
+
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
         if not DISCORD_AVAILABLE:
@@ -613,10 +627,15 @@ class DiscordAdapter(BasePlatformAdapter):
             # so LLM output or echoed user content can't ping the whole
             # server; override per DISCORD_ALLOW_MENTION_* env vars or the
             # discord.allow_mentions.* block in config.yaml.
+            # Explicitly register app commands for guild-installed bots.  Newer
+            # discord.py versions can otherwise emit User Install-only command
+            # payloads (integration_types=[1]), which makes slash commands vanish
+            # from servers even though the bot is alive and text handling works.
             self._client = commands.Bot(
                 command_prefix="!",  # Not really used, we handle raw messages
                 intents=intents,
                 allowed_mentions=_build_allowed_mentions(),
+                **self._discord_app_command_scope_kwargs(),
                 **proxy_kwargs_for_bot(proxy_url),
             )
             adapter_self = self  # capture for closure
