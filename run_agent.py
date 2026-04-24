@@ -5712,6 +5712,12 @@ class AIAgent:
         Falls back to _interruptible_api_call on provider errors indicating
         streaming is not supported.
         """
+        if self.provider == "copilot-acp":
+            # ACP subprocess backends return a one-shot response object, not an
+            # iterable SSE stream. Asking them for stream=True explodes later
+            # when the agent loop tries to iterate a SimpleNamespace.
+            return self._interruptible_api_call(api_kwargs)
+
         if self.api_mode == "codex_responses":
             # Codex streams internally via _run_codex_stream. The main dispatch
             # in _interruptible_api_call already calls it; we just need to
