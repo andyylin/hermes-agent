@@ -195,6 +195,20 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
 # Add new patterns here when a model family needs explicit steering.
 TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok")
 
+WORKSPACE_SCRATCH_GUIDANCE = (
+    "<scratch_space>\n"
+    "- For temporary unpacking, extraction, or generated throwaway files, prefer a "
+    "workspace-local gitignored tmp/ directory when the current repo has one, or "
+    "another clearly scoped scratch root under the active workspace.\n"
+    "- Create fresh scratch directories with `mktemp` instead of deleting-and-recreating "
+    "the same path. Prefer patterns like `mkdir -p tmp && workdir=$(mktemp -d tmp/task.XXXXXX)`.\n"
+    "- Avoid `rm -rf` as routine setup. Reuse a fresh scratch directory rather than "
+    "wiping an old one unless destructive cleanup is explicitly required.\n"
+    "- If cleanup is needed, scope it to the specific fresh scratch directory you created, "
+    "not a broad shared temp path.\n"
+    "</scratch_space>"
+)
+
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.
@@ -240,6 +254,8 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- Do not skip prerequisite steps just because the final action seems obvious.\n"
     "- If a task depends on output from a prior step, resolve that dependency first.\n"
     "</prerequisite_checks>\n"
+    "\n"
+    f"{WORKSPACE_SCRATCH_GUIDANCE}\n"
     "\n"
     "<verification>\n"
     "Before finalizing your response:\n"
