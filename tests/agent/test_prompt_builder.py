@@ -24,6 +24,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
+    WORKSPACE_SCRATCH_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
@@ -48,6 +49,12 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_workspace_scratch_guidance_prefers_fresh_temp_dirs_over_rm_rf(self):
+        assert "mktemp" in WORKSPACE_SCRATCH_GUIDANCE
+        assert "gitignored tmp/" in WORKSPACE_SCRATCH_GUIDANCE
+        assert "Avoid `rm -rf`" in WORKSPACE_SCRATCH_GUIDANCE
+        assert "fresh scratch directory" in OPENAI_MODEL_EXECUTION_GUIDANCE
 
 
 # =========================================================================
