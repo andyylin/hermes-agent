@@ -277,6 +277,24 @@ class TestIncomingDocumentHandling:
         assert event.message_type == MessageType.DOCUMENT
 
     @pytest.mark.asyncio
+    async def test_xlsm_document_cached(self, adapter):
+        """A .xlsm file should be cached as a supported document without macro execution."""
+        msg = make_message([
+            make_attachment(
+                filename="macro-workbook.xlsm",
+                content_type="application/vnd.ms-excel.sheet.macroEnabled.12",
+            )
+        ])
+
+        with _mock_aiohttp_download(b"PK\x03\x04xlsm"):
+            await adapter._handle_message(msg)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert len(event.media_urls) == 1
+        assert event.media_types == ["application/vnd.ms-excel.sheet.macroEnabled.12"]
+        assert event.message_type == MessageType.DOCUMENT
+
+    @pytest.mark.asyncio
     async def test_download_error_handled(self, adapter):
         """If the HTTP download raises, the handler should not crash."""
         resp = AsyncMock()
