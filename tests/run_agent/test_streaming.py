@@ -479,6 +479,34 @@ class TestStreamingFallback:
     so the *next* main-loop retry uses non-streaming automatically.
     """
 
+    def test_copilot_acp_skips_streaming_and_uses_non_streaming_path(self):
+        """ACP-backed providers don't expose iterable SSE streams, so bypass streaming entirely."""
+        from run_agent import AIAgent
+
+        fallback_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="hi", tool_calls=None), finish_reason="stop")],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            model="gpt-5.4",
+        )
+
+        agent = AIAgent(
+            api_key="copilot-acp",
+            base_url="acp://copilot",
+            provider="copilot-acp",
+            model="gpt-5.4",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+        agent._interruptible_api_call = MagicMock(return_value=fallback_response)
+
+        response = agent._interruptible_streaming_api_call({"messages": []})
+
+        assert response is fallback_response
+        agent._interruptible_api_call.assert_called_once_with({"messages": []})
+
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
     def test_stream_not_supported_sets_flag_and_raises(self, mock_close, mock_create):
