@@ -421,7 +421,6 @@ class GatewayStreamConsumer:
 
                     defer_final_markdown_attachment = (
                         got_done
-                        and self._message_id is not None
                         and self._adapter_should_attach_markdown_response(self._accumulated)
                     )
 
@@ -445,18 +444,22 @@ class GatewayStreamConsumer:
                     # full response again.
                     if self._accumulated:
                         if self._adapter_should_attach_markdown_response(self._accumulated):
-                            if current_update_visible:
-                                self._final_response_sent = True
-                            else:
-                                # Discord long fenced-code responses should arrive
-                                # as one Markdown attachment, not as split/edited
-                                # code boxes.  Use send(), not edit_message(), so
-                                # the adapter can attach the file.
+                            final_text = self._clean_for_display(self._accumulated)
+                            continuation = self._continuation_text(final_text)
+                            await self._try_strip_cursor()
+                            if continuation.strip():
+                                # Discord long fenced-code responses should keep
+                                # already-visible prose in place, then send only
+                                # the unseen continuation through the adapter so
+                                # it can attach oversized code blocks inline and
+                                # continue with trailing prose.
                                 sent_id = await self._send_new_chunk(
-                                    self._accumulated,
+                                    continuation,
                                     self._message_id,
                                 )
                                 self._final_response_sent = sent_id is not None
+                            else:
+                                self._final_response_sent = True
                         elif self._fallback_final_send:
                             await self._send_fallback_final(self._accumulated)
                         elif (

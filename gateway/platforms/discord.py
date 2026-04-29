@@ -536,29 +536,53 @@ class DiscordAdapter(BasePlatformAdapter):
         """Return True when content includes a Markdown fenced code block."""
         return "```" in (content or "")
 
-    def _should_attach_markdown_response(self, content: str) -> bool:
-        """Avoid splitting fenced code across Discord message chunks.
+    def _oversized_fenced_code_blocks(self, content: str) -> list[str]:
+        """Return fenced code blocks that are too large for one Discord message."""
+        if not self._contains_fenced_code(content):
+            return []
+        pattern = re.compile(r"```[^\n`]*(?:\n.*?)?\n?```", re.DOTALL)
+        return [
+            match.group(0)
+            for match in pattern.finditer(content or "")
+            if len(match.group(0)) > self.MAX_MESSAGE_LENGTH
+        ]
 
-        Discord's hard 2000-character limit makes chunking unavoidable for
-        long plain text.  For fenced code blocks, though, close/reopen chunking
-        turns one code box into several busted-looking code boxes.  Send the
-        full Markdown as an attachment instead so the code remains intact.
-        """
-        return (
-            self._contains_fenced_code(content)
-            and len(content) > self.MAX_MESSAGE_LENGTH
-        )
+    def _should_attach_markdown_response(self, content: str) -> bool:
+        """True when at least one fenced code block needs attachment fallback."""
+        return bool(self._oversized_fenced_code_blocks(content))
+
+    def _discord_delivery_segments(self, content: str) -> list[dict[str, str]]:
+        """Split content into normal text and oversized-code attachment segments."""
+        if not self._contains_fenced_code(content):
+            return [{"type": "text", "content": content}]
+
+        segments: list[dict[str, str]] = []
+        pattern = re.compile(r"```[^\n`]*(?:\n.*?)?\n?```", re.DOTALL)
+        cursor = 0
+        for match in pattern.finditer(content):
+            block = match.group(0)
+            if len(block) <= self.MAX_MESSAGE_LENGTH:
+                continue
+            before = content[cursor:match.start()].strip()
+            if before:
+                segments.append({"type": "text", "content": before})
+            segments.append({"type": "attachment", "content": block})
+            cursor = match.end()
+        tail = content[cursor:].strip()
+        if tail:
+            segments.append({"type": "text", "content": tail})
+        return segments or [{"type": "text", "content": content}]
 
     @staticmethod
-    def _markdown_attachment(content: str):
+    def _markdown_attachment(content: str, filename: str = "hermes-code-block.md"):
         return discord.File(
             io.BytesIO(content.encode("utf-8")),
-            filename="hermes-response.md",
+            filename=filename,
         )
 
     @staticmethod
     def _markdown_attachment_caption() -> str:
-        return "Response exceeded Discord's message limit; attached as Markdown to preserve code formatting."
+        return "Attached oversized code block to preserve formatting."
 
     async def _send_markdown_attachment(self, channel: Any, content: str, reference: Any = None) -> Any:
         return await channel.send(
@@ -1154,14 +1178,9 @@ class DiscordAdapter(BasePlatformAdapter):
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
                 if self._should_attach_markdown_response(formatted):
-                    return await self._forum_post_file(
-                        channel,
-                        content=self._markdown_attachment_caption(),
-                        file=self._markdown_attachment(formatted),
-                    )
+                    return await self._send_segmented_to_forum(channel, formatted)
                 return await self._send_to_forum(channel, content)
 
-            # Format and split message if needed
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
             message_ids = []
@@ -1178,41 +1197,76 @@ class DiscordAdapter(BasePlatformAdapter):
                     logger.debug("Could not fetch reply-to message: %s", e)
 
             if self._should_attach_markdown_response(formatted):
-                try:
-                    msg = await self._send_markdown_attachment(
-                        channel,
-                        formatted,
-                        reference=reference,
+                sent_index = 0
+                attachment_count = 0
+                for segment in self._discord_delivery_segments(formatted):
+                    segment_type = segment["type"]
+                    segment_content = segment["content"]
+                    segment_chunks = (
+                        [segment_content]
+                        if segment_type == "attachment"
+                        else self.truncate_message(segment_content, self.MAX_MESSAGE_LENGTH)
                     )
-                except Exception as e:
-                    err_text = str(e)
-                    if (
-                        reference is not None
-                        and (
-                            (
-                                "error code: 50035" in err_text
-                                and "Cannot reply to a system message" in err_text
-                            )
-                            or "error code: 10008" in err_text
-                        )
-                    ):
-                        logger.warning(
-                            "[%s] Reply target %s rejected the reply reference; retrying send without reply reference",
-                            self.name,
-                            reply_to,
-                        )
-                        msg = await self._send_markdown_attachment(
-                            channel,
-                            formatted,
-                            reference=None,
-                        )
-                    else:
-                        raise
+
+                    for segment_chunk in segment_chunks:
+                        if self._reply_to_mode == "all":
+                            chunk_reference = reference
+                        else:
+                            chunk_reference = reference if sent_index == 0 else None
+                        try:
+                            if segment_type == "attachment":
+                                attachment_count += 1
+                                msg = await self._send_markdown_attachment(
+                                    channel,
+                                    segment_chunk,
+                                    reference=chunk_reference,
+                                )
+                            else:
+                                msg = await channel.send(
+                                    content=segment_chunk,
+                                    reference=chunk_reference,
+                                )
+                        except Exception as e:
+                            err_text = str(e)
+                            if (
+                                chunk_reference is not None
+                                and (
+                                    (
+                                        "error code: 50035" in err_text
+                                        and "Cannot reply to a system message" in err_text
+                                    )
+                                    or "error code: 10008" in err_text
+                                )
+                            ):
+                                logger.warning(
+                                    "[%s] Reply target %s rejected the reply reference; retrying send without reply reference",
+                                    self.name,
+                                    reply_to,
+                                )
+                                reference = None
+                                if segment_type == "attachment":
+                                    msg = await self._send_markdown_attachment(
+                                        channel,
+                                        segment_chunk,
+                                        reference=None,
+                                    )
+                                else:
+                                    msg = await channel.send(
+                                        content=segment_chunk,
+                                        reference=None,
+                                    )
+                            else:
+                                raise
+                        message_ids.append(str(msg.id))
+                        sent_index += 1
 
                 return SendResult(
                     success=True,
-                    message_id=str(msg.id),
-                    raw_response={"message_ids": [str(msg.id)], "attachment": "hermes-response.md"},
+                    message_id=message_ids[0] if message_ids else None,
+                    raw_response={
+                        "message_ids": message_ids,
+                        "attachments": ["hermes-code-block.md"] * attachment_count,
+                    },
                 )
 
             for i, chunk in enumerate(chunks):
@@ -1315,6 +1369,62 @@ class DiscordAdapter(BasePlatformAdapter):
             message_id=message_ids[0],
             raw_response=raw_response,
         )
+
+    async def _send_segmented_to_forum(self, forum_channel: Any, content: str) -> SendResult:
+        """Create a forum thread while attaching only oversized fenced code blocks."""
+        from tools.send_message_tool import _derive_forum_thread_name
+
+        segments = self._discord_delivery_segments(content)
+        first = segments[0] if segments else {"type": "text", "content": content}
+        message_ids: list[str] = []
+        warnings: list[str] = []
+
+        kwargs: Dict[str, Any] = {"name": _derive_forum_thread_name(content)}
+        if first["type"] == "attachment":
+            kwargs["content"] = self._markdown_attachment_caption()
+            kwargs["file"] = self._markdown_attachment(first["content"])
+            segments = segments[1:]
+        else:
+            first_chunks = self.truncate_message(first["content"], self.MAX_MESSAGE_LENGTH)
+            kwargs["content"] = first_chunks[0] if first_chunks else "New Post"
+            if len(first_chunks) > 1:
+                segments = [{"type": "text", "content": chunk} for chunk in first_chunks[1:]] + segments[1:]
+            else:
+                segments = segments[1:]
+
+        try:
+            thread = await forum_channel.create_thread(**kwargs)
+        except Exception as e:
+            logger.error("[%s] Failed to create forum thread in %s: %s", self.name, forum_channel.id, e)
+            return SendResult(success=False, error=f"Forum thread creation failed: {e}")
+
+        thread_channel = thread if hasattr(thread, "send") else getattr(thread, "thread", None)
+        thread_id = str(getattr(thread_channel, "id", getattr(thread, "id", "")))
+        starter_msg = getattr(thread, "message", None)
+        message_id = str(getattr(starter_msg, "id", thread_id)) if starter_msg else thread_id
+        message_ids.append(message_id)
+
+        for segment in segments:
+            try:
+                if segment["type"] == "attachment":
+                    msg = await thread_channel.send(
+                        content=self._markdown_attachment_caption(),
+                        file=self._markdown_attachment(segment["content"]),
+                    )
+                    message_ids.append(str(msg.id))
+                    continue
+                for chunk in self.truncate_message(segment["content"], self.MAX_MESSAGE_LENGTH):
+                    msg = await thread_channel.send(content=chunk)
+                    message_ids.append(str(msg.id))
+            except Exception as e:
+                warning = f"Failed to send follow-up segment to forum thread {thread_id}: {e}"
+                logger.warning("[%s] %s", self.name, warning)
+                warnings.append(warning)
+
+        raw_response: Dict[str, Any] = {"message_ids": message_ids, "thread_id": thread_id}
+        if warnings:
+            raw_response["warnings"] = warnings
+        return SendResult(success=True, message_id=message_ids[0], raw_response=raw_response)
 
     async def _forum_post_file(
         self,

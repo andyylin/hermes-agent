@@ -42,6 +42,7 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from gateway.platforms.discord import DiscordAdapter  # noqa: E402
+import gateway.platforms.discord as discord_platform  # noqa: E402
 
 
 @pytest.mark.asyncio
@@ -122,16 +123,16 @@ async def test_send_retries_without_reference_when_reply_target_is_deleted():
 
 
 @pytest.mark.asyncio
-async def test_long_fenced_code_response_is_sent_as_markdown_attachment():
+async def test_long_fenced_code_block_is_attached_without_hiding_surrounding_prose(monkeypatch):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     adapter.MAX_MESSAGE_LENGTH = 120
 
-    sent_msg = SimpleNamespace(id=4321)
+    sent_msgs = [SimpleNamespace(id=4321), SimpleNamespace(id=4322), SimpleNamespace(id=4323)]
     send_calls = []
 
     async def fake_send(*, content, reference=None, file=None):
         send_calls.append({"content": content, "reference": reference, "file": file})
-        return sent_msg
+        return sent_msgs[len(send_calls) - 1]
 
     channel = SimpleNamespace(send=AsyncMock(side_effect=fake_send))
     adapter._client = SimpleNamespace(
@@ -139,14 +140,29 @@ async def test_long_fenced_code_response_is_sent_as_markdown_attachment():
         fetch_channel=AsyncMock(),
     )
 
-    content = "Here is the patch:\n```python\n" + "print('do not split me')\n" * 20 + "```"
+    captured_files = []
+
+    def fake_discord_file(buffer, *, filename):
+        buffer.seek(0)
+        captured_files.append({"content": buffer.read().decode("utf-8"), "filename": filename})
+        return SimpleNamespace(filename=filename)
+
+    monkeypatch.setattr(discord_platform.discord, "File", fake_discord_file)
+
+    code_block = "```python\n" + "print('do not split me')\n" * 20 + "```"
+    content = f"Here is the patch:\n{code_block}\nThat should fix it."
     result = await adapter.send("555", content)
 
     assert result.success is True
     assert result.message_id == "4321"
-    assert channel.send.await_count == 1
-    assert send_calls[0]["file"] is not None
-    assert send_calls[0]["content"] == "Response exceeded Discord's message limit; attached as Markdown to preserve code formatting."
+    assert channel.send.await_count == 3
+    assert send_calls[0]["content"] == "Here is the patch:"
+    assert send_calls[0]["file"] is None
+    assert send_calls[1]["file"] is not None
+    assert send_calls[1]["content"] == "Attached oversized code block to preserve formatting."
+    assert captured_files == [{"content": code_block, "filename": "hermes-code-block.md"}]
+    assert send_calls[2]["content"] == "That should fix it."
+    assert send_calls[2]["file"] is None
 
 
 @pytest.mark.asyncio
@@ -262,6 +278,49 @@ class TestIsForumParent:
         adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
         ch = SimpleNamespace(type=11)  # public thread
         assert adapter._is_forum_parent(ch) is False
+
+
+@pytest.mark.asyncio
+async def test_send_to_forum_attaches_only_oversized_code_block(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter.MAX_MESSAGE_LENGTH = 120
+
+    captured_files = []
+
+    def fake_discord_file(buffer, *, filename):
+        buffer.seek(0)
+        captured_files.append({"content": buffer.read().decode("utf-8"), "filename": filename})
+        return SimpleNamespace(filename=filename)
+
+    monkeypatch.setattr(discord_platform.discord, "File", fake_discord_file)
+
+    thread_ch = SimpleNamespace(
+        id=555,
+        send=AsyncMock(side_effect=[SimpleNamespace(id=501), SimpleNamespace(id=502)]),
+    )
+    thread = SimpleNamespace(id=555, message=SimpleNamespace(id=500), thread=thread_ch)
+    forum_channel = _discord_mod.ForumChannel()
+    forum_channel.id = 999
+    forum_channel.name = "ideas"
+    forum_channel.create_thread = AsyncMock(return_value=thread)
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: forum_channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    code_block = "```python\n" + "print('forum code')\n" * 20 + "```"
+    result = await adapter.send("999", f"Intro\n{code_block}\nTail")
+
+    assert result.success is True
+    assert result.message_id == "500"
+    create_kwargs = forum_channel.create_thread.await_args.kwargs
+    assert create_kwargs["content"] == "Intro"
+    assert "file" not in create_kwargs
+    assert thread_ch.send.await_count == 2
+    assert thread_ch.send.await_args_list[0].kwargs["content"] == "Attached oversized code block to preserve formatting."
+    assert thread_ch.send.await_args_list[0].kwargs["file"].filename == "hermes-code-block.md"
+    assert thread_ch.send.await_args_list[1].kwargs["content"] == "Tail"
+    assert captured_files == [{"content": code_block, "filename": "hermes-code-block.md"}]
 
 
 @pytest.mark.asyncio

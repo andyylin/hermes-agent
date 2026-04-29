@@ -949,7 +949,10 @@ class TestDiscordFencedCodeStreaming:
         assert adapter.send.await_count == 2
         final_call = adapter.send.call_args
         assert final_call.kwargs["reply_to"] == "intro_msg"
+        assert not final_call.kwargs["content"].startswith("Intro before code.")
         assert "```python" in final_call.kwargs["content"]
+        adapter.edit_message.assert_called_once()
+        assert adapter.edit_message.call_args.kwargs["content"] == "Intro before code."
         assert consumer.final_response_sent is True
 
 
