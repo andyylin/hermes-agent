@@ -122,6 +122,73 @@ async def test_send_retries_without_reference_when_reply_target_is_deleted():
 
 
 @pytest.mark.asyncio
+async def test_long_fenced_code_response_is_sent_as_markdown_attachment():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter.MAX_MESSAGE_LENGTH = 120
+
+    sent_msg = SimpleNamespace(id=4321)
+    send_calls = []
+
+    async def fake_send(*, content, reference=None, file=None):
+        send_calls.append({"content": content, "reference": reference, "file": file})
+        return sent_msg
+
+    channel = SimpleNamespace(send=AsyncMock(side_effect=fake_send))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    content = "Here is the patch:\n```python\n" + "print('do not split me')\n" * 20 + "```"
+    result = await adapter.send("555", content)
+
+    assert result.success is True
+    assert result.message_id == "4321"
+    assert channel.send.await_count == 1
+    assert send_calls[0]["file"] is not None
+    assert send_calls[0]["content"] == "Response exceeded Discord's message limit; attached as Markdown to preserve code formatting."
+
+
+@pytest.mark.asyncio
+async def test_long_fenced_code_attachment_retries_without_bad_reference():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter.MAX_MESSAGE_LENGTH = 120
+
+    reference_obj = object()
+    ref_msg = SimpleNamespace(id=99, to_reference=MagicMock(return_value=reference_obj))
+    sent_msg = SimpleNamespace(id=4322)
+    send_calls = []
+
+    async def fake_send(*, content, reference=None, file=None):
+        send_calls.append({"content": content, "reference": reference, "file": file})
+        if len(send_calls) == 1:
+            raise RuntimeError(
+                "400 Bad Request (error code: 50035): Invalid Form Body\n"
+                "In message_reference: Cannot reply to a system message"
+            )
+        return sent_msg
+
+    channel = SimpleNamespace(
+        fetch_message=AsyncMock(return_value=ref_msg),
+        send=AsyncMock(side_effect=fake_send),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    content = "```python\n" + "print('still one file')\n" * 20 + "```"
+    result = await adapter.send("555", content, reply_to="99")
+
+    assert result.success is True
+    assert result.message_id == "4322"
+    assert channel.send.await_count == 2
+    assert send_calls[0]["reference"] is reference_obj
+    assert send_calls[1]["reference"] is None
+    assert all(call["file"] is not None for call in send_calls)
+
+
+@pytest.mark.asyncio
 async def test_send_does_not_retry_on_unrelated_errors():
     """Regression guard: errors unrelated to the reply reference (e.g. 50013
     Missing Permissions) must NOT trigger the no-reference retry path — they

@@ -113,6 +113,47 @@ class GatewayStreamConsumer:
         self._in_think_block = False
         self._think_buffer = ""
 
+    def _adapter_should_attach_markdown_response(self, text: str) -> bool:
+        """Ask adapters with native Markdown-attachment fallback if text needs it.
+
+        Look up the hook on the adapter class instead of the instance so plain
+        MagicMock adapters in tests don't pretend to support every attribute.
+        """
+        hook = getattr(type(self.adapter), "_should_attach_markdown_response", None)
+        if not callable(hook):
+            return False
+        try:
+            return bool(hook(self.adapter, text))
+        except Exception:
+            return False
+
+    def _adapter_contains_fenced_code(self, text: str) -> bool:
+        hook = getattr(type(self.adapter), "_contains_fenced_code", None)
+        if callable(hook):
+            try:
+                return bool(hook(text))
+            except Exception:
+                return False
+        return False
+
+    def _should_hold_fenced_code_stream_update(
+        self,
+        *,
+        got_done: bool,
+        got_segment_break: bool,
+        commentary_text: Optional[str],
+    ) -> bool:
+        """Hold live Discord updates once fenced code appears.
+
+        Sending partial fenced code while the model is still streaming creates
+        broken-looking Discord code boxes.  Hold the segment until a final/tool
+        boundary, then the Discord adapter can either send one normal message
+        or attach the full Markdown if it exceeds Discord's hard limit.
+        """
+        if got_done or got_segment_break or commentary_text is not None:
+            return False
+        return self._adapter_contains_fenced_code(self._accumulated)
+
     @property
     def already_sent(self) -> bool:
         """True if at least one message was sent or edited during the run."""
@@ -313,12 +354,20 @@ class GatewayStreamConsumer:
                     )
 
                 current_update_visible = False
+                if self._should_hold_fenced_code_stream_update(
+                    got_done=got_done,
+                    got_segment_break=got_segment_break,
+                    commentary_text=commentary_text,
+                ):
+                    should_edit = False
+
                 if should_edit and self._accumulated:
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
                     if (
                         len(self._accumulated) > _safe_limit
                         and self._message_id is None
+                        and not self._adapter_should_attach_markdown_response(self._accumulated)
                     ):
                         # No existing message to edit (first message or after a
                         # segment break).  Use truncate_message — the same
@@ -348,6 +397,7 @@ class GatewayStreamConsumer:
                         len(self._accumulated) > _safe_limit
                         and self._message_id is not None
                         and self._edit_supported
+                        and not self._adapter_should_attach_markdown_response(self._accumulated)
                     ):
                         split_at = self._accumulated.rfind("\n", 0, _safe_limit)
                         if split_at < _safe_limit // 2:
@@ -369,17 +419,24 @@ class GatewayStreamConsumer:
                     if not got_done and not got_segment_break and commentary_text is None:
                         display_text += self.cfg.cursor
 
+                    defer_final_markdown_attachment = (
+                        got_done
+                        and self._message_id is not None
+                        and self._adapter_should_attach_markdown_response(self._accumulated)
+                    )
+
                     # Segment break: finalize the current message so platforms
                     # that need explicit closure (e.g. DingTalk AI Cards) don't
                     # leave the previous segment stuck in a loading state when
                     # the next segment (tool progress, next chunk) creates a
                     # new message below it.  got_done has its own finalize
                     # path below so we don't finalize here for it.
-                    current_update_visible = await self._send_or_edit(
-                        display_text,
-                        finalize=got_segment_break,
-                    )
-                    self._last_edit_time = time.monotonic()
+                    if not defer_final_markdown_attachment:
+                        current_update_visible = await self._send_or_edit(
+                            display_text,
+                            finalize=got_segment_break,
+                        )
+                        self._last_edit_time = time.monotonic()
 
                 if got_done:
                     # Final edit without cursor. If progressive editing failed
@@ -387,7 +444,20 @@ class GatewayStreamConsumer:
                     # here instead of letting the base gateway path send the
                     # full response again.
                     if self._accumulated:
-                        if self._fallback_final_send:
+                        if self._adapter_should_attach_markdown_response(self._accumulated):
+                            if current_update_visible:
+                                self._final_response_sent = True
+                            else:
+                                # Discord long fenced-code responses should arrive
+                                # as one Markdown attachment, not as split/edited
+                                # code boxes.  Use send(), not edit_message(), so
+                                # the adapter can attach the file.
+                                sent_id = await self._send_new_chunk(
+                                    self._accumulated,
+                                    self._message_id,
+                                )
+                                self._final_response_sent = sent_id is not None
+                        elif self._fallback_final_send:
                             await self._send_fallback_final(self._accumulated)
                         elif (
                             current_update_visible

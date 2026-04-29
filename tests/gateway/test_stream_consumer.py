@@ -872,6 +872,87 @@ class TestInterimCommentaryMessages:
         assert consumer.final_response_sent is True
 
 
+class TestDiscordFencedCodeStreaming:
+    class Adapter:
+        MAX_MESSAGE_LENGTH = 120
+        REQUIRES_EDIT_FINALIZE = False
+
+        def __init__(self):
+            self.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="msg_1"))
+            self.edit_message = AsyncMock(return_value=SimpleNamespace(success=True, message_id="msg_1"))
+
+        @staticmethod
+        def _contains_fenced_code(content: str) -> bool:
+            return "```" in (content or "")
+
+        def _should_attach_markdown_response(self, content: str) -> bool:
+            return self._contains_fenced_code(content) and len(content) > self.MAX_MESSAGE_LENGTH
+
+    @pytest.mark.asyncio
+    async def test_stream_holds_fenced_code_until_final_send(self):
+        adapter = self.Adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉"),
+        )
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("Here is the patch:\n```python\n")
+        await asyncio.sleep(0.08)
+        assert adapter.send.await_count == 0
+        assert adapter.edit_message.await_count == 0
+
+        consumer.on_delta("print('do not split me')\n" * 20)
+        await asyncio.sleep(0.08)
+        assert adapter.send.await_count == 0
+        assert adapter.edit_message.await_count == 0
+
+        consumer.on_delta("```")
+        consumer.finish()
+        await task
+
+        assert adapter.send.await_count == 1
+        assert adapter.edit_message.await_count == 0
+        sent = adapter.send.call_args.kwargs["content"]
+        assert sent.startswith("Here is the patch:\n```python")
+        assert "print('do not split me')" in sent
+        assert sent.endswith("```")
+        assert consumer.final_response_sent is True
+
+    @pytest.mark.asyncio
+    async def test_stream_uses_send_not_edit_when_existing_message_then_long_fenced_code(self):
+        adapter = self.Adapter()
+        adapter.send = AsyncMock(side_effect=[
+            SimpleNamespace(success=True, message_id="intro_msg"),
+            SimpleNamespace(success=True, message_id="attachment_msg"),
+        ])
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉"),
+        )
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("Intro before code.")
+        await asyncio.sleep(0.08)
+        assert adapter.send.await_count == 1
+
+        consumer.on_delta("\n```python\n" + "print('single attachment')\n" * 20 + "```")
+        await asyncio.sleep(0.08)
+        # Once the fence appears, no progressive edit should mangle a code box.
+        assert adapter.edit_message.await_count == 0
+
+        consumer.finish()
+        await task
+
+        assert adapter.send.await_count == 2
+        final_call = adapter.send.call_args
+        assert final_call.kwargs["reply_to"] == "intro_msg"
+        assert "```python" in final_call.kwargs["content"]
+        assert consumer.final_response_sent is True
+
+
 class TestCancelledConsumerSetsFlags:
     """Cancellation must set final_response_sent when already_sent is True.
 

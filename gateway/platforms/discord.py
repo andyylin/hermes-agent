@@ -10,6 +10,7 @@ Uses discord.py library for:
 """
 
 import asyncio
+import io
 import logging
 import os
 import struct
@@ -529,6 +530,42 @@ class DiscordAdapter(BasePlatformAdapter):
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
+
+    @staticmethod
+    def _contains_fenced_code(content: str) -> bool:
+        """Return True when content includes a Markdown fenced code block."""
+        return "```" in (content or "")
+
+    def _should_attach_markdown_response(self, content: str) -> bool:
+        """Avoid splitting fenced code across Discord message chunks.
+
+        Discord's hard 2000-character limit makes chunking unavoidable for
+        long plain text.  For fenced code blocks, though, close/reopen chunking
+        turns one code box into several busted-looking code boxes.  Send the
+        full Markdown as an attachment instead so the code remains intact.
+        """
+        return (
+            self._contains_fenced_code(content)
+            and len(content) > self.MAX_MESSAGE_LENGTH
+        )
+
+    @staticmethod
+    def _markdown_attachment(content: str):
+        return discord.File(
+            io.BytesIO(content.encode("utf-8")),
+            filename="hermes-response.md",
+        )
+
+    @staticmethod
+    def _markdown_attachment_caption() -> str:
+        return "Response exceeded Discord's message limit; attached as Markdown to preserve code formatting."
+
+    async def _send_markdown_attachment(self, channel: Any, content: str, reference: Any = None) -> Any:
+        return await channel.send(
+            content=self._markdown_attachment_caption(),
+            file=self._markdown_attachment(content),
+            reference=reference,
+        )
 
     def _discord_app_command_scope_kwargs(self) -> Dict[str, Any]:
         """Return Discord app-command install/context defaults for Hermes slash commands."""
@@ -1112,12 +1149,19 @@ class DiscordAdapter(BasePlatformAdapter):
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
 
+            formatted = self.format_message(content)
+
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
+                if self._should_attach_markdown_response(formatted):
+                    return await self._forum_post_file(
+                        channel,
+                        content=self._markdown_attachment_caption(),
+                        file=self._markdown_attachment(formatted),
+                    )
                 return await self._send_to_forum(channel, content)
 
             # Format and split message if needed
-            formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
             message_ids = []
@@ -1132,6 +1176,44 @@ class DiscordAdapter(BasePlatformAdapter):
                         reference = ref_msg
                 except Exception as e:
                     logger.debug("Could not fetch reply-to message: %s", e)
+
+            if self._should_attach_markdown_response(formatted):
+                try:
+                    msg = await self._send_markdown_attachment(
+                        channel,
+                        formatted,
+                        reference=reference,
+                    )
+                except Exception as e:
+                    err_text = str(e)
+                    if (
+                        reference is not None
+                        and (
+                            (
+                                "error code: 50035" in err_text
+                                and "Cannot reply to a system message" in err_text
+                            )
+                            or "error code: 10008" in err_text
+                        )
+                    ):
+                        logger.warning(
+                            "[%s] Reply target %s rejected the reply reference; retrying send without reply reference",
+                            self.name,
+                            reply_to,
+                        )
+                        msg = await self._send_markdown_attachment(
+                            channel,
+                            formatted,
+                            reference=None,
+                        )
+                    else:
+                        raise
+
+                return SendResult(
+                    success=True,
+                    message_id=str(msg.id),
+                    raw_response={"message_ids": [str(msg.id)], "attachment": "hermes-response.md"},
+                )
 
             for i, chunk in enumerate(chunks):
                 if self._reply_to_mode == "all":
