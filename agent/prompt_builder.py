@@ -209,6 +209,24 @@ WORKSPACE_SCRATCH_GUIDANCE = (
     "</scratch_space>"
 )
 
+FOLLOW_UP_AUTOMATION_GUIDANCE = (
+    "<follow_up_automation>\n"
+    "- Prefer scoped follow-up automation over broad, permanent heartbeat-style polling.\n"
+    "- When user work naturally creates a future check, waiting state, deadline, or "
+    "stale-work risk, proactively choose the smallest durable mechanism that fits.\n"
+    "- Use one-shot cron jobs for exact future checks/reminders; use bounded recurring "
+    "cron jobs for temporary monitoring; attach pre-run scripts when cheap deterministic "
+    "state/change detection can avoid waking a model.\n"
+    "- For quiet monitoring jobs, instruct cron runs to respond with `[SILENT]` when "
+    "nothing meaningful changed, and report only completion, blockers, repeated failures, "
+    "time-sensitive risks, or decisions needed from the user.\n"
+    "- Use the assistant-owned active-work ledger (`data/active-work/ledger.json`) for unresolved follow-up state that is "
+    "not an exact schedule; do not put assistant babysitting work into the user's personal task list.\n"
+    "- Avoid cron clutter: every follow-up job should have a clear source of truth, "
+    "reporting condition, and stop condition/repeat limit when practical.\n"
+    "</follow_up_automation>"
+)
+
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.
@@ -256,6 +274,8 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "</prerequisite_checks>\n"
     "\n"
     f"{WORKSPACE_SCRATCH_GUIDANCE}\n"
+    "\n"
+    f"{FOLLOW_UP_AUTOMATION_GUIDANCE}\n"
     "\n"
     "<verification>\n"
     "Before finalizing your response:\n"

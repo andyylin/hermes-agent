@@ -24,6 +24,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
+    FOLLOW_UP_AUTOMATION_GUIDANCE,
     WORKSPACE_SCRATCH_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
@@ -55,6 +56,14 @@ class TestGuidanceConstants:
         assert "gitignored tmp/" in WORKSPACE_SCRATCH_GUIDANCE
         assert "Avoid `rm -rf`" in WORKSPACE_SCRATCH_GUIDANCE
         assert "fresh scratch directory" in OPENAI_MODEL_EXECUTION_GUIDANCE
+
+    def test_follow_up_automation_guidance_prefers_scoped_cron_over_heartbeat(self):
+        assert "scoped follow-up automation" in FOLLOW_UP_AUTOMATION_GUIDANCE
+        assert "cron jobs" in FOLLOW_UP_AUTOMATION_GUIDANCE
+        assert "[SILENT]" in FOLLOW_UP_AUTOMATION_GUIDANCE
+        assert "active-work ledger" in FOLLOW_UP_AUTOMATION_GUIDANCE
+        assert "personal task list" in FOLLOW_UP_AUTOMATION_GUIDANCE
+        assert "scoped follow-up automation" in OPENAI_MODEL_EXECUTION_GUIDANCE
 
 
 # =========================================================================
