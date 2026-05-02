@@ -5322,6 +5322,28 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return None
 
+    async def rename_thread(self, thread_id: str, title: str) -> bool:
+        """Best-effort visible Discord thread rename used by auto-title hooks."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return False
+        clean_title = _truncate_thread_name(_strip_discord_noise(title or ""))
+        if not clean_title:
+            return False
+        try:
+            channel = self._client.get_channel(int(thread_id))
+            if channel is None:
+                channel = await self._client.fetch_channel(int(thread_id))
+            if not isinstance(channel, discord.Thread):
+                return False
+            if getattr(channel, "name", None) == clean_title:
+                return True
+            await channel.edit(name=clean_title, reason="Hermes auto-generated conversation title")
+            logger.info("[%s] Renamed Discord thread %s to %r", self.name, thread_id, clean_title)
+            return True
+        except Exception as e:
+            logger.warning("[%s] Failed to rename Discord thread %s: %s", self.name, thread_id, e)
+            return False
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",

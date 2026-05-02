@@ -757,6 +757,45 @@ def _fake_message(channel, *, content="Hello", author_id=42, display_name="Jezza
 
 
 @pytest.mark.asyncio
+async def test_rename_thread_edits_discord_thread(adapter):
+    thread = _FakeThreadChannel(channel_id=777, name="raw first message")
+    thread.edit = AsyncMock()
+    adapter._client.get_channel = lambda _id: thread
+
+    result = await adapter.rename_thread("777", "Helpful Discord thread title")
+
+    assert result is True
+    thread.edit.assert_awaited_once_with(
+        name="Helpful Discord thread title",
+        reason="Hermes auto-generated conversation title",
+    )
+
+
+@pytest.mark.asyncio
+async def test_rename_thread_fetches_when_not_cached(adapter):
+    thread = _FakeThreadChannel(channel_id=777, name="raw first message")
+    thread.edit = AsyncMock()
+    adapter._client.get_channel = lambda _id: None
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
+
+    result = await adapter.rename_thread("777", "Fetched title")
+
+    assert result is True
+    adapter._client.fetch_channel.assert_awaited_once_with(777)
+    thread.edit.assert_awaited_once_with(
+        name="Fetched title",
+        reason="Hermes auto-generated conversation title",
+    )
+
+
+@pytest.mark.asyncio
+async def test_rename_thread_ignores_non_thread_channel(adapter):
+    adapter._client.get_channel = lambda _id: _FakeTextChannel(channel_id=777)
+
+    assert await adapter.rename_thread("777", "Nope") is False
+
+
+@pytest.mark.asyncio
 async def test_auto_thread_creates_thread_and_redirects(adapter, monkeypatch):
     """When DISCORD_AUTO_THREAD=true, a new thread is created and the event routes there."""
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")

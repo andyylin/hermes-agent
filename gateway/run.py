@@ -17852,12 +17852,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "api_mode": getattr(agent, "api_mode", None),
                         } if agent else None,
                     }
+                    title_callbacks = []
                     if self._is_telegram_topic_lane(source):
-                        maybe_auto_title_kwargs["title_callback"] = lambda title: self._schedule_telegram_topic_title_rename(
-                            source,
-                            effective_session_id,
-                            title,
+                        title_callbacks.append(
+                            lambda title: self._schedule_telegram_topic_title_rename(
+                                source,
+                                effective_session_id,
+                                title,
+                            )
                         )
+                    _is_discord_thread = (
+                        getattr(getattr(source, "platform", None), "value", source.platform) == "discord"
+                        and getattr(source, "chat_type", None) == "thread"
+                        and _status_adapter is not None
+                        and getattr(type(_status_adapter), "rename_thread", None) is not None
+                        and str(os.getenv("DISCORD_SMART_THREAD_TITLES", "false")).lower()
+                        in ("true", "1", "yes", "on")
+                    )
+                    if _is_discord_thread:
+                        _title_thread_id = getattr(source, "thread_id", None) or getattr(source, "chat_id", None)
+
+                        def _schedule_discord_thread_title_rename(title: str) -> None:
+                            try:
+                                asyncio.run_coroutine_threadsafe(
+                                    _status_adapter.rename_thread(str(_title_thread_id), title),
+                                    _loop_for_step,
+                                ).result(timeout=15)
+                            except Exception as _e:
+                                logger.warning(
+                                    "Failed to run Discord thread retitle callback for %s: %s",
+                                    _title_thread_id,
+                                    _e,
+                                )
+
+                        title_callbacks.append(_schedule_discord_thread_title_rename)
+
+                    if title_callbacks:
+
+                        def _run_title_callbacks(title: str) -> None:
+                            for callback in title_callbacks:
+                                callback(title)
+
+                        maybe_auto_title_kwargs["title_callback"] = _run_title_callbacks
                     maybe_auto_title(
                         getattr(self._session_db, "_db", self._session_db),
                         effective_session_id,
