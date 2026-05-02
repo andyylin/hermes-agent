@@ -103,6 +103,9 @@ class FakeTree:
 def adapter(monkeypatch):
     monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
     monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_NO_THREAD_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_SMART_THREAD_TITLES", raising=False)
     config = PlatformConfig(enabled=True, token="***")
     adapter = DiscordAdapter(config)
     adapter._client = SimpleNamespace(
@@ -928,6 +931,58 @@ async def test_auto_thread_can_be_disabled(adapter, monkeypatch):
     adapter._auto_create_thread.assert_not_awaited()
     assert len(captured_events) == 1
     assert captured_events[0].source.chat_id == "100"  # stays in channel
+
+
+@pytest.mark.asyncio
+async def test_auto_thread_still_runs_in_free_response_channels(adapter, monkeypatch):
+    """Free-response means no mention required; it must not imply no-thread."""
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "100")
+
+    fake_thread = _FakeThreadChannel(channel_id=999, name="auto-thread")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+
+    captured_events = []
+
+    async def capture_handle(event):
+        captured_events.append(event)
+
+    adapter.handle_message = capture_handle
+
+    msg = _fake_message(_FakeTextChannel(channel_id=100), content="Did Joi's update work?")
+
+    await adapter._handle_message(msg)
+
+    adapter._auto_create_thread.assert_awaited_once_with(msg)
+    assert len(captured_events) == 1
+    assert captured_events[0].source.chat_id == "999"
+    assert captured_events[0].source.chat_type == "thread"
+
+
+@pytest.mark.asyncio
+async def test_auto_thread_respects_no_thread_channels(adapter, monkeypatch):
+    """no_thread_channels is the explicit opt-out from auto-threading."""
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_NO_THREAD_CHANNELS", "100")
+
+    adapter._auto_create_thread = AsyncMock()
+
+    captured_events = []
+
+    async def capture_handle(event):
+        captured_events.append(event)
+
+    adapter.handle_message = capture_handle
+
+    msg = _fake_message(_FakeTextChannel(channel_id=100), content="Stay in channel")
+
+    await adapter._handle_message(msg)
+
+    adapter._auto_create_thread.assert_not_awaited()
+    assert len(captured_events) == 1
+    assert captured_events[0].source.chat_id == "100"
 
 
 @pytest.mark.asyncio
