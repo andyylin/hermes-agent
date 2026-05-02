@@ -19316,18 +19316,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "api_mode": getattr(agent, "api_mode", None),
                         } if agent else None,
                     }
+                    title_callbacks = []
                     if self._is_telegram_topic_lane(source):
-                        maybe_auto_title_kwargs["title_callback"] = lambda title: self._schedule_telegram_topic_title_rename(
-                            source,
-                            effective_session_id,
-                            title,
+                        title_callbacks.append(
+                            lambda title: self._schedule_telegram_topic_title_rename(
+                                source,
+                                effective_session_id,
+                                title,
+                            )
                         )
-                    elif self._is_discord_auto_thread_lane(source):
-                        maybe_auto_title_kwargs["title_callback"] = lambda title: self._schedule_discord_semantic_thread_rename(
-                            source,
-                            effective_session_id,
-                            title,
+                    if self._is_discord_auto_thread_lane(source):
+                        title_callbacks.append(
+                            lambda title: self._schedule_discord_semantic_thread_rename(
+                                source,
+                                effective_session_id,
+                                title,
+                            )
                         )
+                    if title_callbacks:
+
+                        def _run_title_callbacks(title: str) -> None:
+                            for callback in title_callbacks:
+                                callback(title)
+
+                        maybe_auto_title_kwargs["title_callback"] = _run_title_callbacks
                     maybe_auto_title(
                         getattr(self._session_db, "_db", self._session_db),
                         effective_session_id,
