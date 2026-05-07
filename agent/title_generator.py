@@ -125,6 +125,7 @@ def auto_title_session(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
+    on_title: Optional[TitleCallback] = None,
 ) -> None:
     """Generate and set a session title if one doesn't already exist.
 
@@ -134,9 +135,10 @@ def auto_title_session(
     - session already has a title (user-set or previously auto-generated)
     - title generation fails
 
-    ``on_title`` is invoked after the DB title is stored. Gateway adapters use
-    it for best-effort visible retitles (for example editing a Discord thread
-    name) without coupling this module to any platform SDK.
+    ``title_callback`` (or legacy alias ``on_title``) is invoked after the DB
+    title is stored. Gateway adapters use it for best-effort visible retitles
+    (for example editing a Discord thread name) without coupling this module to
+    any platform SDK.
     """
     if not session_db or not session_id:
         return
@@ -159,9 +161,10 @@ def auto_title_session(
         if not session_db.set_session_title(session_id, title):
             return
         logger.debug("Auto-generated session title: %s", title)
-        if title_callback is not None:
+        callback = title_callback or on_title
+        if callback is not None:
             try:
-                title_callback(title)
+                callback(title)
             except Exception:
                 logger.debug("Auto-title callback failed", exc_info=True)
     except Exception as e:
