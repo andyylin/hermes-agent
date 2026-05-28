@@ -31,6 +31,7 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email.utils import formatdate
 from email import encoders
+from html import unescape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -946,7 +947,7 @@ class EmailAdapter(BasePlatformAdapter):
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
         msg["Message-ID"] = msg_id
 
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+        self._attach_body(msg, body)
 
         smtp = self._connect_smtp()
         try:
@@ -960,6 +961,33 @@ class EmailAdapter(BasePlatformAdapter):
 
         logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, subject)
         return msg_id
+
+    @staticmethod
+    def _looks_like_html(body: str) -> bool:
+        """Return True for complete or fragment HTML bodies worth sending as text/html."""
+        return bool(re.search(r"</?(?:html|body|h[1-6]|p|ul|ol|li|br|strong|em|table|tr|td|div|span)\b", body, re.IGNORECASE))
+
+    @staticmethod
+    def _html_to_plain_text(html: str) -> str:
+        """Best-effort plain-text fallback for multipart/alternative HTML email."""
+        text = re.sub(r"<\s*br\s*/?>", "\n", html, flags=re.IGNORECASE)
+        text = re.sub(r"<\s*/\s*(?:p|div|h[1-6]|li|tr)\s*>", "\n", text, flags=re.IGNORECASE)
+        text = re.sub(r"<\s*li\b[^>]*>", "- ", text, flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", "", text)
+        text = unescape(text)
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    def _attach_body(self, msg: MIMEMultipart, body: str) -> None:
+        """Attach email body as HTML when content is HTML, with a plain fallback."""
+        if self._looks_like_html(body):
+            alt = MIMEMultipart("alternative")
+            alt.attach(MIMEText(self._html_to_plain_text(body), "plain", "utf-8"))
+            alt.attach(MIMEText(body, "html", "utf-8"))
+            msg.attach(alt)
+        else:
+            msg.attach(MIMEText(body, "plain", "utf-8"))
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Email has no typing indicator — no-op."""
@@ -1060,7 +1088,7 @@ class EmailAdapter(BasePlatformAdapter):
         msg["Message-ID"] = msg_id
 
         if body:
-            msg.attach(MIMEText(body, "plain", "utf-8"))
+            self._attach_body(msg, body)
 
         for file_path in file_paths:
             p = Path(file_path)
