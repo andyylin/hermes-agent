@@ -25,6 +25,12 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 - `Add Codex OAuth STT provider`
   - Allows STT through OpenAI Codex OAuth (`openai-codex`) without separate OpenAI API key.
 
+- `fix(email): send HTML bodies as multipart alternative`
+  - Sends HTML email content as `text/html` with a plain-text fallback instead of raw tags in plain text.
+
+- `feat(memory): add Memory Tree Lite helper modules`
+  - Keeps deterministic build/search/attention/reconcile/privacy helpers repo-backed instead of script-only.
+
 ## Operating rule
 
 Before restarting live Hermes gateway after upstream updates:
