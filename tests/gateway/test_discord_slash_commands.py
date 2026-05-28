@@ -953,7 +953,7 @@ async def test_auto_thread_skips_threads_and_dms(adapter, monkeypatch):
 
 
 def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
-    """discord.auto_thread in config.yaml should be bridged to DISCORD_AUTO_THREAD env var."""
+    """discord auto-thread keys in config.yaml should be bridged to DISCORD_* env vars."""
     import yaml
     from pathlib import Path
 
@@ -962,10 +962,11 @@ def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
     hermes_dir.mkdir()
     config_path = hermes_dir / "config.yaml"
     config_path.write_text(yaml.dump({
-        "discord": {"auto_thread": True},
+        "discord": {"auto_thread": True, "smart_thread_titles": True},
     }))
 
     monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.delenv("DISCORD_SMART_THREAD_TITLES", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(hermes_dir))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
@@ -974,6 +975,7 @@ def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
 
     import os
     assert os.getenv("DISCORD_AUTO_THREAD") == "true"
+    assert os.getenv("DISCORD_SMART_THREAD_TITLES") == "true"
 
 
 # ------------------------------------------------------------------
