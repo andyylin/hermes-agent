@@ -856,6 +856,25 @@ class TestThreadContext(unittest.TestCase):
             self.assertEqual(send_call["Subject"], "Re: Hermes Agent")
             self.assertIn("Date", send_call)
 
+    def test_html_body_sends_multipart_alternative(self):
+        """HTML replies should include a text/html part instead of raw tags as plain text only."""
+        adapter = self._make_adapter()
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email("newuser@test.com", "<h2>Brief</h2><p><strong>Done</strong></p>", None)
+
+            msg = mock_server.send_message.call_args[0][0]
+            parts = list(msg.walk())
+            content_types = [part.get_content_type() for part in parts]
+            self.assertIn("multipart/alternative", content_types)
+            self.assertIn("text/plain", content_types)
+            self.assertIn("text/html", content_types)
+            html_part = next(part for part in parts if part.get_content_type() == "text/html")
+            self.assertIn("<h2>Brief</h2>", html_part.get_payload(decode=True).decode("utf-8"))
+
 
 class TestSendMethods(unittest.TestCase):
     """Test email send methods."""
