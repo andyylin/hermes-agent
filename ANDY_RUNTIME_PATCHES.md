@@ -28,6 +28,10 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 - `fix(email): send HTML bodies as multipart alternative`
   - Sends HTML email content as `text/html` with a plain-text fallback instead of raw tags in plain text.
 
+- `fix(cron): format Discord cron deliveries without tables`
+  - Uses Discord-friendly headings and bullets for cron reports.
+  - Converts simple Markdown tables to grouped bullet rows before Discord delivery.
+
 - `feat(memory): add Memory Tree Lite helper modules`
   - Keeps deterministic build/search/attention/reconcile/privacy helpers repo-backed instead of script-only.
 
@@ -37,7 +41,8 @@ Before restarting live Hermes gateway after upstream updates:
 
 1. Confirm branch is `andy-runtime`.
 2. Confirm the Discord adapter has `skip_thread = bool(channel_ids & no_thread_channels)`.
-3. Run focused gateway/title/STT tests.
-4. Restart the gateway and inspect logs for reconnect/errors.
+3. Confirm LINE group allowlist handling remains upstream in `plugins/platforms/line/adapter.py`.
+4. Run focused gateway/title/STT/cron tests.
+5. Restart the gateway and inspect logs for reconnect/errors.
 
 If upstream `main` later contains any item above, trim the duplicate local patch and update this ledger.
