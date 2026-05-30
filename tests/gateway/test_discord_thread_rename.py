@@ -120,6 +120,23 @@ async def test_discord_auto_thread_summary_max_chars_is_configurable(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_discord_auto_title_does_not_rename_thread_to_generic_hermes():
+    """A low-information generated title must not replace a useful initial thread name."""
+    runner, adapter = _make_runner()
+
+    await runner._rename_discord_thread_for_session_title(
+        _make_source(
+            thread_id="999",
+            thread_initial_name="Can you try something with claude-rmux.py",
+        ),
+        "sess-discord",
+        "Hermes",
+    )
+
+    adapter.rename_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_non_discord_thread_does_not_auto_rename_thread():
     runner, adapter = _make_runner()
 

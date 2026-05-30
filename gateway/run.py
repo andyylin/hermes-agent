@@ -12969,6 +12969,31 @@ class GatewayRunner:
             return cleaned[:max_chars]
         return cleaned[: max_chars - 3].rstrip() + "..."
 
+    def _is_useful_discord_auto_thread_title(self, title: str) -> bool:
+        """Return False for low-information generated titles like the bot name.
+
+        Auto-title generation can occasionally return only the product/bot name
+        (for example, "Hermes").  That is worse than the initial message-derived
+        Discord thread name, so summary-mode auto-renames skip those generic
+        titles.  Explicit `/title` renames still bypass this guard.
+        """
+        cleaned = re.sub(r"\s+", " ", str(title or "")).strip()
+        if not cleaned:
+            return False
+        normalized = re.sub(r"[^a-z0-9]+", " ", cleaned.lower()).strip()
+        generic_titles = {
+            "hermes",
+            "hermes chat",
+            "hermes agent",
+            "new chat",
+            "new conversation",
+            "new thread",
+            "untitled",
+            "untitled chat",
+            "conversation",
+        }
+        return normalized not in generic_titles
+
     def _is_discord_thread_source(self, source: SessionSource) -> bool:
         """True when a source maps to a Discord thread."""
         return (
@@ -13011,6 +13036,12 @@ class GatewayRunner:
         if require_initial_name_match:
             expected_name = str(getattr(source, "thread_initial_name", "") or "")
             if not expected_name:
+                return
+            if not self._is_useful_discord_auto_thread_title(title):
+                logger.debug(
+                    "Skipping Discord thread auto-rename for low-information generated title %r",
+                    title,
+                )
                 return
         thread_name = self._sanitize_discord_thread_title(title)
         try:
