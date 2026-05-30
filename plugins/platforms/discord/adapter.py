@@ -848,6 +848,24 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._handle_message(message)
 
             @self._client.event
+            async def on_thread_update(before, after):
+                """Sync Discord thread renames back to the Hermes session title."""
+                before_name = getattr(before, "name", None)
+                after_name = getattr(after, "name", None)
+                thread_id = getattr(after, "id", None)
+                if not thread_id or not after_name or before_name == after_name:
+                    return
+                try:
+                    await adapter_self._notify_thread_title_change(str(thread_id), str(after_name))
+                except Exception:
+                    logger.debug(
+                        "[%s] Failed to handle Discord thread title update for %s",
+                        adapter_self.name,
+                        thread_id,
+                        exc_info=True,
+                    )
+
+            @self._client.event
             async def on_voice_state_update(member, before, after):
                 """Track voice channel join/leave events."""
                 # Only track channels where the bot is connected
@@ -3610,6 +3628,15 @@ class DiscordAdapter(BasePlatformAdapter):
         from gateway.platforms.base import resolve_channel_prompt
         return resolve_channel_prompt(self.config.extra, channel_id, parent_id)
 
+    def _discord_auto_thread(self) -> bool:
+        """Return whether Discord should auto-create threads for channel prompts."""
+        configured = self.config.extra.get("auto_thread")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes", "on"}
+
     def _discord_require_mention(self) -> bool:
         """Return whether Discord channel messages require a bot mention."""
         configured = self.config.extra.get("require_mention")
@@ -3941,23 +3968,28 @@ class DiscordAdapter(BasePlatformAdapter):
     # Auto-thread helpers
     # ------------------------------------------------------------------
 
-    async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
+    def _default_auto_thread_name(self, message: Any) -> str:
+        """Build Discord's initial auto-thread name from the triggering message."""
+        # Strip Discord mention syntax (users / roles / channels) so thread
+        # titles don't show raw <@id>, <@&id>, or <#id> markers.  This mirrors
+        # the pre-summary auto-thread behavior; the gateway later renames only
+        # if this initial name is still unchanged.
+        content = (getattr(message, "content", None) or "").strip()
+        content = re.sub(r"<@[!&]?\d+>", "", content)
+        content = re.sub(r"<#\d+>", "", content)
+        content = re.sub(r"\s+", " ", content).strip()
+        if not content:
+            return "Hermes"
+        if len(content) <= 80:
+            return content
+        return content[:77].rstrip() + "..."
+
+    async def _auto_create_thread(self, message: Any, thread_name: Optional[str] = None) -> Optional[Any]:
         """Create a thread from a user message for auto-threading.
 
         Returns the created thread object, or ``None`` on failure.
         """
-        # Build a short thread name from the message. Strip Discord mention
-        # syntax (users / roles / channels) so thread titles don't end up
-        # showing raw <@id>, <@&id>, or <#id> markers — the ID isn't
-        # meaningful to humans glancing at the thread list (#6336).
-        content = (message.content or "").strip()
-        # <@123>, <@!123>, <@&123>, <#123> — collapse to empty; normalize spaces.
-        content = re.sub(r"<@[!&]?\d+>", "", content)
-        content = re.sub(r"<#\d+>", "", content)
-        content = re.sub(r"\s+", " ", content).strip()
-        thread_name = content[:80] if content else "Hermes"
-        if len(content) > 80:
-            thread_name = thread_name[:77] + "..."
+        thread_name = thread_name or self._default_auto_thread_name(message)
 
         try:
             thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
@@ -3981,6 +4013,41 @@ class DiscordAdapter(BasePlatformAdapter):
                     fallback_error,
                 )
                 return None
+
+    async def rename_thread(
+        self,
+        thread_id: str,
+        name: str,
+        expected_current_name: Optional[str] = None,
+    ) -> bool:
+        """Best-effort rename of a Discord thread by ID."""
+        if not self._client or not thread_id or not name:
+            return False
+        try:
+            tid = int(thread_id)
+        except (TypeError, ValueError):
+            return False
+
+        try:
+            thread = self._client.get_channel(tid)
+            if thread is None:
+                thread = await self._client.fetch_channel(tid)
+        except Exception:
+            logger.debug("[%s] Failed to resolve Discord thread %s for rename", self.name, thread_id, exc_info=True)
+            return False
+
+        if expected_current_name is not None and getattr(thread, "name", None) != expected_current_name:
+            return False
+
+        edit = getattr(thread, "edit", None)
+        if edit is None:
+            return False
+        try:
+            await edit(name=name)
+            return True
+        except Exception:
+            logger.debug("[%s] Failed to rename Discord thread %s", self.name, thread_id, exc_info=True)
+            return False
 
     async def create_handoff_thread(
         self,
@@ -4583,19 +4650,22 @@ class DiscordAdapter(BasePlatformAdapter):
         # Messages already inside threads or DMs are unaffected.
         # no_thread_channels: channels where bot responds directly without thread.
         auto_threaded_channel = None
+        auto_thread_initial_name = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
             skip_thread = bool(channel_ids & no_thread_channels) or is_free_channel
-            auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
+            auto_thread = self._discord_auto_thread()
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
-                thread = await self._auto_create_thread(message)
+                default_thread_name = self._default_auto_thread_name(message)
+                thread = await self._auto_create_thread(message, thread_name=default_thread_name)
                 if thread:
                     parent_channel_id = str(message.channel.id)
                     is_thread = True
                     thread_id = str(thread.id)
                     auto_threaded_channel = thread
+                    auto_thread_initial_name = getattr(thread, "name", None) or default_thread_name
                     self._threads.mark(thread_id)
 
         all_attachments = list(message.attachments) + snapshot_attachments
@@ -4668,6 +4738,7 @@ class DiscordAdapter(BasePlatformAdapter):
             guild_id=str(guild.id) if guild else None,
             parent_chat_id=parent_channel_id,
             message_id=str(message.id),
+            thread_initial_name=auto_thread_initial_name,
         )
 
         # Build media URLs -- download image attachments to local cache so the

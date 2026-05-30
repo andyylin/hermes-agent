@@ -91,6 +91,7 @@ class SessionSource:
     guild_id: Optional[str] = None  # Discord guild / Slack workspace / Matrix server scope
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+    thread_initial_name: Optional[str] = None  # Initial auto-created thread name, used to detect user renames
     
     @property
     def description(self) -> str:
@@ -134,6 +135,8 @@ class SessionSource:
             d["parent_chat_id"] = self.parent_chat_id
         if self.message_id:
             d["message_id"] = self.message_id
+        if self.thread_initial_name:
+            d["thread_initial_name"] = self.thread_initial_name
         return d
 
     @classmethod
@@ -152,6 +155,7 @@ class SessionSource:
             guild_id=data.get("guild_id"),
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
+            thread_initial_name=data.get("thread_initial_name"),
         )
     
 
@@ -1233,6 +1237,40 @@ class SessionStore:
                 logger.debug("Session DB reopen_session failed: %s", e)
 
         return new_entry
+
+    def find_session_by_thread(
+        self,
+        platform: Platform,
+        thread_id: str,
+    ) -> Optional[SessionEntry]:
+        """Return the most recently active session mapped to a platform thread.
+
+        Platform-side title-update events (for example Discord thread renames)
+        arrive without a user message, so the gateway cannot rebuild a full
+        ``SessionSource`` with the original participant metadata.  Use the
+        persisted origin metadata instead and only return an existing session;
+        rename events should never create a new conversation.
+        """
+        tid = str(thread_id or "")
+        if not tid:
+            return None
+        with self._lock:
+            self._ensure_loaded_locked()
+            matches = []
+            for entry in self._entries.values():
+                if entry.platform != platform:
+                    continue
+                origin = entry.origin
+                if origin is None:
+                    continue
+                if str(origin.thread_id or "") == tid:
+                    matches.append(entry)
+                    continue
+                if entry.chat_type == "thread" and str(origin.chat_id or "") == tid:
+                    matches.append(entry)
+            if not matches:
+                return None
+            return max(matches, key=lambda entry: entry.updated_at)
 
     def list_sessions(self, active_minutes: Optional[int] = None) -> List[SessionEntry]:
         """List all sessions, optionally filtered by activity."""

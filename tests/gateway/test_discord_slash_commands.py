@@ -684,7 +684,7 @@ async def test_auto_thread_creates_thread_and_redirects(adapter, monkeypatch):
 
     await adapter._handle_message(msg)
 
-    adapter._auto_create_thread.assert_awaited_once_with(msg)
+    adapter._auto_create_thread.assert_awaited_once_with(msg, thread_name="Hello world")
     assert len(captured_events) == 1
     event = captured_events[0]
     assert event.source.chat_id == "999"  # redirected to thread
