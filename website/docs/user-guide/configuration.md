@@ -1569,14 +1569,18 @@ Configure Discord-specific behavior for the messaging gateway:
 
 ```yaml
 discord:
-  require_mention: true          # Require @mention to respond in server channels
-  free_response_channels: ""     # Comma-separated channel IDs where bot responds without @mention
-  auto_thread: true              # Auto-create threads on @mention in channels
+  require_mention: true              # Require @mention to respond in server channels
+  free_response_channels: ""         # Comma-separated channel IDs where bot responds without @mention
+  auto_thread: true                  # Auto-create threads on @mention in channels
+  auto_thread_name_mode: summary     # summary | message (how auto-created threads are named)
+  auto_thread_summary_max_chars: 70  # Max chars for summary-generated thread names
 ```
 
 - `require_mention` — when `true` (default), the bot only responds in server channels when mentioned with `@BotName`. DMs always work without mention.
 - `free_response_channels` — comma-separated list of channel IDs where the bot responds to every message without requiring a mention.
 - `auto_thread` — when `true` (default), mentions in channels automatically create a thread for the conversation, keeping channels clean (similar to Slack threading).
+- `auto_thread_name_mode` — controls how auto-created Discord threads are named. `summary` (default) renames the thread to the generated Hermes session title after the first response; `message` keeps the initial message-derived thread name.
+- `auto_thread_summary_max_chars` — maximum length for summary-generated auto-thread names. Defaults to `70`; values above Discord's 100-character thread-name limit are capped.
 
 ## Security
 
