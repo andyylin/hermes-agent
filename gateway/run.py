@@ -6985,6 +6985,8 @@ class GatewayRunner:
                 Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
                 Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
             }.get(source.platform, "")
+            if not chat_allowlist_env and source.platform and source.platform.value == "line":
+                chat_allowlist_env = "LINE_ALLOWED_GROUPS"
             if chat_allowlist_env:
                 raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
                 if raw_chat_allowlist:
@@ -7025,6 +7027,8 @@ class GatewayRunner:
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
             Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
         }
+        if source.platform and source.platform.value == "line":
+            platform_group_chat_env_map[source.platform] = "LINE_ALLOWED_GROUPS"
         platform_allow_all_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
             Platform.DISCORD: "DISCORD_ALLOW_ALL_USERS",
