@@ -35,6 +35,11 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 - `feat(memory): add Memory Tree Lite helper modules`
   - Keeps deterministic build/search/attention/reconcile/privacy helpers repo-backed instead of script-only.
 
+- `fix(line): preserve read-only/archive/prefix group gates`
+  - Admits `LINE_ALLOWED_GROUPS | LINE_READ_ONLY_GROUPS | LINE_ARCHIVE_GROUPS` at adapter intake.
+  - Archives `LINE_ARCHIVE_GROUPS`, short-circuits `LINE_READ_ONLY_GROUPS`, and requires `LINE_GROUP_PREFIXES` for `LINE_REQUIRE_PREFIX_GROUPS` before agent dispatch.
+  - Teaches the generic gateway auth layer that LINE group chats use `LINE_ALLOWED_GROUPS` as a chat allowlist, not sender-only `LINE_ALLOWED_USERS`.
+
 ## Operating rule
 
 Before restarting live Hermes gateway after upstream updates:
