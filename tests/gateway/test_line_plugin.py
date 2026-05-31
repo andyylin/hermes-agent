@@ -297,7 +297,70 @@ class TestMarkdownAndChunking:
 
 
 # ---------------------------------------------------------------------------
-# 7. Send routing (reply -> push fallback, batching, system-bypass)
+# 7. Group archive/read-only/prefix dispatch gates
+# ---------------------------------------------------------------------------
+
+class TestGroupDispatchGates:
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
+        monkeypatch.delenv("LINE_CHANNEL_SECRET", raising=False)
+        from gateway.config import PlatformConfig
+
+        cfg = PlatformConfig(enabled=True, extra={
+            "channel_access_token": "tok",
+            "channel_secret": "sec",
+            "allowed_groups": ["Callowed"],
+            "archive_groups": ["Callowed"],
+            "read_only_groups": ["Creadonly"],
+            "require_prefix_groups": ["Callowed"],
+            "group_prefixes": ["Hermes:"],
+        })
+        ad = LineAdapter(cfg)
+        ad.handle_message = AsyncMock()
+        return ad
+
+    def _event(self, *, chat_id="Callowed", user_id="Uother", text="hello", msg_type="text"):
+        message = {"id": "m1", "type": msg_type}
+        if msg_type == "text":
+            message["text"] = text
+        return {
+            "type": "message",
+            "timestamp": 123,
+            "webhookEventId": "evt1",
+            "replyToken": "reply-token",
+            "source": {"type": "group", "groupId": chat_id, "userId": user_id},
+            "message": message,
+        }
+
+    def test_prefix_required_group_ignores_unprefixed_text(self, adapter):
+        asyncio.run(adapter._handle_message_event(self._event(text="not for hermes")))
+        adapter.handle_message.assert_not_called()
+        assert "Callowed" not in adapter._reply_tokens
+
+    def test_prefix_required_group_strips_prefix_and_dispatches(self, adapter):
+        asyncio.run(adapter._handle_message_event(self._event(text="Hermes: summarize this")))
+        adapter.handle_message.assert_called_once()
+        event = adapter.handle_message.call_args.args[0]
+        assert event.text == "summarize this"
+        assert event.source.chat_id == "Callowed"
+        assert event.source.user_id == "Uother"
+
+    def test_read_only_group_archives_without_dispatch(self, adapter, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        asyncio.run(adapter._handle_message_event(
+            self._event(chat_id="Creadonly", text="archive me")
+        ))
+        adapter.handle_message.assert_not_called()
+        archive = tmp_path / "data" / "line-read-only" / "Creadonly.jsonl"
+        assert archive.exists()
+        row = json.loads(archive.read_text().splitlines()[-1])
+        assert row["text"] == "archive me"
+        assert row["chat_id"] == "Creadonly"
+
+
+# ---------------------------------------------------------------------------
+# 8. Send routing (reply -> push fallback, batching, system-bypass)
 # ---------------------------------------------------------------------------
 
 class TestSendRouting:
@@ -468,23 +531,31 @@ class TestRegister:
 
 class TestEnvEnablement:
 
+    def _clear_optional_env(self, monkeypatch):
+        for k in ("LINE_PORT", "LINE_PUBLIC_URL", "LINE_HOME_CHANNEL", "LINE_HOME_CHANNEL_THREAD_ID"):
+            monkeypatch.delenv(k, raising=False)
+
     def test_returns_none_without_credentials(self, monkeypatch):
         monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
         monkeypatch.delenv("LINE_CHANNEL_SECRET", raising=False)
+        self._clear_optional_env(monkeypatch)
         assert _env_enablement() is None
 
     def test_returns_dict_with_credentials(self, monkeypatch):
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "tok")
         monkeypatch.setenv("LINE_CHANNEL_SECRET", "sec")
+        self._clear_optional_env(monkeypatch)
         assert _env_enablement() == {}
 
     def test_seeds_port_from_env(self, monkeypatch):
+        self._clear_optional_env(monkeypatch)
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "tok")
         monkeypatch.setenv("LINE_CHANNEL_SECRET", "sec")
         monkeypatch.setenv("LINE_PORT", "8080")
         assert _env_enablement() == {"port": 8080}
 
     def test_seeds_public_url(self, monkeypatch):
+        self._clear_optional_env(monkeypatch)
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "tok")
         monkeypatch.setenv("LINE_CHANNEL_SECRET", "sec")
         monkeypatch.setenv("LINE_PUBLIC_URL", "https://my-tunnel.example.com")
@@ -591,7 +662,19 @@ class TestValidateConfig:
 class TestAdapterInit:
 
     def test_init_from_config_extra(self, monkeypatch):
-        for k in ("LINE_CHANNEL_ACCESS_TOKEN", "LINE_CHANNEL_SECRET", "LINE_PORT"):
+        for k in (
+            "LINE_CHANNEL_ACCESS_TOKEN",
+            "LINE_CHANNEL_SECRET",
+            "LINE_PORT",
+            "LINE_PUBLIC_URL",
+            "LINE_ALLOWED_USERS",
+            "LINE_ALLOWED_GROUPS",
+            "LINE_ALLOWED_ROOMS",
+            "LINE_READ_ONLY_GROUPS",
+            "LINE_ARCHIVE_GROUPS",
+            "LINE_REQUIRE_PREFIX_GROUPS",
+            "LINE_GROUP_PREFIXES",
+        ):
             monkeypatch.delenv(k, raising=False)
         from gateway.config import PlatformConfig
         cfg = PlatformConfig(
