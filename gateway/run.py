@@ -15981,15 +15981,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
-        # Disable tool progress for webhooks - they don't support message editing,
-        # so each progress line would be sent as a separate message.
+        # Disable tool/status chatter on batch/non-interactive sinks. Webhooks
+        # and email can't edit progress in place; emitting progress/status there
+        # creates permanent noisy deliveries instead of useful live feedback.
         from gateway.config import Platform
-        tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        _quiet_delivery_platform = source.platform in (Platform.WEBHOOK, Platform.EMAIL)
+        tool_progress_enabled = progress_mode != "off" and not _quiet_delivery_platform
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
-        # in chat platforms while opting into concise mid-turn updates.
+        # in chat platforms while opting into concise mid-turn updates. Batch
+        # sinks stay final-answer-only even if global display config is chatty.
         interim_assistant_messages_enabled = (
-            source.platform != Platform.WEBHOOK
+            not _quiet_delivery_platform
             and _resolve_gateway_display_bool(
                 user_config,
                 platform_key,
@@ -18084,7 +18087,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # 0 = disable notifications.
         _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
-        if not bool(
+        if source.platform == Platform.EMAIL or not bool(
             resolve_display_setting(
                 user_config,
                 platform_key,
