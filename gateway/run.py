@@ -17319,24 +17319,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _phrase_err:
                 logger.debug("generic status phrase selection failed: %s", _phrase_err)
                 return "still on it" if kind in {"heartbeat", "waiting", "long_running", "status"} else "one sec"
-        # Disable tool progress for webhooks - they don't support message editing,
-        # so each progress line would be sent as a separate message.
+        # Disable tool/status chatter on batch/non-interactive sinks. Webhooks
+        # and email can't edit progress in place; emitting progress/status there
+        # creates permanent noisy deliveries instead of useful live feedback.
         from gateway.config import Platform
-        tool_progress_enabled = progress_mode not in {"off", "log"} and source.platform != Platform.WEBHOOK
+        _quiet_delivery_platform = source.platform in (Platform.WEBHOOK, Platform.EMAIL)
+        tool_progress_enabled = progress_mode not in {"off", "log"} and not _quiet_delivery_platform
         # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
         # instead of the chat (#3459 / #3458). Gateway-only by design.
-        log_mode_enabled = progress_mode == "log" and source.platform != Platform.WEBHOOK
+        log_mode_enabled = progress_mode == "log" and not _quiet_delivery_platform
         log_queue: "queue.Queue | None" = queue.Queue() if log_mode_enabled else None
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
-        # in chat platforms while opting into concise mid-turn updates.
+        # in chat platforms while opting into concise mid-turn updates. Batch
+        # sinks stay final-answer-only even if global display config is chatty.
         interim_assistant_messages_mode = _display_surface_mode(
             "interim_assistant_messages",
             default=True,
             require_platform_override_for={Platform.MATTERMOST},
         )
         interim_assistant_messages_enabled = (
-            source.platform != Platform.WEBHOOK
+            not _quiet_delivery_platform
             and interim_assistant_messages_mode != "off"
         )
         # thinking_progress is independent — if enabled, we need the progress
@@ -19540,7 +19543,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             default=True,
             allow_generic=True,
         )
-        if _long_running_mode == "off":
+        if _quiet_delivery_platform or _long_running_mode == "off":
             _NOTIFY_INTERVAL = None
         _notify_start = time.time()
 
