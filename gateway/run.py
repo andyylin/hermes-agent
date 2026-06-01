@@ -17874,11 +17874,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if _is_discord_thread:
                         _title_thread_id = getattr(source, "thread_id", None) or getattr(source, "chat_id", None)
+                        try:
+                            from plugins.platforms.discord.adapter import (
+                                _build_auto_thread_name,
+                                _legacy_auto_thread_name,
+                            )
+                            _expected_current_thread_name = (
+                                _build_auto_thread_name(message)
+                                if str(os.getenv("DISCORD_SMART_THREAD_TITLES", "false")).lower()
+                                in ("true", "1", "yes", "on")
+                                else _legacy_auto_thread_name(message)
+                            )
+                        except Exception:
+                            _expected_current_thread_name = None
 
                         def _schedule_discord_thread_title_rename(title: str) -> None:
                             try:
+                                rename_kwargs = {}
+                                if _expected_current_thread_name is not None:
+                                    rename_kwargs["only_if_current_name"] = _expected_current_thread_name
                                 asyncio.run_coroutine_threadsafe(
-                                    _status_adapter.rename_thread(str(_title_thread_id), title),
+                                    _status_adapter.rename_thread(
+                                        str(_title_thread_id),
+                                        title,
+                                        **rename_kwargs,
+                                    ),
                                     _loop_for_step,
                                 ).result(timeout=15)
                             except Exception as _e:

@@ -5322,20 +5322,44 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return None
 
-    async def rename_thread(self, thread_id: str, title: str) -> bool:
-        """Best-effort visible Discord thread rename used by auto-title hooks."""
+    async def rename_thread(
+        self,
+        thread_id: str,
+        title: str,
+        *,
+        only_if_current_name: Optional[str] = None,
+    ) -> bool:
+        """Best-effort visible Discord thread rename used by auto-title hooks.
+
+        ``only_if_current_name`` is a guard for auto-title callbacks: if the
+        visible Discord thread has already been renamed by a human, leave it
+        alone instead of clobbering the operator's chosen title.
+        """
         if not self._client or not DISCORD_AVAILABLE:
             return False
         clean_title = _truncate_thread_name(_strip_discord_noise(title or ""))
         if not clean_title:
             return False
+        expected_current_name = None
+        if only_if_current_name is not None:
+            expected_current_name = _truncate_thread_name(_strip_discord_noise(only_if_current_name or ""))
         try:
             channel = self._client.get_channel(int(thread_id))
-            if channel is None:
+            if not channel:
                 channel = await self._client.fetch_channel(int(thread_id))
             if not isinstance(channel, discord.Thread):
                 return False
-            if getattr(channel, "name", None) == clean_title:
+            current_name = getattr(channel, "name", None)
+            if expected_current_name is not None and current_name != expected_current_name:
+                logger.info(
+                    "[%s] Skipping Discord auto-retitle for %s: current name %r no longer matches auto-created name %r",
+                    self.name,
+                    thread_id,
+                    current_name,
+                    expected_current_name,
+                )
+                return False
+            if current_name == clean_title:
                 return True
             await channel.edit(name=clean_title, reason="Hermes auto-generated conversation title")
             logger.info("[%s] Renamed Discord thread %s to %r", self.name, thread_id, clean_title)
