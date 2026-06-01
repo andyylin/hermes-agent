@@ -884,7 +884,7 @@ class EmailAdapter(BasePlatformAdapter):
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, content, reply_to
+                None, self._send_email, chat_id, content, reply_to, metadata
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -896,21 +896,29 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         reply_to_msg_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Send an email via SMTP. Runs in executor thread."""
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        # Thread context for reply
+        metadata = metadata or {}
+        explicit_subject = metadata.get("subject")
+        suppress_threading = bool(metadata.get("suppress_threading"))
+
+        # Thread context for reply, unless the caller supplies a fresh subject.
         ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
+        if explicit_subject:
+            subject = str(explicit_subject)
+        else:
+            subject = ctx.get("subject", "Hermes Agent")
+            if not subject.startswith("Re:"):
+                subject = f"Re: {subject}"
         msg["Subject"] = subject
 
         # Threading headers
-        original_msg_id = reply_to_msg_id or ctx.get("message_id")
+        original_msg_id = None if suppress_threading else (reply_to_msg_id or ctx.get("message_id"))
         if original_msg_id:
             msg["In-Reply-To"] = original_msg_id
             msg["References"] = original_msg_id
@@ -1195,6 +1203,7 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    subject=None,
 ):
     """Out-of-process Email delivery via SMTP (one-shot). Implements the
     standalone_sender_fn contract; replaces the legacy _send_email helper."""
@@ -1219,7 +1228,7 @@ async def _standalone_send(
         msg = MIMEText(message, "plain", "utf-8")
         msg["From"] = address
         msg["To"] = chat_id
-        msg["Subject"] = "Hermes Agent"
+        msg["Subject"] = subject or "Hermes Agent"
         msg["Date"] = formatdate(localtime=True)
 
         server = smtplib.SMTP(smtp_host, smtp_port)
