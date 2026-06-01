@@ -1747,6 +1747,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         for_discord = str(platform_name).lower() == "discord"
         for_email = str(platform_name).lower() == "email"
+        email_subject = _format_cron_email_subject(job) if for_email else None
         if wrap_response:
             delivery_content = _format_cron_delivery_content(
                 job,
@@ -1941,6 +1942,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
+
+            if email_subject and platform_name.lower() == "email":
+                route_metadata = dict(route_metadata or {})
+                route_metadata["subject"] = email_subject
+                route_metadata["suppress_threading"] = True
 
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
@@ -2165,7 +2171,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            send_subject = email_subject if platform_name.lower() == "email" else None
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                subject=send_subject,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -2194,7 +2209,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(
+                            asyncio.run,
+                            _send_to_platform(
+                                platform,
+                                pconfig,
+                                chat_id,
+                                cleaned_delivery_content,
+                                thread_id=thread_id,
+                                media_files=media_files,
+                                subject=send_subject,
+                            ),
+                        )
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)

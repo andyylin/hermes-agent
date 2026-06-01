@@ -729,6 +729,33 @@ class TestDeliverResultWrapping:
         assert "Cronjob Response" not in sent_content
         assert "The agent cannot see" not in sent_content
 
+    def test_email_delivery_passes_templated_subject(self):
+        """Email cron jobs can start a fresh dated thread via subject template."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.EMAIL: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler._hermes_now") as now_mock:
+            now_mock.return_value.strftime.side_effect = lambda fmt: {
+                "%Y-%m-%d": "2026-06-02",
+                "%Y%m%d": "20260602",
+            }[fmt]
+            job = {
+                "id": "brief-job",
+                "name": "joi-morning-briefing-hermes-owner",
+                "deliver": "email:andy@example.com",
+                "email_subject_template": "Andy Morning Brief — {date}",
+            }
+            _deliver_result(job, "Brief body")
+
+        send_mock.assert_called_once()
+        assert send_mock.call_args.kwargs["subject"] == "Andy Morning Brief — 2026-06-02"
+
     def test_delivery_extracts_media_tags_before_send(self, tmp_path, monkeypatch):
         """Cron delivery should pass MEDIA attachments separately to the send helper."""
         from gateway.config import Platform
