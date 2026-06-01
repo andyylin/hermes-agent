@@ -883,8 +883,10 @@ class EmailAdapter(BasePlatformAdapter):
         """Send an email reply to the given address."""
         try:
             loop = asyncio.get_running_loop()
+            subject = (metadata or {}).get("subject")
+            suppress_threading = bool((metadata or {}).get("suppress_threading"))
             message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, content, reply_to, metadata
+                None, self._send_email, chat_id, content, reply_to, subject, suppress_threading
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -896,21 +898,22 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         reply_to_msg_id: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        subject_override: Optional[str] = None,
+        suppress_threading: bool = False,
     ) -> str:
+
         """Send an email via SMTP. Runs in executor thread."""
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        metadata = metadata or {}
-        explicit_subject = metadata.get("subject")
-        suppress_threading = bool(metadata.get("suppress_threading"))
-
         # Thread context for reply, unless the caller supplies a fresh subject.
+        if isinstance(subject_override, dict):
+            suppress_threading = bool(subject_override.get("suppress_threading"))
+            subject_override = subject_override.get("subject")
         ctx = self._thread_context.get(to_addr, {})
-        if explicit_subject:
-            subject = str(explicit_subject)
+        if subject_override:
+            subject = str(subject_override)
         else:
             subject = ctx.get("subject", "Hermes Agent")
             if not subject.startswith("Re:"):

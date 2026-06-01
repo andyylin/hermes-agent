@@ -934,6 +934,31 @@ class TestSendMethods(unittest.TestCase):
             mock_server.send_message.assert_called_once()
             mock_server.quit.assert_called_once()
 
+    def test_metadata_subject_sends_fresh_subject_without_threading_headers(self):
+        """A caller can send a fresh email subject and suppress reply threading."""
+        import asyncio
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com"] = {
+            "subject": "Old chain",
+            "message_id": "<old@test.com>",
+        }
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            result = asyncio.run(adapter.send(
+                "user@test.com",
+                "Fresh body.",
+                metadata={"subject": "Joi Morning Briefing — 2026-06-02", "suppress_threading": True},
+            ))
+
+            self.assertTrue(result.success)
+            msg = mock_server.send_message.call_args[0][0]
+            self.assertEqual(msg["Subject"], "Joi Morning Briefing — 2026-06-02")
+            self.assertNotIn("In-Reply-To", msg)
+            self.assertNotIn("References", msg)
+
     def test_send_failure_returns_error(self):
         """SMTP failure should return SendResult with error."""
         import asyncio
