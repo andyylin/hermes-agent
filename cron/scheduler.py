@@ -1322,6 +1322,25 @@ def _markdown_tables_to_bullets(markdown_text: str) -> str:
     return "\n".join(output)
 
 
+def _format_cron_email_subject(job: dict) -> Optional[str]:
+    """Return an explicit email subject for cron delivery when a job asks for one.
+
+    Supports ``{date}`` / ``{date_compact}`` / ``{job_name}`` / ``{job_id}``
+    templates. Dates are evaluated at delivery time in Hermes' configured
+    timezone, so daily email automations do not thread into one endless chain.
+    """
+    template = job.get("email_subject_template") or job.get("delivery_subject_template")
+    if not template:
+        return None
+    now = _hermes_now()
+    return str(template).format(
+        date=now.strftime("%Y-%m-%d"),
+        date_compact=now.strftime("%Y%m%d"),
+        job_name=job.get("name", job.get("id", "")),
+        job_id=job.get("id", ""),
+    )
+
+
 def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool) -> str:
     """Apply the cron wrapper, using Discord-native Markdown when relevant."""
     task_name = job.get("name", job["id"])
@@ -1542,6 +1561,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             str(target.get("platform", "")).lower() == "discord" for target in targets
         ) else content
 
+    email_subject = _format_cron_email_subject(job)
+
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
@@ -1756,6 +1777,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
+
+            if email_subject and platform_name.lower() == "email":
+                route_metadata = dict(route_metadata or {})
+                route_metadata["subject"] = email_subject
+                route_metadata["suppress_threading"] = True
 
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
@@ -1980,7 +2006,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            send_subject = email_subject if platform_name.lower() == "email" else None
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                subject=send_subject,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -2009,7 +2044,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(
+                            asyncio.run,
+                            _send_to_platform(
+                                platform,
+                                pconfig,
+                                chat_id,
+                                cleaned_delivery_content,
+                                thread_id=thread_id,
+                                media_files=media_files,
+                                subject=send_subject,
+                            ),
+                        )
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)

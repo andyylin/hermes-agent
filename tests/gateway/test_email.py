@@ -875,6 +875,30 @@ class TestThreadContext(unittest.TestCase):
             html_part = next(part for part in parts if part.get_content_type() == "text/html")
             self.assertIn("<h2>Brief</h2>", html_part.get_payload(decode=True).decode("utf-8"))
 
+    def test_explicit_subject_suppresses_reply_threading(self):
+        """Cron-style email sends can start a fresh subject/thread."""
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com"] = {
+            "subject": "Old thread",
+            "message_id": "<old@test.com>",
+        }
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email(
+                "user@test.com",
+                "Fresh briefing",
+                None,
+                {"subject": "Andy Morning Brief — 2026-06-02", "suppress_threading": True},
+            )
+
+            msg = mock_server.send_message.call_args[0][0]
+            self.assertEqual(msg["Subject"], "Andy Morning Brief — 2026-06-02")
+            self.assertNotIn("In-Reply-To", msg)
+            self.assertNotIn("References", msg)
+
 
 class TestSendMethods(unittest.TestCase):
     """Test email send methods."""
