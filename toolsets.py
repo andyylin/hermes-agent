@@ -47,7 +47,7 @@ _HERMES_CORE_TOOLS = [
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
-    "todo", "memory",
+    "todo", "memory", "memory_tree",
     # Session history search
     "session_search",
     # Clarifying questions
@@ -213,6 +213,12 @@ TOOLSETS = {
     "memory": {
         "description": "Persistent memory across sessions (personal notes + user profile)",
         "tools": ["memory"],
+        "includes": []
+    },
+
+    "memory_tree": {
+        "description": "On-call retrieval from generated Memory Tree Lite packs (no auto-injection)",
+        "tools": ["memory_tree"],
         "includes": []
     },
 

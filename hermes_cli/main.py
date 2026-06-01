@@ -12039,7 +12039,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "computer-use",
         "config", "cron", "curator", "dashboard", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
-        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
+        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "memory-tree", "migrate",
         "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
@@ -14245,6 +14245,13 @@ Examples:
             memory_command(args)
 
     memory_parser.set_defaults(func=cmd_memory)
+
+    # =========================================================================
+    # memory-tree command
+    # =========================================================================
+    from hermes_cli.memory_tree import add_memory_tree_parser
+
+    add_memory_tree_parser(subparsers)
 
     # =========================================================================
     # tools command
