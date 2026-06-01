@@ -859,6 +859,41 @@ async def test_rename_thread_fetches_when_not_cached(adapter):
 
 
 @pytest.mark.asyncio
+async def test_rename_thread_skips_when_human_renamed_thread(adapter):
+    thread = _FakeThreadChannel(channel_id=777, name="Andy's Manual Title")
+    thread.edit = AsyncMock()
+    adapter._client.get_channel = lambda _id: thread
+
+    result = await adapter.rename_thread(
+        "777",
+        "Generated Conversation Title",
+        only_if_current_name="raw first message",
+    )
+
+    assert result is False
+    thread.edit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rename_thread_guard_allows_auto_created_name(adapter):
+    thread = _FakeThreadChannel(channel_id=777, name="raw first message")
+    thread.edit = AsyncMock()
+    adapter._client.get_channel = lambda _id: thread
+
+    result = await adapter.rename_thread(
+        "777",
+        "Generated Conversation Title",
+        only_if_current_name="raw first message",
+    )
+
+    assert result is True
+    thread.edit.assert_awaited_once_with(
+        name="Generated Conversation Title",
+        reason="Hermes auto-generated conversation title",
+    )
+
+
+@pytest.mark.asyncio
 async def test_rename_thread_ignores_non_thread_channel(adapter):
     adapter._client.get_channel = lambda _id: _FakeTextChannel(channel_id=777)
 
