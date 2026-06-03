@@ -14597,6 +14597,36 @@ def _ws_client_is_allowed(ws: "WebSocket") -> bool:
     return client_host in _LOOPBACK_HOSTS
 
 
+def _ws_origin_is_accepted(origin_netloc: str, bound_host: str) -> bool:
+    """Return True when a browser Origin is allowed for WS upgrades."""
+    if _is_accepted_host(origin_netloc, bound_host):
+        return True
+
+    # Cloudflare Tunnel / reverse-proxy deployments commonly rewrite the
+    # origin-facing Host header to the loopback upstream (e.g.
+    # ``httpHostHeader: 127.0.0.1:9119``) while the browser correctly sends
+    # ``Origin: https://hermes.example.com``. That is not a rebinding attack
+    # when the operator explicitly configured dashboard.public_url; it is the
+    # declared public origin. Keep the relief valve explicit so random public
+    # hostnames still die here.
+    try:
+        from hermes_cli.dashboard_auth.prefix import resolve_public_url
+
+        public_url = resolve_public_url()
+    except Exception:
+        public_url = ""
+
+    if not public_url:
+        return False
+
+    try:
+        public = urllib.parse.urlparse(public_url)
+    except ValueError:
+        return False
+
+    return bool(public.netloc) and origin_netloc.lower() == public.netloc.lower()
+
+
 def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     """Return a Host/Origin rejection reason, or None when allowed.
 
@@ -14620,13 +14650,12 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     if parsed.scheme not in {"http", "https"}:
         # Non-web origin (packaged Electron: file://, null, app://). The
         # upstream credential check is the real auth boundary; trust it.
-        # See _ws_host_origin_is_allowed for the full rationale.
         return None
 
     if not parsed.netloc:
         return f"origin_mismatch origin={origin} bound={bound_host}"
 
-    if not _is_accepted_host(parsed.netloc, bound_host):
+    if not _ws_origin_is_accepted(parsed.netloc, bound_host):
         return f"origin_mismatch origin={origin} bound={bound_host}"
     return None
 
@@ -14636,9 +14665,9 @@ def _ws_host_origin_is_allowed(ws: "WebSocket") -> bool:
 
     FastAPI HTTP middleware does not run for WebSocket routes, so the
     DNS-rebinding Host check used for normal dashboard HTTP requests must be
-    repeated here before accepting the upgrade.  Browsers also send an Origin
-    header on WebSocket handshakes; when present, require it to target the
-    same bound dashboard host.
+    repeated here before accepting the upgrade. Browsers also send an Origin
+    header on WebSocket handshakes; when present, require it to target either
+    the same bound dashboard host or the operator-declared public URL.
     """
     return _ws_host_origin_reason(ws) is None
 
