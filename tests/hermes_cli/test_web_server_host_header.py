@@ -215,3 +215,27 @@ class TestWebSocketHostOriginGuard:
             },
         ):
             pass
+
+    def test_configured_public_url_origin_is_accepted_behind_loopback_proxy(self, monkeypatch):
+        """Cloudflare Tunnel may rewrite Host to loopback while Origin stays public."""
+        from fastapi.testclient import TestClient
+
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.1", raising=False)
+        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+        monkeypatch.setattr(
+            "hermes_cli.dashboard_auth.prefix.resolve_public_url",
+            lambda: "https://hermes.andyylin.com",
+        )
+
+        client = TestClient(ws.app)
+        url = f"/api/events?token={ws._SESSION_TOKEN}&channel=security-test"
+        with client.websocket_connect(
+            url,
+            headers={
+                "Host": "127.0.0.1:9119",
+                "Origin": "https://hermes.andyylin.com",
+            },
+        ):
+            pass
