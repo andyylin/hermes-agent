@@ -1414,3 +1414,60 @@ class TestClaimDispatch:
         due = get_due_jobs()
         assert due == []
         assert load_jobs() == []  # cleaned up
+
+
+# =============================================================================
+# Deterministic cron definition export
+# =============================================================================
+
+
+class TestCronDefinitionsExport:
+    def test_create_job_exports_stable_definition(self, tmp_cron_dir, monkeypatch):
+        from cron.jobs import create_job
+
+        monkeypatch.setattr("cron.jobs._resolve_default_model_snapshot", lambda: "test-model")
+        job = create_job(
+            {"kind": "interval", "minutes": 30},
+            "Say hi",
+            name="demo",
+            deliver="local",
+            skills=["watchers"],
+            enabled_toolsets=["web"],
+        )
+
+        export_path = tmp_cron_dir / "cron" / "jobs.definitions.json"
+        assert export_path.exists()
+        data = json.loads(export_path.read_text())
+        assert data["schema"] == "hermes-cron-definitions-v1"
+        exported = data["jobs"][0]
+        assert exported["id"] == job["id"]
+        assert exported["name"] == "demo"
+        assert exported["prompt"] == "Say hi"
+        assert exported["deliver"] == "local"
+        assert exported["skills"] == ["watchers"]
+        assert exported["enabled_toolsets"] == ["web"]
+        assert "next_run_at" not in exported
+        assert "last_run_at" not in exported
+
+    def test_update_and_remove_refresh_export(self, tmp_cron_dir, monkeypatch):
+        from cron.jobs import create_job, update_job, remove_job
+
+        monkeypatch.setattr("cron.jobs._resolve_default_model_snapshot", lambda: None)
+        job = create_job({"kind": "interval", "minutes": 5}, "old", name="old-name")
+        export_path = tmp_cron_dir / "cron" / "jobs.definitions.json"
+
+        update_job(job["id"], {"prompt": "new", "name": "new-name"})
+        data = json.loads(export_path.read_text())
+        assert data["jobs"][0]["prompt"] == "new"
+        assert data["jobs"][0]["name"] == "new-name"
+
+        assert remove_job(job["id"]) is True
+        data = json.loads(export_path.read_text())
+        assert data["jobs"] == []
+
+    def test_export_definitions_file_reports_no_change(self, tmp_cron_dir, monkeypatch):
+        from cron.jobs import create_job, export_definitions_file
+
+        monkeypatch.setattr("cron.jobs._resolve_default_model_snapshot", lambda: None)
+        create_job({"kind": "interval", "minutes": 5}, "same", name="same-name")
+        assert export_definitions_file() is False
