@@ -289,6 +289,19 @@ def _strip_discord_noise(content: str) -> str:
     return text
 
 
+def _strip_gateway_speaker_prefix(content: str) -> str:
+    """Strip gateway-added speaker prefixes from messages used as title guards.
+
+    Discord auto-thread creation sees the raw Discord message, while the agent
+    conversation text may be prefixed as ``[display name] message`` before title
+    generation.  Guard comparisons must compare against the visible raw-thread
+    name, not treat that prefix as a human rename.
+    """
+    text = (content or "").strip()
+    match = re.match(r"^\[[^\]\n]{1,80}\]\s+(.+)$", text, flags=re.DOTALL)
+    return match.group(1).strip() if match else text
+
+
 def _legacy_auto_thread_name(content: str) -> str:
     text = _strip_discord_noise(content)
     return _truncate_thread_name(text) if text else "Hermes"
@@ -5343,9 +5356,16 @@ class DiscordAdapter(BasePlatformAdapter):
         clean_title = _truncate_thread_name(_strip_discord_noise(title or ""))
         if not clean_title:
             return False
-        expected_current_name = None
+        expected_current_names = None
         if only_if_current_name is not None:
-            expected_current_name = _truncate_thread_name(_strip_discord_noise(only_if_current_name or ""))
+            raw_expected = only_if_current_name or ""
+            expected_current_names = {
+                _truncate_thread_name(_strip_discord_noise(raw_expected)),
+                _truncate_thread_name(
+                    _strip_discord_noise(_strip_gateway_speaker_prefix(raw_expected))
+                ),
+            }
+            expected_current_names.discard("")
         try:
             channel = self._client.get_channel(int(thread_id))
             if not channel:
@@ -5353,13 +5373,13 @@ class DiscordAdapter(BasePlatformAdapter):
             if not isinstance(channel, discord.Thread):
                 return False
             current_name = getattr(channel, "name", None)
-            if expected_current_name is not None and current_name != expected_current_name:
+            if expected_current_names is not None and current_name not in expected_current_names:
                 logger.info(
-                    "[%s] Skipping Discord auto-retitle for %s: current name %r no longer matches auto-created name %r",
+                    "[%s] Skipping Discord auto-retitle for %s: current name %r no longer matches auto-created name(s) %r",
                     self.name,
                     thread_id,
                     current_name,
-                    expected_current_name,
+                    sorted(expected_current_names),
                 )
                 return False
             if current_name == clean_title:
