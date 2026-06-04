@@ -911,6 +911,25 @@ async def test_rename_thread_guard_allows_auto_created_name(adapter):
 
 
 @pytest.mark.asyncio
+async def test_rename_thread_guard_allows_gateway_prefixed_expected_name(adapter):
+    thread = _FakeThreadChannel(channel_id=777, name="How com eyou are no longer auto-titling Discord threads again")
+    thread.edit = AsyncMock()
+    adapter._client.get_channel = lambda _id: thread
+
+    result = await adapter.rename_thread(
+        "777",
+        "Discord Auto Title Regression",
+        only_if_current_name="[INeedAUsername] How com eyou are no longer auto-titling Discord threads again",
+    )
+
+    assert result is True
+    thread.edit.assert_awaited_once_with(
+        name="Discord Auto Title Regression",
+        reason="Hermes auto-generated conversation title",
+    )
+
+
+@pytest.mark.asyncio
 async def test_rename_thread_ignores_non_thread_channel(adapter):
     adapter._client.get_channel = lambda _id: _FakeTextChannel(channel_id=777)
 

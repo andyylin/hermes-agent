@@ -300,6 +300,19 @@ def _strip_discord_noise(content: str) -> str:
     return text
 
 
+def _strip_gateway_speaker_prefix(content: str) -> str:
+    """Strip gateway-added speaker prefixes from messages used as title guards.
+
+    Discord auto-thread creation sees the raw Discord message, while the agent
+    conversation text may be prefixed as ``[display name] message`` before title
+    generation.  Guard comparisons must compare against the visible raw-thread
+    name, not treat that prefix as a human rename.
+    """
+    text = (content or "").strip()
+    match = re.match(r"^\[[^\]\n]{1,80}\]\s+(.+)$", text, flags=re.DOTALL)
+    return match.group(1).strip() if match else text
+
+
 def _legacy_auto_thread_name(content: str) -> str:
     text = _strip_discord_noise(content)
     return _truncate_thread_name(text) if text else "Hermes"
@@ -5494,12 +5507,20 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
 
         current_name = getattr(thread, "name", None)
-        if only_if_current_name is not None and current_name != only_if_current_name:
-            logger.info(
-                "[%s] Discord semantic thread rename skipped for %s: current name %r != expected %r",
-                self.name, thread_id, current_name, only_if_current_name,
-            )
-            return False
+        if only_if_current_name is not None:
+            raw_expected = str(only_if_current_name or "")
+            expected_names = {
+                raw_expected,
+                _strip_gateway_speaker_prefix(raw_expected),
+            }
+            expected_names = {re.sub(r"\s+", " ", name).strip() for name in expected_names}
+            expected_names.discard("")
+            if current_name not in expected_names:
+                logger.info(
+                    "[%s] Discord semantic thread rename skipped for %s: current name %r != expected %r",
+                    self.name, thread_id, current_name, sorted(expected_names),
+                )
+                return False
         if current_name == cleaned:
             return True
 
