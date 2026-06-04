@@ -31,6 +31,8 @@ _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
 
+
+
 try:
     import discord
     from discord import Message as DiscordMessage, Intents
@@ -4009,7 +4011,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         Returns the created thread object, or ``None`` on failure.
         """
-        content = message.content or ""
+        content = (message.content or "").strip()
         if _discord_bool_env("DISCORD_SMART_THREAD_TITLES", False):
             thread_name = _build_auto_thread_name(content)
         else:
@@ -4037,6 +4039,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     fallback_error,
                 )
                 return None
+
 
     async def create_handoff_thread(
         self,
