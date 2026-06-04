@@ -13352,6 +13352,18 @@ def main():
     # cron tick (mostly for debugging)
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     _add_accept_hooks_flag(cron_tick)
+
+    # cron export-definitions
+    cron_export_definitions = cron_subparsers.add_parser(
+        "export-definitions",
+        aliases=["export"],
+        help="Export deterministic job definitions without runtime timestamp/status churn",
+    )
+    cron_export_definitions.add_argument(
+        "--output",
+        help="Output path (defaults to ~/.hermes/cron/jobs.definitions.json)",
+    )
+
     _add_accept_hooks_flag(cron_parser)
     cron_parser.set_defaults(func=cmd_cron)
 

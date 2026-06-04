@@ -37,6 +37,7 @@ except ImportError:
 HERMES_DIR = get_hermes_home().resolve()
 CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
+DEFINITIONS_FILE = CRON_DIR / "jobs.definitions.json"
 
 # In-process lock protecting load_jobs→modify→save_jobs cycles.
 # Required when tick() runs jobs in parallel threads — without this,
@@ -471,8 +472,15 @@ def load_jobs() -> List[Dict[str, Any]]:
     )
 
 
-def save_jobs(jobs: List[Dict[str, Any]]):
-    """Save all jobs to storage."""
+def save_jobs(jobs: List[Dict[str, Any]], *, export_definitions: bool = False):
+    """Save all jobs to storage.
+
+    ``cron/jobs.json`` is live scheduler state. When a caller has changed the
+    durable definition surface (create/edit/pause/resume/remove), pass
+    ``export_definitions=True`` so ``cron/jobs.definitions.json`` is refreshed
+    with a deterministic git-friendly projection. Runtime-only scheduler writes
+    leave the export untouched.
+    """
     ensure_dirs()
     fd, tmp_path = tempfile.mkstemp(dir=str(JOBS_FILE.parent), suffix='.tmp', prefix='.jobs_')
     try:
@@ -482,12 +490,31 @@ def save_jobs(jobs: List[Dict[str, Any]]):
             os.fsync(f.fileno())
         atomic_replace(tmp_path, JOBS_FILE)
         _secure_file(JOBS_FILE)
+        if export_definitions:
+            try:
+                export_definitions_file(jobs)
+            except Exception as exc:  # pragma: no cover - defensive logging path
+                logger.warning("Failed to export deterministic cron definitions: %s", exc)
     except BaseException:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
         raise
+
+
+def export_definitions_file(
+    jobs: Optional[List[Dict[str, Any]]] = None,
+    output_path: Optional[Path] = None,
+) -> bool:
+    """Export deterministic cron definitions and return True if file changed."""
+    from cron.definitions_export import definitions_path_for_jobs_file, export_cron_definitions
+
+    ensure_dirs()
+    if jobs is None:
+        jobs = load_jobs()
+    path = output_path or definitions_path_for_jobs_file(JOBS_FILE)
+    return export_cron_definitions(jobs, path)
 
 
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
@@ -707,7 +734,7 @@ def create_job(
 
     jobs = load_jobs()
     jobs.append(job)
-    save_jobs(jobs)
+    save_jobs(jobs, export_definitions=True)
 
     return job
 
@@ -828,7 +855,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             updated["next_run_at"] = compute_next_run(updated["schedule"])
 
         jobs[i] = updated
-        save_jobs(jobs)
+        save_jobs(jobs, export_definitions=True)
         return _normalize_job_record(jobs[i])
     return None
 
@@ -899,7 +926,7 @@ def remove_job(job_id: str) -> bool:
         # left over from before the create-time guard) fails closed without
         # half-applying the removal.
         job_output_dir = _job_output_dir(canonical_id)
-        save_jobs(jobs)
+        save_jobs(jobs, export_definitions=True)
         # Clean up output directory to prevent orphaned dirs accumulating
         if job_output_dir.exists():
             shutil.rmtree(job_output_dir)
@@ -939,7 +966,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     if times is not None and times > 0 and completed >= times:
                         # Remove the job (limit reached)
                         jobs.pop(i)
-                        save_jobs(jobs)
+                        save_jobs(jobs, export_definitions=True)
                         return
                 
                 # Compute next run

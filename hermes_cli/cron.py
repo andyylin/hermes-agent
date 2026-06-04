@@ -184,6 +184,18 @@ def cron_status():
     print()
 
 
+def cron_export_definitions(args):
+    """Export deterministic cron job definitions."""
+    from cron.jobs import DEFINITIONS_FILE, export_definitions_file
+
+    output = getattr(args, "output", None)
+    path = Path(output).expanduser() if output else DEFINITIONS_FILE
+    changed = export_definitions_file(output_path=path)
+    print(color(f"Exported cron definitions: {path}", Colors.GREEN))
+    print(f"  Changed: {'yes' if changed else 'no'}")
+    return 0
+
+
 def cron_create(args):
     # Defense: reject cron jobs that contain gateway lifecycle commands.
     # Prevents agents from scheduling their own restart/stop, which creates
@@ -339,6 +351,9 @@ def cron_command(args):
     if subcmd == "tick":
         cron_tick()
         return 0
+
+    if subcmd in {"export-definitions", "export"}:
+        return cron_export_definitions(args)
 
     if subcmd in {"create", "add"}:
         return cron_create(args)

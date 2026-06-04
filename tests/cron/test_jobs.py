@@ -1,5 +1,6 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import json
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
@@ -21,7 +22,9 @@ from cron.jobs import (
     advance_next_run,
     get_due_jobs,
     save_job_output,
+    export_definitions_file,
 )
+from cron.definitions_export import render_cron_definitions
 
 
 # =========================================================================
@@ -991,3 +994,85 @@ class TestSaveJobOutput:
         with pytest.raises(ValueError, match="output path"):
             save_job_output(str(tmp_cron_dir / "outside"), "# Results")
         assert not (tmp_cron_dir / "outside").exists()
+
+
+# =========================================================================
+# Deterministic cron definition export
+# =========================================================================
+
+class TestCronDefinitionExport:
+    def test_render_ignores_runtime_timestamp_churn(self):
+        base_job = {
+            "id": "job-a",
+            "name": "Definition job",
+            "prompt": "Do the thing",
+            "schedule": {"kind": "interval", "minutes": 30, "display": "every 30m"},
+            "schedule_display": "every 30m",
+            "repeat": {"times": 5, "completed": 1},
+            "enabled": True,
+            "state": "scheduled",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "next_run_at": "2026-01-01T00:30:00+00:00",
+            "last_run_at": "2026-01-01T00:00:00+00:00",
+            "last_status": "ok",
+            "last_error": None,
+            "last_delivery_error": None,
+        }
+        churned = dict(base_job)
+        churned.update(
+            {
+                "next_run_at": "2026-01-01T01:00:00+00:00",
+                "last_run_at": "2026-01-01T00:30:00+00:00",
+                "last_status": "error",
+                "last_error": "network burp",
+                "last_delivery_error": "discord burp",
+                "repeat": {"times": 5, "completed": 2},
+            }
+        )
+
+        assert render_cron_definitions([base_job]) == render_cron_definitions([churned])
+        exported = json.loads(render_cron_definitions([base_job]))
+        job = exported["jobs"][0]
+        assert job["repeat"] == {"times": 5}
+        assert "next_run_at" not in job
+        assert "last_run_at" not in job
+        assert "last_status" not in job
+        assert "last_error" not in job
+
+    def test_create_update_pause_remove_refreshes_export(self, tmp_cron_dir):
+        export_path = tmp_cron_dir / "cron" / "jobs.definitions.json"
+
+        job = create_job(prompt="Initial prompt", schedule="every 30m", name="Export me")
+        assert export_path.exists()
+        created_export = json.loads(export_path.read_text())
+        assert created_export["jobs"][0]["prompt"] == "Initial prompt"
+
+        update_job(job["id"], {"prompt": "Updated prompt"})
+        updated_export = json.loads(export_path.read_text())
+        assert updated_export["jobs"][0]["prompt"] == "Updated prompt"
+
+        pause_job(job["id"], reason="maintenance")
+        paused_export = json.loads(export_path.read_text())
+        assert paused_export["jobs"][0]["state"] == "paused"
+        assert paused_export["jobs"][0]["paused_reason"] == "maintenance"
+        assert "paused_at" not in paused_export["jobs"][0]
+
+        assert remove_job(job["id"])
+        removed_export = json.loads(export_path.read_text())
+        assert removed_export["jobs"] == []
+
+    def test_runtime_mark_run_does_not_rewrite_export(self, tmp_cron_dir):
+        export_path = tmp_cron_dir / "cron" / "jobs.definitions.json"
+        job = create_job(prompt="Runtime churn", schedule="every 30m")
+        before = export_path.read_text()
+
+        mark_job_run(job["id"], success=True)
+
+        assert export_path.read_text() == before
+        live_job = get_job(job["id"])
+        assert live_job["last_status"] == "ok"
+        assert live_job["last_run_at"]
+
+    def test_manual_export_returns_false_when_unchanged(self, tmp_cron_dir):
+        create_job(prompt="Manual export", schedule="every 1h")
+        assert export_definitions_file() is False
