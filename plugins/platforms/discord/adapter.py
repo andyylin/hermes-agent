@@ -84,6 +84,8 @@ _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS = (
     re.compile(r"^\s*♻️?\s+Gateway\s+(?:restarted successfully|online\b)[\s\S]*$", re.IGNORECASE),
 )
 
+
+
 try:
     import discord
     from discord import Message as DiscordMessage, Intents
@@ -5199,7 +5201,7 @@ class DiscordAdapter(BasePlatformAdapter):
         (e.g. ``Cannot connect to host discord.com:443``) don't immediately
         burn through to the caller's failure path (#20243).
         """
-        content = message.content or ""
+        content = (message.content or "").strip()
         if _discord_bool_env("DISCORD_SMART_THREAD_TITLES", False):
             thread_name = _build_auto_thread_name(content)
         else:
@@ -5243,6 +5245,7 @@ class DiscordAdapter(BasePlatformAdapter):
             last_fallback_error,
         )
         return None
+
 
     async def create_handoff_thread(
         self,
