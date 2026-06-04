@@ -88,6 +88,8 @@ _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS = (
     re.compile(r"^\s*♻️?\s+Gateway\s+(?:restarted successfully|online\b)[\s\S]*$", re.IGNORECASE),
 )
 
+
+
 try:
     import discord
     from discord import Message as DiscordMessage, Intents

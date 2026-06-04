@@ -116,6 +116,7 @@ def adapter(monkeypatch):
         "DISCORD_HISTORY_BACKFILL",
         "DISCORD_HISTORY_BACKFILL_LIMIT",
         "DISCORD_ALLOW_BOTS",
+        "DISCORD_SMART_THREAD_TITLES",
     ):
         monkeypatch.delenv(_var, raising=False)
 

@@ -634,6 +634,23 @@ async def test_auto_create_thread_uses_message_content_as_name(adapter, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_auto_create_thread_uses_summarized_name_when_enabled(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_SMART_THREAD_TITLES", "true")
+    thread = SimpleNamespace(id=999, name="smart")
+    message = SimpleNamespace(
+        content="<@123> Can you make yourself auto-retitle threads intelligently? Based on the first message",
+        create_thread=AsyncMock(return_value=thread),
+        channel=SimpleNamespace(send=AsyncMock()),
+        author=SimpleNamespace(display_name="Jezza"),
+    )
+
+    await adapter._auto_create_thread(message)
+
+    name = message.create_thread.await_args[1]["name"]
+    assert name == "make yourself auto-retitle threads intelligently"
+
+
+@pytest.mark.asyncio
 async def test_auto_create_thread_strips_mention_syntax_from_name(adapter):
     """Thread names must not contain raw <@id>, <@&id>, or <#id> markers.
 
@@ -1109,6 +1126,29 @@ def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
 
     import os
     assert os.getenv("DISCORD_AUTO_THREAD") == "true"
+    assert os.getenv("DISCORD_SMART_THREAD_TITLES") == "true"
+
+
+def test_discord_smart_thread_titles_config_bridge(monkeypatch, tmp_path):
+    """discord.smart_thread_titles in config.yaml should bridge to runtime env."""
+    import yaml
+    from pathlib import Path
+
+    hermes_dir = tmp_path / ".hermes"
+    hermes_dir.mkdir()
+    config_path = hermes_dir / "config.yaml"
+    config_path.write_text(yaml.dump({
+        "discord": {"smart_thread_titles": True},
+    }))
+
+    monkeypatch.delenv("DISCORD_SMART_THREAD_TITLES", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_dir))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    from gateway.config import load_gateway_config
+    load_gateway_config()
+
+    import os
     assert os.getenv("DISCORD_SMART_THREAD_TITLES") == "true"
 
 
