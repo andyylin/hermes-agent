@@ -285,7 +285,7 @@ def cmd_memory_tree(args: Any) -> int:
     if action == "attention":
         from agent.memory_tree_attention import format_attention_json, format_attention_report, scan_attention
 
-        items = scan_attention(stale_days=getattr(args, "stale_days", 7))
+        items = scan_attention(stale_days=getattr(args, "stale_days", 7), include_stale=getattr(args, "include_stale", False))
         print(format_attention_json(items, max_chars=getattr(args, "chars", 4000)) if getattr(args, "json", False) else format_attention_report(items, max_chars=getattr(args, "chars", 4000)))
         return 0
     if action == "reconcile":
@@ -341,6 +341,7 @@ def add_memory_tree_parser(subparsers: Any) -> Any:
     attention = sub.add_parser("attention", help="Run attention scan")
     attention.add_argument("--stale-days", type=int, default=7)
     attention.add_argument("--chars", type=int, default=4000)
+    attention.add_argument("--include-stale", action="store_true", help="Include low-priority stale active-work ledger review items")
     attention.add_argument("--json", action="store_true")
 
     reconcile = sub.add_parser("reconcile", help="Reconcile active-work source handles")

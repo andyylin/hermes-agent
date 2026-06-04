@@ -8,6 +8,7 @@ attention needed.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -89,23 +90,24 @@ def _parse_dt(value: Any) -> datetime | None:
 
 
 def _record_time(record: dict[str, Any]) -> datetime | None:
+    candidates: list[datetime] = []
     for key in ("updated_at", "last_checked_at", "created_at", "timestamp"):
         dt = _parse_dt(record.get(key))
         if dt:
-            return dt
+            candidates.append(dt)
     runtime = record.get("runtime")
     if isinstance(runtime, dict):
         for key in ("last_run_at", "last_checked_at", "updated_at"):
             dt = _parse_dt(runtime.get(key))
             if dt:
-                return dt
+                candidates.append(dt)
     verification = record.get("verification")
     if isinstance(verification, dict):
-        for key in ("checked_at", "updated_at", "last_run_at"):
+        for key in ("checked_at", "updated_at", "last_run_at", "last_checked_at"):
             dt = _parse_dt(verification.get(key))
             if dt:
-                return dt
-    return None
+                candidates.append(dt)
+    return max(candidates) if candidates else None
 
 
 def _age(now: datetime, dt: datetime | None) -> tuple[float, str]:
@@ -131,8 +133,20 @@ def _stringify(value: Any) -> str:
 
 
 def _contains_failure_marker(*values: Any) -> bool:
-    haystack = " ".join(_stringify(v).lower() for v in values)
-    return any(marker in haystack for marker in FAILED_MARKERS)
+    return any(_is_failure_status(v) for v in values)
+
+
+def _is_failure_status(value: Any) -> bool:
+    text = _stringify(value).strip().lower()
+    if not text:
+        return False
+    # Compound status labels such as "ok_with_personal_rclone_errors" are
+    # historical/qualified OK states, not current failures. Current failures
+    # must be encoded as a failing status or a non-empty explicit error field.
+    if re.match(r"^(ok|success|succeeded|pass|passed|clean|healthy|silent|noop|no_op)(\b|[_-])", text):
+        return False
+    tokens = {token for token in re.split(r"[^a-z0-9]+", text) if token}
+    return bool(tokens & FAILED_MARKERS)
 
 
 def _status_values(*containers: Any) -> list[Any]:
@@ -181,7 +195,14 @@ def _has_source_of_truth(record: dict[str, Any], runtime: dict[str, Any], verifi
     return False
 
 
-def _scan_ledger_records(records: Iterable[dict[str, Any]], *, now: datetime, stale_days: int, source_path: Path) -> list[AttentionItem]:
+def _scan_ledger_records(
+    records: Iterable[dict[str, Any]],
+    *,
+    now: datetime,
+    stale_days: int,
+    source_path: Path,
+    include_stale: bool = True,
+) -> list[AttentionItem]:
     items: list[AttentionItem] = []
     for index, record in enumerate(records):
         if not isinstance(record, dict):
@@ -194,8 +215,9 @@ def _scan_ledger_records(records: Iterable[dict[str, Any]], *, now: datetime, st
         runtime: dict[str, Any] = raw_runtime if isinstance(raw_runtime, dict) else {}
         verification: dict[str, Any] = raw_verification if isinstance(raw_verification, dict) else {}
 
-        failure_values = [status, *_status_values(runtime, verification), *_error_values(record, runtime, verification)]
-        if _contains_failure_marker(*failure_values):
+        explicit_errors = _error_values(record, runtime, verification)
+        failure_values = [status, *_status_values(runtime, verification)]
+        if explicit_errors or _contains_failure_marker(*failure_values):
             evidence_parts = [f"status={status or 'unknown'}"]
             cron_job_id = runtime.get("cron_job_id") if isinstance(runtime, dict) else None
             if cron_job_id:
@@ -240,6 +262,8 @@ def _scan_ledger_records(records: Iterable[dict[str, Any]], *, now: datetime, st
                 )
             )
             continue
+        if not include_stale:
+            continue
         days, age = _age(now, record_dt)
         if days >= stale_days:
             purpose = _short(str(record.get("purpose") or record.get("summary") or ""), 180)
@@ -262,7 +286,7 @@ def _scan_ledger_records(records: Iterable[dict[str, Any]], *, now: datetime, st
     return items
 
 
-def scan_attention(*, now: datetime | None = None, stale_days: int = 7) -> list[AttentionItem]:
+def scan_attention(*, now: datetime | None = None, stale_days: int = 7, include_stale: bool = True) -> list[AttentionItem]:
     """Return deterministic attention items from local Hermes state."""
 
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -270,7 +294,7 @@ def scan_attention(*, now: datetime | None = None, stale_days: int = 7) -> list[
     ledger = _load_json(ledger_path)
     raw_records = ledger.get("records")
     records: list[dict[str, Any]] = raw_records if isinstance(raw_records, list) else []
-    items = _scan_ledger_records(records, now=now, stale_days=stale_days, source_path=ledger_path)
+    items = _scan_ledger_records(records, now=now, stale_days=stale_days, source_path=ledger_path, include_stale=include_stale)
     severity_rank = {"failure": 0, "attention": 1, "info": 2}
     return sorted(items, key=lambda item: (severity_rank.get(item.severity, 9), item.kind, item.source_id))
 
@@ -356,8 +380,8 @@ def format_attention_json(items: list[AttentionItem], *, max_chars: int = 4000) 
     return _bounded_json(payload, max_chars=max_chars)
 
 
-def scan_and_format_attention(*, stale_days: int = 7, max_chars: int = 4000) -> str:
-    return format_attention_report(scan_attention(stale_days=stale_days), max_chars=max_chars)
+def scan_and_format_attention(*, stale_days: int = 7, max_chars: int = 4000, include_stale: bool = True) -> str:
+    return format_attention_report(scan_attention(stale_days=stale_days, include_stale=include_stale), max_chars=max_chars)
 
 
 __all__ = [
