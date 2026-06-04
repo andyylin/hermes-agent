@@ -69,6 +69,7 @@ HERMES_DIR = get_hermes_home().resolve()
 # with use_cron_store() instead of mutating them process-wide.
 CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
+DEFINITIONS_FILE = CRON_DIR / "jobs.definitions.json"
 # Heartbeat file the in-process ticker touches on every loop iteration. The
 # gateway process and the (separate) ``hermes cron status`` process share it
 # so status can tell whether the ticker THREAD is alive, not just whether the
@@ -868,7 +869,7 @@ def load_jobs() -> List[Dict[str, Any]]:
     )
 
 
-def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
+def _save_jobs_unlocked(jobs: List[Dict[str, Any]], *, export_definitions: bool = False):
     """Save all jobs to storage. Caller must hold _jobs_lock()."""
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
@@ -880,6 +881,11 @@ def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
             os.fsync(f.fileno())
         atomic_replace(tmp_path, jobs_file)
         _secure_file(jobs_file)
+        if export_definitions:
+            try:
+                export_definitions_file(jobs)
+            except Exception as exc:  # pragma: no cover - defensive logging path
+                logger.warning("Failed to export deterministic cron definitions: %s", exc)
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -888,10 +894,24 @@ def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
         raise
 
 
-def save_jobs(jobs: List[Dict[str, Any]]):
+def save_jobs(jobs: List[Dict[str, Any]], *, export_definitions: bool = False):
     """Save all jobs to storage."""
     with _jobs_lock():
-        _save_jobs_unlocked(jobs)
+        _save_jobs_unlocked(jobs, export_definitions=export_definitions)
+
+
+def export_definitions_file(
+    jobs: Optional[List[Dict[str, Any]]] = None,
+    output_path: Optional[Path] = None,
+) -> bool:
+    """Export deterministic cron definitions and return True if file changed."""
+    from cron.definitions_export import definitions_path_for_jobs_file, export_cron_definitions
+
+    ensure_dirs()
+    if jobs is None:
+        jobs = load_jobs()
+    path = output_path or definitions_path_for_jobs_file(_current_cron_store().jobs_file)
+    return export_cron_definitions(jobs, path)
 
 
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
@@ -1223,7 +1243,7 @@ def create_job(
     with _jobs_lock():
         jobs = load_jobs()
         jobs.append(job)
-        save_jobs(jobs)
+        save_jobs(jobs, export_definitions=True)
 
     return job
 
@@ -1379,7 +1399,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updated["next_run_at"] = next_run
 
             jobs[i] = updated
-            save_jobs(jobs)
+            save_jobs(jobs, export_definitions=True)
             return _normalize_job_record(jobs[i])
     return None
 
@@ -1457,7 +1477,7 @@ def remove_job(job_id: str) -> bool:
             # left over from before the create-time guard) fails closed without
             # half-applying the removal.
             job_output_dir = _job_output_dir(canonical_id)
-            save_jobs(jobs)
+            save_jobs(jobs, export_definitions=True)
             # Clean up output directory to prevent orphaned dirs accumulating
             if job_output_dir.exists():
                 shutil.rmtree(job_output_dir)
