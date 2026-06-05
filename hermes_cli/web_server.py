@@ -1651,7 +1651,36 @@ async def get_profiles_sessions(
     min_message_count = max(0, min_messages)
     archived_only = archived == "only"
     include_archived = archived == "include"
+    # Desktop's chat sidebar is for human conversations. Cron sessions are
+    # internal automation transcripts; if exposed, their system prompts become
+    # junk "chats" like the LINE digest [SILENT] prompt. Keep them queryable in
+    # the DB, but hide them from this user-facing aggregate list by default.
+    excluded_sources = ["cron"]
     per_profile = min(max(limit + offset, limit), 500)
+
+    def _count_profile_sessions(db, excluded: List[str]) -> int:
+        where_clauses = [
+            "(s.parent_session_id IS NULL"
+            " OR EXISTS (SELECT 1 FROM sessions p"
+            "            WHERE p.id = s.parent_session_id"
+            "            AND p.end_reason = 'branched'"
+            "            AND s.started_at >= p.ended_at))"
+        ]
+        params: List[Any] = []
+        if excluded:
+            placeholders = ",".join("?" for _ in excluded)
+            where_clauses.append(f"s.source NOT IN ({placeholders})")
+            params.extend(excluded)
+        if min_message_count > 0:
+            where_clauses.append("s.message_count >= ?")
+            params.append(min_message_count)
+        if archived_only:
+            where_clauses.append("s.archived = 1")
+        elif not include_archived:
+            where_clauses.append("s.archived = 0")
+        where_sql = " AND ".join(where_clauses)
+        cursor = db._conn.execute(f"SELECT COUNT(*) FROM sessions s WHERE {where_sql}", params)
+        return int(cursor.fetchone()[0])
 
     merged: List[Dict[str, Any]] = []
     total = 0
@@ -1675,12 +1704,9 @@ async def get_profiles_sessions(
                 include_archived=include_archived,
                 archived_only=archived_only,
                 order_by_last_active=order == "recent",
+                exclude_sources=excluded_sources,
             )
-            profile_total = db.session_count(
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-            )
+            profile_total = _count_profile_sessions(db, excluded_sources)
             total += profile_total
             profile_totals[name] = profile_total
             for s in rows:
