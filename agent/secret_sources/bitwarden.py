@@ -409,8 +409,8 @@ def fetch_bitwarden_secrets(
 
     secrets, warnings = _run_bws_list(bws, access_token, project_id, server_url)
     entry = _CachedFetch(secrets=secrets, fetched_at=time.time())
-    _CACHE[cache_key] = entry
-    if use_cache:
+    if use_cache and cache_ttl_seconds > 0:
+        _CACHE[cache_key] = entry
         _DISK_CACHE.write(cache_key, entry, cache_ttl_seconds, home_path)
     return secrets, warnings
 
