@@ -8,6 +8,7 @@ from cron.jobs import (
     parse_duration,
     parse_schedule,
     compute_next_run,
+    _compute_grace_seconds,
     create_job,
     load_jobs,
     save_jobs,
@@ -224,6 +225,9 @@ class TestComputeNextRun:
 
     def test_unknown_kind_returns_none(self):
         assert compute_next_run({"kind": "unknown"}) is None
+
+    def test_recurring_catch_up_grace_is_capped_at_30_minutes(self):
+        assert _compute_grace_seconds({"kind": "interval", "minutes": 24 * 60}) == 30 * 60
 
 
 # =========================================================================
@@ -802,7 +806,7 @@ class TestGetDueJobs:
     def test_past_due_within_window_returned(self, tmp_cron_dir):
         """Jobs within the dynamic grace window are still considered due (not stale).
 
-        For an hourly job, grace = 30 min (half the period, clamped to [120s, 2h]).
+        For an hourly job, grace = 30 min (half the period, clamped to [120s, 30m]).
         """
         job = create_job(prompt="Due now", schedule="every 1h")
         # Force next_run_at to 10 minutes ago (within the 30-min grace for hourly)
