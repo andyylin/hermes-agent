@@ -754,6 +754,38 @@ def test_disk_cache_written_after_first_fetch(monkeypatch, tmp_path):
     assert "0.t" not in cache_path.read_text()
 
 
+def test_disk_cache_not_written_when_ttl_zero(monkeypatch, tmp_path):
+    """cache_ttl_seconds=0 disables plaintext disk and in-process caching."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([{"key": "K1", "value": "v1"}])
+
+    call_count = {"n": 0}
+
+    def fake_run(*a, **kw):
+        call_count["n"] += 1
+        return mock.Mock(returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+    bw._reset_cache_for_tests(home)
+
+    secrets, _ = bw.fetch_bitwarden_secrets(
+        access_token="0.t", project_id="proj-1", binary=fake_binary,
+        cache_ttl_seconds=0, home_path=home,
+    )
+    assert secrets == {"K1": "v1"}
+    assert call_count["n"] == 1
+    assert not bw._disk_cache_path(home).exists()
+
+    bw.fetch_bitwarden_secrets(
+        access_token="0.t", project_id="proj-1", binary=fake_binary,
+        cache_ttl_seconds=0, home_path=home,
+    )
+    assert call_count["n"] == 2
+
+
 def test_disk_cache_short_circuits_bws_when_fresh(monkeypatch, tmp_path):
     """Second fetch (different process simulation) skips bws entirely."""
     home = tmp_path / ".hermes"
