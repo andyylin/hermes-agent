@@ -1733,6 +1733,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # The OpenAI SDK Stream object exposes the underlying httpx
         # response via .response before any chunks are consumed.
         agent._capture_rate_limits(getattr(stream, "response", None))
+        agent._capture_credits(getattr(stream, "response", None))
         # Snapshot diagnostic headers (cf-ray, x-openrouter-provider, etc.)
         # so they survive even when the stream dies before any chunk
         # arrives.  Best-effort; never raises.
@@ -1934,6 +1935,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         arguments=arguments,
                     ),
                 ))
+
+        # Zero-chunk guard: stream yielded nothing usable — a provider/upstream
+        # error or malformed SSE, not a legitimate empty completion. Raise so the
+        # retry machinery handles it instead of fabricating a successful turn.
+        if (
+            finish_reason is None
+            and not content_parts
+            and not reasoning_parts
+            and not tool_calls_acc
+        ):
+            raise RuntimeError(
+                "Provider returned an empty stream with no finish_reason "
+                "(possible upstream error or malformed SSE response)."
+            )
 
         effective_finish_reason = finish_reason or "stop"
         if has_truncated_tool_args:

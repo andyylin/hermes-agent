@@ -25,6 +25,13 @@ export interface SlashExecResponse {
   warning?: string
 }
 
+export interface SessionSteerResponse {
+  // 'queued' == accepted into the live turn's steer slot (injected at the next
+  // tool-result boundary); 'rejected' == no live tool window, caller queues.
+  status?: 'queued' | 'rejected'
+  text?: string
+}
+
 export interface SessionTitleResponse {
   title?: string
   // True when the session row isn't persisted yet and the title was queued
@@ -84,4 +91,9 @@ export interface ClientSessionState {
   /** A blocking clarify prompt is waiting on the user for this session. Drives
    *  the sidebar "needs input" indicator; cleared when the turn resumes/ends. */
   needsInput: boolean
+  /** Epoch ms the current turn started, or null when idle. Per-session so a
+   *  background turn's elapsed timer keeps counting while another session is
+   *  focused, and switching sessions doesn't zero a still-running turn's clock.
+   *  The global $turnStartedAt mirrors whichever session is currently viewed. */
+  turnStartedAt: number | null
 }
