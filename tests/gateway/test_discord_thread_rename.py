@@ -99,6 +99,32 @@ async def test_discord_thread_renames_placeholder_to_sanitized_generated_title()
 
 
 @pytest.mark.asyncio
+async def test_discord_thread_rename_guard_uses_raw_initial_name_for_attachment_prompts():
+    """Attachment metadata injected into the agent prompt must not trip the manual-rename guard."""
+    runner, adapter = _make_runner()
+    raw_initial_name = "This FreeCAD file keeps crashing in the latest FreeCAD"
+    enriched_agent_prompt = (
+        "[The user sent a document: 'window-stop-v5.FCStd.zip'. The file is saved at: "
+        "/home/pi/.hermes/cache/documents/doc_faa917d1c408_window-stop-v5.FCStd.zip. "
+        "Ask the user what they'd like you to do with it.]\n\n"
+        "[INeedAUsername] This FreeCAD file keeps crashing in the latest FreeCAD. "
+        "Can you figure out what the problem is?"
+    )
+
+    await runner._rename_discord_thread_for_session_title(
+        _make_source(thread_id="999", thread_initial_name=raw_initial_name),
+        "sess-discord",
+        "Diagnosing FreeCAD File Crashes",
+    )
+
+    adapter.rename_thread.assert_awaited_once()
+    kwargs = adapter.rename_thread.await_args.kwargs
+    assert kwargs["name"] == "Diagnosing FreeCAD File Crashes"
+    assert kwargs["expected_current_name"] == raw_initial_name
+    assert kwargs["expected_current_name"] not in enriched_agent_prompt[:80]
+
+
+@pytest.mark.asyncio
 async def test_discord_auto_thread_name_mode_message_skips_summary_rename(monkeypatch):
     monkeypatch.delenv("DISCORD_AUTO_THREAD_NAME_MODE", raising=False)
     runner, adapter = _make_runner(extra={"auto_thread_name_mode": "message"})
