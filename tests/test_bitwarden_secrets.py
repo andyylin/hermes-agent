@@ -664,6 +664,58 @@ def test_env_loader_calls_bsm_when_enabled(tmp_path, monkeypatch):
     assert os.environ.get("MY_BSM_KEY") == "from-bsm"
 
 
+def test_env_loader_reapplies_bsm_after_second_dotenv_load(tmp_path, monkeypatch):
+    """A later dotenv reload must not clobber already-fetched BSM values."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / ".env").write_text(
+        "BWS_ACCESS_TOKEN=0.t\n"
+        "API_SERVER_KEY=\n"
+        "DISCORD_BOT_TOKEN=\n"
+    )
+    (home / "config.yaml").write_text(
+        "secrets:\n"
+        "  bitwarden:\n"
+        "    enabled: true\n"
+        "    project_id: 'proj-1'\n"
+        "    access_token_env: 'BWS_ACCESS_TOKEN'\n"
+        "    cache_ttl_seconds: 300\n"
+        "    override_existing: true\n"
+        "    auto_install: false\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    called = {"n": 0}
+
+    def fake_apply(**kwargs):
+        called["n"] += 1
+        os.environ["API_SERVER_KEY"] = "api-from-bsm"
+        os.environ["DISCORD_BOT_TOKEN"] = "discord-from-bsm"
+        return bw.FetchResult(
+            secrets={
+                "API_SERVER_KEY": "api-from-bsm",
+                "DISCORD_BOT_TOKEN": "discord-from-bsm",
+            },
+            applied=["API_SERVER_KEY", "DISCORD_BOT_TOKEN"],
+        )
+
+    monkeypatch.setattr(
+        "agent.secret_sources.bitwarden.apply_bitwarden_secrets",
+        fake_apply,
+    )
+
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    load_hermes_dotenv(hermes_home=home)
+    assert os.environ["API_SERVER_KEY"] == "api-from-bsm"
+    assert os.environ["DISCORD_BOT_TOKEN"] == "discord-from-bsm"
+
+    load_hermes_dotenv(hermes_home=home)
+    assert called["n"] == 1
+    assert os.environ["API_SERVER_KEY"] == "api-from-bsm"
+    assert os.environ["DISCORD_BOT_TOKEN"] == "discord-from-bsm"
+
+
 # ---------------------------------------------------------------------------
 # Disk-persisted cache (cross-process — speeds up back-to-back CLI invocations)
 # ---------------------------------------------------------------------------
