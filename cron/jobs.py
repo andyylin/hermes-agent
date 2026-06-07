@@ -345,12 +345,12 @@ def _recoverable_oneshot_run_at(
 def _compute_grace_seconds(schedule: dict) -> int:
     """Compute how late a job can be and still catch up instead of fast-forwarding.
 
-    Uses half the schedule period, clamped between 120 seconds and 2 hours.
-    This ensures daily jobs can catch up if missed by up to 2 hours,
+    Uses half the schedule period, clamped between 120 seconds and 30 minutes.
+    This ensures daily jobs can catch up if missed by up to 30 minutes,
     while frequent jobs (every 5-10 min) still fast-forward quickly.
     """
     MIN_GRACE = 120
-    MAX_GRACE = 7200  # 2 hours
+    MAX_GRACE = 1800  # 30 minutes
 
     kind = schedule.get("kind")
 
@@ -1111,7 +1111,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             grace = _compute_grace_seconds(schedule)
             if kind in {"cron", "interval"} and (now - next_run_dt).total_seconds() > grace:
                 # Job is past its catch-up grace window — this is a stale missed run.
-                # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
+                # Grace scales with schedule period: daily=30m, hourly=30m, 10min=5m.
                 new_next = compute_next_run(schedule, now.isoformat())
                 if new_next:
                     logger.info(
