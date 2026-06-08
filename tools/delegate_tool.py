@@ -1737,7 +1737,8 @@ def _run_single_child(
     """
     child_start = time.monotonic()
 
-    requested_model = getattr(child, "_delegate_requested_model", None)
+    _requested_model = getattr(child, "_delegate_requested_model", None)
+    requested_model = _requested_model if isinstance(_requested_model, str) and _requested_model else None
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
