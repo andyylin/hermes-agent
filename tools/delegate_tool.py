@@ -1181,6 +1181,13 @@ def _build_child_agent(
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+    # Preserve the model that delegation resolved for this child. Credential
+    # pool binding happens later in _run_single_child(); pool entries belong to
+    # a provider credential, not to the caller's per-task model choice. Re-apply
+    # this after binding so dynamic delegate_task(model=...) cannot be silently
+    # clobbered by a shared parent pool.
+    if model:
+        setattr(child, "_delegate_requested_model", effective_model)
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
@@ -1381,6 +1388,8 @@ def _run_single_child(
     """
     child_start = time.monotonic()
 
+    requested_model = getattr(child, "_delegate_requested_model", None)
+
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
 
@@ -1401,6 +1410,8 @@ def _run_single_child(
                 leased_entry = child_pool.current()
                 if leased_entry is not None and hasattr(child, "_swap_credential"):
                     child._swap_credential(leased_entry)
+                if requested_model:
+                    setattr(child, "model", requested_model)
             except Exception as exc:
                 logger.debug("Failed to bind child to leased credential: %s", exc)
 
