@@ -314,13 +314,18 @@ def _strip_gateway_speaker_prefix(content: str) -> str:
 
 
 def _legacy_auto_thread_name(content: str) -> str:
-    text = _strip_discord_noise(content)
+    text = _strip_discord_noise(_strip_gateway_speaker_prefix(content))
     return _truncate_thread_name(text) if text else "Hermes"
 
 
 def _build_auto_thread_name(content: str) -> str:
     """Build a deterministic smart title for Discord auto-created threads."""
-    text = _strip_discord_noise(content)
+    # The gateway can prefix agent-facing messages as ``[sender] message``.
+    # Discord's visible auto-thread name is created from the raw message, so
+    # helpers used for initial names and retitle guards must normalize the same
+    # way. Otherwise long starter messages get stuck as ugly prefixed slices and
+    # compare-and-swap retitles can misclassify untouched threads as human-edited.
+    text = _strip_discord_noise(_strip_gateway_speaker_prefix(content))
     if not text:
         return "Hermes"
 
