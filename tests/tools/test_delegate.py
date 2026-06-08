@@ -36,6 +36,7 @@ from tools.delegate_tool import (
     _resolve_delegation_credentials,
     _inherit_parent_base_url,
     _resolve_model_provider_override,
+    _run_single_child,
 )
 
 
@@ -1824,6 +1825,40 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             # But provider/base_url/api_key should inherit from parent
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["base_url"], parent.base_url)
+
+    def test_run_single_child_preserves_requested_model_after_pool_binding(self):
+        """A shared credential pool must not clobber delegate_task(model=...)."""
+        child = MagicMock()
+        child.model = "gpt-5.4-mini"
+        child.provider = "openai-codex"
+        child.api_mode = "codex_responses"
+        child.session_prompt_tokens = 0
+        child.session_completion_tokens = 0
+        child._delegate_requested_model = "gpt-5.4-mini"
+        child._delegate_saved_tool_names = []
+        child._credential_pool.acquire_lease.return_value = "lease-1"
+        child._credential_pool.current.return_value = MagicMock(id="cred-1")
+
+        def _swap_credential(_entry):
+            # Regression shape: binding the parent's pool may reset the child to
+            # the parent's model. _run_single_child must re-apply the delegated
+            # model before the child talks to the LLM.
+            child.model = "gpt-5.5"
+
+        child._swap_credential.side_effect = _swap_credential
+        observed = {}
+
+        def _run_conversation(*_args, **_kwargs):
+            observed["model"] = child.model
+            return {"final_response": "ok", "completed": True, "api_calls": 1}
+
+        child.run_conversation.side_effect = _run_conversation
+
+        result = _run_single_child(0, "dynamic model", child, _make_mock_parent())
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(observed["model"], "gpt-5.4-mini")
+        self.assertEqual(result["model"], "gpt-5.4-mini")
 
 
 class TestResolveModelProviderOverride(unittest.TestCase):
