@@ -250,6 +250,61 @@ class TestDelegateTask(unittest.TestCase):
         self.assertEqual(result["results"][0]["summary"], "Done!")
         mock_run.assert_called_once()
 
+    def test_single_task_model_override_reaches_child_construction(self):
+        """delegate_task(goal=..., model=...) must construct the child with that model."""
+        parent = _make_mock_parent()
+
+        with patch("tools.delegate_tool._resolve_model_provider_override") as mock_resolve, \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_resolve.return_value = {
+                "model": "gpt-5.4-mini",
+                "provider": "openrouter",
+                "base_url": parent.base_url,
+                "api_key": parent.api_key,
+                "api_mode": parent.api_mode,
+                "command": None,
+                "args": [],
+            }
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "dynamic model smoke ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                goal="Reply with exactly: dynamic model smoke ok",
+                model="gpt-5.4-mini",
+                parent_agent=parent,
+            )
+
+        mock_resolve.assert_called_once()
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["model"], "gpt-5.4-mini")
+
+    def test_dispatch_delegate_task_forwards_model_provider_overrides(self):
+        """Regression: AIAgent's tool dispatcher must not drop explicit model overrides."""
+        from run_agent import AIAgent
+
+        agent = AIAgent.__new__(AIAgent)
+        args = {
+            "goal": "Reply with exactly: dynamic model smoke ok",
+            "toolsets": [],
+            "model": "gpt-5.4-mini",
+            "provider": "openrouter",
+        }
+
+        with patch("tools.delegate_tool.delegate_task") as mock_delegate:
+            mock_delegate.return_value = json.dumps({"results": []})
+            agent._dispatch_delegate_task(args)
+
+        _, kwargs = mock_delegate.call_args
+        self.assertEqual(kwargs["model"], "gpt-5.4-mini")
+        self.assertEqual(kwargs["provider"], "openrouter")
+        self.assertNotIn("toolsets", kwargs)
+        self.assertIs(kwargs["parent_agent"], agent)
+
     @patch("tools.delegate_tool._run_single_child")
     def test_batch_mode(self, mock_run):
         mock_run.side_effect = [
