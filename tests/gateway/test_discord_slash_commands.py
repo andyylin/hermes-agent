@@ -78,6 +78,7 @@ _ensure_discord_mock()
 from plugins.platforms.discord.adapter import (  # noqa: E402
     DiscordAdapter,
     _build_auto_thread_name,
+    _legacy_auto_thread_name,
 )
 
 
@@ -565,6 +566,21 @@ def test_build_auto_thread_name_summarizes_request():
 
 def test_build_auto_thread_name_strips_polite_openers():
     assert _build_auto_thread_name("<@123> please help me debug Discord auto-thread titles") == "debug Discord auto-thread titles"
+
+
+def test_auto_thread_name_helpers_strip_gateway_speaker_prefix():
+    message = (
+        "[INeedAUsername] I originally organized alerts and reports to go into their "
+        "own dedicated Discord channels, but I think that's worse than having the "
+        "alerts and reports go into their own designated threads."
+    )
+
+    assert _build_auto_thread_name(message) == (
+        "I originally organized alerts and reports to go into their own dedicated Disc..."
+    )
+    assert _legacy_auto_thread_name(message) == (
+        "I originally organized alerts and reports to go into their own dedicated Disc..."
+    )
 
 
 @pytest.mark.asyncio

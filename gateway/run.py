@@ -13014,26 +13014,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         session_id: str,
         title: str,
+        *,
+        only_if_current_name: str | None = None,
     ) -> None:
         """Best-effort visible Discord thread rename when Hermes auto-titles a session."""
-        if not self._discord_smart_thread_titles_enabled() or not self._is_discord_thread_lane(source):
+        if not self._discord_smart_thread_titles_enabled():
+            logger.debug("Skipping Discord thread auto-retitle for %s: smart titles disabled", session_id)
+            return
+        if not self._is_discord_thread_lane(source):
+            logger.debug(
+                "Skipping Discord thread auto-retitle for %s: not a Discord thread lane (%s)",
+                session_id,
+                source,
+            )
             return
         adapter = self.adapters.get(Platform.DISCORD) if getattr(self, "adapters", None) else None
         if adapter is None:
+            logger.debug("Skipping Discord thread auto-retitle for %s: Discord adapter missing", session_id)
             return
         rename_thread = getattr(adapter, "rename_thread", None)
         if rename_thread is None:
+            logger.debug("Skipping Discord thread auto-retitle for %s: adapter has no rename_thread", session_id)
             return
         try:
-            await rename_thread(str(source.thread_id), title)
+            rename_kwargs = {}
+            if only_if_current_name is not None:
+                rename_kwargs["only_if_current_name"] = only_if_current_name
+            logger.info(
+                "Renaming Discord thread %s for session %s to %r (guard=%r)",
+                source.thread_id,
+                session_id,
+                title,
+                only_if_current_name,
+            )
+            renamed = await rename_thread(str(source.thread_id), title, **rename_kwargs)
+            logger.info(
+                "Discord thread auto-retitle result for %s/%s: %s",
+                session_id,
+                source.thread_id,
+                renamed,
+            )
         except Exception:
-            logger.debug("Failed to rename Discord thread for auto-generated title", exc_info=True)
+            logger.warning("Failed to rename Discord thread for auto-generated title", exc_info=True)
 
     def _schedule_discord_thread_title_rename(
         self,
         source: SessionSource,
         session_id: str,
         title: str,
+        *,
+        only_if_current_name: str | None = None,
     ) -> None:
         """Schedule a Discord thread rename from the auto-title background thread."""
         if not title or not self._discord_smart_thread_titles_enabled() or not self._is_discord_thread_lane(source):
@@ -13049,7 +13079,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             copied_source = source
         future = safe_schedule_threadsafe(
-            self._rename_discord_thread_for_session_title(copied_source, session_id, title),
+            self._rename_discord_thread_for_session_title(
+                copied_source,
+                session_id,
+                title,
+                only_if_current_name=only_if_current_name,
+            ),
             loop,
             logger=logger,
             log_message="Discord thread title rename failed to schedule",
@@ -17936,7 +17971,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         in ("true", "1", "yes", "on")
                     )
                     if _is_discord_thread:
-                        _title_thread_id = getattr(source, "thread_id", None) or getattr(source, "chat_id", None)
                         try:
                             from plugins.platforms.discord.adapter import (
                                 _build_auto_thread_name,
@@ -17951,27 +17985,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception:
                             _expected_current_thread_name = None
 
-                        def _schedule_discord_thread_title_rename(title: str) -> None:
-                            try:
-                                rename_kwargs = {}
-                                if _expected_current_thread_name is not None:
-                                    rename_kwargs["only_if_current_name"] = _expected_current_thread_name
-                                asyncio.run_coroutine_threadsafe(
-                                    _status_adapter.rename_thread(
-                                        str(_title_thread_id),
-                                        title,
-                                        **rename_kwargs,
-                                    ),
-                                    _loop_for_step,
-                                ).result(timeout=15)
-                            except Exception as _e:
-                                logger.warning(
-                                    "Failed to run Discord thread retitle callback for %s: %s",
-                                    _title_thread_id,
-                                    _e,
-                                )
+                        def _schedule_discord_thread_title_rename_callback(title: str) -> None:
+                            self._schedule_discord_thread_title_rename(
+                                source,
+                                effective_session_id,
+                                title,
+                                only_if_current_name=_expected_current_thread_name,
+                            )
 
-                        title_callbacks.append(_schedule_discord_thread_title_rename)
+                        title_callbacks.append(_schedule_discord_thread_title_rename_callback)
 
                     if title_callbacks:
 
