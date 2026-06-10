@@ -1341,11 +1341,56 @@ def _format_cron_email_subject(job: dict) -> Optional[str]:
     )
 
 
+def _is_one_shot_job(job: dict) -> bool:
+    """Return True when a cron job is configured to run only once."""
+    repeat = job.get("repeat")
+    if isinstance(repeat, dict) and repeat.get("times") == 1:
+        return True
+    if repeat == 1:
+        return True
+
+    schedule = job.get("schedule")
+    if isinstance(schedule, dict) and schedule.get("kind") == "once":
+        return True
+    return False
+
+
+def _one_shot_delivery_footer(job: dict) -> str:
+    """Human-facing footer for one-shot deliveries.
+
+    One-off reminders should not imply there is a recurring job to stop.
+    """
+    label_source = " ".join(
+        str(job.get(field) or "")
+        for field in ("name", "prompt")
+    ).lower()
+    noun = "reminder" if "remind" in label_source or "reminder" in label_source else "job"
+    return f"This was a one-off {noun}; it will not repeat."
+
+
 def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool) -> str:
     """Apply the cron wrapper, using Discord-native Markdown when relevant."""
     task_name = job.get("name", job["id"])
     job_id = job.get("id", "")
     body = _markdown_tables_to_bullets(content) if for_discord else content
+    if _is_one_shot_job(job):
+        footer = _one_shot_delivery_footer(job)
+        if for_discord:
+            return (
+                f"# Cron Alert: {task_name}\n\n"
+                f"**Job ID:** `{job_id}`\n\n"
+                f"## Report\n\n"
+                f"{body}\n\n"
+                f"## One-off\n\n"
+                f"{footer}"
+            )
+        return (
+            f"Cronjob Response: {task_name}\n"
+            f"(job_id: {job_id})\n"
+            f"-------------\n\n"
+            f"{body}\n\n"
+            f"{footer}"
+        )
     if for_discord:
         return (
             f"# Cron Alert: {task_name}\n\n"
