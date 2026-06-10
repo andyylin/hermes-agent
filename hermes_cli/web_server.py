@@ -12882,6 +12882,9 @@ async def pub_ws(ws: WebSocket) -> None:
         pass
 
 
+_EVENTS_WS_HEARTBEAT_SECONDS = 25.0
+
+
 @app.websocket("/api/events")
 async def events_ws(ws: WebSocket) -> None:
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
@@ -12909,10 +12912,19 @@ async def events_ws(ws: WebSocket) -> None:
 
     try:
         while True:
-            # Subscribers don't speak — the receive() just blocks until
-            # disconnect so the connection stays open as long as the
-            # browser holds it.
-            await ws.receive_text()
+            # Subscribers don't speak. Keep the read side open to detect browser
+            # disconnects, but send periodic JSON heartbeats so Cloudflare and
+            # other reverse proxies do not reap the otherwise-idle WebSocket
+            # before the next tool-call event. The React sidebar ignores unknown
+            # event types, so this is wire-compatible with current clients.
+            try:
+                await asyncio.wait_for(
+                    ws.receive_text(), timeout=_EVENTS_WS_HEARTBEAT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                await ws.send_text(
+                    '{"method":"event","params":{"type":"heartbeat","payload":{}}}'
+                )
     except WebSocketDisconnect:
         pass
     finally:

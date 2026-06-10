@@ -6228,6 +6228,25 @@ class TestPtyWebSocket:
                 pass
         assert exc.value.code == 4400
 
+    def test_events_sends_heartbeat_to_keep_idle_proxy_alive(self, monkeypatch):
+        """Idle /api/events subscribers get periodic JSON heartbeats.
+
+        Cloudflare/reverse proxies can reap quiet WebSockets before the next
+        tool event. The heartbeat keeps the sidebar event feed alive while
+        remaining harmless to clients that only handle known event types.
+        """
+        monkeypatch.setattr(self.ws_module, "_EVENTS_WS_HEARTBEAT_SECONDS", 0.01)
+
+        with self.client.websocket_connect(
+            f"/api/events?token={self.token}&channel=heartbeat-test"
+        ) as conn:
+            frame = json.loads(conn.receive_text())
+
+        assert frame == {
+            "method": "event",
+            "params": {"type": "heartbeat", "payload": {}},
+        }
+
 
 def test_resolve_chat_argv_injects_gateway_ws_url(monkeypatch):
     import hermes_cli.main as cli_main
