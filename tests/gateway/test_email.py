@@ -875,6 +875,25 @@ class TestThreadContext(unittest.TestCase):
             html_part = next(part for part in parts if part.get_content_type() == "text/html")
             self.assertIn("<h2>Brief</h2>", html_part.get_payload(decode=True).decode("utf-8"))
 
+    def test_plain_text_body_defaults_to_html_with_plain_fallback(self):
+        """Plain assistant replies should be sent as multipart HTML email with plain fallback."""
+        adapter = self._make_adapter()
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email("newuser@test.com", "Summary\n\n- One\n- Two", None)
+
+            msg = mock_server.send_message.call_args[0][0]
+            parts = list(msg.walk())
+            plain_part = next(part for part in parts if part.get_content_type() == "text/plain")
+            html_part = next(part for part in parts if part.get_content_type() == "text/html")
+            self.assertIn("Summary\n\n- One\n- Two", plain_part.get_payload(decode=True).decode("utf-8"))
+            html = html_part.get_payload(decode=True).decode("utf-8")
+            self.assertIn("<p>Summary</p>", html)
+            self.assertIn("<ul><li>One</li><li>Two</li></ul>", html)
+
     def test_explicit_subject_suppresses_reply_threading(self):
         """Cron-style email sends can start a fresh subject/thread."""
         adapter = self._make_adapter()
