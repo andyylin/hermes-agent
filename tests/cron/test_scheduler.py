@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _format_cron_delivery_content
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -592,6 +592,35 @@ class TestDeliverResultWrapping:
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
+
+    def test_one_off_reminder_delivery_says_it_will_not_repeat(self):
+        """One-shot reminders should not advertise stop/manage instructions."""
+        job = {
+            "id": "reminder-job",
+            "name": "Remind Andy to get Supernote beta access",
+            "prompt": "Remind Andy: get Supernote beta access.",
+            "repeat": {"times": 1, "completed": 0},
+        }
+
+        sent_content = _format_cron_delivery_content(job, "Get Supernote beta access.", for_discord=True)
+
+        assert "## One-off" in sent_content
+        assert "This was a one-off reminder; it will not repeat." in sent_content
+        assert "To stop or manage this job" not in sent_content
+        assert "stop reminder" not in sent_content
+
+    def test_one_off_non_reminder_delivery_says_one_off_job(self):
+        """One-shot non-reminder jobs also should not get recurring-job management copy."""
+        job = {
+            "id": "once-job",
+            "name": "Verify import propagation",
+            "repeat": {"times": 1, "completed": 0},
+        }
+
+        sent_content = _format_cron_delivery_content(job, "Done.", for_discord=False)
+
+        assert "This was a one-off job; it will not repeat." in sent_content
+        assert "To stop or manage this job" not in sent_content
 
     def test_delivery_uses_job_id_when_no_name(self):
         """When a job has no name, the wrapper should fall back to job id."""
