@@ -2186,3 +2186,23 @@ class TestJobsJsonUtf8Bom:
         loaded = load_jobs()
         assert [j["id"] for j in loaded] == ["ctrlbom01"]
         assert "newline" in loaded[0]["name"]
+
+
+class TestCronDefinitionsExport:
+    def test_email_subject_template_is_preserved_in_definition_export(self):
+        from cron.definitions_export import render_cron_definitions
+
+        rendered = render_cron_definitions([
+            {
+                "id": "brief",
+                "name": "brief",
+                "enabled": True,
+                "schedule": {"kind": "interval", "minutes": 30},
+                "prompt": "Brief",
+                "email_subject_template": "Joi Morning Briefing - {date}",
+                "next_run_at": "2026-01-01T00:30:00+00:00",
+            }
+        ])
+        job = json.loads(rendered)["jobs"][0]
+        assert job["email_subject_template"] == "Joi Morning Briefing - {date}"
+        assert "next_run_at" not in job
