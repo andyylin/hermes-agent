@@ -36,6 +36,8 @@ _DEFINITION_FIELDS = (
     "schedule_display",
     "repeat",
     "deliver",
+    "email_subject_template",
+    "delivery_subject_template",
     "origin",
     "enabled_toolsets",
     "workdir",

@@ -1015,6 +1015,7 @@ class TestCronDefinitionExport:
             "repeat": {"times": 5, "completed": 1},
             "enabled": True,
             "state": "scheduled",
+            "email_subject_template": "Joi Morning Briefing - {date}",
             "created_at": "2026-01-01T00:00:00+00:00",
             "next_run_at": "2026-01-01T00:30:00+00:00",
             "last_run_at": "2026-01-01T00:00:00+00:00",
@@ -1038,6 +1039,7 @@ class TestCronDefinitionExport:
         exported = json.loads(render_cron_definitions([base_job]))
         job = exported["jobs"][0]
         assert job["repeat"] == {"times": 5}
+        assert job["email_subject_template"] == "Joi Morning Briefing - {date}"
         assert "next_run_at" not in job
         assert "last_run_at" not in job
         assert "last_status" not in job
