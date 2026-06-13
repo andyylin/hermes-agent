@@ -1368,6 +1368,56 @@ def _one_shot_delivery_footer(job: dict) -> str:
     return f"This was a one-off {noun}; it will not repeat."
 
 
+
+
+def _cron_repair_gate_alert_routing_enabled() -> bool:
+    """Whether source cron alerts should be held for the repair gate.
+
+    When enabled, ordinary automations still record failed/warning output and
+    ``last_status`` normally, but the source job does not immediately notify the
+    user. The universal automation repairer scans that state, attempts one
+    bounded repair, and reports only repaired/blocked/escalated outcomes.
+    """
+    env = os.getenv("HERMES_CRON_ROUTE_ALERTS_THROUGH_REPAIR_GATE", "").strip().lower()
+    if env in {"1", "true", "yes", "on"}:
+        return True
+    if env in {"0", "false", "no", "off"}:
+        return False
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron") or {} if isinstance(cfg, dict) else {}
+        return bool(cron_cfg.get("route_alerts_through_repair_gate", False))
+    except Exception as exc:
+        logger.debug("Could not read cron repair-gate alert routing config: %s", exc)
+        return False
+
+
+def _is_repair_gate_job(job: dict) -> bool:
+    return (
+        job.get("script") == "automation_failure_repair_gate.py"
+        or job.get("name") == "automation-failure-first-pass-repairer"
+    )
+
+
+def _looks_like_cron_warning_or_error_alert(content: str) -> bool:
+    """Best-effort guard for successful jobs that emitted an alert payload.
+
+    This is intentionally conservative so routine reports that merely contain a
+    risks/caveats section still deliver. It catches deterministic watchdog
+    outputs and short alert-style LLM responses whose leading line/status says
+    warning/error/attention/report.
+    """
+    text = (content or "").strip()
+    if not text:
+        return False
+    head = "\n".join(line.strip() for line in text.splitlines()[:8] if line.strip())
+    if re.search(r'(?is)^\s*\{.*"status"\s*:\s*"(REPORT|WARNING|FAILURE|ERROR)"', text[:2000]):
+        return True
+    return bool(re.search(
+        r"(?i)^(?:[#*_\s>`-]*)?(?:⚠|⚠️|warning[:：]|error[:：]|alert[:：]|attention needed\b|action required\b|.+\bfailed\b)",
+        head,
+    ))
+
 def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool) -> str:
     """Apply the cron wrapper, using Discord-native Markdown when relevant."""
     task_name = job.get("name", job["id"])
@@ -3890,14 +3940,21 @@ def tick(
             body."""
             return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
 
-        # Partition due jobs: those with a per-job workdir mutate
-        # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
-        # they queue on the single-thread sequential pool to run one at a time.
-        # That alone only keeps workdir jobs from overlapping EACH OTHER;
-        # run_job's _terminal_cwd_lock is what additionally stops a concurrently
-        # firing workdir-less parallel-pool job from observing the override.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        # Partition due jobs: jobs with a per-job workdir and/or profile touch
+        # process-global runtime state inside run_job. Workdir jobs temporarily
+        # set os.environ["TERMINAL_CWD"]; profile jobs use a context-local
+        # Hermes home override, scheduler _hermes_home hook, and temporary
+        # profile .env load into os.environ with snapshot/restore. They MUST run
+        # sequentially to avoid corrupting each other. Jobs without either field
+        # stay parallel-safe.
+        sequential_jobs = [
+            j for j in due_jobs
+            if (j.get("workdir") or "").strip() or (j.get("profile") or "").strip()
+        ]
+        parallel_jobs = [
+            j for j in due_jobs
+            if not ((j.get("workdir") or "").strip() or (j.get("profile") or "").strip())
+        ]
 
         _results: list = []
         _all_futures: list = []
