@@ -277,7 +277,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim, load_jobs
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -1522,6 +1522,77 @@ def _is_channel_dm_topic(
             job_id, chat_id,
         )
     return is_channel
+
+
+def _cron_repair_gate_alert_routing_enabled() -> bool:
+    """Whether source cron alerts should be held for the repair gate."""
+    env = os.getenv("HERMES_CRON_ROUTE_ALERTS_THROUGH_REPAIR_GATE", "").strip().lower()
+    if env in {"1", "true", "yes", "on"}:
+        return True
+    if env in {"0", "false", "no", "off"}:
+        return False
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron") or {} if isinstance(cfg, dict) else {}
+        return bool(cron_cfg.get("route_alerts_through_repair_gate", False))
+    except Exception as exc:
+        logger.debug("Could not read cron repair-gate alert routing config: %s", exc)
+        return False
+
+
+def _is_repair_gate_job(job: dict) -> bool:
+    return (
+        job.get("script") == "automation_failure_repair_gate.py"
+        or job.get("name") == "automation-failure-first-pass-repairer"
+    )
+
+
+def _cron_repair_gate_available() -> bool:
+    """Return True when the universal repair gate is present and not known-broken."""
+    try:
+        for candidate in load_jobs():
+            if not isinstance(candidate, dict) or not _is_repair_gate_job(candidate):
+                continue
+            if not candidate.get("enabled", True):
+                continue
+            if candidate.get("state") not in (None, "scheduled", "running"):
+                continue
+            if str(candidate.get("last_status") or "").lower() == "error":
+                continue
+            if candidate.get("last_delivery_error"):
+                continue
+            script = str(candidate.get("script") or "")
+            if script and not (_get_hermes_home() / "scripts" / script).exists():
+                continue
+            return True
+    except Exception as exc:
+        logger.warning("Could not verify automation repair gate availability: %s", exc)
+    return False
+
+
+def _looks_like_cron_warning_or_error_alert(content: str) -> bool:
+    """Conservatively identify successful outputs that are alert-shaped."""
+    text = (content or "").strip()
+    if not text:
+        return False
+    head = "\n".join(line.strip() for line in text.splitlines()[:8] if line.strip())
+    if re.search(r'(?is)^\s*\{.*"status"\s*:\s*"(REPORT|WARNING|FAILURE|ERROR)"', text[:2000]):
+        return True
+    return bool(re.search(
+        r"(?im)^(?:[#*_\s>`-]*)?(?:⚠|⚠️|warning[:：]|error[:：]|alert[:：]|(?:.+\b)?attention needed\b|action required\b|.+\bfailed\b|.*(?:讀取失敗|失敗|錯誤|異常)[:：]?)",
+        head,
+    ))
+
+
+def _should_hold_cron_output_for_repair_gate(job: dict, *, success: bool, deliver_content: str) -> bool:
+    """Whether this job output should go to Supervisor instead of direct delivery."""
+    if not deliver_content.strip() or not _cron_repair_gate_alert_routing_enabled():
+        return False
+    if _is_repair_gate_job(job):
+        return False
+    if success and not _looks_like_cron_warning_or_error_alert(deliver_content):
+        return False
+    return _cron_repair_gate_available()
 
 
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
@@ -3919,6 +3990,18 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # tolerance the cron contract relies on.
             if should_deliver and success and _is_cron_silence_response(deliver_content):
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+                should_deliver = False
+
+            if (
+                should_deliver
+                and _should_hold_cron_output_for_repair_gate(
+                    job, success=success, deliver_content=deliver_content
+                )
+            ):
+                logger.info(
+                    "Job '%s': holding source alert for automation repair gate instead of direct delivery",
+                    job["id"],
+                )
                 should_deliver = False
 
             if should_deliver:
