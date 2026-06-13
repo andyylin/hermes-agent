@@ -15,6 +15,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -763,6 +764,56 @@ def _one_shot_delivery_footer(job: dict) -> str:
     noun = "reminder" if "remind" in label_source or "reminder" in label_source else "job"
     return f"This was a one-off {noun}; it will not repeat."
 
+
+
+
+def _cron_repair_gate_alert_routing_enabled() -> bool:
+    """Whether source cron alerts should be held for the repair gate.
+
+    When enabled, ordinary automations still record failed/warning output and
+    ``last_status`` normally, but the source job does not immediately notify the
+    user. The universal automation repairer scans that state, attempts one
+    bounded repair, and reports only repaired/blocked/escalated outcomes.
+    """
+    env = os.getenv("HERMES_CRON_ROUTE_ALERTS_THROUGH_REPAIR_GATE", "").strip().lower()
+    if env in {"1", "true", "yes", "on"}:
+        return True
+    if env in {"0", "false", "no", "off"}:
+        return False
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron") or {} if isinstance(cfg, dict) else {}
+        return bool(cron_cfg.get("route_alerts_through_repair_gate", False))
+    except Exception as exc:
+        logger.debug("Could not read cron repair-gate alert routing config: %s", exc)
+        return False
+
+
+def _is_repair_gate_job(job: dict) -> bool:
+    return (
+        job.get("script") == "automation_failure_repair_gate.py"
+        or job.get("name") == "automation-failure-first-pass-repairer"
+    )
+
+
+def _looks_like_cron_warning_or_error_alert(content: str) -> bool:
+    """Best-effort guard for successful jobs that emitted an alert payload.
+
+    This is intentionally conservative so routine reports that merely contain a
+    risks/caveats section still deliver. It catches deterministic watchdog
+    outputs and short alert-style LLM responses whose leading line/status says
+    warning/error/attention/report.
+    """
+    text = (content or "").strip()
+    if not text:
+        return False
+    head = "\n".join(line.strip() for line in text.splitlines()[:8] if line.strip())
+    if re.search(r'(?is)^\s*\{.*"status"\s*:\s*"(REPORT|WARNING|FAILURE|ERROR)"', text[:2000]):
+        return True
+    return bool(re.search(
+        r"(?i)^(?:[#*_\s>`-]*)?(?:⚠|⚠️|warning[:：]|error[:：]|alert[:：]|attention needed\b|action required\b|.+\bfailed\b)",
+        head,
+    ))
 
 def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool) -> str:
     """Apply the cron wrapper, using Discord-native Markdown when relevant."""
@@ -2286,6 +2337,18 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 should_deliver = bool(deliver_content.strip())
                 if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+                    should_deliver = False
+
+                if (
+                    should_deliver
+                    and _cron_repair_gate_alert_routing_enabled()
+                    and not _is_repair_gate_job(job)
+                    and (not success or _looks_like_cron_warning_or_error_alert(deliver_content))
+                ):
+                    logger.info(
+                        "Job '%s': holding source alert for automation repair gate instead of direct delivery",
+                        job["id"],
+                    )
                     should_deliver = False
 
                 delivery_error = None
