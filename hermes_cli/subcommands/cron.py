@@ -156,6 +156,12 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     # cron status
     cron_subparsers.add_parser("status", help="Check if cron scheduler is running")
 
+    # cron export-definitions
+    cron_subparsers.add_parser(
+        "export-definitions",
+        help="Write deterministic cron job definitions without runtime state",
+    )
+
     # cron tick (mostly for debugging)
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     add_accept_hooks_flag(cron_tick)
