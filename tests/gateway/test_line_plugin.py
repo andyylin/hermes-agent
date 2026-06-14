@@ -643,6 +643,73 @@ class TestAdapterInit:
         assert asyncio.run(ad.get_chat_info("R123"))["type"] == "channel"
 
 
+class TestGroupArchiveAndPrefixGates:
+    def _event(self, text="hello", group_id="Carchive", user_id="Usender"):
+        return {
+            "type": "message",
+            "timestamp": 1234567890,
+            "webhookEventId": "evt-1",
+            "source": {"type": "group", "groupId": group_id, "userId": user_id},
+            "message": {"type": "text", "id": "msg-1", "text": text},
+        }
+
+    def test_archive_group_is_admitted_archived_and_prefix_dropped(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
+        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
+        monkeypatch.setenv("LINE_ARCHIVE_GROUPS", "Carchive")
+        monkeypatch.setenv("LINE_REQUIRE_PREFIX_GROUPS", "Carchive")
+        monkeypatch.setenv("LINE_GROUP_PREFIXES", "Hermes:")
+        from gateway.config import PlatformConfig
+        ad = LineAdapter(PlatformConfig(enabled=True))
+        ad.handle_message = AsyncMock()
+
+        asyncio.run(ad._dispatch_event(self._event("ordinary family chatter")))
+
+        ad.handle_message.assert_not_called()
+        archive = tmp_path / "data" / "line-read-only" / "Carchive.jsonl"
+        rows = [json.loads(line) for line in archive.read_text().splitlines()]
+        assert rows[-1]["chat_id"] == "Carchive"
+        assert rows[-1]["user_id"] == "Usender"
+        assert rows[-1]["text"] == "ordinary family chatter"
+
+    def test_prefixed_archive_group_dispatches_stripped_text(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
+        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
+        monkeypatch.setenv("LINE_ARCHIVE_GROUPS", "Carchive")
+        monkeypatch.setenv("LINE_REQUIRE_PREFIX_GROUPS", "Carchive")
+        monkeypatch.setenv("LINE_GROUP_PREFIXES", "Hermes:")
+        from gateway.config import PlatformConfig
+        ad = LineAdapter(PlatformConfig(enabled=True))
+        ad.handle_message = AsyncMock()
+
+        asyncio.run(ad._dispatch_event(self._event("Hermes: summarize this")))
+
+        ad.handle_message.assert_awaited_once()
+        assert ad.handle_message.await_args is not None
+        dispatched = ad.handle_message.await_args.args[0]
+        assert dispatched.text == "summarize this"
+        archive = tmp_path / "data" / "line-read-only" / "Carchive.jsonl"
+        rows = [json.loads(line) for line in archive.read_text().splitlines()]
+        assert rows[-1]["text"] == "Hermes: summarize this"
+
+    def test_read_only_group_archives_without_dispatch(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
+        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
+        monkeypatch.setenv("LINE_READ_ONLY_GROUPS", "Creadonly")
+        from gateway.config import PlatformConfig
+        ad = LineAdapter(PlatformConfig(enabled=True))
+        ad.handle_message = AsyncMock()
+
+        asyncio.run(ad._dispatch_event(self._event("capture me", group_id="Creadonly")))
+
+        ad.handle_message.assert_not_called()
+        archive = tmp_path / "data" / "line-read-only" / "Creadonly.jsonl"
+        assert json.loads(archive.read_text().splitlines()[-1])["text"] == "capture me"
+
+
 # ---------------------------------------------------------------------------
 # 9. Inbound message-type classification
 # ---------------------------------------------------------------------------

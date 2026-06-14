@@ -23,7 +23,10 @@ button and always Push-fallback instead.
 
 **Three-allowlist gating.** Separate allowlists for users (U-prefixed),
 groups (C-prefixed), and rooms (R-prefixed). ``LINE_ALLOW_ALL_USERS=true``
-is a dev-only escape hatch.
+is a dev-only escape hatch. ``LINE_READ_ONLY_GROUPS`` and
+``LINE_ARCHIVE_GROUPS`` admit group events for passive JSONL capture before
+normal agent authorization, so digest/watchdog jobs do not depend on pairing
+every sender in the group.
 
 **Media via public HTTPS.** LINE's Messaging API does *not* accept
 binary uploads — images, audio, and video must be reachable HTTPS URLs.
@@ -438,6 +441,16 @@ def _allowed_for_source(
     return False
 
 
+def _line_archive_path(chat_id: str) -> Path:
+    hermes_home = Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes")
+    return hermes_home / "data" / "line-read-only" / f"{chat_id}.jsonl"
+
+
+def _line_group_prefixes(raw: Any) -> List[str]:
+    prefixes = [p for p in (str(raw or "").split(",")) if p]
+    return prefixes or ["Hermes:"]
+
+
 # ---------------------------------------------------------------------------
 # LINE Reply / Push HTTP client
 # ---------------------------------------------------------------------------
@@ -688,6 +701,18 @@ class LineAdapter(BasePlatformAdapter):
         self.allowed_rooms = _csv_set(
             os.getenv("LINE_ALLOWED_ROOMS", "")
         ) | set(extra.get("allowed_rooms", []))
+        self.read_only_groups = _csv_set(
+            os.getenv("LINE_READ_ONLY_GROUPS", "")
+        ) | set(extra.get("read_only_groups", []))
+        self.archive_groups = _csv_set(
+            os.getenv("LINE_ARCHIVE_GROUPS", "")
+        ) | set(extra.get("archive_groups", []))
+        self.require_prefix_groups = _csv_set(
+            os.getenv("LINE_REQUIRE_PREFIX_GROUPS", "")
+        ) | set(extra.get("require_prefix_groups", []))
+        self.group_prefixes = _line_group_prefixes(
+            os.getenv("LINE_GROUP_PREFIXES") or extra.get("group_prefixes", "Hermes:")
+        )
 
         # Slow-LLM postback button threshold
         try:
@@ -909,12 +934,14 @@ class LineAdapter(BasePlatformAdapter):
         if self._bot_user_id and sender_user_id == self._bot_user_id:
             return
 
-        # Allowlist gate.
+        # Allowlist gate. Passive archive/read-only groups must be admitted
+        # before gateway user-pairing authorization so digest capture does not
+        # depend on every group sender being paired with Hermes.
         if not _allowed_for_source(
             source,
             allow_all=self.allow_all,
             user_ids=self.allowed_users,
-            group_ids=self.allowed_groups,
+            group_ids=self.allowed_groups | self.read_only_groups | self.archive_groups,
             room_ids=self.allowed_rooms,
         ):
             logger.info("LINE: rejecting unauthorized source %s", source)
@@ -981,6 +1008,29 @@ class LineAdapter(BasePlatformAdapter):
             chat_name=chat_id,
         )
 
+        if self._should_archive_group(chat_id, chat_type):
+            self._archive_message_event(
+                event,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                user_id=user_id,
+                message_type=msg_type,
+                text=text,
+                media_urls=media_urls,
+                media_types=media_types,
+            )
+
+        if chat_type == "group" and chat_id in self.read_only_groups:
+            logger.debug("LINE: archived read-only group message from %s", chat_id)
+            return
+
+        if chat_type == "group" and chat_id in self.require_prefix_groups:
+            matched_prefix = next((p for p in self.group_prefixes if text.startswith(p)), None)
+            if not matched_prefix:
+                logger.debug("LINE: ignoring group message without required prefix from %s", chat_id)
+                return
+            text = text[len(matched_prefix):].lstrip()
+
         event_obj = MessageEvent(
             text=text,
             message_type=_LINE_MESSAGE_TYPES.get(msg_type, MessageType.TEXT),
@@ -992,6 +1042,47 @@ class LineAdapter(BasePlatformAdapter):
         )
 
         await self.handle_message(event_obj)
+
+    def _should_archive_group(self, chat_id: str, chat_type: str) -> bool:
+        return bool(
+            chat_type == "group"
+            and chat_id
+            and (chat_id in self.read_only_groups or chat_id in self.archive_groups)
+        )
+
+    def _archive_message_event(
+        self,
+        event: Dict[str, Any],
+        *,
+        chat_id: str,
+        chat_type: str,
+        user_id: str,
+        message_type: str,
+        text: str,
+        media_urls: List[str],
+        media_types: List[str],
+    ) -> None:
+        msg = event.get("message") or {}
+        row = {
+            "received_at": time.time(),
+            "event_timestamp": event.get("timestamp"),
+            "webhook_event_id": event.get("webhookEventId", "") or "",
+            "chat_id": chat_id,
+            "chat_type": chat_type,
+            "user_id": user_id,
+            "message_id": msg.get("id", "") or "",
+            "message_type": message_type,
+            "text": text,
+            "media_urls": list(media_urls),
+            "media_types": list(media_types),
+        }
+        path = _line_archive_path(chat_id)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+        except Exception as exc:
+            logger.warning("LINE: failed to archive group message for %s: %s", chat_id, exc)
 
     async def _handle_postback_event(self, event: Dict[str, Any]) -> None:
         """User tapped the slow-LLM postback button — deliver cached payload."""
