@@ -2,12 +2,22 @@
 
 import { TextMessagePartProvider, useMessagePartText } from '@assistant-ui/react'
 import {
+  parseMarkdownIntoBlocks,
   type StreamdownTextComponents,
   StreamdownTextPrimitive,
   type SyntaxHighlighterProps
 } from '@assistant-ui/react-streamdown'
 import { code } from '@streamdown/code'
-import { type ComponentProps, memo, type ReactNode, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  type ComponentProps,
+  memo,
+  type ReactNode,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState
+} from 'react'
 
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { SyntaxHighlighter } from '@/components/chat/shiki-highlighter'
@@ -17,6 +27,8 @@ import { createMemoizedMathPlugin } from '@/lib/katex-memo'
 import { preprocessMarkdown } from '@/lib/markdown-preprocess'
 import {
   filePathFromMediaPath,
+  gatewayMediaDataUrl,
+  isRemoteGateway,
   mediaExternalUrl,
   mediaKind,
   mediaName,
@@ -24,6 +36,7 @@ import {
   mediaStreamUrl
 } from '@/lib/media'
 import { previewTargetFromMarkdownHref } from '@/lib/preview-targets'
+import { tailBoundedRemend } from '@/lib/remend-tail'
 import { cn } from '@/lib/utils'
 
 // Math rendering plugin (KaTeX). Configured once at module scope — the
@@ -40,6 +53,51 @@ import { cn } from '@/lib/utils'
 // LLM convention). The default false-setting only accepts `$$...$$`.
 const mathPlugin = createMemoizedMathPlugin({ singleDollarTextMath: true })
 
+// Replaces Streamdown's `parseIncompleteMarkdown` (full-text remend per
+// flush) with a tail-bounded repair — see lib/remend-tail.ts. Must stay
+// module-scope so the prop identity is stable across renders.
+function preprocessWithTailRepair(text: string): string {
+  return tailBoundedRemend(preprocessMarkdown(text))
+}
+
+// Memoized block splitter. Streamdown calls `parseMarkdownIntoBlocks` (a full
+// `marked` lex of the entire message, ~1.6ms per 28KB) inside a useMemo keyed
+// on the text — but the same text is re-lexed every time a message REMOUNTS
+// (virtualizer scroll, session switch) and whenever multiple surfaces render
+// the same content (deferred + smooth reveal republish). A small module-level
+// LRU keyed by the exact source string removes all of those repeat parses
+// with zero correctness risk (same input → same output). Streaming tail
+// growth misses the cache by design (every flush is a new string) — that
+// single lex is the irreducible cost.
+const BLOCK_CACHE_MAX = 64
+const BLOCK_CACHE_MIN_LENGTH = 1024
+const blockCache = new Map<string, string[]>()
+
+function parseMarkdownIntoBlocksCached(markdown: string): string[] {
+  if (markdown.length < BLOCK_CACHE_MIN_LENGTH) {
+    return parseMarkdownIntoBlocks(markdown)
+  }
+
+  const hit = blockCache.get(markdown)
+
+  if (hit) {
+    // Refresh recency (Map iteration order is insertion order).
+    blockCache.delete(markdown)
+    blockCache.set(markdown, hit)
+
+    return hit
+  }
+
+  const blocks = parseMarkdownIntoBlocks(markdown)
+  blockCache.set(markdown, blocks)
+
+  if (blockCache.size > BLOCK_CACHE_MAX) {
+    blockCache.delete(blockCache.keys().next().value as string)
+  }
+
+  return blocks
+}
+
 async function mediaSrc(path: string): Promise<string> {
   if (/^(?:https?|data):/i.test(path)) {
     return path
@@ -49,6 +107,12 @@ async function mediaSrc(path: string): Promise<string> {
   // load the whole file into memory, which broke playback for larger videos.
   if (window.hermesDesktop && ['audio', 'video'].includes(mediaKind(path))) {
     return mediaStreamUrl(path)
+  }
+
+  // Remote gateway: the image lives on the gateway machine, so read it over the
+  // authenticated API rather than this machine's disk.
+  if (window.hermesDesktop && isRemoteGateway()) {
+    return gatewayMediaDataUrl(path)
   }
 
   if (!window.hermesDesktop?.readFileDataUrl) {
@@ -233,6 +297,13 @@ function MarkdownImage({ className, src, alt, ...props }: ComponentProps<'img'>)
 // keeps draining its tail instead of snapping.
 const REVEAL_DRAIN_MS = 500
 const REVEAL_MAX_CHARS_PER_FRAME = 30
+// Floor between reveal commits. Each commit republishes the text context and
+// re-runs the whole Streamdown pipeline (preprocess → remend → lex → micromark
+// on the open block) over the full accumulated text — at raw rAF cadence
+// that's 60 full parses/second and was the dominant streaming cost for
+// reasoning text. ~33ms keeps the reveal visually fluid (2 frames) while
+// halving the parse work.
+const REVEAL_MIN_COMMIT_MS = 33
 
 function useSmoothReveal(text: string, isRunning: boolean): string {
   const [displayed, setDisplayed] = useState(isRunning ? '' : text)
@@ -265,10 +336,27 @@ function useSmoothReveal(text: string, isRunning: boolean): string {
     const tick = () => {
       const now = performance.now()
       const dt = now - lastTickRef.current
+
+      // Skip this frame if the floor hasn't elapsed — the backlog math below
+      // is dt-proportional, so delayed commits reveal proportionally more.
+      if (dt < REVEAL_MIN_COMMIT_MS) {
+        frameRef.current = requestAnimationFrame(tick)
+
+        return
+      }
+
       lastTickRef.current = now
 
       const remaining = targetRef.current.length - shownRef.current.length
-      const add = Math.min(remaining, REVEAL_MAX_CHARS_PER_FRAME, Math.max(1, Math.ceil((remaining * dt) / REVEAL_DRAIN_MS)))
+
+      const add = Math.min(
+        remaining,
+        // dt-scaled so the per-commit cap stays equivalent to the old
+        // per-frame cap at any commit cadence.
+        Math.ceil((REVEAL_MAX_CHARS_PER_FRAME * dt) / 16.7),
+        Math.max(1, Math.ceil((remaining * dt) / REVEAL_DRAIN_MS))
+      )
+
       shownRef.current = targetRef.current.slice(0, shownRef.current.length + add)
       setDisplayed(shownRef.current)
 
@@ -417,7 +505,7 @@ function MarkdownTextSurface({ containerClassName, containerProps }: MarkdownTex
           <div className="aui-md-table my-2 max-w-full overflow-x-auto rounded-[0.375rem] border border-border">
             <table
               className={cn(
-                'm-0 w-full border-collapse text-[0.8125rem] [&_tr]:border-b [&_tr]:border-border last:[&_tr]:border-0',
+                'm-0 w-full min-w-[18rem] border-collapse text-[0.8125rem] [&_tr]:border-b [&_tr]:border-border last:[&_tr]:border-0',
                 className
               )}
               {...props}
@@ -430,7 +518,7 @@ function MarkdownTextSurface({ containerClassName, containerProps }: MarkdownTex
         th: ({ className, ...props }: ComponentProps<'th'>) => (
           <th
             className={cn(
-              'px-2.5 py-1.5 text-left align-middle text-[0.75rem] font-medium text-muted-foreground',
+              'whitespace-nowrap px-2.5 py-1.5 text-left align-middle text-[0.75rem] font-medium text-muted-foreground',
               className
             )}
             {...props}
@@ -452,17 +540,20 @@ function MarkdownTextSurface({ containerClassName, containerProps }: MarkdownTex
       containerProps={containerProps}
       lineNumbers={false}
       mode="streaming"
-      // Always auto-close incomplete fences — even during streaming.
-      // Without this, an unclosed ```python ... ``` whose body contains
-      // `$` (very common: shell snippets, JS template strings, dollar
-      // amounts) leaks those dollars out to the math parser and they
-      // get rendered as broken inline math until the closing fence
-      // arrives. Shiki is independently deferred via `defer={isStreaming}`
-      // on the SyntaxHighlighter component, so we don't pay code-block
-      // tokenization on every token even with this set.
-      parseIncompleteMarkdown
+      // Incomplete-markdown repair is handled by `preprocessWithTailRepair`
+      // below (tail-bounded remend) instead of Streamdown's built-in pass,
+      // which re-runs remend over the ENTIRE message on every flush — ~18%
+      // of streaming script time on 50KB+ messages. The repair itself stays
+      // always-on (even between flushes / for completed messages): an
+      // unclosed ```python ... ``` whose body contains `$` (shell snippets,
+      // JS template strings, dollar amounts) would otherwise leak those
+      // dollars to the math parser and render broken inline math. Shiki is
+      // independently deferred via `defer={isStreaming}` on the
+      // SyntaxHighlighter component.
+      parseIncompleteMarkdown={false}
+      parseMarkdownIntoBlocksFn={parseMarkdownIntoBlocksCached}
       plugins={plugins}
-      preprocess={preprocessMarkdown}
+      preprocess={preprocessWithTailRepair}
     />
   )
 }
@@ -486,11 +577,9 @@ export function MarkdownTextContent({ isRunning, text, ...surfaceProps }: Markdo
 
 const MarkdownTextImpl = () => {
   return (
-    <SmoothStreamingText>
-      <DeferStreamingText>
-        <MarkdownTextSurface />
-      </DeferStreamingText>
-    </SmoothStreamingText>
+    <DeferStreamingText>
+      <MarkdownTextSurface />
+    </DeferStreamingText>
   )
 }
 

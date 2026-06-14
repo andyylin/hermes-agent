@@ -169,6 +169,7 @@ def init_agent(
     save_trajectories: bool = False,
     verbose_logging: bool = False,
     quiet_mode: bool = False,
+    tool_progress_mode: str = "all",
     ephemeral_system_prompt: str = None,
     log_prefix_chars: int = 100,
     log_prefix: str = "",
@@ -186,6 +187,7 @@ def init_agent(
     thinking_callback: callable = None,
     reasoning_callback: callable = None,
     clarify_callback: callable = None,
+    read_terminal_callback: callable = None,
     step_callback: callable = None,
     stream_delta_callback: callable = None,
     interim_assistant_callback: callable = None,
@@ -280,6 +282,7 @@ def init_agent(
     agent.save_trajectories = save_trajectories
     agent.verbose_logging = verbose_logging
     agent.quiet_mode = quiet_mode
+    agent.tool_progress_mode = tool_progress_mode
     agent.ephemeral_system_prompt = ephemeral_system_prompt
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
@@ -415,6 +418,7 @@ def init_agent(
     agent.thinking_callback = thinking_callback
     agent.reasoning_callback = reasoning_callback
     agent.clarify_callback = clarify_callback
+    agent.read_terminal_callback = read_terminal_callback
     agent.step_callback = step_callback
     agent.stream_delta_callback = stream_delta_callback
     agent.interim_assistant_callback = interim_assistant_callback
@@ -896,6 +900,9 @@ def init_agent(
         agent.api_key = client_kwargs.get("api_key", "")
         agent.base_url = client_kwargs.get("base_url", agent.base_url)
         try:
+            from agent.ssl_guard import verify_ca_bundle_with_fallback
+
+            verify_ca_bundle_with_fallback()
             agent.client = agent._create_openai_client(client_kwargs, reason="agent_init", shared=True)
             if not agent.quiet_mode:
                 print(f"🤖 AI Agent initialized with model: {agent.model}")
@@ -1189,38 +1196,8 @@ def init_agent(
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
             agent._memory_manager = None
 
-    # Inject memory provider tool schemas into the tool surface.
-    # Skip tools whose names already exist (plugins may register the
-    # same tools via ctx.register_tool(), which lands in agent.tools
-    # through _ra().get_tool_definitions()).  Duplicate function names cause
-    # 400 errors on providers that enforce unique names (e.g. Xiaomi
-    # MiMo via Nous Portal).
-    #
-    # Respect the platform's enabled_toolsets configuration (#5544):
-    #   enabled_toolsets is None        → no filter, inject (backward compat)
-    #   "memory" in enabled_toolsets    → user opted in, inject
-    #   otherwise (incl. [])            → user excluded memory, skip injection
-    #
-    # Without this gate, `platform_toolsets: telegram: []` still leaks memory
-    # provider tools (fact_store, etc.) into the tool surface — a 10x latency
-    # penalty on local models and a frequent trigger of tool-call loops.
-    if agent._memory_manager and agent.tools is not None and (
-        agent.enabled_toolsets is None or "memory" in agent.enabled_toolsets
-    ):
-        _existing_tool_names = {
-            t.get("function", {}).get("name")
-            for t in agent.tools
-            if isinstance(t, dict)
-        }
-        for _schema in agent._memory_manager.get_all_tool_schemas():
-            _tname = _schema.get("name", "")
-            if _tname and _tname in _existing_tool_names:
-                continue  # already registered via plugin path
-            _wrapped = {"type": "function", "function": _schema}
-            agent.tools.append(_wrapped)
-            if _tname:
-                agent.valid_tool_names.add(_tname)
-                _existing_tool_names.add(_tname)
+    from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
+    _inject_memory_provider_tools(agent)
 
     # Skills config: nudge interval for skill creation reminders
     agent._skill_nudge_interval = 10

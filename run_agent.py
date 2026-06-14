@@ -169,7 +169,7 @@ from agent.codex_responses_adapter import (
     _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
     _deterministic_call_id as _codex_deterministic_call_id,
     _split_responses_tool_id as _codex_split_responses_tool_id,
-    _summarize_user_message_for_log,  # noqa: F401  # re-exported for tests
+    _summarize_user_message_for_log,  # also used by _sync_external_memory_for_turn (memory boundary)
 )
 from agent.tool_guardrails import (
     ToolGuardrailDecision,
@@ -196,7 +196,7 @@ from agent.tool_dispatch_helpers import (
     _extract_error_preview,
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
 )
-from utils import atomic_json_write, base_url_host_matches, base_url_hostname, is_truthy_value
+from utils import atomic_json_write, base_url_host_matches, base_url_hostname, is_truthy_value, model_forces_max_completion_tokens
 
 
 
@@ -358,6 +358,7 @@ class AIAgent:
         save_trajectories: bool = False,
         verbose_logging: bool = False,
         quiet_mode: bool = False,
+        tool_progress_mode: str = "all",
         ephemeral_system_prompt: str = None,
         log_prefix_chars: int = 100,
         log_prefix: str = "",
@@ -375,6 +376,7 @@ class AIAgent:
         thinking_callback: callable = None,
         reasoning_callback: callable = None,
         clarify_callback: callable = None,
+        read_terminal_callback: callable = None,
         step_callback: callable = None,
         stream_delta_callback: callable = None,
         interim_assistant_callback: callable = None,
@@ -430,6 +432,7 @@ class AIAgent:
             save_trajectories=save_trajectories,
             verbose_logging=verbose_logging,
             quiet_mode=quiet_mode,
+            tool_progress_mode=tool_progress_mode,
             ephemeral_system_prompt=ephemeral_system_prompt,
             log_prefix_chars=log_prefix_chars,
             log_prefix=log_prefix,
@@ -447,6 +450,7 @@ class AIAgent:
             thinking_callback=thinking_callback,
             reasoning_callback=reasoning_callback,
             clarify_callback=clarify_callback,
+            read_terminal_callback=read_terminal_callback,
             step_callback=step_callback,
             stream_delta_callback=stream_delta_callback,
             interim_assistant_callback=interim_assistant_callback,
@@ -1249,13 +1253,24 @@ class AIAgent:
     def _max_tokens_param(self, value: int) -> dict:
         """Return the correct max tokens kwarg for the current provider.
 
-        OpenAI's newer models (gpt-4o, o-series, gpt-5+) require
-        'max_completion_tokens'. Azure OpenAI also requires
-        'max_completion_tokens' for gpt-5.x models served via the
-        OpenAI-compatible endpoint. OpenRouter, local models, and older
+        OpenAI's newer models (gpt-4o, gpt-4.1, gpt-5+, o-series) require
+        'max_completion_tokens'. Azure OpenAI and GitHub Copilot also require
+        'max_completion_tokens' for those families served via their
+        OpenAI-compatible endpoints. OpenRouter, local models, and older
         OpenAI models use 'max_tokens'.
+
+        The check is URL-first (api.openai.com / Azure / Copilot all use the
+        new kwarg), then falls back to a model-name check so third-party
+        OpenAI-compatible endpoints fronting those models are recognised —
+        URL-only detection misses that case and silently sends the wrong
+        kwarg, which the upstream model rejects with a 400.
         """
-        if self._is_direct_openai_url() or self._is_azure_openai_url() or self._is_github_copilot_url():
+        if (
+            self._is_direct_openai_url()
+            or self._is_azure_openai_url()
+            or self._is_github_copilot_url()
+            or model_forces_max_completion_tokens(self.model)
+        ):
             return {"max_completion_tokens": value}
         return {"max_tokens": value}
 
@@ -1533,9 +1548,10 @@ class AIAgent:
     def _flush_messages_to_session_db(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Persist any un-flushed messages to the SQLite session store.
 
-        Uses _last_flushed_db_idx to track which messages have already been
-        written, so repeated calls (from multiple exit paths) only write
-        truly new messages — preventing the duplicate-write bug (#860).
+        Uses per-session message identity tracking so repeated calls (from
+        multiple exit paths) only write truly new messages — preventing the
+        duplicate-write bug (#860) without relying on positional slices that
+        can drift after message-sequence repair.
         """
         if not self._session_db:
             return
@@ -1544,9 +1560,41 @@ class AIAgent:
             # Retry row creation if the earlier attempt failed transiently.
             if not self._session_db_created:
                 self._ensure_db_session()
-            start_idx = len(conversation_history) if conversation_history else 0
-            flush_from = max(start_idx, self._last_flushed_db_idx)
-            for msg in messages[flush_from:]:
+            # Positional flushing used to slice at
+            # max(len(conversation_history), _last_flushed_db_idx). That
+            # assumes the live `messages` list is the original history plus a
+            # new tail. repair_message_sequence can shrink/merge the history
+            # copy before the final flush, making len(conversation_history)
+            # larger than len(messages); the slice is then empty and delivered
+            # assistant responses never reach state.db (#46053).
+            #
+            # Track object identities instead. `messages` is a shallow copy of
+            # `conversation_history`, so history dicts are skipped by identity,
+            # and new dicts appended during this turn are written once even if
+            # repair compacts the list around them.
+            current_session_id = getattr(self, "session_id", None)
+            flushed_session_id = getattr(self, "_flushed_db_message_session_id", None)
+            if flushed_session_id != current_session_id or self._last_flushed_db_idx == 0:
+                self._flushed_db_message_ids = set()
+                self._flushed_db_message_session_id = current_session_id
+            flushed_ids = getattr(self, "_flushed_db_message_ids", None)
+            if not isinstance(flushed_ids, set):
+                flushed_ids = set()
+                self._flushed_db_message_ids = flushed_ids
+            history_ids = {
+                id(item) for item in (conversation_history or [])
+                if isinstance(item, dict)
+            }
+
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                msg_id = id(msg)
+                if msg_id in flushed_ids:
+                    continue
+                if msg_id in history_ids:
+                    flushed_ids.add(msg_id)
+                    continue
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
                 # Persist multimodal tool results as their text summary only —
@@ -1585,6 +1633,7 @@ class AIAgent:
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
                 )
+                flushed_ids.add(msg_id)
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
@@ -2812,21 +2861,53 @@ class AIAgent:
         """
         if getattr(self, "notice_callback", None) is None and getattr(self, "notice_clear_callback", None) is None:
             return
+        if not self._credits_notices_enabled():
+            return
         state = getattr(self, "_credits_state", None)
         if state is None:
             return
         try:
-            from agent.credits_tracker import evaluate_credits_notices
+            from agent.credits_tracker import evaluate_credits_notices, is_free_tier_model
             latch = getattr(self, "_credits_latch", None)
             if latch is None:
                 latch = self._credits_latch = {"active": set(), "seen_below_90": False, "usage_band": None}
-            to_show, to_clear = evaluate_credits_notices(state, latch)
+            # Free-model gate: a depleted account on a free model can still
+            # inference, so the depleted error banner is suppressed. Local-data
+            # only (":free" suffix + pricing-cache peek) — never a network call.
+            model_is_free = is_free_tier_model(
+                getattr(self, "model", "") or "",
+                getattr(self, "base_url", "") or "",
+            )
+            to_show, to_clear = evaluate_credits_notices(state, latch, model_is_free=model_is_free)
             for key in to_clear:        # clears FIRST …
                 self._emit_notice_clear(key)
             for notice in to_show:      # … then shows (depleted lands last in a latest-wins slot)
                 self._emit_notice(notice)
         except Exception:
             logger.warning("credits notice evaluation/emit failed", exc_info=True)
+
+    def _credits_notices_enabled(self) -> bool:
+        """Whether credits notices are enabled (config display.credits_notices).
+
+        Read once per agent and cached — the policy runs after every API
+        response, and the setting governs UI noise, not correctness, so a
+        config flip applying on the next session is fine.  Fail-open True
+        (preserve current behaviour) on any config error.
+        """
+        cached = getattr(self, "_credits_notices_enabled_cache", None)
+        if cached is not None:
+            return cached
+        enabled = True
+        try:
+            from hermes_cli.config import load_config as _load_config
+            _cfg = _load_config() or {}
+            _display = _cfg.get("display") if isinstance(_cfg, dict) else None
+            if isinstance(_display, dict) and "credits_notices" in _display:
+                enabled = bool(_display.get("credits_notices"))
+        except Exception:
+            enabled = True
+        self._credits_notices_enabled_cache = enabled
+        return enabled
 
     def get_credits_state(self):
         """Return the last captured CreditsState, or None."""
@@ -2968,17 +3049,24 @@ class AIAgent:
             return
         if not (self._memory_manager and final_response and original_user_message):
             return
+        # Multimodal turns carry content as a list of typed parts; providers
+        # expect plain strings, so flatten to text first (newline-joined for
+        # memory, vs the default space-join used for log/trajectory previews).
+        user_text = _summarize_user_message_for_log(original_user_message, sep="\n")
+        response_text = _summarize_user_message_for_log(final_response, sep="\n")
+        if not (user_text and response_text):
+            return
         try:
             sync_kwargs = {"session_id": self.session_id or ""}
             if messages is not None:
                 sync_kwargs["messages"] = messages
             self._memory_manager.sync_all(
-                original_user_message,
-                final_response,
+                user_text,
+                response_text,
                 **sync_kwargs,
             )
             self._memory_manager.queue_prefetch_all(
-                original_user_message,
+                user_text,
                 session_id=self.session_id or "",
             )
         except Exception:
@@ -3087,6 +3175,17 @@ class AIAgent:
         except Exception:
             pass
 
+        # 6. Free conversation history.  Mirrors _release_evicted_agent_soft's
+        # soft-eviction clear — close() is the hard teardown for true session
+        # boundaries (/new, /reset, session expiry), so the message list won't
+        # be reused.  Drops the reference proactively rather than waiting for
+        # the agent object itself to be collected, which matters when a caller
+        # still holds the closed agent (e.g. a draining background task).
+        try:
+            self._session_messages = []
+        except Exception:
+            pass
+
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """
         Recover todo state from conversation history.
@@ -3176,7 +3275,11 @@ class AIAgent:
         return sanitize_api_messages(messages)
 
     @staticmethod
-    def _is_thinking_only_assistant(msg: Dict[str, Any]) -> bool:
+    def _is_thinking_only_assistant(
+        msg: Dict[str, Any],
+        *,
+        drop_codex_reasoning_items: bool = True,
+    ) -> bool:
         """Return True if ``msg`` is an assistant turn whose only payload is reasoning.
 
         "Thinking-only" means the model emitted reasoning (``reasoning`` or
@@ -3227,15 +3330,30 @@ class AIAgent:
         rd = msg.get("reasoning_details")
         if isinstance(rd, list) and rd:
             return True
+        # Codex Responses stores encrypted reasoning state under a separate
+        # assistant-message key. Treat only real reasoning items as
+        # thinking-only; empty/junk lists should fall through to the generic
+        # empty-turn handling instead of being dropped here.
+        codex_items = msg.get("codex_reasoning_items")
+        if drop_codex_reasoning_items and isinstance(codex_items, list):
+            return any(
+                isinstance(item, dict) and item.get("type") == "reasoning"
+                for item in codex_items
+            )
         return False
 
     @staticmethod
     def _drop_thinking_only_and_merge_users(
         messages: List[Dict[str, Any]],
+        *,
+        drop_codex_reasoning_items: bool = True,
     ) -> List[Dict[str, Any]]:
         """Forwarder — see ``agent.agent_runtime_helpers.drop_thinking_only_and_merge_users``."""
         from agent.agent_runtime_helpers import drop_thinking_only_and_merge_users
-        return drop_thinking_only_and_merge_users(messages)
+        return drop_thinking_only_and_merge_users(
+            messages,
+            drop_codex_reasoning_items=drop_codex_reasoning_items,
+        )
 
     @staticmethod
     def _cap_delegate_task_calls(tool_calls: list) -> list:
@@ -3904,6 +4022,13 @@ class AIAgent:
     def _anthropic_messages_create(self, api_kwargs: dict):
         if self.api_mode == "anthropic_messages":
             self._try_refresh_anthropic_client_credentials()
+        # Defensive: strip Responses-only kwargs that can leak in under an
+        # api_mode-flip race (the Anthropic SDK raises a non-retryable
+        # TypeError on them). See #31673.
+        from agent.anthropic_adapter import sanitize_anthropic_kwargs
+        sanitize_anthropic_kwargs(
+            api_kwargs, log_prefix=getattr(self, "log_prefix", "")
+        )
         return self._anthropic_client.messages.create(**api_kwargs)
 
     def _rebuild_anthropic_client(self) -> None:
@@ -4255,6 +4380,23 @@ class AIAgent:
         except Exception:
             return False
 
+    def _provider_supports_vision_tool_messages(self) -> bool:
+        """Return True if the active provider accepts list-type tool content.
+
+        Some providers (e.g. Xiaomi MiMo) support multimodal user messages
+        but reject list-type tool message content with 400 errors.  This
+        checks the provider profile's ``supports_vision_tool_messages`` field.
+        """
+        try:
+            from providers import get_provider_profile
+            provider = (getattr(self, "provider", "") or "").strip()
+            profile = get_provider_profile(provider)
+            if profile is not None:
+                return getattr(profile, "supports_vision_tool_messages", True)
+        except Exception:
+            pass
+        return True  # default: assume compatible
+
     def _preprocess_anthropic_content(self, content: Any, role: str) -> Any:
         if not self._content_has_image_parts(content):
             return content
@@ -4394,13 +4536,17 @@ class AIAgent:
             return content
 
         if self._model_supports_vision():
-            # Vision-capable on paper — but if we've already learned in this
-            # session that the active (provider, model) rejects list-type
-            # tool content (e.g. Xiaomi MiMo's 400 "text is not set"),
-            # short-circuit to a text summary so we don't burn another
-            # round-trip relearning the same lesson.  Cache populated by
-            # the 400 recovery path in agent.conversation_loop.  Transient
-            # per-session; next session retries.
+            # Vision-capable on paper — but if the provider rejects list-type
+            # tool content (e.g. Xiaomi MiMo's 400 "text is not set"), or if
+            # we've already learned this lesson in-session, short-circuit to
+            # a text summary so we don't burn a round-trip relearning it.
+            if not self._provider_supports_vision_tool_messages():
+                logger.debug(
+                    "Tool %s: provider %s does not accept list-type tool "
+                    "content — sending text summary",
+                    tool_name, getattr(self, "provider", ""),
+                )
+                return _multimodal_text_summary(result)
             key = (
                 (getattr(self, "provider", "") or "").strip().lower(),
                 (getattr(self, "model", "") or "").strip(),
@@ -4436,10 +4582,18 @@ class AIAgent:
         )
         return summary
 
-    def _try_shrink_image_parts_in_messages(self, api_messages: list) -> bool:
+    def _try_shrink_image_parts_in_messages(
+        self,
+        api_messages: list,
+        *,
+        max_dimension: int = 8000,
+    ) -> bool:
         """Forwarder — see ``agent.conversation_compression.try_shrink_image_parts_in_messages``."""
         from agent.conversation_compression import try_shrink_image_parts_in_messages
-        return try_shrink_image_parts_in_messages(api_messages)
+        return try_shrink_image_parts_in_messages(
+            api_messages,
+            max_dimension=max_dimension,
+        )
 
     def _try_strip_image_parts_from_tool_messages(self, api_messages: list) -> bool:
         """Downgrade list-type tool messages to text summaries in-place.
