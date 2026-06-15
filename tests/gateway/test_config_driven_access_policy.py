@@ -60,6 +60,9 @@ def _clear_auth_env(monkeypatch) -> None:
         "YUANBAO_ALLOW_ALL_USERS",
         "QQ_ALLOW_ALL_USERS",
         "WHATSAPP_ALLOW_ALL_USERS",
+        "LINE_ALLOWED_USERS",
+        "LINE_ALLOWED_GROUPS",
+        "LINE_ALLOW_ALL_USERS",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -406,3 +409,27 @@ def test_unauthorized_dm_behavior_open_policy_keeps_default(monkeypatch):
 
     # No allowlist + no restrictive policy → open-gateway pairing default.
     assert runner._get_unauthorized_dm_behavior(Platform.WECOM) == "pair"
+
+
+def test_line_group_chat_id_allowlist_authorizes_sender_without_user_allowlist(monkeypatch):
+    """LINE groups listed in LINE_ALLOWED_GROUPS authorize by chat ID.
+
+    The sender does not need to be present in LINE_ALLOWED_USERS; group-scoped
+    LINE traffic is gated by the C... chat ID, matching the LINE archive/prefix
+    workflow used by digest jobs.
+    """
+    _clear_auth_env(monkeypatch)
+    line = Platform("line")
+    monkeypatch.setenv("LINE_ALLOWED_GROUPS", "Callowed")
+    config = GatewayConfig(platforms={line: PlatformConfig(enabled=True)})
+    runner, _adapter = _make_runner(line, config, enforces=False)
+
+    source = SessionSource(
+        platform=line,
+        user_id="Usender-not-in-user-allowlist",
+        chat_id="Callowed",
+        user_name="line sender",
+        chat_type="group",
+    )
+
+    assert runner._is_user_authorized(source) is True
