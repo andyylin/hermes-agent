@@ -23,6 +23,15 @@ _BEARER_RE = re.compile(r"(?i)\bbearer\s+([A-Za-z0-9._~+/=-]{16,})")
 _PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 _LONG_CREDENTIAL_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b")
 
+_PLACEHOLDER_SECRET_VALUES = {
+    "<redacted>",
+    "***",
+    "your_password",
+    "your_app_password",
+    "your_google_app_password",
+    "your_16_character_google_app_password",
+}
+
 
 @dataclass(frozen=True)
 class PrivacyFinding:
@@ -71,7 +80,10 @@ def _truncate(text: str, max_chars: int) -> str:
 
 
 def _redact_line(line: str) -> str:
-    redacted = _SECRET_ASSIGNMENT_RE.sub(lambda m: f"{m.group(1)}=<redacted>", line)
+    redacted = _SECRET_ASSIGNMENT_RE.sub(
+        lambda m: f"{m.group(1)}=<redacted>" if _is_secret_assignment_match(m) else m.group(0),
+        line,
+    )
     redacted = _BEARER_RE.sub("Bearer <redacted>", redacted)
     redacted = _LONG_CREDENTIAL_RE.sub("<redacted>", redacted)
     if _PRIVATE_KEY_RE.search(redacted):
@@ -79,10 +91,40 @@ def _redact_line(line: str) -> str:
     return redacted
 
 
+def _is_placeholder_secret_value(value: str) -> bool:
+    normalized = value.strip().strip("'\"").strip().lower()
+    if normalized in _PLACEHOLDER_SECRET_VALUES:
+        return True
+    return normalized.startswith("your_") or normalized.startswith("example_")
+
+
+def _is_secret_assignment_match(match: re.Match[str]) -> bool:
+    """Return True for credential-shaped assignments worth reporting.
+
+    The scanner intentionally runs on generated memory packs, which contain a
+    lot of prose and code examples. Keep obvious real-secret key shapes, but do
+    not page Andy for harmless camelCase words containing ``token`` (for
+    example ``contextTokens=500``) or placeholder credentials in documentation.
+    """
+    key = match.group(1)
+    value = match.group(2)
+    if _is_placeholder_secret_value(value):
+        return False
+
+    key_upper = key.upper()
+    if any(marker in key_upper for marker in ("API_KEY", "API-KEY", "SECRET", "PASSWORD", "PASSWD", "PRIVATE_KEY", "PRIVATE-KEY")):
+        return True
+    if "TOKEN" in key_upper:
+        # TOKEN in conventional env-style keys is credential-shaped; token as a
+        # camelCase suffix in prose/config counters is not.
+        return key == key_upper or bool(re.search(r"(?i)(^|[_\-.])TOKEN($|[_\-.])", key))
+    return True
+
+
 def _finding_kind(line: str) -> str | None:
     if _PRIVATE_KEY_RE.search(line):
         return "private_key"
-    if _SECRET_ASSIGNMENT_RE.search(line):
+    if any(_is_secret_assignment_match(match) for match in _SECRET_ASSIGNMENT_RE.finditer(line)):
         return "secret_assignment"
     if _BEARER_RE.search(line):
         return "bearer_token"
