@@ -6672,7 +6672,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
                 return None
         elif not self._is_user_authorized(source):
-            logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
+            logger.warning(
+                "Unauthorized user: %s (%s) on %s chat_type=%s chat_id=%s",
+                source.user_id,
+                source.user_name,
+                source.platform.value,
+                source.chat_type or "unknown",
+                source.chat_id or "unknown",
+            )
             # In DMs: offer pairing code. In groups: silently ignore.
             if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
                 platform_name = source.platform.value if source.platform else "unknown"
