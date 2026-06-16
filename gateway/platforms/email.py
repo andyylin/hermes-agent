@@ -17,6 +17,7 @@ Environment variables:
 
 import asyncio
 import email as email_lib
+import html
 import imaplib
 import logging
 import os
@@ -230,6 +231,55 @@ def _strip_html(html: str) -> str:
     text = re.sub(r"&gt;", ">", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def _looks_like_html(text: str) -> bool:
+    """Return True when text contains plausible HTML tags."""
+    return bool(re.search(
+        r"</?(?:html|body|div|p|br|h[1-6]|ul|ol|li|strong|b|em|i|a|table|tr|td|th)\b[^>]*>",
+        text,
+        flags=re.IGNORECASE,
+    ))
+
+
+def _plain_text_to_html_email(text: str) -> str:
+    """Render a small email-safe HTML version of Markdown-ish plain text."""
+    blocks = re.split(r"\n{2,}", text.strip()) if text.strip() else []
+    rendered: List[str] = []
+    for block in blocks:
+        lines = block.splitlines()
+        if len(lines) == 1 and re.match(r"^#{1,6}\s+", lines[0]):
+            level = min(len(lines[0]) - len(lines[0].lstrip("#")), 3)
+            title = html.escape(re.sub(r"^#{1,6}\s+", "", lines[0]).strip())
+            rendered.append(f"<h{level}>{title}</h{level}>")
+            continue
+        if lines and all(re.match(r"^\s*[-*]\s+", line) for line in lines if line.strip()):
+            items = []
+            for line in lines:
+                item = re.sub(r"^\s*[-*]\s+", "", line).strip()
+                if item:
+                    items.append(f"<li>{html.escape(item)}</li>")
+            if items:
+                rendered.append("<ul>" + "".join(items) + "</ul>")
+                continue
+        escaped = "<br>".join(html.escape(line) for line in lines)
+        rendered.append(f"<p>{escaped}</p>")
+    body = "\n".join(rendered) or "<p></p>"
+    return f"<!doctype html><html><body>{body}</body></html>"
+
+
+def _html_parts_for_body(body: str, metadata: Optional[Dict[str, Any]] = None) -> tuple[str, Optional[str]]:
+    """Return (plain_body, html_body) using explicit metadata or safe conversion."""
+    metadata = metadata or {}
+    html_body = str(metadata.get("html_body") or "")
+    wants_html = bool(metadata.get("html") or html_body)
+    if html_body:
+        return body, html_body
+    if not wants_html:
+        return body, None
+    if _looks_like_html(body):
+        return _strip_html(body), body
+    return body, _plain_text_to_html_email(body)
 
 
 def _extract_email_address(raw: str) -> str:
@@ -619,7 +669,7 @@ class EmailAdapter(BasePlatformAdapter):
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, content, reply_to
+                None, self._send_email, chat_id, content, reply_to, metadata
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -631,22 +681,27 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         reply_to_msg_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Send an email via SMTP. Runs in executor thread."""
-        msg = MIMEMultipart()
+        metadata = metadata or {}
+        plain_body, html_body = _html_parts_for_body(body, metadata)
+        msg = MIMEMultipart("alternative" if html_body else "mixed")
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        # Thread context for reply
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
+        # Thread context for replies; cron/report sends can override the subject.
+        subject = str(metadata.get("subject") or "").strip()
+        if not subject:
+            ctx = self._thread_context.get(to_addr, {})
+            subject = ctx.get("subject", "Hermes Agent")
+            if not subject.startswith("Re:"):
+                subject = f"Re: {subject}"
         msg["Subject"] = subject
 
         # Threading headers
-        original_msg_id = reply_to_msg_id or ctx.get("message_id")
-        if original_msg_id:
+        original_msg_id = reply_to_msg_id or self._thread_context.get(to_addr, {}).get("message_id")
+        if original_msg_id and not metadata.get("subject"):
             msg["In-Reply-To"] = original_msg_id
             msg["References"] = original_msg_id
 
@@ -654,7 +709,9 @@ class EmailAdapter(BasePlatformAdapter):
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._address.split('@')[1]}>"
         msg["Message-ID"] = msg_id
 
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+        msg.attach(MIMEText(plain_body, "plain", "utf-8"))
+        if html_body:
+            msg.attach(MIMEText(html_body, "html", "utf-8"))
 
         smtp = self._connect_smtp()
         try:

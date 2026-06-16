@@ -686,7 +686,7 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, metadata=None):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -893,7 +893,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         elif platform == Platform.SIGNAL:
             result = await _send_signal(pconfig.extra, chat_id, chunk)
         elif platform == Platform.EMAIL:
-            result = await _send_email(pconfig.extra, chat_id, chunk)
+            result = await _send_email(pconfig.extra, chat_id, chunk, metadata=metadata)
         elif platform == Platform.SMS:
             result = await _send_sms(pconfig.api_key, chat_id, chunk)
         elif platform == Platform.MATRIX:
@@ -1401,9 +1401,11 @@ async def _send_signal(extra, chat_id, message, media_files=None):
         return _error(f"Signal send failed: {e}")
 
 
-async def _send_email(extra, chat_id, message):
+async def _send_email(extra, chat_id, message, metadata=None):
     """Send via SMTP (one-shot, no persistent connection needed)."""
+    import html as html_lib
     import smtplib
+    from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
 
     address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
@@ -1418,10 +1420,47 @@ async def _send_email(extra, chat_id, message):
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
     try:
-        msg = MIMEText(message, "plain", "utf-8")
+        metadata = metadata or {}
+        html_body = str(metadata.get("html_body") or "")
+        wants_html = bool(metadata.get("html") or html_body)
+        if wants_html and not html_body:
+            if re.search(r"</?(?:html|body|div|p|br|h[1-6]|ul|ol|li|strong|b|em|i|a|table|tr|td|th)\b[^>]*>", message, flags=re.IGNORECASE):
+                html_body = message
+                plain_body = re.sub(r"<br\s*/?>", "\n", message, flags=re.IGNORECASE)
+                plain_body = re.sub(r"<[^>]+>", "", plain_body).strip()
+            else:
+                plain_body = message
+                parts = []
+                for block in re.split(r"\n{2,}", message.strip()):
+                    if not block:
+                        continue
+                    lines = block.splitlines()
+                    if len(lines) == 1 and re.match(r"^#{1,6}\s+", lines[0]):
+                        level = min(len(lines[0]) - len(lines[0].lstrip("#")), 3)
+                        title = re.sub(r"^#{1,6}\s+", "", lines[0]).strip()
+                        parts.append(f"<h{level}>{html_lib.escape(title)}</h{level}>")
+                    elif lines and all(re.match(r"^\s*[-*]\s+", line) for line in lines if line.strip()):
+                        items = []
+                        for line in lines:
+                            if line.strip():
+                                item = re.sub(r"^\s*[-*]\s+", "", line).strip()
+                                items.append(f"<li>{html_lib.escape(item)}</li>")
+                        parts.append("<ul>" + "".join(items) + "</ul>")
+                    else:
+                        parts.append("<p>" + "<br>".join(html_lib.escape(line) for line in lines) + "</p>")
+                html_body = "<!doctype html><html><body>" + "\n".join(parts) + "</body></html>"
+        else:
+            plain_body = message
+
+        if html_body:
+            msg = MIMEMultipart("alternative")
+            msg.attach(MIMEText(plain_body, "plain", "utf-8"))
+            msg.attach(MIMEText(html_body, "html", "utf-8"))
+        else:
+            msg = MIMEText(plain_body, "plain", "utf-8")
         msg["From"] = address
         msg["To"] = chat_id
-        msg["Subject"] = "Hermes Agent"
+        msg["Subject"] = str(metadata.get("subject") or "Hermes Agent")
         msg["Date"] = formatdate(localtime=True)
 
         server = smtplib.SMTP(smtp_host, smtp_port)

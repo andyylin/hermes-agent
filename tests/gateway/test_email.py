@@ -667,6 +667,54 @@ class TestThreadContext(unittest.TestCase):
             self.assertEqual(send_call["Subject"], "Re: Hermes Agent")
             self.assertIn("Date", send_call)
 
+    def test_metadata_subject_overrides_reply_threading_for_reports(self):
+        """Cron/report sends can set a non-Re unique subject."""
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com"] = {
+            "subject": "Old thread",
+            "message_id": "<old@test.com>",
+        }
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email(
+                "user@test.com",
+                "Hello!",
+                None,
+                {"subject": "2026-06-16 Tuesday Morning Briefing"},
+            )
+
+            send_call = mock_server.send_message.call_args[0][0]
+            self.assertEqual(send_call["Subject"], "2026-06-16 Tuesday Morning Briefing")
+            self.assertNotIn("In-Reply-To", send_call)
+            self.assertNotIn("References", send_call)
+
+    def test_metadata_html_sends_multipart_alternative(self):
+        """HTML report metadata should produce a real text/html MIME part."""
+        adapter = self._make_adapter()
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email(
+                "user@test.com",
+                "## Morning Briefing\n\n- One\n- Two",
+                None,
+                {"subject": "Brief", "html": True},
+            )
+
+            send_call = mock_server.send_message.call_args[0][0]
+            self.assertTrue(send_call.is_multipart())
+            payloads = send_call.get_payload()
+            self.assertEqual(payloads[0].get_content_type(), "text/plain")
+            self.assertEqual(payloads[1].get_content_type(), "text/html")
+            html_payload = payloads[1].get_payload(decode=True).decode("utf-8")
+            self.assertIn("<h2>Morning Briefing</h2>", html_payload)
+            self.assertIn("<li>One</li>", html_payload)
+
 
 class TestSendMethods(unittest.TestCase):
     """Test email send methods."""

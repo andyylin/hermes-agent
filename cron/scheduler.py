@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from datetime import datetime
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -600,6 +601,40 @@ _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
 _IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
 
 
+def _format_cron_email_subject(job: dict) -> Optional[str]:
+    """Render an optional per-job email subject template."""
+    template = str(job.get("email_subject_template") or "").strip()
+    if not template:
+        return None
+    try:
+        now = _hermes_now()
+    except Exception:
+        now = datetime.now()
+    values = {
+        "date": now.strftime("%Y-%m-%d"),
+        "weekday": now.strftime("%A"),
+        "job_name": job.get("name", job.get("id", "")),
+        "job_id": job.get("id", ""),
+    }
+    try:
+        return template.format(**values)
+    except Exception as exc:
+        logger.warning("Job '%s': invalid email_subject_template %r: %s", job.get("id", "?"), template, exc)
+        return template
+
+
+def _delivery_metadata_for_target(job: dict, platform_name: str, thread_id: Optional[str] = None) -> Optional[dict]:
+    """Build platform-specific delivery metadata for cron auto-delivery."""
+    metadata: dict[str, object] = {"thread_id": thread_id} if thread_id else {}
+    if platform_name.lower() == "email":
+        subject = _format_cron_email_subject(job)
+        if subject:
+            metadata["subject"] = subject
+        if job.get("email_html", True):
+            metadata["html"] = True
+    return metadata or None
+
+
 def _send_media_via_adapter(
     adapter,
     chat_id: str,
@@ -757,7 +792,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
-            send_metadata = {"thread_id": thread_id} if thread_id else None
+            send_metadata = _delivery_metadata_for_target(job, platform_name, thread_id)
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
                 text_to_send = cleaned_delivery_content.strip()
@@ -819,8 +854,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 )
 
         if not delivered:
-            # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            send_metadata = _delivery_metadata_for_target(job, platform_name, thread_id)
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                metadata=send_metadata,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError:
@@ -830,7 +873,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # fresh thread that has no running loop.
                 coro.close()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, metadata=send_metadata))
                     result = future.result(timeout=30)
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
