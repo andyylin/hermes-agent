@@ -164,6 +164,7 @@ class Platform(Enum):
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
+    RELAY = "relay"  # generic relay adapter fronted by the connector (EXPERIMENTAL)
     @classmethod
     def _missing_(cls, value):
         """Accept unknown platform names only for known plugin adapters.
@@ -417,9 +418,9 @@ class StreamingConfig:
     # if the original preview has been visible for at least this many
     # seconds, so the platform's visible timestamp reflects completion
     # time instead of the preview creation time.  Currently applied to
-    # Telegram only (other platforms ignore the setting).  Default 60s
-    # matches the OpenClaw rollout.  Set to 0 to disable.
-    fresh_final_after_seconds: float = 60.0
+    # Telegram only (other platforms ignore the setting).  Default 0 disables
+    # the fresh-message replacement path; set >0 to opt in.
+    fresh_final_after_seconds: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -446,7 +447,7 @@ class StreamingConfig:
             ),
             cursor=data.get("cursor", DEFAULT_STREAMING_CURSOR),
             fresh_final_after_seconds=_coerce_float(
-                data.get("fresh_final_after_seconds"), 60.0
+                data.get("fresh_final_after_seconds"), 0.0
             ),
         )
 
@@ -491,6 +492,13 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.DINGTALK: lambda cfg: bool(
         (cfg.extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID"))
         and (cfg.extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET"))
+    ),
+    # Relay dials OUT to a connector; it is "connected" once an endpoint URL is
+    # configured (extra["relay_url"] or extra["url"]). The capability descriptor
+    # is negotiated at handshake time, so the URL is the only config-level
+    # signal in the experimental phase. EXPERIMENTAL — may change.
+    Platform.RELAY: lambda cfg: bool(
+        cfg.extra.get("relay_url") or cfg.extra.get("url")
     ),
 }
 
@@ -2203,6 +2211,25 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                     )
     except Exception as e:
         logger.debug("Plugin platform enable pass failed: %s", e)
+
+    # Relay (generic connector-fronted platform, EXPERIMENTAL). Enabled when a
+    # connector relay URL is configured via GATEWAY_RELAY_URL (env) or
+    # gateway.relay_url (config.yaml). The adapter is registered into the
+    # platform_registry at gateway startup (gateway.relay.register_relay_adapter)
+    # and dials OUT to the connector — so, like Telegram/Matrix, it has no public
+    # inbound port and just needs Platform.RELAY present+enabled in
+    # config.platforms for start_gateway()'s connect loop to bring it up. The
+    # connected-checker (Platform.RELAY in _PLATFORM_CONNECTED_CHECKERS) keys on
+    # extra["relay_url"], so mirror the URL into extra here.
+    relay_url_env = os.getenv("GATEWAY_RELAY_URL", "").strip()
+    relay_url_yaml = ""
+    existing_relay = config.platforms.get(Platform.RELAY)
+    if existing_relay is not None:
+        relay_url_yaml = str(existing_relay.extra.get("relay_url") or "").strip()
+    relay_url_val = relay_url_env or relay_url_yaml
+    if relay_url_val:
+        relay_config = _enable_from_env(Platform.RELAY)
+        relay_config.extra["relay_url"] = relay_url_val.rstrip("/")
 
     for platform_config in config.platforms.values():
         platform_config.extra.pop("_enabled_explicit", None)

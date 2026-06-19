@@ -161,6 +161,9 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_KEY,
         _SESSION_ID,
         _SESSION_MESSAGE_ID,
+        _CRON_AUTO_DELIVER_PLATFORM,
+        _CRON_AUTO_DELIVER_CHAT_ID,
+        _CRON_AUTO_DELIVER_THREAD_ID,
     ):
         var.set("")
     try:
