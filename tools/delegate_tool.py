@@ -2828,7 +2828,7 @@ def _resolve_model_provider_override(
             f"Cannot import model switch resolver for delegation override: {exc}"
         ) from exc
 
-    parsed_model, parsed_provider, _ignored_global, _ignored_refresh = parse_model_flags(raw_model)
+    parsed_model, parsed_provider, _ignored_global, _ignored_refresh, *_ignored_rest = parse_model_flags(raw_model)
     if explicit_provider and parsed_provider and explicit_provider != parsed_provider:
         raise ValueError(
             f"Conflicting provider overrides: provider={explicit_provider!r} "
