@@ -1010,6 +1010,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         target_errors = []
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
             send_metadata = {"thread_id": thread_id} if thread_id else None
+            if thread_id and platform_name.lower() == "telegram":
+                try:
+                    if int(str(chat_id)) > 0:
+                        send_metadata = dict(send_metadata or {})
+                        # Private Telegram DM topic delivery cannot rely on
+                        # message_thread_id alone when there is no live user
+                        # message to reply to. Give the in-process adapter the
+                        # Bot API direct_messages_topic_id so cron posts land in
+                        # the requested topic instead of being refused or
+                        # falling back outside the thread.
+                        send_metadata["direct_messages_topic_id"] = str(thread_id)
+                except (TypeError, ValueError):
+                    pass
             if email_subject and platform_name.lower() == "email":
                 send_metadata = dict(send_metadata or {})
                 send_metadata["subject"] = email_subject
