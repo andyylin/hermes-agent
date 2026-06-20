@@ -1234,8 +1234,6 @@ async def _standalone_send(
     standalone_sender_fn contract; replaces the legacy _send_email helper."""
     import smtplib
     import ssl as _ssl
-    from email.mime.text import MIMEText
-    from email.utils import formatdate
 
     extra = getattr(pconfig, "extra", {}) or {}
     address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
@@ -1250,11 +1248,22 @@ async def _standalone_send(
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
     try:
-        msg = MIMEText(message, "plain", "utf-8")
+        msg = MIMEMultipart()
         msg["From"] = address
         msg["To"] = chat_id
         msg["Subject"] = subject or "Hermes Agent"
         msg["Date"] = formatdate(localtime=True)
+
+        alt = MIMEMultipart("alternative")
+        if EmailAdapter._looks_like_html(message or ""):
+            plain_body = EmailAdapter._html_to_plain_text(message or "")
+            html_body = message or ""
+        else:
+            plain_body = message or ""
+            html_body = EmailAdapter._plain_text_to_html(plain_body)
+        alt.attach(MIMEText(plain_body, "plain", "utf-8"))
+        alt.attach(MIMEText(html_body, "html", "utf-8"))
+        msg.attach(alt)
 
         server = smtplib.SMTP(smtp_host, smtp_port)
         server.starttls(context=_ssl.create_default_context())
