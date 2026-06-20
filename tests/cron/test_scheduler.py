@@ -1009,6 +1009,47 @@ class TestDeliverResultWrapping:
         send_mock.assert_called_once()
         assert send_mock.call_args.kwargs["thread_id"] == "17585"
 
+    def test_live_adapter_private_telegram_topic_uses_direct_messages_topic_id(self):
+        """Cron deliveries to Telegram DM topics need Bot API topic metadata.
+
+        A bare message_thread_id for a private DM topic has no live reply
+        anchor, so the Telegram adapter refuses to send outside the requested
+        topic. Cron must pass direct_messages_topic_id for exact thread targets.
+        """
+        import concurrent.futures
+
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        adapter = MagicMock()
+        adapter.send = MagicMock(return_value=object())
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        future = concurrent.futures.Future()
+        future.set_result(SendResult(success=True))
+
+        job = {
+            "id": "dm-topic-job",
+            "name": "dm-topic-job",
+            "deliver": "telegram:545944400:78807",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("agent.async_utils.safe_schedule_threadsafe", return_value=future):
+            _deliver_result(job, "hello", adapters={Platform.TELEGRAM: adapter}, loop=loop)
+
+        adapter.send.assert_called_once()
+        assert adapter.send.call_args.args[0] == "545944400"
+        assert "hello" in adapter.send.call_args.args[1]
+        assert adapter.send.call_args.kwargs["metadata"] == {
+            "thread_id": "78807",
+            "direct_messages_topic_id": "78807",
+        }
+
 
 class TestDeliverResultErrorReturns:
     """Verify _deliver_result returns error strings on failure, None on success."""
