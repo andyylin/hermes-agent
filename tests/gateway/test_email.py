@@ -919,6 +919,46 @@ class TestThreadContext(unittest.TestCase):
             self.assertNotIn("References", msg)
 
 
+class TestStandaloneEmailSend(unittest.TestCase):
+    """Test send_message_tool's standalone email path used by cron without a live gateway adapter."""
+
+    @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "hermes@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_SMTP_HOST": "smtp.test.com",
+        "EMAIL_SMTP_PORT": "587",
+    }, clear=False)
+    def test_standalone_email_sends_html_as_multipart_alternative(self):
+        """Cron fallback email delivery must not send HTML tags as text/plain only."""
+        import asyncio
+        from gateway.config import PlatformConfig
+        from plugins.platforms.email.adapter import _standalone_send
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            result = asyncio.run(_standalone_send(
+                PlatformConfig(enabled=True, extra={"address": "hermes@test.com", "smtp_host": "smtp.test.com"}),
+                "user@test.com",
+                "<h2>Bottom line</h2><p><strong>Done</strong></p>",
+                subject="2026-06-20 Morning Briefing",
+            ))
+
+            self.assertEqual(result["success"], True)
+            msg = mock_server.send_message.call_args[0][0]
+            self.assertEqual(msg["Subject"], "2026-06-20 Morning Briefing")
+            content_types = [part.get_content_type() for part in msg.walk()]
+            self.assertIn("multipart/alternative", content_types)
+            self.assertIn("text/plain", content_types)
+            self.assertIn("text/html", content_types)
+            plain_part = next(part for part in msg.walk() if part.get_content_type() == "text/plain")
+            html_part = next(part for part in msg.walk() if part.get_content_type() == "text/html")
+            self.assertIn("Bottom line", plain_part.get_payload(decode=True).decode("utf-8"))
+            self.assertNotIn("<h2>", plain_part.get_payload(decode=True).decode("utf-8"))
+            self.assertIn("<h2>Bottom line</h2>", html_part.get_payload(decode=True).decode("utf-8"))
+
+
 class TestSendMethods(unittest.TestCase):
     """Test email send methods."""
 
