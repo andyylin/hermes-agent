@@ -1415,10 +1415,67 @@ async def _send_signal(extra, chat_id, message, media_files=None):
         return _error(f"Signal send failed: {e}")
 
 
+def _email_message_looks_like_html(body: str) -> bool:
+    """Return True when an outgoing email body contains renderable HTML."""
+    return bool(re.search(r"</?(?:html|body|h[1-6]|p|ul|ol|li|br|strong|em|table|tr|td|div|span)\b", body or "", re.IGNORECASE))
+
+
+def _email_html_to_plain_text(html: str) -> str:
+    """Best-effort text/plain alternative for HTML email bodies."""
+    from html import unescape
+
+    text = re.sub(r"<\s*br\s*/?>", "\n", html or "", flags=re.IGNORECASE)
+    text = re.sub(r"<\s*/\s*(?:p|div|h[1-6]|li|tr)\s*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<\s*li\b[^>]*>", "- ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = unescape(text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _email_plain_text_to_html(body: str) -> str:
+    """Render plain assistant text as basic email-safe HTML."""
+    from html import escape
+
+    escaped = escape(body or "")
+    blocks = re.split(r"\n{2,}", escaped.strip())
+    if not blocks:
+        return "<p></p>"
+    html_blocks = []
+    for block in blocks:
+        lines = block.splitlines()
+        nonempty_lines = [line for line in lines if line.strip()]
+        if nonempty_lines and all(line.startswith(("- ", "* ")) for line in nonempty_lines):
+            items = "".join(f"<li>{line[2:].strip()}</li>" for line in nonempty_lines)
+            html_blocks.append(f"<ul>{items}</ul>")
+        else:
+            html_lines = "<br>\n".join(lines)
+            html_blocks.append(f"<p>{html_lines}</p>")
+    return "\n".join(html_blocks)
+
+
+def _attach_email_body_parts(msg, body: str) -> None:
+    """Attach outgoing email as multipart/alternative, not text/plain only."""
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    alt = MIMEMultipart("alternative")
+    if _email_message_looks_like_html(body):
+        plain_body = _email_html_to_plain_text(body)
+        html_body = body or ""
+    else:
+        plain_body = body or ""
+        html_body = _email_plain_text_to_html(plain_body)
+    alt.attach(MIMEText(plain_body, "plain", "utf-8"))
+    alt.attach(MIMEText(html_body, "html", "utf-8"))
+    msg.attach(alt)
+
+
 async def _send_email(extra, chat_id, message, subject=None):
     """Send via SMTP (one-shot, no persistent connection needed)."""
     import smtplib
-    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
 
     address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
     password = os.getenv("EMAIL_PASSWORD", "")
@@ -1432,11 +1489,12 @@ async def _send_email(extra, chat_id, message, subject=None):
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
     try:
-        msg = MIMEText(message, "plain", "utf-8")
+        msg = MIMEMultipart()
         msg["From"] = address
         msg["To"] = chat_id
         msg["Subject"] = subject or "Hermes Agent"
         msg["Date"] = formatdate(localtime=True)
+        _attach_email_body_parts(msg, message)
 
         server = smtplib.SMTP(smtp_host, smtp_port)
         server.starttls(context=ssl.create_default_context())
