@@ -711,10 +711,143 @@ class TestAdapterInit:
         monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
         monkeypatch.setenv("LINE_ALLOWED_USERS", "U1, U2,U3")
         monkeypatch.setenv("LINE_ALLOWED_GROUPS", "C1")
+        monkeypatch.setenv("LINE_READ_ONLY_GROUPS", "C2")
+        monkeypatch.setenv("LINE_ARCHIVE_GROUPS", "C4")
+        monkeypatch.setenv("LINE_REQUIRE_PREFIX_GROUPS", "C3")
+        monkeypatch.setenv("LINE_GROUP_PREFIXES", "Hermes:, Joi:")
         from gateway.config import PlatformConfig
         ad = LineAdapter(PlatformConfig(enabled=True))
         assert ad.allowed_users == {"U1", "U2", "U3"}
         assert ad.allowed_groups == {"C1"}
+        assert ad.read_only_groups == {"C2"}
+        assert ad.archive_groups == {"C4"}
+        assert ad.require_prefix_groups == {"C3"}
+        assert ad.group_prefixes == ["Hermes:", "Joi:"]
+
+    def test_read_only_group_message_is_archived_without_agent_dispatch(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
+        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
+        monkeypatch.setenv("LINE_READ_ONLY_GROUPS", "Cread")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        from gateway.config import PlatformConfig
+
+        ad = LineAdapter(PlatformConfig(enabled=True))
+        captured = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        ad.handle_message = _capture
+        event = {
+            "type": "message",
+            "webhookEventId": "evt-1",
+            "timestamp": 1234567890,
+            "replyToken": "reply-token",
+            "source": {"type": "group", "groupId": "Cread", "userId": "U123"},
+            "message": {"type": "text", "id": "m1", "text": "大家好"},
+        }
+
+        asyncio.run(ad._dispatch_event(event))
+
+        assert captured == []
+        assert "Cread" not in ad._reply_tokens
+        archive = tmp_path / ".hermes" / "data" / "line-read-only" / "Cread.jsonl"
+        rows = [json.loads(line) for line in archive.read_text().splitlines()]
+        assert rows[-1]["chat_id"] == "Cread"
+        assert rows[-1]["user_id"] == "U123"
+        assert rows[-1]["text"] == "大家好"
+        assert rows[-1]["media_urls"] == []
+        assert rows[-1]["media_types"] == []
+
+    def test_archive_group_preserves_prefix_dispatch(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
+        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
+        monkeypatch.setenv("LINE_ALLOWED_GROUPS", "Carchive")
+        monkeypatch.setenv("LINE_ARCHIVE_GROUPS", "Carchive")
+        monkeypatch.setenv("LINE_REQUIRE_PREFIX_GROUPS", "Carchive")
+        monkeypatch.setenv("LINE_GROUP_PREFIXES", "Hermes:")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        from gateway.config import PlatformConfig
+
+        ad = LineAdapter(PlatformConfig(enabled=True))
+        captured = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        ad.handle_message = _capture
+        event = {
+            "type": "message",
+            "webhookEventId": "evt-archive-prefix",
+            "source": {"type": "group", "groupId": "Carchive", "userId": "U123"},
+            "message": {"type": "text", "id": "m-archive", "text": "Hermes: hello"},
+        }
+
+        asyncio.run(ad._handle_message_event(event))
+
+        archive = tmp_path / ".hermes" / "data" / "line-read-only" / "Carchive.jsonl"
+        rows = [json.loads(line) for line in archive.read_text().splitlines()]
+        assert rows[-1]["text"] == "Hermes: hello"
+        assert len(captured) == 1
+        assert captured[0].text == "hello"
+        assert captured[0].source.chat_id == "Carchive"
+
+    def test_prefix_required_group_ignores_unprefixed_message(self, monkeypatch):
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
+        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
+        monkeypatch.setenv("LINE_ALLOWED_GROUPS", "Cprefix")
+        monkeypatch.setenv("LINE_REQUIRE_PREFIX_GROUPS", "Cprefix")
+        from gateway.config import PlatformConfig
+
+        ad = LineAdapter(PlatformConfig(enabled=True))
+        captured = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        ad.handle_message = _capture
+        event = {
+            "type": "message",
+            "webhookEventId": "evt-prefix-ignore",
+            "replyToken": "reply-token",
+            "source": {"type": "group", "groupId": "Cprefix", "userId": "U123"},
+            "message": {"type": "text", "id": "m1", "text": "hello"},
+        }
+
+        asyncio.run(ad._dispatch_event(event))
+
+        assert captured == []
+        assert "Cprefix" not in ad._reply_tokens
+
+    def test_prefix_required_group_dispatches_prefixed_message_without_prefix(self, monkeypatch):
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
+        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
+        monkeypatch.setenv("LINE_ALLOWED_GROUPS", "Cprefix")
+        monkeypatch.setenv("LINE_REQUIRE_PREFIX_GROUPS", "Cprefix")
+        from gateway.config import PlatformConfig
+
+        ad = LineAdapter(PlatformConfig(enabled=True))
+        captured = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        ad.handle_message = _capture
+        event = {
+            "type": "message",
+            "webhookEventId": "evt-prefix-dispatch",
+            "replyToken": "reply-token",
+            "source": {"type": "group", "groupId": "Cprefix", "userId": "U123"},
+            "message": {"type": "text", "id": "m1", "text": "Hermes: hello"},
+        }
+
+        asyncio.run(ad._dispatch_event(event))
+
+        assert len(captured) == 1
+        assert captured[0].text == "hello"
+        assert captured[0].source.chat_id == "Cprefix"
 
     def test_get_chat_info_infers_type_from_prefix(self, monkeypatch):
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
