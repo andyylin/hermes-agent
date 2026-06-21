@@ -119,6 +119,9 @@ class TestConnectBindGuard:
         assert is_network_accessible(adapter._host) is False
         result = await adapter.connect()
         assert result is False
+        assert adapter.has_fatal_error is True
+        assert adapter.fatal_error_code == "missing_api_server_key"
+        assert adapter.fatal_error_retryable is False
 
     @pytest.mark.asyncio
     async def test_allows_wildcard_with_key(self):

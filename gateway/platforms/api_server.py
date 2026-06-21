@@ -4305,11 +4305,15 @@ class APIServerAdapter(BasePlatformAdapter):
             # dispatch terminal-capable agent work, so every deployment needs
             # an explicit API_SERVER_KEY regardless of bind address.
             if not self._api_key:
-                logger.error(
-                    "[%s] Refusing to start: API_SERVER_KEY is required for the API server, "
-                    "including loopback-only binds on %s.",
-                    self.name, self._host,
+                message = (
+                    "API_SERVER_KEY is required for the API server, "
+                    f"including loopback-only binds on {self._host}."
                 )
+                logger.error(
+                    "[%s] Refusing to start: %s",
+                    self.name, message,
+                )
+                self._set_fatal_error("missing_api_server_key", message, retryable=False)
                 return False
 
             # Refuse to start network-accessible with a placeholder key.
