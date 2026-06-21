@@ -474,6 +474,12 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     text = str(message or "").strip()
     if not text:
         return None
+    platform_value = _gateway_platform_value(platform)
+    # Email is batch delivery, not an interactive status surface.  Do not leak
+    # lifecycle/compaction/retry chatter into the user's inbox; only the final
+    # response belongs there.
+    if platform_value == "email":
+        return None
     if _gateway_surface_passes_raw_text(platform):
         return text
 
