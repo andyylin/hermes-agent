@@ -1434,25 +1434,101 @@ def _email_html_to_plain_text(html: str) -> str:
     return text.strip()
 
 
-def _email_plain_text_to_html(body: str) -> str:
-    """Render plain assistant text as basic email-safe HTML."""
-    from html import escape
+def _email_render_inline_markdown(text: str) -> str:
+    """Render a small, escaped Markdown subset for outbound email HTML."""
+    from html import escape, unescape
 
-    escaped = escape(body or "")
-    blocks = re.split(r"\n{2,}", escaped.strip())
-    if not blocks:
-        return "<p></p>"
+    rendered = escape(text or "")
+    rendered = re.sub(r"`([^`]+)`", lambda m: f"<code>{m.group(1)}</code>", rendered)
+    rendered = re.sub(
+        r"\[([^\]]+)\]\((https?://[^\s)]+)\)",
+        lambda m: f'<a href="{escape(unescape(m.group(2)), quote=True)}">{m.group(1)}</a>',
+        rendered,
+    )
+    rendered = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", rendered)
+    rendered = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<em>\1</em>", rendered)
+    return rendered
+
+
+def _email_plain_text_to_html(body: str) -> str:
+    """Render assistant Markdown-ish text as rich, safe HTML email."""
+    source = (body or "").strip()
+    if not source:
+        return "<html><body><p></p></body></html>"
+
     html_blocks = []
-    for block in blocks:
-        lines = block.splitlines()
-        nonempty_lines = [line for line in lines if line.strip()]
-        if nonempty_lines and all(line.startswith(("- ", "* ")) for line in nonempty_lines):
-            items = "".join(f"<li>{line[2:].strip()}</li>" for line in nonempty_lines)
-            html_blocks.append(f"<ul>{items}</ul>")
-        else:
-            html_lines = "<br>\n".join(lines)
-            html_blocks.append(f"<p>{html_lines}</p>")
-    return "\n".join(html_blocks)
+    list_items = []
+    quote_lines = []
+    para_lines = []
+
+    def flush_list():
+        nonlocal list_items
+        if list_items:
+            html_blocks.append("<ul>" + "".join(list_items) + "</ul>")
+            list_items = []
+
+    def flush_quote():
+        nonlocal quote_lines
+        if quote_lines:
+            html_blocks.append(
+                '<blockquote style="border-left:4px solid #d0d7de; margin:16px 0; '
+                'padding:8px 12px; color:#57606a; background:#f6f8fa;">'
+                + "<br>\n".join(quote_lines)
+                + "</blockquote>"
+            )
+            quote_lines = []
+
+    def flush_para():
+        nonlocal para_lines
+        if para_lines:
+            html_blocks.append("<p>" + "<br>\n".join(para_lines) + "</p>")
+            para_lines = []
+
+    def flush_all():
+        flush_para()
+        flush_quote()
+        flush_list()
+
+    for raw_line in source.splitlines():
+        stripped = raw_line.rstrip().strip()
+        if not stripped:
+            flush_all()
+            continue
+        heading = re.match(r"^(#{1,6})\s+(.+)$", stripped)
+        if heading:
+            flush_all()
+            level = min(len(heading.group(1)), 3)
+            html_blocks.append(f"<h{level}>{_email_render_inline_markdown(heading.group(2))}</h{level}>")
+            continue
+        quote = re.match(r"^>\s?(.*)$", stripped)
+        if quote:
+            flush_para()
+            flush_list()
+            quote_lines.append(_email_render_inline_markdown(quote.group(1)))
+            continue
+        bullet = re.match(r"^[-*]\s+(?:\[([ xX])\]\s+)?(.+)$", stripped)
+        if bullet:
+            flush_para()
+            flush_quote()
+            checked, item = bullet.groups()
+            marker = "☑ " if checked and checked.lower() == "x" else "☐ " if checked else ""
+            list_items.append(f"<li>{marker}{_email_render_inline_markdown(item)}</li>")
+            continue
+        flush_quote()
+        flush_list()
+        para_lines.append(_email_render_inline_markdown(stripped))
+    flush_all()
+    return (
+        '<!doctype html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'
+        "'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.45; color:#24292f; "
+        'font-size:15px; max-width:760px; margin:0 auto; padding:16px;">'
+        '<style>a{color:#0969da} code{background:#f6f8fa; padding:2px 4px; '
+        'border-radius:4px; font-family:SFMono-Regular,Consolas,monospace} '
+        'h1,h2,h3{line-height:1.25; margin:20px 0 8px} '
+        'ul{padding-left:22px} li{margin:4px 0}</style>'
+        + "\n".join(html_blocks)
+        + "</body></html>"
+    )
 
 
 def _attach_email_body_parts(msg, body: str) -> None:
