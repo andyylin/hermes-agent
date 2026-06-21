@@ -144,6 +144,18 @@ def test_chat_gateways_keep_normal_answers(platform):
     assert _sanitize_gateway_final_response(platform, answer) == answer
 
 
+def test_email_status_is_suppressed():
+    """Email is final-response-only; compaction/status chatter must not hit inboxes."""
+    messages = [
+        "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
+        "⏳ Retrying in 4.2s (attempt 1/3)...",
+        "any lifecycle status",
+    ]
+
+    for message in messages:
+        assert _prepare_gateway_status_message(Platform.EMAIL, "lifecycle", message) is None
+
+
 def test_telegram_status_sanitizes_raw_provider_security_errors():
     """Provider policy/security bodies should be replaced before chat delivery."""
     raw = (
