@@ -1452,6 +1452,8 @@ def _email_render_inline_markdown(text: str) -> str:
 
 def _email_plain_text_to_html(body: str) -> str:
     """Render assistant Markdown-ish text as rich, safe HTML email."""
+    from html import escape
+
     source = (body or "").strip()
     if not source:
         return "<html><body><p></p></body></html>"
@@ -1460,6 +1462,8 @@ def _email_plain_text_to_html(body: str) -> str:
     list_items = []
     quote_lines = []
     para_lines = []
+    code_lines = []
+    in_code_fence = False
 
     def flush_list():
         nonlocal list_items
@@ -1484,13 +1488,38 @@ def _email_plain_text_to_html(body: str) -> str:
             html_blocks.append("<p>" + "<br>\n".join(para_lines) + "</p>")
             para_lines = []
 
+    def flush_code():
+        nonlocal code_lines
+        if code_lines:
+            html_blocks.append(
+                '<pre style="background:#f6f8fa; padding:12px; border-radius:6px; '
+                'overflow:auto; font-family:SFMono-Regular,Consolas,monospace; '
+                'font-size:13px; line-height:1.4;"><code>'
+                + escape("\n".join(code_lines))
+                + "</code></pre>"
+            )
+            code_lines = []
+
     def flush_all():
         flush_para()
         flush_quote()
         flush_list()
+        flush_code()
 
     for raw_line in source.splitlines():
-        stripped = raw_line.rstrip().strip()
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if in_code_fence:
+                flush_code()
+                in_code_fence = False
+            else:
+                flush_all()
+                in_code_fence = True
+            continue
+        if in_code_fence:
+            code_lines.append(line)
+            continue
         if not stripped:
             flush_all()
             continue
@@ -1522,7 +1551,7 @@ def _email_plain_text_to_html(body: str) -> str:
         '<!doctype html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'
         "'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.45; color:#24292f; "
         'font-size:15px; max-width:760px; margin:0 auto; padding:16px;">'
-        '<style>a{color:#0969da} code{background:#f6f8fa; padding:2px 4px; '
+        '<style>a{color:#0969da} p code,li code{background:#f6f8fa; padding:2px 4px; '
         'border-radius:4px; font-family:SFMono-Regular,Consolas,monospace} '
         'h1,h2,h3{line-height:1.25; margin:20px 0 8px} '
         'ul{padding-left:22px} li{margin:4px 0}</style>'
