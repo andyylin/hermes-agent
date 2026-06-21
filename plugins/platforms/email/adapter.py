@@ -963,23 +963,112 @@ class EmailAdapter(BasePlatformAdapter):
         return text.strip()
 
     @staticmethod
-    def _plain_text_to_html(body: str) -> str:
-        """Render plain assistant text as simple readable HTML email."""
-        escaped = escape(body or "")
-        blocks = re.split(r"\n{2,}", escaped.strip())
-        if not blocks:
-            return "<p></p>"
+    def _render_inline_markdown(text: str) -> str:
+        """Render a small, escaped Markdown subset for outbound email HTML."""
+        rendered = escape(text or "")
+        rendered = re.sub(
+            r"`([^`]+)`",
+            lambda m: f"<code>{m.group(1)}</code>",
+            rendered,
+        )
+        rendered = re.sub(
+            r"\[([^\]]+)\]\((https?://[^\s)]+)\)",
+            lambda m: (
+                f'<a href="{escape(unescape(m.group(2)), quote=True)}">'
+                f"{m.group(1)}</a>"
+            ),
+            rendered,
+        )
+        rendered = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", rendered)
+        rendered = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<em>\1</em>", rendered)
+        return rendered
+
+    @classmethod
+    def _plain_text_to_html(cls, body: str) -> str:
+        """Render assistant Markdown-ish text as rich, safe HTML email."""
+        source = (body or "").strip()
+        if not source:
+            return "<html><body><p></p></body></html>"
+
         html_blocks: List[str] = []
-        for block in blocks:
-            lines = block.splitlines()
-            nonempty_lines = [line for line in lines if line.strip()]
-            if nonempty_lines and all(line.startswith(("- ", "* ")) for line in nonempty_lines):
-                items = "".join(f"<li>{line[2:].strip()}</li>" for line in nonempty_lines)
-                html_blocks.append(f"<ul>{items}</ul>")
-            else:
-                html_lines = "<br>\n".join(lines)
-                html_blocks.append(f"<p>{html_lines}</p>")
-        return "\n".join(html_blocks)
+        list_items: List[str] = []
+        quote_lines: List[str] = []
+        para_lines: List[str] = []
+
+        def flush_list() -> None:
+            nonlocal list_items
+            if list_items:
+                html_blocks.append("<ul>" + "".join(list_items) + "</ul>")
+                list_items = []
+
+        def flush_quote() -> None:
+            nonlocal quote_lines
+            if quote_lines:
+                html_blocks.append(
+                    '<blockquote style="border-left:4px solid #d0d7de; margin:16px 0; '
+                    'padding:8px 12px; color:#57606a; background:#f6f8fa;">'
+                    + "<br>\n".join(quote_lines)
+                    + "</blockquote>"
+                )
+                quote_lines = []
+
+        def flush_para() -> None:
+            nonlocal para_lines
+            if para_lines:
+                html_blocks.append("<p>" + "<br>\n".join(para_lines) + "</p>")
+                para_lines = []
+
+        def flush_all() -> None:
+            flush_para()
+            flush_quote()
+            flush_list()
+
+        for raw_line in source.splitlines():
+            line = raw_line.rstrip()
+            stripped = line.strip()
+            if not stripped:
+                flush_all()
+                continue
+
+            heading = re.match(r"^(#{1,6})\s+(.+)$", stripped)
+            if heading:
+                flush_all()
+                level = min(len(heading.group(1)), 3)
+                html_blocks.append(f"<h{level}>{cls._render_inline_markdown(heading.group(2))}</h{level}>")
+                continue
+
+            quote = re.match(r"^>\s?(.*)$", stripped)
+            if quote:
+                flush_para()
+                flush_list()
+                quote_lines.append(cls._render_inline_markdown(quote.group(1)))
+                continue
+
+            bullet = re.match(r"^[-*]\s+(?:\[([ xX])\]\s+)?(.+)$", stripped)
+            if bullet:
+                flush_para()
+                flush_quote()
+                checked, item = bullet.groups()
+                marker = "☑ " if checked and checked.lower() == "x" else "☐ " if checked else ""
+                list_items.append(f"<li>{marker}{cls._render_inline_markdown(item)}</li>")
+                continue
+
+            flush_quote()
+            flush_list()
+            para_lines.append(cls._render_inline_markdown(stripped))
+
+        flush_all()
+        body_html = "\n".join(html_blocks)
+        return (
+            '<!doctype html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'
+            "'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.45; color:#24292f; "
+            'font-size:15px; max-width:760px; margin:0 auto; padding:16px;">'
+            '<style>a{color:#0969da} code{background:#f6f8fa; padding:2px 4px; '
+            'border-radius:4px; font-family:SFMono-Regular,Consolas,monospace} '
+            'h1,h2,h3{line-height:1.25; margin:20px 0 8px} '
+            'ul{padding-left:22px} li{margin:4px 0}</style>'
+            f"{body_html}</body></html>"
+        )
 
     def _attach_body(self, msg: MIMEMultipart, body: str) -> None:
         """Attach email body as HTML by default, with a plain-text fallback."""
