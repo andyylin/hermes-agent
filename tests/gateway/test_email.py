@@ -917,6 +917,8 @@ class TestThreadContext(unittest.TestCase):
             self.assertEqual(msg["Subject"], "Andy Morning Brief — 2026-06-02")
             self.assertNotIn("In-Reply-To", msg)
             self.assertNotIn("References", msg)
+            plain_part = next(part for part in msg.walk() if part.get_content_type() == "text/plain")
+            self.assertIn("REF: HERMES-NOTIFY:andy-morning-brief-2026-06-02:", plain_part.get_payload(decode=True).decode("utf-8"))
 
 
 class TestStandaloneEmailSend(unittest.TestCase):
@@ -955,8 +957,10 @@ class TestStandaloneEmailSend(unittest.TestCase):
             plain_part = next(part for part in msg.walk() if part.get_content_type() == "text/plain")
             html_part = next(part for part in msg.walk() if part.get_content_type() == "text/html")
             self.assertIn("Bottom line", plain_part.get_payload(decode=True).decode("utf-8"))
+            self.assertIn("REF: HERMES-NOTIFY:2026-06-20-morning-briefing:", plain_part.get_payload(decode=True).decode("utf-8"))
             self.assertNotIn("<h2>", plain_part.get_payload(decode=True).decode("utf-8"))
             self.assertIn("<h2>Bottom line</h2>", html_part.get_payload(decode=True).decode("utf-8"))
+            self.assertIn("<h3>Reference</h3>", html_part.get_payload(decode=True).decode("utf-8"))
 
 
 class TestSendMethods(unittest.TestCase):
