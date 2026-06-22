@@ -1305,6 +1305,27 @@ def _home_thread_env_var(platform_name: str) -> str:
     return f"{_home_target_env_var(platform_name)}_THREAD_ID"
 
 
+def _platform_has_home_channel(platform: "Platform | str") -> bool:
+    """Return whether a platform has a configured home channel.
+
+    Legacy setups store home targets in platform-specific env vars, while
+    newer config writes may store them under ``platforms.<name>.home_channel``.
+    The first-session ``/sethome`` nudge should honor both; otherwise a valid
+    config-backed Email home channel still gets nagged because ``EMAIL_HOME_ADDRESS``
+    is unset.
+    """
+    platform_name = platform.value if isinstance(platform, Platform) else str(platform)
+    if os.getenv(_home_target_env_var(platform_name)):
+        return True
+
+    try:
+        platform_enum = platform if isinstance(platform, Platform) else Platform(platform_name)
+        home = load_gateway_config().get_home_channel(platform_enum)
+        return bool(home and home.chat_id)
+    except Exception:
+        return False
+
+
 def _restart_notification_pending() -> bool:
     """Return True when a /restart completion marker is waiting to be delivered."""
     return (_hermes_home / ".restart_notify.json").exists()
@@ -11606,8 +11627,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
         if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
             platform_name = source.platform.value
-            env_key = _home_target_env_var(platform_name)
-            if not os.getenv(env_key):
+            if not _platform_has_home_channel(source.platform):
                 # Slack dispatches all Hermes commands through a single
                 # parent slash command `/hermes`; bare `/sethome` is not
                 # registered and would fail with "app did not respond".
