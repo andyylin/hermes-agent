@@ -1453,6 +1453,15 @@ def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool,
         )
     if _is_one_shot_job(job):
         footer = _one_shot_delivery_footer(job)
+        if for_email:
+            return (
+                f"## Cron Alert: {task_name}\n\n"
+                f"**Job ID:** `{job_id}`\n\n"
+                f"### Report\n\n"
+                f"{body}\n\n"
+                f"### One-off\n\n"
+                f"{footer}"
+            )
         if for_discord:
             return (
                 f"# Cron Alert: {task_name}\n\n"
@@ -1468,6 +1477,15 @@ def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool,
             f"-------------\n\n"
             f"{body}\n\n"
             f"{footer}"
+        )
+    if for_email:
+        return (
+            f"## Cron Alert: {task_name}\n\n"
+            f"**Job ID:** `{job_id}`\n\n"
+            f"### Report\n\n"
+            f"{body}\n\n"
+            f"### Manage\n\n"
+            f"To stop or manage this job, send me a new message (e.g. `stop reminder {task_name}`)."
         )
     if for_discord:
         return (

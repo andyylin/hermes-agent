@@ -976,153 +976,30 @@ class EmailAdapter(BasePlatformAdapter):
     @staticmethod
     def _looks_like_html(body: str) -> bool:
         """Return True for complete or fragment HTML bodies worth sending as text/html."""
-        return bool(re.search(r"</?(?:html|body|h[1-6]|p|ul|ol|li|br|strong|em|table|tr|td|div|span)\b", body, re.IGNORECASE))
+        from tools.email_rendering import message_looks_like_html
+
+        return message_looks_like_html(body)
 
     @staticmethod
     def _html_to_plain_text(html: str) -> str:
         """Best-effort plain-text fallback for multipart/alternative HTML email."""
-        text = re.sub(r"<\s*br\s*/?>", "\n", html, flags=re.IGNORECASE)
-        text = re.sub(r"<\s*/\s*(?:p|div|h[1-6]|li|tr)\s*>", "\n", text, flags=re.IGNORECASE)
-        text = re.sub(r"<\s*li\b[^>]*>", "- ", text, flags=re.IGNORECASE)
-        text = re.sub(r"<[^>]+>", "", text)
-        text = unescape(text)
-        text = re.sub(r"[ \t]+\n", "\n", text)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        return text.strip()
+        from tools.email_rendering import html_to_plain_text
+
+        return html_to_plain_text(html)
 
     @staticmethod
     def _render_inline_markdown(text: str) -> str:
         """Render a small, escaped Markdown subset for outbound email HTML."""
-        rendered = escape(text or "")
-        rendered = re.sub(
-            r"`([^`]+)`",
-            lambda m: f"<code>{m.group(1)}</code>",
-            rendered,
-        )
-        rendered = re.sub(
-            r"\[([^\]]+)\]\((https?://[^\s)]+)\)",
-            lambda m: (
-                f'<a href="{escape(unescape(m.group(2)), quote=True)}">'
-                f"{m.group(1)}</a>"
-            ),
-            rendered,
-        )
-        rendered = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", rendered)
-        rendered = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<em>\1</em>", rendered)
-        return rendered
+        from tools.email_rendering import render_inline_markdown
+
+        return render_inline_markdown(text)
 
     @classmethod
     def _plain_text_to_html(cls, body: str) -> str:
         """Render assistant Markdown-ish text as rich, safe HTML email."""
-        source = (body or "").strip()
-        if not source:
-            return "<html><body><p></p></body></html>"
+        from tools.email_rendering import plain_text_to_html
 
-        html_blocks: List[str] = []
-        list_items: List[str] = []
-        quote_lines: List[str] = []
-        para_lines: List[str] = []
-        code_lines: List[str] = []
-        in_code_fence = False
-
-        def flush_list() -> None:
-            nonlocal list_items
-            if list_items:
-                html_blocks.append("<ul>" + "".join(list_items) + "</ul>")
-                list_items = []
-
-        def flush_quote() -> None:
-            nonlocal quote_lines
-            if quote_lines:
-                html_blocks.append(
-                    '<blockquote style="border-left:4px solid #d0d7de; margin:16px 0; '
-                    'padding:8px 12px; color:#57606a; background:#f6f8fa;">'
-                    + "<br>\n".join(quote_lines)
-                    + "</blockquote>"
-                )
-                quote_lines = []
-
-        def flush_para() -> None:
-            nonlocal para_lines
-            if para_lines:
-                html_blocks.append("<p>" + "<br>\n".join(para_lines) + "</p>")
-                para_lines = []
-
-        def flush_code() -> None:
-            nonlocal code_lines
-            if code_lines:
-                html_blocks.append(
-                    '<pre style="background:#f6f8fa; padding:12px; border-radius:6px; '
-                    'overflow:auto; font-family:SFMono-Regular,Consolas,monospace; '
-                    'font-size:13px; line-height:1.4;"><code>'
-                    + escape("\n".join(code_lines))
-                    + "</code></pre>"
-                )
-                code_lines = []
-
-        def flush_all() -> None:
-            flush_para()
-            flush_quote()
-            flush_list()
-            flush_code()
-
-        for raw_line in source.splitlines():
-            line = raw_line.rstrip()
-            stripped = line.strip()
-            if stripped.startswith("```"):
-                if in_code_fence:
-                    flush_code()
-                    in_code_fence = False
-                else:
-                    flush_all()
-                    in_code_fence = True
-                continue
-            if in_code_fence:
-                code_lines.append(line)
-                continue
-            if not stripped:
-                flush_all()
-                continue
-
-            heading = re.match(r"^(#{1,6})\s+(.+)$", stripped)
-            if heading:
-                flush_all()
-                level = min(len(heading.group(1)), 3)
-                html_blocks.append(f"<h{level}>{cls._render_inline_markdown(heading.group(2))}</h{level}>")
-                continue
-
-            quote = re.match(r"^>\s?(.*)$", stripped)
-            if quote:
-                flush_para()
-                flush_list()
-                quote_lines.append(cls._render_inline_markdown(quote.group(1)))
-                continue
-
-            bullet = re.match(r"^[-*]\s+(?:\[([ xX])\]\s+)?(.+)$", stripped)
-            if bullet:
-                flush_para()
-                flush_quote()
-                checked, item = bullet.groups()
-                marker = "☑ " if checked and checked.lower() == "x" else "☐ " if checked else ""
-                list_items.append(f"<li>{marker}{cls._render_inline_markdown(item)}</li>")
-                continue
-
-            flush_quote()
-            flush_list()
-            para_lines.append(cls._render_inline_markdown(stripped))
-
-        flush_all()
-        body_html = "\n".join(html_blocks)
-        return (
-            '<!doctype html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'
-            "'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.45; color:#24292f; "
-            'font-size:15px; max-width:760px; margin:0 auto; padding:16px;">'
-            '<style>a{color:#0969da} p code,li code{background:#f6f8fa; padding:2px 4px; '
-            'border-radius:4px; font-family:SFMono-Regular,Consolas,monospace} '
-            'h1,h2,h3{line-height:1.25; margin:20px 0 8px} '
-            'ul{padding-left:22px} li{margin:4px 0}</style>'
-            f"{body_html}</body></html>"
-        )
+        return plain_text_to_html(body)
 
     def _attach_body(self, msg: MIMEMultipart, body: str) -> None:
         """Attach email body as HTML by default, with a plain-text fallback."""
