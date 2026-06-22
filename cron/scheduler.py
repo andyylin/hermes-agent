@@ -1362,11 +1362,153 @@ def _markdown_tables_to_bullets(markdown_text: str) -> str:
     return "\n".join(output)
 
 
-def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool) -> str:
-    """Apply the cron wrapper, using Discord-native Markdown when relevant."""
+def _format_cron_email_subject(job: dict) -> Optional[str]:
+    """Return an explicit email subject for cron delivery when a job asks for one.
+
+    Supports ``{date}`` / ``{date_compact}`` / ``{job_name}`` / ``{job_id}``
+    templates. Dates are evaluated at delivery time in Hermes' configured
+    timezone, so daily email automations do not thread into one endless chain.
+    """
+    template = job.get("email_subject_template") or job.get("delivery_subject_template")
+    if not template:
+        return None
+    now = _hermes_now()
+    return str(template).format(
+        date=now.strftime("%Y-%m-%d"),
+        date_compact=now.strftime("%Y%m%d"),
+        job_name=job.get("name", job.get("id", "")),
+        job_id=job.get("id", ""),
+    )
+
+
+def _is_one_shot_job(job: dict) -> bool:
+    """Return True when a cron job is configured to run only once."""
+    repeat = job.get("repeat")
+    if isinstance(repeat, dict) and repeat.get("times") == 1:
+        return True
+    if repeat == 1:
+        return True
+
+    schedule = job.get("schedule")
+    if isinstance(schedule, dict) and schedule.get("kind") == "once":
+        return True
+    return False
+
+
+def _one_shot_delivery_footer(job: dict) -> str:
+    """Human-facing footer for one-shot deliveries.
+
+    One-off reminders should not imply there is a recurring job to stop.
+    """
+    label_source = " ".join(
+        str(job.get(field) or "")
+        for field in ("name", "prompt")
+    ).lower()
+    noun = "reminder" if "remind" in label_source or "reminder" in label_source else "job"
+    return f"This was a one-off {noun}; it will not repeat."
+
+
+
+
+def _cron_repair_gate_alert_routing_enabled() -> bool:
+    """Whether source cron alerts should be held for the repair gate.
+
+    When enabled, ordinary automations still record failed/warning output and
+    ``last_status`` normally, but the source job does not immediately notify the
+    user. The universal automation repairer scans that state, attempts one
+    bounded repair, and reports only repaired/blocked/escalated outcomes.
+    """
+    env = os.getenv("HERMES_CRON_ROUTE_ALERTS_THROUGH_REPAIR_GATE", "").strip().lower()
+    if env in {"1", "true", "yes", "on"}:
+        return True
+    if env in {"0", "false", "no", "off"}:
+        return False
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron") or {} if isinstance(cfg, dict) else {}
+        return bool(cron_cfg.get("route_alerts_through_repair_gate", False))
+    except Exception as exc:
+        logger.debug("Could not read cron repair-gate alert routing config: %s", exc)
+        return False
+
+
+def _is_repair_gate_job(job: dict) -> bool:
+    return (
+        job.get("script") == "automation_failure_repair_gate.py"
+        or job.get("name") == "automation-failure-first-pass-repairer"
+    )
+
+
+def _looks_like_cron_warning_or_error_alert(content: str) -> bool:
+    """Best-effort guard for successful jobs that emitted an alert payload.
+
+    This is intentionally conservative so routine reports that merely contain a
+    risks/caveats section still deliver. It catches deterministic watchdog
+    outputs and short alert-style LLM responses whose leading line/status says
+    warning/error/attention/report.
+    """
+    text = (content or "").strip()
+    if not text:
+        return False
+    head = "\n".join(line.strip() for line in text.splitlines()[:8] if line.strip())
+    if re.search(r'(?is)^\s*\{.*"status"\s*:\s*"(REPORT|WARNING|FAILURE|ERROR)"', text[:2000]):
+        return True
+    return bool(re.search(
+        r"(?i)^(?:[#*_\s>`-]*)?(?:⚠|⚠️|warning[:：]|error[:：]|alert[:：]|attention needed\b|action required\b|.+\bfailed\b)",
+        head,
+    ))
+
+def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool, for_email: bool = False) -> str:
+    """Apply the cron wrapper, using native formatting for delivery surfaces."""
     task_name = job.get("name", job["id"])
     job_id = job.get("id", "")
     body = _markdown_tables_to_bullets(content) if for_discord else content
+    if for_email and re.search(r"</?(?:html|body|h[1-6]|p|ul|ol|li|br|strong|em|table|tr|td|div|span|blockquote)\b", body or "", re.IGNORECASE):
+        from html import escape
+
+        body_match = re.search(r"<body[^>]*>(.*?)</body>", body, flags=re.IGNORECASE | re.DOTALL)
+        body_html = body_match.group(1) if body_match else body
+        manage = (
+            f'To stop or manage this job, send me a new message '
+            f'(e.g. &quot;stop reminder {escape(str(task_name))}&quot;).'
+        )
+        if _is_one_shot_job(job):
+            manage = escape(_one_shot_delivery_footer(job))
+        return (
+            '<!doctype html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'
+            "'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.45; color:#24292f; "
+            'font-size:15px; max-width:860px; margin:0 auto; padding:16px;">'
+            '<style>a{color:#0969da} code{background:#f6f8fa; padding:2px 4px; border-radius:4px; '
+            'font-family:SFMono-Regular,Consolas,monospace} table{border-collapse:collapse; width:100%;} '
+            'th,td{border:1px solid #d0d7de; padding:6px; vertical-align:top;} '
+            'th{background:#f6f8fa; text-align:left;} blockquote{border-left:4px solid #d0d7de; '
+            'margin:16px 0; padding:8px 12px; color:#57606a; background:#f6f8fa;}</style>'
+            f"<h2>Cron Alert: {escape(str(task_name))}</h2>"
+            f"<p><strong>Job ID:</strong> <code>{escape(str(job_id))}</code></p>"
+            "<hr>"
+            f"{body_html}"
+            "<hr>"
+            f"<p>{manage}</p>"
+            "</body></html>"
+        )
+    if _is_one_shot_job(job):
+        footer = _one_shot_delivery_footer(job)
+        if for_discord:
+            return (
+                f"# Cron Alert: {task_name}\n\n"
+                f"**Job ID:** `{job_id}`\n\n"
+                f"## Report\n\n"
+                f"{body}\n\n"
+                f"## One-off\n\n"
+                f"{footer}"
+            )
+        return (
+            f"Cronjob Response: {task_name}\n"
+            f"(job_id: {job_id})\n"
+            f"-------------\n\n"
+            f"{body}\n\n"
+            f"{footer}"
+        )
     if for_discord:
         return (
             f"# Cron Alert: {task_name}\n\n"
@@ -1604,11 +1746,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         thread_id = target.get("thread_id")
 
         for_discord = str(platform_name).lower() == "discord"
+        for_email = str(platform_name).lower() == "email"
         if wrap_response:
             delivery_content = _format_cron_delivery_content(
                 job,
                 content,
                 for_discord=for_discord,
+                for_email=for_email,
             )
         else:
             delivery_content = _markdown_tables_to_bullets(content) if for_discord else content
