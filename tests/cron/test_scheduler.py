@@ -671,6 +671,32 @@ class TestDeliverResultWrapping:
         sent_content = send_mock.call_args[0][3]
         assert "Brief body." in sent_content
 
+    def test_email_delivery_wraps_html_output_as_html(self):
+        """HTML cron output should keep a rich HTML wrapper instead of plain-text chrome."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.EMAIL: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "privacy-job",
+                "name": "memory-tree-privacy-scan",
+                "deliver": "email:andy@example.com",
+                "email_subject_template": "[Hermes][Memory Tree] Privacy scan",
+            }
+            _deliver_result(job, "<!doctype html><html><body><h2>Privacy</h2><table><tr><td>x</td></tr></table></body></html>")
+
+        sent_content = send_mock.call_args[0][3]
+        assert sent_content.startswith("<!doctype html><html><body")
+        assert "<h2>Cron Alert: memory-tree-privacy-scan</h2>" in sent_content
+        assert "<h2>Privacy</h2>" in sent_content
+        assert "<table" in sent_content
+        assert "Cronjob Response:" not in sent_content
+
     def test_delivery_skips_wrapping_when_config_disabled(self):
         """When cron.wrap_response is false, deliver raw content without header/footer."""
         from gateway.config import Platform
