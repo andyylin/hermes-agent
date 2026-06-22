@@ -696,6 +696,31 @@ class TestDeliverResultWrapping:
         assert "<table" in sent_content
         assert "Cronjob Response:" not in sent_content
 
+    def test_email_delivery_wraps_plain_output_as_markdown_for_html_rendering(self):
+        """Plain cron output should be sent as Markdown-ish structure for rich email rendering."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.EMAIL: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "29b4bd5a6186",
+                "name": "memory-tree-reconcile-scan",
+                "deliver": "email:andy@example.com",
+                "email_subject_template": "[Hermes][Memory Tree] Reconcile scan",
+            }
+            _deliver_result(job, "Memory Tree reconcile attention\n\nactive_verified: 39\n\n- Item [runtime_attention]\n  source_id: abc\n  next: Inspect it.")
+
+        sent_content = send_mock.call_args[0][3]
+        assert "## Cron Alert: memory-tree-reconcile-scan" in sent_content
+        assert "### Report" in sent_content
+        assert "**Job ID:** `29b4bd5a6186`" in sent_content
+        assert "Cronjob Response:" not in sent_content
+
     def test_delivery_skips_wrapping_when_config_disabled(self):
         """When cron.wrap_response is false, deliver raw content without header/footer."""
         from gateway.config import Platform
