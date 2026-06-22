@@ -1002,6 +1002,7 @@ class EmailAdapter(BasePlatformAdapter):
             suppress_threading = bool(subject_override.get("suppress_threading"))
             thread_anchor_key = subject_override.get("thread_anchor_key") or thread_anchor_key
             subject_override = subject_override.get("subject")
+        notification_like = bool(subject_override) or suppress_threading
         ctx = self._thread_context.get(to_addr, {})
         if subject_override:
             subject = str(subject_override)
@@ -1023,6 +1024,14 @@ class EmailAdapter(BasePlatformAdapter):
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
         msg["Message-ID"] = msg_id
 
+        if notification_like:
+            from tools.email_rendering import append_notification_reference_footer
+
+            body = append_notification_reference_footer(
+                body,
+                subject=subject,
+                ask="investigate this REF",
+            )
         self._attach_body(msg, body)
 
         smtp = self._connect_smtp()

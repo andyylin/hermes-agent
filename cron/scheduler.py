@@ -1425,6 +1425,24 @@ def _one_shot_delivery_footer(job: dict) -> str:
     return f"This was a one-off {noun}; it will not repeat."
 
 
+def _append_cron_email_reference_footer(job: dict, body: str) -> str:
+    """Add a copy/paste reference code to cron email notifications."""
+    from tools.email_rendering import append_notification_reference_footer, make_notification_ref
+
+    job_id = str(job.get("id") or "")
+    task_name = str(job.get("name") or job_id or "cron-job")
+    script = str(job.get("script") or "")
+    source = f"/home/pi/.hermes/scripts/{script}" if script else "Hermes cron job definition"
+    return append_notification_reference_footer(
+        body,
+        ref=make_notification_ref("cron", task_name, job_id),
+        job_id=job_id,
+        script=script or None,
+        source=source,
+        ask="investigate this REF",
+    )
+
+
 
 
 def _cron_repair_gate_alert_routing_enabled() -> bool:
@@ -1491,7 +1509,7 @@ def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool,
         )
         if _is_one_shot_job(job):
             manage = escape(_one_shot_delivery_footer(job))
-        return (
+        html_body = (
             '<!doctype html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'
             "'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.45; color:#24292f; "
             'font-size:15px; max-width:860px; margin:0 auto; padding:16px;">'
@@ -1508,8 +1526,18 @@ def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool,
             f"<p>{manage}</p>"
             "</body></html>"
         )
+        return _append_cron_email_reference_footer(job, html_body)
     if _is_one_shot_job(job):
         footer = _one_shot_delivery_footer(job)
+        if for_email:
+            return _append_cron_email_reference_footer(job, (
+                f"## Cron Alert: {task_name}\n\n"
+                f"**Job ID:** `{job_id}`\n\n"
+                f"### Report\n\n"
+                f"{body}\n\n"
+                f"### One-off\n\n"
+                f"{footer}"
+            ))
         if for_discord:
             return (
                 f"# Cron Alert: {task_name}\n\n"
@@ -1526,6 +1554,15 @@ def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool,
             f"{body}\n\n"
             f"{footer}"
         )
+    if for_email:
+        return _append_cron_email_reference_footer(job, (
+            f"## Cron Alert: {task_name}\n\n"
+            f"**Job ID:** `{job_id}`\n\n"
+            f"### Report\n\n"
+            f"{body}\n\n"
+            f"### Manage\n\n"
+            f"To stop or manage this job, send me a new message (e.g. `stop reminder {task_name}`)."
+        ))
     if for_discord:
         return (
             f"# Cron Alert: {task_name}\n\n"
@@ -1819,6 +1856,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_errors.append(msg)
             continue
 
+        target_content = cleaned_delivery_content
+        if platform_name.lower() == "email":
+            target_content = _append_cron_email_reference_footer(job, target_content)
+
         # Prefer the live adapter when the gateway is running — this supports E2EE
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
         runtime_adapter = (adapters or {}).get(platform)
@@ -1976,7 +2017,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # standalone cron path lacked this, so DM-topic cron deliveries
                 # landed in the General topic or were rejected by Bot API 10.0
                 # (#22773).
-                text_to_send = cleaned_delivery_content.strip()
+                text_to_send = target_content.strip()
                 adapter_ok = True
                 timed_out = False
                 if text_to_send:
@@ -2196,7 +2237,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 platform,
                 pconfig,
                 chat_id,
-                cleaned_delivery_content,
+                target_content,
                 thread_id=thread_id,
                 media_files=media_files,
                 subject=send_subject,
@@ -2235,7 +2276,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 platform,
                                 pconfig,
                                 chat_id,
-                                cleaned_delivery_content,
+                                target_content,
                                 thread_id=thread_id,
                                 media_files=media_files,
                                 subject=send_subject,
