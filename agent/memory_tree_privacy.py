@@ -23,6 +23,21 @@ _SECRET_ASSIGNMENT_RE = re.compile(
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+([A-Za-z0-9._~+/=-]{16,})")
 _PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 _LONG_CREDENTIAL_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b")
+_REDACTED_VALUES = {"***", "[REDACTED]", "<REDACTED>", "REDACTED", "<redacted>", "redacted"}
+
+
+def _assignment_match(line: str) -> re.Match[str] | None:
+    match = _SECRET_ASSIGNMENT_RE.search(line)
+    if not match:
+        return None
+    key = match.group(1)
+    # Avoid ordinary config words like contextTokens=500/dialecticMaxChars=400.
+    if key != key.upper() and "_" not in key and "-" not in key:
+        return None
+    value = match.group(2).strip().strip("'\"")
+    if value in _REDACTED_VALUES:
+        return None
+    return match
 
 
 @dataclass(frozen=True)
@@ -83,7 +98,7 @@ def _redact_line(line: str) -> str:
 def _finding_kind(line: str) -> str | None:
     if _PRIVATE_KEY_RE.search(line):
         return "private_key"
-    if _SECRET_ASSIGNMENT_RE.search(line):
+    if _assignment_match(line):
         return "secret_assignment"
     if _BEARER_RE.search(line):
         return "bearer_token"

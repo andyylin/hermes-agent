@@ -26,6 +26,9 @@ except Exception:  # pragma: no cover
 DEFAULT_TZ = "Asia/Taipei"
 DEFAULT_MAX_TEXT_CHARS = 4000
 SECRET_KEY_RE = re.compile(r"(secret|token|password|passwd|api[_-]?key|authorization|auth|credential|cookie)", re.I)
+SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?im)\b([A-Z0-9_.-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY)[A-Z0-9_.-]*)\b(\s*[:=]\s*)([^\s`'\"]+|'[^'\n]+'|\"[^\"\n]+\")"
+)
 SECRET_VALUE_RE = re.compile(
     r"(?i)(bearer\s+[a-z0-9._~+/=-]{12,}|xox[baprs]-[a-z0-9-]{12,}|sk-[a-z0-9_-]{12,}|gh[pousr]_[a-z0-9_]{16,})"
 )
@@ -93,7 +96,8 @@ def redact_secrets(value: Any) -> Any:
     if isinstance(value, list):
         return [redact_secrets(item) for item in value[:50]]
     if isinstance(value, str):
-        return SECRET_VALUE_RE.sub("[REDACTED]", value)
+        redacted = SECRET_ASSIGNMENT_RE.sub("[REDACTED_SECRET_ASSIGNMENT]", value)
+        return SECRET_VALUE_RE.sub("[REDACTED]", redacted)
     return value
 
 
@@ -106,6 +110,17 @@ def compact_text(text: str, limit: int = DEFAULT_MAX_TEXT_CHARS) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + f"\n\n...[truncated {len(text) - limit} chars]"
+
+
+def _redact_record(record: SourceRecord, *, max_chars: int) -> SourceRecord:
+    return SourceRecord(
+        source_type=record.source_type,
+        source_id=record.source_id,
+        title=record.title,
+        timestamp=record.timestamp,
+        text=compact_text(str(redact_secrets(record.text)), max_chars),
+        metadata={str(key): str(redact_secrets(value)) for key, value in record.metadata.items()},
+    )
 
 
 def collect_active_work_records(home: Path, *, limit: int) -> list[SourceRecord]:
@@ -191,7 +206,11 @@ def build_memory_tree_packs(options: BuildOptions | None = None) -> dict[str, An
     )
     active_records = collect_active_work_records(home, limit=options.ledger_limit)
     cron_records = collect_cron_records(home, limit=options.cron_limit)
-    records = [*session_records, *active_records, *cron_records]
+    records = [
+        *(_redact_record(record, max_chars=options.max_record_chars) for record in session_records),
+        *(_redact_record(record, max_chars=options.max_record_chars) for record in active_records),
+        *(_redact_record(record, max_chars=options.max_record_chars) for record in cron_records),
+    ]
 
     recent_md = build_markdown_pack(
         records,
