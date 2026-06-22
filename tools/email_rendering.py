@@ -8,6 +8,7 @@ quotes, fenced code, inline emphasis/code/links, and simple tables.
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from html import escape, unescape
 
 _HTML_TAG_RE = re.compile(
@@ -20,6 +21,79 @@ _KEY_VALUE_RE = re.compile(r"^([A-Za-z][\w /().-]{0,60}?):\s+(.+)$")
 _ORDERED_RE = re.compile(r"^\d+[.)]\s+(.+)$")
 _BULLET_RE = re.compile(r"^[-*]\s+(?:\[([ xX])\]\s+)?(.+)$")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
+_REF_RE = re.compile(r"\bREF:\s*HERMES-NOTIFY:", re.IGNORECASE)
+
+
+def notification_ref_slug(value: str, *, fallback: str = "notification") -> str:
+    """Return a compact copy/paste-safe slug for notification reference codes."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", value or "").strip("-").lower()
+    return slug[:64] or fallback
+
+
+def make_notification_ref(*parts: str, now: datetime | None = None) -> str:
+    """Build a stable-enough reference token for outbound notification email."""
+    timestamp = (now or datetime.now().astimezone()).isoformat(timespec="minutes")
+    safe_parts = [notification_ref_slug(part) for part in parts if str(part or "").strip()]
+    if not safe_parts:
+        safe_parts = ["email"]
+    return "HERMES-NOTIFY:" + ":".join(safe_parts + [timestamp])
+
+
+def append_notification_reference_footer(
+    body: str,
+    *,
+    ref: str | None = None,
+    subject: str | None = None,
+    source: str | None = None,
+    state: str | None = None,
+    logs: str | None = None,
+    job_id: str | None = None,
+    script: str | None = None,
+    ask: str = "investigate this REF",
+) -> str:
+    """Append a copy/paste resume reference to notification email bodies.
+
+    The footer is added to both plain/Markdown-ish bodies and existing HTML
+    bodies. If a body already has a HERMES-NOTIFY reference, it is left alone
+    to avoid duplicated footers when cron wraps and then sends through the
+    generic email transport.
+    """
+    content = body or ""
+    if _REF_RE.search(content):
+        return content
+    ref = ref or make_notification_ref(subject or "email")
+    rows = [("REF", ref)]
+    if job_id:
+        rows.append(("Job ID", job_id))
+    if script:
+        rows.append(("Script", script))
+    if source:
+        rows.append(("Source", source))
+    if state:
+        rows.append(("State", state))
+    if logs:
+        rows.append(("Logs", logs))
+    rows.append(("Ask Hermes", f"{ask}: {ref}"))
+
+    if message_looks_like_html(content):
+        html_rows = "".join(
+            f"<tr><th>{escape(label)}</th><td><code>{escape(value)}</code></td></tr>"
+            for label, value in rows
+        )
+        footer = (
+            "<hr>"
+            "<h3>Reference</h3>"
+            '<table class="notification-reference"><tbody>'
+            f"{html_rows}"
+            "</tbody></table>"
+        )
+        if re.search(r"</body>\s*</html>\s*$", content, flags=re.IGNORECASE):
+            return re.sub(r"</body>\s*</html>\s*$", footer + "</body></html>", content, flags=re.IGNORECASE)
+        return content + footer
+
+    lines = ["", "### Reference"]
+    lines.extend(f"{label}: `{value}`" for label, value in rows)
+    return content.rstrip() + "\n\n" + "\n".join(lines)
 
 
 def message_looks_like_html(body: str) -> bool:
