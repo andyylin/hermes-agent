@@ -1482,6 +1482,13 @@ async def _send_email(extra, chat_id, message, subject=None):
         msg["To"] = chat_id
         msg["Subject"] = subject or "Hermes Agent"
         msg["Date"] = formatdate(localtime=True)
+        from tools.email_rendering import append_notification_reference_footer
+
+        message = append_notification_reference_footer(
+            message,
+            subject=msg["Subject"],
+            ask="investigate this REF",
+        )
         _attach_email_body_parts(msg, message)
 
         server = smtplib.SMTP(smtp_host, smtp_port)
