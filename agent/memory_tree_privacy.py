@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass
+from html import escape
 from pathlib import Path
 from typing import Any
 
@@ -174,3 +175,51 @@ def format_privacy_text(report: PrivacyReport, *, max_chars: int = 4000) -> str:
         if len(text) > max_chars:
             return _truncate(text, max_chars)
     return "\n".join(lines)
+
+
+def format_privacy_html(report: PrivacyReport, *, max_chars: int = 12000) -> str:
+    """Return an email-safe HTML privacy report with redacted snippets."""
+    if not report.findings:
+        return ""
+
+    rows: list[str] = []
+    for finding in report.findings:
+        rows.append(
+            "<tr>"
+            f"<td>{escape(finding.severity)}</td>"
+            f"<td><code>{escape(finding.kind)}</code></td>"
+            f"<td>{escape(finding.pack)}</td>"
+            f"<td><code>{escape(str(finding.line))}</code></td>"
+            f"<td><code>{escape(finding.path)}</code></td>"
+            f"<td><code>{escape(finding.snippet)}</code></td>"
+            "</tr>"
+        )
+
+    body = (
+        "<!doctype html><html><body>"
+        "<h2>Memory Tree Privacy Scan</h2>"
+        "<blockquote><strong>Action required:</strong> generated Memory Tree packs contain "
+        "credential-shaped text. Findings are reported with redacted snippets only; "
+        "the scanner does not delete or rewrite files automatically.</blockquote>"
+        "<ul>"
+        f"<li><strong>Findings:</strong> {len(report.findings)}</li>"
+        f"<li><strong>Packs scanned:</strong> {report.summary.get('packs_scanned', 0)}</li>"
+        "<li><strong>Default behavior:</strong> report-only, fingerprint-deduped notifications.</li>"
+        "</ul>"
+        "<h3>Findings</h3>"
+        "<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\">"
+        "<thead><tr><th>Severity</th><th>Kind</th><th>Pack</th><th>Line</th><th>Path</th><th>Redacted snippet</th></tr></thead>"
+        "<tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+        "<h3>What happens next</h3>"
+        "<ul>"
+        "<li>Nothing is removed automatically. That would be too blunt for a generated index.</li>"
+        "<li>The notification repeats only when the finding set changes.</li>"
+        "<li>Fix is manual: remove the source secret, rebuild Memory Tree, then confirm the scan is clean.</li>"
+        "</ul>"
+        "</body></html>"
+    )
+    if len(body) <= max_chars:
+        return body
+    return format_privacy_text(report, max_chars=max_chars)
