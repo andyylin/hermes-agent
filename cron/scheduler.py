@@ -1289,11 +1289,39 @@ def _looks_like_cron_warning_or_error_alert(content: str) -> bool:
         head,
     ))
 
-def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool) -> str:
-    """Apply the cron wrapper, using Discord-native Markdown when relevant."""
+def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool, for_email: bool = False) -> str:
+    """Apply the cron wrapper, using native formatting for delivery surfaces."""
     task_name = job.get("name", job["id"])
     job_id = job.get("id", "")
     body = _markdown_tables_to_bullets(content) if for_discord else content
+    if for_email and re.search(r"</?(?:html|body|h[1-6]|p|ul|ol|li|br|strong|em|table|tr|td|div|span|blockquote)\b", body or "", re.IGNORECASE):
+        from html import escape
+
+        body_match = re.search(r"<body[^>]*>(.*?)</body>", body, flags=re.IGNORECASE | re.DOTALL)
+        body_html = body_match.group(1) if body_match else body
+        manage = (
+            f'To stop or manage this job, send me a new message '
+            f'(e.g. &quot;stop reminder {escape(str(task_name))}&quot;).'
+        )
+        if _is_one_shot_job(job):
+            manage = escape(_one_shot_delivery_footer(job))
+        return (
+            '<!doctype html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'
+            "'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.45; color:#24292f; "
+            'font-size:15px; max-width:860px; margin:0 auto; padding:16px;">'
+            '<style>a{color:#0969da} code{background:#f6f8fa; padding:2px 4px; border-radius:4px; '
+            'font-family:SFMono-Regular,Consolas,monospace} table{border-collapse:collapse; width:100%;} '
+            'th,td{border:1px solid #d0d7de; padding:6px; vertical-align:top;} '
+            'th{background:#f6f8fa; text-align:left;} blockquote{border-left:4px solid #d0d7de; '
+            'margin:16px 0; padding:8px 12px; color:#57606a; background:#f6f8fa;}</style>'
+            f"<h2>Cron Alert: {escape(str(task_name))}</h2>"
+            f"<p><strong>Job ID:</strong> <code>{escape(str(job_id))}</code></p>"
+            "<hr>"
+            f"{body_html}"
+            "<hr>"
+            f"<p>{manage}</p>"
+            "</body></html>"
+        )
     if _is_one_shot_job(job):
         footer = _one_shot_delivery_footer(job)
         if for_discord:
@@ -1465,6 +1493,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             job,
             content,
             for_discord=any(str(target.get("platform", "")).lower() == "discord" for target in targets),
+            for_email=any(str(target.get("platform", "")).lower() == "email" for target in targets),
         )
     else:
         delivery_content = _markdown_tables_to_bullets(content) if any(
