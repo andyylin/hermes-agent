@@ -40,3 +40,32 @@ def test_home_thread_env_var_uses_home_target_name_plus_thread_id():
     assert _home_thread_env_var("discord") == "DISCORD_HOME_CHANNEL_THREAD_ID"
     assert _home_thread_env_var("matrix") == "MATRIX_HOME_ROOM_THREAD_ID"
     assert _home_thread_env_var("email") == "EMAIL_HOME_ADDRESS_THREAD_ID"
+
+
+def test_platform_has_home_channel_honors_config_backed_email_home(monkeypatch):
+    from gateway import run as gateway_run
+    from gateway.config import HomeChannel, Platform
+
+    class Config:
+        def get_home_channel(self, platform):
+            assert platform == Platform.EMAIL
+            return HomeChannel(platform=Platform.EMAIL, chat_id="andy@example.com", name="Andy")
+
+    monkeypatch.delenv("EMAIL_HOME_ADDRESS", raising=False)
+    monkeypatch.setattr(gateway_run, "load_gateway_config", lambda: Config())
+
+    assert gateway_run._platform_has_home_channel(Platform.EMAIL) is True
+
+
+def test_platform_has_home_channel_false_when_env_and_config_missing(monkeypatch):
+    from gateway import run as gateway_run
+    from gateway.config import Platform
+
+    class Config:
+        def get_home_channel(self, platform):
+            return None
+
+    monkeypatch.delenv("EMAIL_HOME_ADDRESS", raising=False)
+    monkeypatch.setattr(gateway_run, "load_gateway_config", lambda: Config())
+
+    assert gateway_run._platform_has_home_channel(Platform.EMAIL) is False
