@@ -1,4 +1,4 @@
-"""Cua-driver backend (macOS only).
+"""Cua-driver backend (macOS, Windows, Linux).
 
 Speaks MCP over stdio to `cua-driver`. The Python `mcp` SDK is async, so we
 run a dedicated asyncio event loop on a background thread and marshal sync
@@ -9,10 +9,8 @@ Install: `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cu
 After install, `cua-driver` is on $PATH and supports `cua-driver mcp` (stdio
 transport) which is what we invoke.
 
-The private SkyLight SPIs cua-driver uses (SLEventPostToPid, SLPSPostEvent-
-RecordTo, _AXObserverAddNotificationAndCheckRemote) are not Apple-public and
-can break on OS updates. Pin the installed version via `HERMES_CUA_DRIVER_
-VERSION` if you want reproducibility across an OS bump.
+The backend is OS-agnostic; cua-driver surfaces per-host desktop/session gaps
+such as missing DISPLAY, X11/XWayland reachability, or accessibility bus access.
 """
 
 from __future__ import annotations
@@ -418,7 +416,7 @@ class CuaDriverBackend(ComputerUseBackend):
             self._bridge.stop()
 
     def is_available(self) -> bool:
-        if not _is_macos():
+        if sys.platform not in ("darwin", "win32", "linux"):
             return False
         return cua_driver_binary_available()
 
@@ -437,17 +435,21 @@ class CuaDriverBackend(ComputerUseBackend):
         sc = lw_out.get("structuredContent") or {}
         raw_windows = sc.get("windows") if sc else None
         if raw_windows:
-            windows = [
-                {
-                    "app_name": w.get("app_name", ""),
-                    "pid": int(w["pid"]),
-                    "window_id": int(w["window_id"]),
+            windows = []
+            for w in raw_windows:
+                pid = w.get("pid")
+                window_id = w.get("window_id")
+                if pid is None or window_id is None:
+                    continue
+                title = w.get("title", "")
+                windows.append({
+                    "app_name": w.get("app_name") or w.get("name") or title,
+                    "pid": int(pid),
+                    "window_id": int(window_id),
                     "off_screen": not w.get("is_on_screen", True),
-                    "title": w.get("title", ""),
+                    "title": title,
                     "z_index": w.get("z_index", 0),
-                }
-                for w in raw_windows
-            ]
+                })
             # Sort by z_index descending (lowest z_index = frontmost on macOS).
             windows.sort(key=lambda w: w["z_index"])
         else:

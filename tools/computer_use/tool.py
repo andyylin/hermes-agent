@@ -810,9 +810,11 @@ def _element_to_dict(e: UIElement) -> Dict[str, Any]:
 def check_computer_use_requirements() -> bool:
     """Return True iff computer_use can run on this host.
 
-    Conditions: macOS + cua-driver binary installed (or override via env).
+    Conditions: macOS, Windows, or Linux + cua-driver binary installed (or
+    override via env). cua-driver itself reports finer-grained desktop-session
+    blockers (for example missing DISPLAY/WAYLAND_DISPLAY on Linux).
     """
-    if sys.platform != "darwin":
+    if sys.platform not in ("darwin", "win32", "linux"):
         return False
     from tools.computer_use.cua_backend import cua_driver_binary_available
     return cua_driver_binary_available()

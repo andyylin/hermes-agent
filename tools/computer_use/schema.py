@@ -16,14 +16,15 @@ from typing import Any, Dict
 COMPUTER_USE_SCHEMA: Dict[str, Any] = {
     "name": "computer_use",
     "description": (
-        "Drive the macOS desktop in the background — screenshots, mouse, "
+        "Drive the desktop in the background — screenshots, mouse, "
         "keyboard, scroll, drag — without stealing the user's cursor, "
-        "keyboard focus, or Space. Preferred workflow: call with "
+        "keyboard focus, or virtual desktop. Supported on macOS, Windows, "
+        "and Linux. Preferred workflow: call with "
         "action='capture' (mode='som' gives numbered element overlays), "
         "then click by `element` index for reliability. Pixel coordinates "
         "are supported for models trained on them. Works on any window — "
-        "hidden, minimized, on another Space, or behind another app. "
-        "macOS only; requires cua-driver to be installed."
+        "hidden, minimized, on another virtual desktop, or behind another app. "
+        "Requires cua-driver to be installed."
     ),
     "parameters": {
         "type": "object",
