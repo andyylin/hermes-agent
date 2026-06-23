@@ -1028,17 +1028,25 @@ class CuaDriverBackend(ComputerUseBackend):
             {"on_screen_only": True, "session": self._session_id},
         )
         raw_windows = (lw_out.get("structuredContent") or {}).get("windows") or []
-        windows = [
-            {
-                "app_name": w.get("app_name", ""),
-                "pid": int(w["pid"]),
-                "window_id": int(w["window_id"]),
+        windows = []
+        for w in raw_windows:
+            pid = w.get("pid")
+            window_id = w.get("window_id")
+            # Linux/wlroots can expose compositor/overlay surfaces (for
+            # example the agent cursor overlay) that have a window_id but no
+            # owning process. cua-driver input/state calls require a pid, so
+            # skip those pseudo-windows instead of exploding on int(None).
+            if pid is None or window_id is None:
+                continue
+            title = w.get("title", "")
+            windows.append({
+                "app_name": w.get("app_name") or w.get("name") or title,
+                "pid": int(pid),
+                "window_id": int(window_id),
                 "off_screen": not w.get("is_on_screen", True),
-                "title": w.get("title", ""),
+                "title": title,
                 "z_index": w.get("z_index", 0),
-            }
-            for w in raw_windows
-        ]
+            })
         # Sort by z_index descending (lowest z_index = frontmost on macOS).
         windows.sort(key=lambda w: w["z_index"])
 
