@@ -1133,12 +1133,13 @@ def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             pid_int, window_id_int = int(pid), int(window_id)
         except (TypeError, ValueError):
             continue
+        title = w.get("title", "")
         windows.append({
-            "app_name": w.get("app_name", ""),
+            "app_name": w.get("app_name") or w.get("name") or title,
             "pid": pid_int,
             "window_id": window_id_int,
             "off_screen": not w.get("is_on_screen", True),
-            "title": w.get("title", ""),
+            "title": title,
             "z_index": w.get("z_index", 0),
         })
     return windows
