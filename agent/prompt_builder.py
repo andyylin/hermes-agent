@@ -18,7 +18,7 @@ from typing import Optional
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
     extract_skill_conditions,
-    extract_skill_prompt_summary,
+    extract_skill_description,
     get_all_skills_dirs,
     get_disabled_skill_names,
     iter_skill_index_files,
@@ -1377,7 +1377,7 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
         if not skill_matches_environment(frontmatter):
             return False, frontmatter, ""
 
-        return True, frontmatter, extract_skill_prompt_summary(frontmatter)
+        return True, frontmatter, extract_skill_description(frontmatter)
     except Exception as e:
         logger.warning("Failed to parse skill file %s: %s", skill_file, e)
         return True, {}, ""
