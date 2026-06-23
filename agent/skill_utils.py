@@ -48,6 +48,7 @@ EXCLUDED_SKILL_DIRS = frozenset(
 # be scanned for active SKILL.md/DESCRIPTION.md entries, even if a Curator or
 # archive workflow preserves a complete old skill package under references/.
 SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
+SKILL_DESCRIPTION_PROMPT_MAX_LENGTH = 60
 
 
 def is_excluded_skill_path(path) -> bool:
@@ -792,25 +793,14 @@ def _compact_text(value: Any, max_length: int) -> str:
 
 
 def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
-    """Extract a truncated description from parsed frontmatter."""
-    raw_desc = frontmatter.get("description", "")
-    return _compact_text(raw_desc, 60)
+    """Return the compact prompt-index description from skill frontmatter.
 
-
-def extract_skill_prompt_summary(frontmatter: Dict[str, Any]) -> str:
-    """Extract the routing text used in the system prompt skills index.
-
-    Skill authors can provide ``metadata.hermes.prompt_summary`` when the
-    normal human-facing ``description`` is too long, too broad, or formatted
-    for docs/search rather than prompt routing.  The fallback intentionally
-    preserves the existing 60-character description cap so current prompts do
-    not grow unless a skill explicitly opts in to a longer prompt summary.
+    ``description`` is the single source of routing text. Keep it short and
+    action-oriented in the SKILL.md itself; Hermes normalizes whitespace and
+    caps the prompt-facing copy here as a safety net.
     """
-    raw_summary = _hermes_metadata(frontmatter).get("prompt_summary")
-    summary = _compact_text(raw_summary, 180)
-    if summary:
-        return summary
-    return extract_skill_description(frontmatter)
+    raw_desc = frontmatter.get("description", "")
+    return _compact_text(raw_desc, SKILL_DESCRIPTION_PROMPT_MAX_LENGTH)
 
 
 # ── File iteration ────────────────────────────────────────────────────────

@@ -149,7 +149,6 @@ version: 1.0.0
 platforms: [macos, linux]     # Optional — restrict to specific OS platforms
 metadata:
   hermes:
-    prompt_summary: Short routing hint for the injected skills index
     tags: [python, automation]
     category: devops
     fallback_for_toolsets: [web]    # Optional — conditional activation (see below)
@@ -177,10 +176,10 @@ Trigger conditions for this skill.
 How to confirm it worked.
 ```
 
-`description` is for humans, docs, search, and hub listings. The injected
-system-prompt skills index uses a compact routing hint; by default Hermes falls
-back to a capped `description`, but skill authors can provide a more precise
-`metadata.hermes.prompt_summary` when the description is too long or too broad.
+`description` is also the routing hint in the injected system-prompt skills
+index. Keep it short and action-oriented; put longer trigger rules, examples,
+and caveats in the body or reference files. Hermes normalizes and caps the
+prompt-facing copy as a safety net.
 
 ### Platform-Specific Skills
 
