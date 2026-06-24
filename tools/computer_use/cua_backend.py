@@ -953,10 +953,20 @@ class CuaDriverBackend(ComputerUseBackend):
     # ── Lifecycle ──────────────────────────────────────────────────
     def start(self) -> None:
         _maybe_nudge_update()
-        # The MCP client SDK (`mcp`) is installed in Andy's Hermes runtime venv.
-        # Upstream lazy-deps wiring is newer than this runtime branch; importing
-        # through that allowlist here breaks the live backport, so start the
-        # cua-driver MCP session directly.
+        # The MCP client SDK (`mcp`) is an optional dependency (the
+        # `computer-use` / `mcp` extras), not part of Hermes' minimal core.
+        # Lazy-install it on first use — the same pattern every other optional
+        # backend uses — so users never hit an opaque `No module named 'mcp'`
+        # at invoke time. Auto-install is gated by `security.allow_lazy_installs`
+        # (default on); when it's disabled or fails, ensure() raises
+        # FeatureUnavailable carrying an actionable `uv pip install mcp==…`
+        # hint, which surfaces via the backend-unavailable path in tool.py.
+        from tools.lazy_deps import ensure as _lazy_ensure
+        _lazy_ensure("tool.computer_use", prompt=False)
+        # A just-installed package may not be importable until the import
+        # machinery's caches are refreshed within this process.
+        import importlib
+        importlib.invalidate_caches()
         self._session.start()
 
         # Declare the run's session identity to cua-driver. From the

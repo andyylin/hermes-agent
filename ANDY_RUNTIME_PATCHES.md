@@ -27,6 +27,7 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 
 - `fix(email): send HTML bodies as multipart alternative`
   - Sends HTML email content as `text/html` with a plain-text fallback instead of raw tags in plain text.
+  - After the upstream email plugin migration, keep subject/HTML behavior at both live adapter and standalone plugin-send boundaries.
 
 - `fix(cron): format Discord cron deliveries without tables`
   - Uses Discord-friendly headings and bullets for cron reports.
@@ -39,6 +40,23 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
   - Admits `LINE_ALLOWED_GROUPS | LINE_READ_ONLY_GROUPS | LINE_ARCHIVE_GROUPS` at adapter intake.
   - Archives `LINE_ARCHIVE_GROUPS`, short-circuits `LINE_READ_ONLY_GROUPS`, and requires `LINE_GROUP_PREFIXES` for `LINE_REQUIRE_PREFIX_GROUPS` before agent dispatch.
   - Teaches the generic gateway auth layer that LINE group chats use `LINE_ALLOWED_GROUPS` as a chat allowlist, not sender-only `LINE_ALLOWED_USERS`.
+
+- `fix: respect disabled Mattermost gateway config`
+  - Keeps migrated plugin platforms disabled when config explicitly says `enabled: false`, even if credentials exist in env.
+  - Important for profiles that retain tokens but intentionally disable a channel.
+
+- `feat(delegate): per-task model/provider routing`
+  - Preserves structured `provider` / `model` overrides through `delegate_task`, including after credential lease resolution.
+  - Upstream currently documents subagent model as config-level; do not drop this without regression coverage.
+
+- `fix(computer-use): Linux cua-driver pseudo-window guard`
+  - Keeps cross-platform upstream cua-driver support but skips Linux compositor/overlay windows with no `pid`/`window_id` owner.
+
+## Covered by upstream after 2026-06-24 integration
+
+- Telegram DM-topic cron delivery now routes through upstream `DeliveryRouter` and `direct_messages_topic_id`; local cron metadata glue was reduced to email subject handling.
+- Computer Use cross-platform availability is upstream; only the Linux pseudo-window guard remains local.
+- Bitwarden zero-TTL cache behavior is upstream-equivalent and covered by env-loader secret-source tests.
 
 ## Operating rule
 

@@ -70,24 +70,24 @@ class TestTargetToStringRoundtrip:
 
 class TestCaseSensitiveChatIdParsing:
     """Test that chat IDs preserve their original case (issue #11768)."""
-    
+
     def test_slack_uppercase_chat_id_preserved(self):
         """Slack channel IDs like C123ABC should preserve case."""
         target = DeliveryTarget.parse("slack:C123ABC")
         assert target.platform == Platform.SLACK
         assert target.chat_id == "C123ABC"  # Should NOT be lowercased to c123abc
         assert target.is_explicit is True
-    
+
     def test_slack_chat_id_with_thread_preserved(self):
         """Slack channel:thread IDs should preserve case."""
         target = DeliveryTarget.parse("slack:C123ABC:thread123")
         assert target.platform == Platform.SLACK
         assert target.chat_id == "C123ABC"
         assert target.thread_id == "thread123"
-    
+
     def test_matrix_room_id_preserved(self):
         """Matrix room IDs like !RoomABC:example.org should preserve case.
-        
+
         Note: Matrix room IDs contain colons (e.g., !RoomABC:example.org).
         Due to the platform:chat_id:thread_id format, these are parsed as
         chat_id=!RoomABC and thread_id=example.org. This is a known limitation
@@ -100,7 +100,7 @@ class TestCaseSensitiveChatIdParsing:
         # This is a format limitation - the case is preserved but the structure is split
         assert target.chat_id == "!RoomABC"
         assert target.thread_id == "example.org"
-    
+
     def test_mixed_case_chat_id_roundtrip(self):
         """Mixed-case chat IDs should survive parse-to_string roundtrip."""
         original = "telegram:ChatId123ABC"
@@ -112,13 +112,13 @@ class TestCaseSensitiveChatIdParsing:
 
 class TestPlatformNameCaseInsensitivity:
     """Test that platform names are case-insensitive."""
-    
+
     def test_uppercase_platform_name(self):
         """Platform names should be case-insensitive."""
         target = DeliveryTarget.parse("TELEGRAM:12345")
         assert target.platform == Platform.TELEGRAM
         assert target.chat_id == "12345"
-    
+
     def test_mixed_case_platform_name(self):
         """Mixed-case platform names should work."""
         target = DeliveryTarget.parse("TeleGram:12345")
@@ -281,3 +281,141 @@ async def test_platform_send_failure_raises_for_delivery_result(tmp_path, monkey
 
     with pytest.raises(RuntimeError, match="route failed"):
         await router._deliver_to_platform(target, "hello", metadata={"telegram_reply_to_message_id": "9001"})
+
+
+# ---------------------------------------------------------------------------
+# Cron output truncation / adapter-aware chunking (issue #50126)
+# ---------------------------------------------------------------------------
+
+class ChunkingAdapter:
+    """Adapter that declares splits_long_messages=True (like Discord/Telegram)."""
+    splits_long_messages = True
+
+    def __init__(self):
+        self.calls = []
+
+    async def send(self, chat_id, content, metadata=None):
+        self.calls.append({"chat_id": chat_id, "content": content, "metadata": metadata})
+        return {"success": True}
+
+
+class NonChunkingAdapter:
+    """Adapter without splits_long_messages (default False — legacy behavior)."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def send(self, chat_id, content, metadata=None):
+        self.calls.append({"chat_id": chat_id, "content": content, "metadata": metadata})
+        return {"success": True}
+
+
+@pytest.mark.asyncio
+async def test_long_output_truncated_for_non_chunking_adapter(tmp_path, monkeypatch):
+    """Non-chunking adapters receive truncated content with a footer + file save."""
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = NonChunkingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget.parse("discord:123")
+
+    long_content = "x" * 5000
+    await router._deliver_to_platform(target, long_content, metadata={"job_id": "job1"})
+
+    delivered = adapter.calls[0]["content"]
+    assert len(delivered) < 5000  # was truncated
+    assert "truncated" in delivered.lower()
+    assert "full output saved to" in delivered
+    # Full output was saved to disk
+    saved_files = list(tmp_path.glob("cron/output/job1_*.txt"))
+    assert len(saved_files) == 1
+    assert saved_files[0].read_text() == long_content
+
+
+@pytest.mark.asyncio
+async def test_long_output_preserved_for_chunking_adapter(tmp_path, monkeypatch):
+    """Chunking adapters (splits_long_messages=True) receive the FULL content."""
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = ChunkingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget.parse("discord:123")
+
+    long_content = "x" * 5000
+    await router._deliver_to_platform(target, long_content, metadata={"job_id": "job2"})
+
+    delivered = adapter.calls[0]["content"]
+    assert delivered == long_content  # NOT truncated — adapter handles chunking
+    assert "truncated" not in delivered.lower()
+    # Full output still saved to disk as audit trail
+    saved_files = list(tmp_path.glob("cron/output/job2_*.txt"))
+    assert len(saved_files) == 1
+    assert saved_files[0].read_text() == long_content
+
+
+@pytest.mark.asyncio
+async def test_short_output_never_truncated(tmp_path, monkeypatch):
+    """Output under the limit passes through untouched for any adapter."""
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = NonChunkingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget.parse("discord:123")
+
+    short_content = "x" * 100
+    await router._deliver_to_platform(target, short_content, metadata={"job_id": "job3"})
+
+    assert adapter.calls[0]["content"] == short_content
+    # Nothing saved to disk
+    assert not list(tmp_path.glob("cron/output/*.txt"))
+
+
+@pytest.mark.asyncio
+async def test_audit_save_failure_does_not_break_chunking_delivery(tmp_path, monkeypatch):
+    """If the audit save fails (disk full, permissions), chunking adapters
+    still receive the full content — the save is best-effort."""
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+
+    adapter = ChunkingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget.parse("discord:123")
+
+    long_content = "x" * 5000
+
+    call_count = {"n": 0}
+
+    def failing_save(content, job_id):
+        call_count["n"] += 1
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(router, "_save_full_output", failing_save)
+
+    # Should NOT raise — audit failure is caught for chunking adapters
+    await router._deliver_to_platform(target, long_content, metadata={"job_id": "job6"})
+
+    # Adapter still got the full content
+    assert adapter.calls[0]["content"] == long_content
+    # Save was attempted (best-effort, swallowed)
+    assert call_count["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_save_failure_during_truncation_raises_for_non_chunking_adapter(tmp_path, monkeypatch):
+    """For a non-chunking adapter, the truncation footer needs a valid saved
+    path. If the save fails there, that is a real delivery problem and the
+    error propagates (not swallowed like the chunking best-effort save)."""
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+
+    adapter = NonChunkingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget.parse("discord:123")
+
+    long_content = "x" * 5000
+
+    def failing_save(content, job_id):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(router, "_save_full_output", failing_save)
+
+    # Non-chunking adapter must truncate → needs a valid saved path → the
+    # Step 1 best-effort catch swallows the first attempt, but the Step 2
+    # retry (footer needs the path) re-raises.
+    with pytest.raises(OSError, match="No space left on device"):
+        await router._deliver_to_platform(target, long_content, metadata={"job_id": "job7"})
