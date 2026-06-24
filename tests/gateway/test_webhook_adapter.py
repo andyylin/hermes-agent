@@ -500,6 +500,51 @@ class TestHTTPHandling:
             assert data["route"] == "test"
 
     @pytest.mark.asyncio
+    async def test_enqueue_repair_route_queues_without_agent_tools(self, tmp_path):
+        """enqueue_repair stores a packet and does not start a webhook agent run."""
+        queue_path = tmp_path / "repair-inbox.jsonl"
+        routes = {
+            "repair": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "should not become an agent prompt",
+                "enqueue_repair": {
+                    "path": str(queue_path),
+                    "trigger_cron_job_id": "repair123",
+                    "resolved_delivery_target": "email:andy@example.com",
+                    "recommended_first_checks": ["verify live state"],
+                },
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        with patch("gateway.platforms.webhook.subprocess.Popen") as mock_popen:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/webhooks/repair",
+                    json={
+                        "event_type": "automation.failure",
+                        "automation": {"id": "job-1", "name": "Job One"},
+                        "failure": {"status": "failed", "message": "boom"},
+                    },
+                    headers={"X-GitHub-Delivery": "delivery-repair-1"},
+                )
+                assert resp.status == 202
+                data = await resp.json()
+                assert data["status"] == "queued"
+                assert data["delivery_id"] == "delivery-repair-1"
+
+        adapter.handle_message.assert_not_called()
+        mock_popen.assert_called_once()
+        record = json.loads(queue_path.read_text().strip())
+        assert record["type"] == "webhook_repair_packet"
+        assert record["route"] == "repair"
+        assert record["delivery_id"] == "delivery-repair-1"
+        assert record["payload"]["automation"]["id"] == "job-1"
+        assert record["repair"]["recommended_first_checks"] == ["verify live state"]
+
+    @pytest.mark.asyncio
     async def test_route_without_secret_rejects_unsigned_request(self):
         """Missing HMAC secret must fail closed even if connect() was bypassed."""
         routes = {"test": {"prompt": "hi"}}
