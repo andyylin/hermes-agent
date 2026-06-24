@@ -1990,4 +1990,5 @@ class TestCronDefinitionsExport:
         ])
         job = json.loads(rendered)["jobs"][0]
         assert job["email_subject_template"] == "Joi Morning Briefing - {date}"
+        assert job["email_thread_key"] == "joi-morning-briefing"
         assert "next_run_at" not in job

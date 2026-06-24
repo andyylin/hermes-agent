@@ -420,8 +420,21 @@ def _extract_attachments(
     return attachments
 
 
+def _stable_thread_message_id(key: str, domain: str) -> Optional[str]:
+    """Build a deterministic Message-ID-like anchor for recurring notifications."""
+    key = str(key or "").strip().lower()
+    domain = str(domain or "").strip().lower()
+    if not key or not domain:
+        return None
+    safe_key = re.sub(r"[^a-z0-9._-]+", "-", key).strip(".-_")[:80]
+    safe_domain = re.sub(r"[^a-z0-9.-]+", "", domain).strip(".")
+    if not safe_key or not safe_domain:
+        return None
+    return f"<hermes-thread-{safe_key}@{safe_domain}>"
+
+
 class EmailAdapter(BasePlatformAdapter):
-    """Email gateway adapter using IMAP (receive) and SMTP (send)."""
+    """Email platform adapter."""
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.EMAIL)
@@ -901,10 +914,23 @@ class EmailAdapter(BasePlatformAdapter):
         """Send an email reply to the given address."""
         try:
             loop = asyncio.get_running_loop()
-            subject = (metadata or {}).get("subject")
-            suppress_threading = bool((metadata or {}).get("suppress_threading"))
+            meta = metadata or {}
+            subject = meta.get("subject")
+            suppress_threading = bool(meta.get("suppress_threading"))
+            thread_key = (
+                meta.get("thread_anchor_key")
+                or meta.get("email_thread_key")
+                or meta.get("thread_key")
+            )
             message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, content, reply_to, subject, suppress_threading
+                None,
+                self._send_email,
+                chat_id,
+                content,
+                reply_to,
+                subject,
+                suppress_threading,
+                thread_key,
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -926,8 +952,9 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         reply_to_msg_id: Optional[str] = None,
-        subject_override: Optional[str] = None,
+        subject_override: Optional[str | Dict[str, Any]] = None,
         suppress_threading: bool = False,
+        thread_anchor_key: Optional[str] = None,
     ) -> str:
 
         """Send an email via SMTP. Runs in executor thread."""
@@ -938,6 +965,7 @@ class EmailAdapter(BasePlatformAdapter):
         # Thread context for reply, unless the caller supplies a fresh subject.
         if isinstance(subject_override, dict):
             suppress_threading = bool(subject_override.get("suppress_threading"))
+            thread_anchor_key = subject_override.get("thread_anchor_key") or thread_anchor_key
             subject_override = subject_override.get("subject")
         notification_like = bool(subject_override) or suppress_threading
         ctx = self._thread_context.get(to_addr, {})
@@ -950,7 +978,9 @@ class EmailAdapter(BasePlatformAdapter):
         msg["Subject"] = subject
 
         # Threading headers
-        original_msg_id = None if suppress_threading else (reply_to_msg_id or ctx.get("message_id"))
+        domain = self._address.split("@", 1)[1] if "@" in self._address else ""
+        thread_anchor_msg_id = _stable_thread_message_id(str(thread_anchor_key or ""), domain)
+        original_msg_id = thread_anchor_msg_id or (None if suppress_threading else (reply_to_msg_id or ctx.get("message_id")))
         if original_msg_id:
             msg["In-Reply-To"] = original_msg_id
             msg["References"] = original_msg_id
@@ -1280,8 +1310,20 @@ async def _standalone_send(
         msg = MIMEMultipart()
         msg["From"] = address
         msg["To"] = chat_id
+        thread_anchor_key = None
+        if isinstance(subject, dict):
+            suppress_threading = bool(subject.get("suppress_threading"))
+            thread_anchor_key = subject.get("thread_anchor_key")
+            subject = subject.get("subject")
         msg["Subject"] = subject or "Hermes Agent"
         msg["Date"] = formatdate(localtime=True)
+        domain = address.split("@", 1)[1] if "@" in address else ""
+        thread_anchor_msg_id = _stable_thread_message_id(str(thread_anchor_key or ""), domain)
+        if thread_anchor_msg_id:
+            msg["In-Reply-To"] = thread_anchor_msg_id
+            msg["References"] = thread_anchor_msg_id
+        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{domain or 'localhost'}>"
+        msg["Message-ID"] = msg_id
 
         alt = MIMEMultipart("alternative")
         if EmailAdapter._looks_like_html(message or ""):
@@ -1299,7 +1341,7 @@ async def _standalone_send(
         server.login(address, password)
         server.send_message(msg)
         server.quit()
-        return {"success": True, "platform": "email", "chat_id": chat_id}
+        return {"success": True, "platform": "email", "chat_id": chat_id, "message_id": msg_id}
     except Exception as e:
         try:
             from tools.send_message_tool import _error as _e

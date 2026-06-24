@@ -672,6 +672,32 @@ class TestDeliverResultWrapping:
         assert "Brief body." in sent_content
         assert "REF: `HERMES-NOTIFY:cron:joi-morning-briefing-hermes-owner:brief-job:" in sent_content
 
+    def test_email_delivery_passes_stable_thread_key_when_configured(self):
+        """Recurring email cron jobs can opt into explicit reply headers for Apple Mail threading."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.EMAIL: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "217e74bd5079",
+                "name": "workday-mattermost-brief-email",
+                "deliver": "email:andy@example.com",
+                "email_subject_template": "[Hermes][Mattermost Brief] Workday",
+                "email_thread_key": "mattermost-brief-workday",
+            }
+            _deliver_result(job, "Brief body.")
+
+        send_mock.assert_called_once()
+        assert send_mock.call_args.kwargs["subject"] == {
+            "subject": "[Hermes][Mattermost Brief] Workday",
+            "thread_anchor_key": "mattermost-brief-workday",
+        }
+
     def test_email_delivery_wraps_html_output_as_html(self):
         """HTML cron output should keep a rich HTML wrapper instead of plain-text chrome."""
         from gateway.config import Platform
