@@ -37,6 +37,7 @@ _DEFINITION_FIELDS = (
     "repeat",
     "deliver",
     "email_subject_template",
+    "email_thread_key",
     "delivery_subject_template",
     "origin",
     "enabled_toolsets",

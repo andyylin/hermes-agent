@@ -1381,6 +1381,23 @@ def _format_cron_email_subject(job: dict) -> Optional[str]:
     )
 
 
+def _format_cron_email_subject_payload(job: dict):
+    """Return the subject payload for email delivery.
+
+    Most jobs get a plain subject string. Jobs with ``email_thread_key`` opt
+    into explicit RFC 5322 threading headers so mail clients that do not rely
+    on Gmail-style same-subject heuristics (notably Apple Mail) can keep a
+    recurring stream in one conversation.
+    """
+    subject = _format_cron_email_subject(job)
+    if not subject:
+        return None
+    thread_key = str(job.get("email_thread_key") or "").strip()
+    if not thread_key:
+        return subject
+    return {"subject": subject, "thread_anchor_key": thread_key}
+
+
 def _is_one_shot_job(job: dict) -> bool:
     """Return True when a cron job is configured to run only once."""
     repeat = job.get("repeat")
@@ -1744,11 +1761,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
-        email_subject = _format_cron_email_subject(job) if str(platform_name).lower() == "email" else None
+        email_subject = _format_cron_email_subject_payload(job) if str(platform_name).lower() == "email" else None
 
         for_discord = str(platform_name).lower() == "discord"
         for_email = str(platform_name).lower() == "email"
-        email_subject = _format_cron_email_subject(job) if for_email else None
         if wrap_response:
             delivery_content = _format_cron_delivery_content(
                 job,
@@ -1946,8 +1962,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
             if email_subject and platform_name.lower() == "email":
                 route_metadata = dict(route_metadata or {})
-                route_metadata["subject"] = email_subject
-                route_metadata["suppress_threading"] = True
+                if isinstance(email_subject, dict):
+                    route_metadata.update(email_subject)
+                else:
+                    route_metadata["subject"] = email_subject
+                    route_metadata["suppress_threading"] = True
 
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
