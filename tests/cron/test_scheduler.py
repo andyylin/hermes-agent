@@ -63,7 +63,7 @@ class TestPerJobToolsetMcpMerge:
         result = _resolve_cron_enabled_toolsets(job, self.CFG)
         assert set(result) == {"web", "terminal"} | self._enabled_names()
 
-    def test_resolver_empty_per_job_falls_through_to_platform(self):
+    def test_resolver_none_per_job_falls_through_to_platform(self):
         # No per-job list -> must delegate to _get_platform_tools (the platform
         # fallback), NOT the per-job merge. Stub the platform resolver and assert
         # it is the path taken and its result is returned.
@@ -76,6 +76,13 @@ class TestPerJobToolsetMcpMerge:
         # _get_platform_tools args: (cfg, "cron")
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
+
+    def test_resolver_explicit_empty_per_job_means_no_tools(self):
+        job = {"enabled_toolsets": []}
+        with patch("hermes_cli.tools_config._get_platform_tools") as m_platform:
+            result = _resolve_cron_enabled_toolsets(job, self.CFG)
+        m_platform.assert_not_called()
+        assert result == []
 
 
 class TestResolveOrigin:

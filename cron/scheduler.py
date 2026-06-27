@@ -152,6 +152,8 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
         add nothing further (the user named exactly the servers they want)
       * otherwise -> union in every globally-enabled MCP server
     """
+    if not per_job:
+        return []
     result = [t for t in per_job if t != "no_mcp"]
     if "no_mcp" in per_job:
         return result
@@ -187,8 +189,8 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     get cron WITHOUT ``moa`` by default (issue reported by Norbert —
     surprise $4.63 run).
     """
-    per_job = job.get("enabled_toolsets")
-    if per_job:
+    if "enabled_toolsets" in job and job.get("enabled_toolsets") is not None:
+        per_job = job.get("enabled_toolsets") or []
         return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
