@@ -93,6 +93,37 @@ cronjob(
 
 This is useful when you want a scheduled agent to inherit reusable workflows without stuffing the full skill text into the cron prompt itself.
 
+## Tool scope for cron jobs
+
+Cron jobs run in fresh agent sessions, so any tool schema you allow is injected every run. Keep that list tight:
+
+- Use `no_agent=true` for fixed watchdogs, deterministic reminders, and scripts whose stdout is already the final message.
+- For LLM-backed jobs, pass `enabled_toolsets=[...]` when creating or updating the job so only the required toolsets are exposed.
+- If a job lists only native toolsets and does **not** need any MCP tools, include the `no_mcp` sentinel. The scheduler strips the sentinel before constructing the model tool list.
+- If a job intentionally needs an MCP server, name that MCP server explicitly instead of relying on globally enabled MCP defaults.
+- An explicit empty list, `enabled_toolsets=[]`, means no tools on current runtimes; older jobs/runtimes should be verified before relying on that behavior.
+
+Examples:
+
+```python
+# Script-backed formatter: only terminal, no MCP tools.
+cronjob(
+    action="create",
+    schedule="0 9 * * *",
+    script="daily_packet.py",
+    prompt="Format the script output into a short email.",
+    enabled_toolsets=["terminal", "no_mcp"],
+)
+
+# n8n verification: terminal plus the n8n MCP server, explicitly.
+cronjob(
+    action="create",
+    schedule="once at 2026-07-02 10:10",
+    prompt="Check the n8n workflow execution and report the result.",
+    enabled_toolsets=["terminal", "n8n"],
+)
+```
+
 ## Running a job inside a project directory
 
 Cron jobs default to running detached from any repo — no `AGENTS.md`, `CLAUDE.md`, or `.cursorrules` is loaded, and the terminal / file / code-exec tools run from whatever working directory the gateway started in. Pass `--workdir` (CLI) or `workdir=` (tool call) to change that:
