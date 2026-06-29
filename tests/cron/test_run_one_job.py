@@ -89,15 +89,58 @@ def test_run_one_job_empty_response_is_soft_failure(monkeypatch):
 
 
 def test_run_one_job_failed_job_delivers_error(monkeypatch):
-    """A failed job still delivers (the error notice) and marks not-ok."""
+    """A failed job still delivers when repair-gate routing is disabled."""
     calls = _patch_pipeline(monkeypatch, success=False, final="", error="boom")
+    monkeypatch.setattr(s, "_cron_repair_gate_alert_routing_enabled", lambda: False)
 
     s.run_one_job({"id": "j5", "name": "t"})
 
     kinds = [c[0] for c in calls]
-    assert "deliver" in kinds  # failures always deliver
+    assert "deliver" in kinds
     mark = [c for c in calls if c[0] == "mark"][0]
     assert mark == ("mark", "j5", False)
+
+
+def test_run_one_job_failed_job_routes_to_repair_gate_when_available(monkeypatch):
+    """All source job failures are held for Supervisor when the bridge is healthy."""
+    calls = _patch_pipeline(monkeypatch, success=False, final="", error="boom")
+    monkeypatch.setattr(s, "_cron_repair_gate_alert_routing_enabled", lambda: True)
+    monkeypatch.setattr(s, "_cron_repair_gate_available", lambda: True)
+
+    s.run_one_job({"id": "j5b", "name": "t"})
+
+    kinds = [c[0] for c in calls]
+    assert "deliver" not in kinds
+    mark = [c for c in calls if c[0] == "mark"][0]
+    assert mark == ("mark", "j5b", False)
+
+
+def test_run_one_job_failed_job_delivers_when_repair_gate_unavailable(monkeypatch):
+    """If the Supervisor bridge is broken, source jobs fall back to direct email."""
+    calls = _patch_pipeline(monkeypatch, success=False, final="", error="boom")
+    monkeypatch.setattr(s, "_cron_repair_gate_alert_routing_enabled", lambda: True)
+    monkeypatch.setattr(s, "_cron_repair_gate_available", lambda: False)
+
+    s.run_one_job({"id": "j5c", "name": "t"})
+
+    kinds = [c[0] for c in calls]
+    assert "deliver" in kinds
+    mark = [c for c in calls if c[0] == "mark"][0]
+    assert mark == ("mark", "j5c", False)
+
+
+def test_run_one_job_warning_output_routes_to_repair_gate_when_available(monkeypatch):
+    """Alert-shaped successful output is held; normal successful reports deliver."""
+    calls = _patch_pipeline(monkeypatch, success=True, final="Attention needed: upstream broken")
+    monkeypatch.setattr(s, "_cron_repair_gate_alert_routing_enabled", lambda: True)
+    monkeypatch.setattr(s, "_cron_repair_gate_available", lambda: True)
+
+    s.run_one_job({"id": "j5d", "name": "t"})
+
+    kinds = [c[0] for c in calls]
+    assert "deliver" not in kinds
+    mark = [c for c in calls if c[0] == "mark"][0]
+    assert mark == ("mark", "j5d", True)
 
 
 def test_run_one_job_exception_marks_failure(monkeypatch):
