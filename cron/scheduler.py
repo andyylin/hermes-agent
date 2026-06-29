@@ -239,7 +239,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, load_jobs
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1305,6 +1305,52 @@ def _is_repair_gate_job(job: dict) -> bool:
         job.get("script") == "automation_failure_repair_gate.py"
         or job.get("name") == "automation-failure-first-pass-repairer"
     )
+
+
+def _cron_repair_gate_available() -> bool:
+    """Return True when the universal repair gate is present and not known-broken.
+
+    Source cron failures should be held for Supervisor first-pass repair, not
+    emailed directly. The only sane fallback is when the bridge itself is
+    missing, disabled, or explicitly failing; then the source job may notify so
+    the failure does not disappear into a dead repair lane.
+    """
+    try:
+        for job in load_jobs():
+            if not isinstance(job, dict) or not _is_repair_gate_job(job):
+                continue
+            if not job.get("enabled", True):
+                continue
+            if job.get("state") not in (None, "scheduled", "running"):
+                continue
+            if str(job.get("last_status") or "").lower() == "error":
+                continue
+            if job.get("last_delivery_error"):
+                continue
+            script = str(job.get("script") or "")
+            if script:
+                script_path = _get_hermes_home() / "scripts" / script
+                if not script_path.exists():
+                    continue
+            return True
+    except Exception as exc:
+        logger.warning("Could not verify automation repair gate availability: %s", exc)
+    return False
+
+
+def _should_hold_cron_output_for_repair_gate(job: dict, *, success: bool, deliver_content: str) -> bool:
+    """Whether this job output should go to Supervisor instead of direct delivery."""
+    if not deliver_content.strip():
+        return False
+    if not _cron_repair_gate_alert_routing_enabled():
+        return False
+    if _is_repair_gate_job(job):
+        return False
+    # Failed jobs are all errors. Successful jobs are held only when their
+    # output is explicitly alert-shaped, so normal reports still deliver.
+    if success and not _looks_like_cron_warning_or_error_alert(deliver_content):
+        return False
+    return _cron_repair_gate_available()
 
 
 def _looks_like_cron_warning_or_error_alert(content: str) -> bool:
@@ -3454,6 +3500,16 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # tolerance the cron contract relies on.
         if should_deliver and success and _is_cron_silence_response(deliver_content):
             logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+            should_deliver = False
+
+        if (
+            should_deliver
+            and _should_hold_cron_output_for_repair_gate(job, success=success, deliver_content=deliver_content)
+        ):
+            logger.info(
+                "Job '%s': holding source alert for automation repair gate instead of direct delivery",
+                job["id"],
+            )
             should_deliver = False
 
         delivery_error = None
