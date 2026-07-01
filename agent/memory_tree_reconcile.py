@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -126,6 +127,39 @@ def _find_cron_job(path: Path, job_id: str) -> dict[str, Any] | None:
     return None
 
 
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _cron_job_runtime_ok(job: dict[str, Any]) -> bool:
+    if not bool(job.get("enabled", True)):
+        return False
+    if str(job.get("last_status") or "unknown") != "error":
+        return True
+    if str(job.get("last_repair_verification_status") or "").lower() != "ok":
+        return False
+    verified_at = _parse_iso_datetime(job.get("last_repair_verification_at"))
+    last_run_at = _parse_iso_datetime(job.get("last_run_at"))
+    return bool(verified_at and (last_run_at is None or verified_at > last_run_at))
+
+
+def _cron_job_evidence_status(job: dict[str, Any]) -> str:
+    last_status = str(job.get("last_status") or "unknown")
+    repair_status = str(job.get("last_repair_verification_status") or "").lower()
+    repair_at = job.get("last_repair_verification_at")
+    if last_status == "error" and repair_status == "ok" and repair_at:
+        return f"last_status=error post_failure_verification=ok at {repair_at}"
+    return f"last_status={last_status}"
+
+
 def _record_id(record: dict[str, Any]) -> str:
     return str(record.get("id") or record.get("record_id") or record.get("title") or "unknown")
 
@@ -188,9 +222,8 @@ def _verify_cron_record(record: dict[str, Any], source: dict[str, Any], home: Pa
             next_action="Retire/remove the ledger record or update it to the current cron job id.",
         )
 
-    last_status = str(job.get("last_status") or "unknown")
     enabled = bool(job.get("enabled", True))
-    status = "active_verified" if enabled and last_status != "error" else "runtime_attention"
+    status = "active_verified" if _cron_job_runtime_ok(job) else "runtime_attention"
     severity = "ok" if status == "active_verified" else "attention"
     return ReconcileItem(
         status=status,
@@ -198,7 +231,7 @@ def _verify_cron_record(record: dict[str, Any], source: dict[str, Any], home: Pa
         title=_record_title(record),
         severity=severity,
         source_path=str(cron_path),
-        evidence=f"cron job {job_id} enabled={enabled} last_status={last_status}",
+        evidence=f"cron job {job_id} enabled={enabled} {_cron_job_evidence_status(job)}",
         next_action="No action." if status == "active_verified" else "Inspect the cron job and update the ledger verification.",
     )
 
@@ -260,15 +293,20 @@ def _verify_cron_jobs_record(record: dict[str, Any], source: dict[str, Any], hom
             evidence=f"cron jobs missing={','.join(missing)}",
             next_action="Retire/remove missing job ids or update the ledger to current cron ids.",
         )
-    bad = [job_id for job_id in ids if not bool(jobs[job_id].get("enabled", True)) or str(jobs[job_id].get("last_status") or "unknown") == "error"]
+    bad = [job_id for job_id in ids if not _cron_job_runtime_ok(jobs[job_id])]
     status = "active_verified" if not bad else "runtime_attention"
+    evidence = f"cron jobs verified={len(ids)}"
+    if bad:
+        evidence = f"cron jobs need attention={','.join(bad)}"
+    elif any(str(jobs[job_id].get("last_status") or "unknown") == "error" for job_id in ids):
+        evidence = "cron jobs verified by post-failure repair diagnostics"
     return ReconcileItem(
         status=status,
         source_id=_record_id(record),
         title=_record_title(record),
         severity="ok" if status == "active_verified" else "attention",
         source_path=str(cron_path),
-        evidence=f"cron jobs verified={len(ids)}" if not bad else f"cron jobs need attention={','.join(bad)}",
+        evidence=evidence,
         next_action="No action." if status == "active_verified" else "Inspect the cron jobs and update ledger verification.",
     )
 
