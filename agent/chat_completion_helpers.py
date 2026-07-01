@@ -503,14 +503,16 @@ def interruptible_api_call(agent, api_kwargs: dict):
         if _codex_floor:
             _stale_timeout = max(_stale_timeout, _codex_floor)
 
+    # Stream-idle cutoff after the first Codex SSE frame. Even small cron
+    # reports can legitimately spend tens of seconds in reasoning after an
+    # opening frame, and a 12s floor has caused repeated false BrokenPipe
+    # failures by killing healthy subscription-backed Codex generations.
     if _est_tokens_for_codex_watchdog > 100_000:
         _codex_idle_timeout_default = 180.0
     elif _est_tokens_for_codex_watchdog > 50_000:
         _codex_idle_timeout_default = 120.0
-    elif _est_tokens_for_codex_watchdog > 10_000:
-        _codex_idle_timeout_default = 60.0
     else:
-        _codex_idle_timeout_default = 12.0
+        _codex_idle_timeout_default = 60.0
 
     # No-byte TTFB cutoff. The OpenAI SDK's own streaming read timeout is far
     # longer (openai 2.x DEFAULT_TIMEOUT.read = 600s), so a tight 12s default
