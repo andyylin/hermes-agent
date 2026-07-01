@@ -271,6 +271,46 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     assert "codex_ttfb_kill" not in closes
 
 
+def test_event_idle_default_tolerates_quiet_reasoning_gap(tmp_path, monkeypatch):
+    """The default stream-idle floor must tolerate a normal quiet reasoning gap
+    after the opening SSE frame. A 12s floor caused false BrokenPipe cron
+    failures for small subscription-backed Codex report jobs."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.delenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setattr(
+        agent, "_compute_non_stream_stale_timeout", lambda *a, **k: 30.0
+    )
+
+    closes: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(
+        agent,
+        "_abort_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_close_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+
+    sentinel = SimpleNamespace(ok=True)
+
+    def fake_stream(api_kwargs, client=None, on_first_delta=None):
+        agent._codex_stream_last_event_ts = time.time()
+        time.sleep(13.0)
+        return sentinel
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_stream)
+
+    resp = h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+    assert resp is sentinel
+    assert "codex_stream_idle_kill" not in closes
+
+
 def test_event_idle_kills_after_first_event_then_silence(tmp_path, monkeypatch):
     """If Codex emits an opening SSE event and then goes silent, kill it via
     the stream-idle watchdog instead of waiting for the long non-stream stale
