@@ -141,9 +141,14 @@ def _is_failure_status(value: Any) -> bool:
     if not text:
         return False
     # Compound status labels such as "ok_with_personal_rclone_errors" are
-    # historical/qualified OK states, not current failures. Current failures
-    # must be encoded as a failing status or a non-empty explicit error field.
+    # historical/qualified OK states, not current failures. Likewise,
+    # "*_verified" ledger verification snapshots can describe verified
+    # error-routing/repair coverage rather than an active failure. Current
+    # failures must be encoded as a failing status or a non-empty explicit
+    # error field.
     if re.match(r"^(ok|success|succeeded|pass|passed|clean|healthy|silent|noop|no_op)(\b|[_-])", text):
+        return False
+    if re.search(r"(^|[_-])(verified|validated|recovered|resolved)$", text):
         return False
     tokens = {token for token in re.split(r"[^a-z0-9]+", text) if token}
     return bool(tokens & FAILED_MARKERS)

@@ -38,6 +38,25 @@ def test_ok_status_with_historical_error_word_is_stale_not_failure():
     assert items[0].severity == "attention"
 
 
+def test_verified_error_routing_status_is_not_failure():
+    records = [
+        {
+            "id": "supervisor-agent-health-scan",
+            "title": "Supervisor-agent health scan",
+            "status": "active",
+            "updated_at": "2026-06-04T00:00:00+00:00",
+            "runtime": {"cron_job_id": "79b7c4346140", "last_status": "ok"},
+            "verification": {
+                "status": "broad_error_routing_verified",
+                "checked_at": "2026-06-04T00:00:00+00:00",
+                "evidence": "Repair-gate error routing was verified; this is not a current error.",
+            },
+        }
+    ]
+
+    assert _items(records) == []
+
+
 def test_current_runtime_error_is_still_failure():
     records = [
         {
