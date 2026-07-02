@@ -1311,11 +1311,13 @@ async def _standalone_send(
         msg["From"] = address
         msg["To"] = chat_id
         thread_anchor_key = None
+        suppress_threading = False
         if isinstance(subject, dict):
             suppress_threading = bool(subject.get("suppress_threading"))
             thread_anchor_key = subject.get("thread_anchor_key")
             subject = subject.get("subject")
         msg["Subject"] = subject or "Hermes Agent"
+        notification_like = bool(subject) or suppress_threading
         msg["Date"] = formatdate(localtime=True)
         domain = address.split("@", 1)[1] if "@" in address else ""
         thread_anchor_msg_id = _stable_thread_message_id(str(thread_anchor_key or ""), domain)
@@ -1325,12 +1327,22 @@ async def _standalone_send(
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{domain or 'localhost'}>"
         msg["Message-ID"] = msg_id
 
+        body = message or ""
+        if notification_like:
+            from tools.email_rendering import append_notification_reference_footer
+
+            body = append_notification_reference_footer(
+                body,
+                subject=str(subject or "Hermes Agent"),
+                ask="investigate this REF",
+            )
+
         alt = MIMEMultipart("alternative")
-        if EmailAdapter._looks_like_html(message or ""):
-            plain_body = EmailAdapter._html_to_plain_text(message or "")
-            html_body = message or ""
+        if EmailAdapter._looks_like_html(body):
+            plain_body = EmailAdapter._html_to_plain_text(body)
+            html_body = body
         else:
-            plain_body = message or ""
+            plain_body = body
             html_body = EmailAdapter._plain_text_to_html(plain_body)
         alt.attach(MIMEText(plain_body, "plain", "utf-8"))
         alt.attach(MIMEText(html_body, "html", "utf-8"))

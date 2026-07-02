@@ -891,7 +891,7 @@ class TestThreadContext(unittest.TestCase):
             html_part = next(part for part in parts if part.get_content_type() == "text/html")
             self.assertIn("Summary\n\n- One\n- Two", plain_part.get_payload(decode=True).decode("utf-8"))
             html = html_part.get_payload(decode=True).decode("utf-8")
-            self.assertIn("<p>Summary</p>", html)
+            self.assertIn("<h2>Summary</h2>", html)
             self.assertIn("<ul><li>One</li><li>Two</li></ul>", html)
 
     def test_explicit_subject_suppresses_reply_threading(self):
