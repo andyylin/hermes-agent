@@ -1,5 +1,6 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import json
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
@@ -1431,8 +1432,8 @@ class TestCronDefinitionsExport:
 
         monkeypatch.setattr("cron.jobs._resolve_default_model_snapshot", lambda: "test-model")
         job = create_job(
-            {"kind": "interval", "minutes": 30},
             "Say hi",
+            "every 30m",
             name="demo",
             deliver="local",
             skills=["watchers"],
@@ -1442,7 +1443,8 @@ class TestCronDefinitionsExport:
         export_path = tmp_cron_dir / "cron" / "jobs.definitions.json"
         assert export_path.exists()
         data = json.loads(export_path.read_text())
-        assert data["schema"] == "hermes-cron-definitions-v1"
+        assert data["version"] == 1
+        assert data["source"] == "cron/jobs.json"
         exported = data["jobs"][0]
         assert exported["id"] == job["id"]
         assert exported["name"] == "demo"
@@ -1457,7 +1459,7 @@ class TestCronDefinitionsExport:
         from cron.jobs import create_job, update_job, remove_job
 
         monkeypatch.setattr("cron.jobs._resolve_default_model_snapshot", lambda: None)
-        job = create_job({"kind": "interval", "minutes": 5}, "old", name="old-name")
+        job = create_job("old", "every 5m", name="old-name")
         export_path = tmp_cron_dir / "cron" / "jobs.definitions.json"
 
         update_job(job["id"], {"prompt": "new", "name": "new-name"})
@@ -1473,7 +1475,7 @@ class TestCronDefinitionsExport:
         from cron.jobs import create_job, export_definitions_file
 
         monkeypatch.setattr("cron.jobs._resolve_default_model_snapshot", lambda: None)
-        create_job({"kind": "interval", "minutes": 5}, "same", name="same-name")
+        create_job("same", "every 5m", name="same-name")
         assert export_definitions_file() is False
 
 
@@ -1488,6 +1490,7 @@ class TestCronDefinitionsExport:
                 "schedule": {"kind": "interval", "minutes": 30},
                 "prompt": "Brief",
                 "email_subject_template": "Joi Morning Briefing - {date}",
+                "email_thread_key": "joi-morning-briefing",
                 "next_run_at": "2026-01-01T00:30:00+00:00",
             }
         ])

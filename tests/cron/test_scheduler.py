@@ -520,7 +520,7 @@ class TestRoutingIntents:
                     "SIGNAL_HOME_CHANNEL", "MATRIX_HOME_ROOM", "MATTERMOST_HOME_CHANNEL",
                     "SMS_HOME_CHANNEL", "EMAIL_HOME_ADDRESS", "DINGTALK_HOME_CHANNEL",
                     "FEISHU_HOME_CHANNEL", "WECOM_HOME_CHANNEL", "WEIXIN_HOME_CHANNEL",
-                    "BLUEBUBBLES_HOME_CHANNEL", "QQBOT_HOME_CHANNEL", "QQ_HOME_CHANNEL"):
+                    "BLUEBUBBLES_HOME_CHANNEL", "QQBOT_HOME_CHANNEL", "QQ_HOME_CHANNEL", "LINE_HOME_CHANNEL"):
             monkeypatch.delenv(var, raising=False)
 
         assert _resolve_delivery_targets({"deliver": "all", "origin": None}) == []
@@ -550,6 +550,7 @@ class TestRoutingIntents:
         """'ALL' / 'All' / 'all' are all recognized."""
         from cron.scheduler import _resolve_delivery_targets
 
+        monkeypatch.delenv("LINE_HOME_CHANNEL", raising=False)
         monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "-222")
 
@@ -1116,8 +1117,14 @@ class TestDeliverResultWrapping:
         adapter.send = MagicMock(return_value=object())
         loop = MagicMock()
         loop.is_running.return_value = True
-        future = concurrent.futures.Future()
-        future.set_result(SendResult(success=True))
+        def fake_schedule(coro, _loop):
+            import asyncio as _asyncio
+            future = concurrent.futures.Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
 
         job = {
             "id": "dm-topic-job",
@@ -1126,15 +1133,15 @@ class TestDeliverResultWrapping:
         }
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
-             patch("agent.async_utils.safe_schedule_threadsafe", return_value=future):
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule):
             _deliver_result(job, "hello", adapters={Platform.TELEGRAM: adapter}, loop=loop)
 
         adapter.send.assert_called_once()
         assert adapter.send.call_args.args[0] == "545944400"
         assert "hello" in adapter.send.call_args.args[1]
         assert adapter.send.call_args.kwargs["metadata"] == {
-            "thread_id": "78807",
             "direct_messages_topic_id": "78807",
+            "job_id": "dm-topic-job",
         }
 
 
