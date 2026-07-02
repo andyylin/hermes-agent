@@ -3,17 +3,10 @@ from tools.email_rendering import append_notification_reference_footer, plain_te
 
 
 BODY = (
-    "## Digest
-
-"
-    "> Bottom line: **act now**
-
-"
-    "- **Kelly:** see [details](https://example.com?a=1&b=2)
-"
-    "- [ ] Reply to `Alice`
-
-"
+    "## Digest\n\n"
+    "> Bottom line: **act now**\n\n"
+    "- **Kelly:** see [details](https://example.com?a=1&b=2)\n"
+    "- [ ] Reply to `Alice`\n\n"
     "<script>alert(1)</script>"
 )
 
@@ -39,9 +32,7 @@ def test_shared_email_plain_text_to_html_renders_rich_markdown_safely():
 
 def test_notification_reference_footer_is_copyable_in_plain_and_html():
     plain = append_notification_reference_footer(
-        "## Alert
-
-Body",
+        "## Alert\n\nBody",
         ref="HERMES-NOTIFY:test-alert:abc123:2026-06-22T08:10+08:00",
         job_id="abc123",
         source="/home/pi/.hermes/scripts/test.py",
