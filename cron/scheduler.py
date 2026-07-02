@@ -1367,8 +1367,11 @@ def _looks_like_cron_warning_or_error_alert(content: str) -> bool:
     head = "\n".join(line.strip() for line in text.splitlines()[:8] if line.strip())
     if re.search(r'(?is)^\s*\{.*"status"\s*:\s*"(REPORT|WARNING|FAILURE|ERROR)"', text[:2000]):
         return True
+    # Check each leading line, not just the whole joined head. Bilingual jobs may
+    # put a Chinese failure summary first and an English "... failed" line second;
+    # anchoring to only the first line lets those alerts bypass the repair gate.
     return bool(re.search(
-        r"(?i)^(?:[#*_\s>`-]*)?(?:⚠|⚠️|warning[:：]|error[:：]|alert[:：]|(?:.+\b)?attention needed\b|action required\b|.+\bfailed\b)",
+        r"(?im)^(?:[#*_\s>`-]*)?(?:⚠|⚠️|warning[:：]|error[:：]|alert[:：]|(?:.+\b)?attention needed\b|action required\b|.+\bfailed\b|.*(?:讀取失敗|失敗|錯誤|異常)[:：]?)",
         head,
     ))
 
