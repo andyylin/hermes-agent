@@ -28,6 +28,29 @@ DONE_STATUSES = {
     "cancelled",
 }
 FAILED_MARKERS = {"fail", "failed", "failure", "error", "errored", "critical", "broken"}
+HEALTHY_STATUS_PREFIXES = (
+    "ok",
+    "success",
+    "succeeded",
+    "pass",
+    "passed",
+    "clean",
+    "healthy",
+    "silent",
+    "noop",
+    "no_op",
+)
+RESOLVED_STATUS_TOKENS = {
+    "cleared",
+    "fixed",
+    "repaired",
+    "recovered",
+    "resolved",
+    "verified",
+    "validated",
+    "excluded",
+}
+PENDING_FOLLOWUP_TOKENS = {"pending", "awaiting", "waiting"}
 
 
 @dataclass(frozen=True)
@@ -146,12 +169,23 @@ def _is_failure_status(value: Any) -> bool:
     # error-routing/repair coverage rather than an active failure. Current
     # failures must be encoded as a failing status or a non-empty explicit
     # error field.
-    if re.match(r"^(ok|success|succeeded|pass|passed|clean|healthy|silent|noop|no_op)(\b|[_-])", text):
+    healthy_prefixes = "|".join(re.escape(prefix) for prefix in HEALTHY_STATUS_PREFIXES)
+    if re.match(rf"^({healthy_prefixes})(\b|[_-])", text):
         return False
     if re.search(r"(^|[_-])(verified|validated|recovered|resolved)$", text):
         return False
     tokens = {token for token in re.split(r"[^a-z0-9]+", text) if token}
-    return bool(tokens & FAILED_MARKERS)
+    if not tokens & FAILED_MARKERS:
+        return False
+    # Statuses like ``case_only_failure_cleared_pending_next_full_run`` and
+    # ``...personal_vault_excluded_pending...`` describe resolved work with a
+    # pending follow-up. They are not current failures unless paired with an
+    # explicit error field, which is handled separately by _error_values().
+    if tokens & RESOLVED_STATUS_TOKENS:
+        return False
+    if tokens & PENDING_FOLLOWUP_TOKENS and tokens & {"cleared", "excluded", "verified"}:
+        return False
+    return True
 
 
 def _status_values(*containers: Any) -> list[Any]:
@@ -309,7 +343,7 @@ def format_attention_report(items: list[AttentionItem], *, max_chars: int = 4000
 
     if not items:
         return ""
-    lines = [f"Memory Tree attention: {len(items)} item(s)"]
+    lines = [f"Attention needed: Memory Tree attention: {len(items)} item(s)"]
     for idx, item in enumerate(items, start=1):
         lines.extend(
             [
