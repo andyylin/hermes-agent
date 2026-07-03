@@ -1935,6 +1935,7 @@ class TestCronDefinitionsExport:
             deliver="local",
             skills=["watchers"],
             enabled_toolsets=["web"],
+            attach_to_session=True,
         )
 
         export_path = tmp_cron_dir / "cron" / "jobs.definitions.json"
@@ -1949,6 +1950,7 @@ class TestCronDefinitionsExport:
         assert exported["deliver"] == "local"
         assert exported["skills"] == ["watchers"]
         assert exported["enabled_toolsets"] == ["web"]
+        assert exported["attach_to_session"] is True
         assert "next_run_at" not in exported
         assert "last_run_at" not in exported
 
