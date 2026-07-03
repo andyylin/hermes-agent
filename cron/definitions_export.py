@@ -31,6 +31,7 @@ _DEFINITION_FIELDS = (
     "base_url",
     "script",
     "no_agent",
+    "attach_to_session",
     "context_from",
     "schedule",
     "schedule_display",
