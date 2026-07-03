@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agent.memory_tree_attention import _scan_ledger_records
+from agent.memory_tree_attention import _scan_ledger_records, format_attention_report
 
 
 def _items(records):
@@ -50,6 +50,25 @@ def test_verified_error_routing_status_is_not_failure():
                 "status": "broad_error_routing_verified",
                 "checked_at": "2026-06-04T00:00:00+00:00",
                 "evidence": "Repair-gate error routing was verified; this is not a current error.",
+            },
+        }
+    ]
+
+    assert _items(records) == []
+
+
+def test_resolved_failure_pending_next_run_is_not_current_failure():
+    records = [
+        {
+            "id": "backup-monitor",
+            "title": "Backup monitor",
+            "status": "active_remote_cron_running_with_case_rename_autorepair_and_personal_vault_exclusion",
+            "updated_at": "2026-06-04T00:00:00+00:00",
+            "runtime": {"cron_job_id": "abc123", "last_status": "ok"},
+            "verification": {
+                "status": "case_only_failure_cleared_personal_vault_excluded_pending_next_full_run",
+                "checked_at": "2026-06-04T00:00:00+00:00",
+                "evidence": "Prior case-only rename failure was cleared; next full run will prove the mirror.",
             },
         }
     ]
@@ -109,3 +128,18 @@ def test_recent_verification_with_source_handle_is_not_attention():
     ]
 
     assert _items(records) == []
+
+
+def test_attention_report_starts_with_repair_gate_marker():
+    records = [
+        {
+            "id": "broken-job",
+            "title": "Broken job",
+            "status": "active",
+            "runtime": {"cron_job_id": "abc123", "last_status": "error"},
+        }
+    ]
+
+    report = format_attention_report(_items(records))
+
+    assert report.startswith("Attention needed: Memory Tree attention:")

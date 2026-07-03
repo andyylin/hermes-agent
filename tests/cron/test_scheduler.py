@@ -94,6 +94,15 @@ Mattermost fetch failed: the posts API timed out or was reset on 3 visible chann
 
         assert _looks_like_cron_warning_or_error_alert(content)
 
+    def test_memory_tree_attention_report_is_alert_shaped(self):
+        content = """Attention needed: Memory Tree attention: 1 item(s)
+
+1. [failure] Backup monitor
+   kind: failed_automation
+"""
+
+        assert _looks_like_cron_warning_or_error_alert(content)
+
     def test_routine_report_with_risk_section_is_not_alert_shaped(self):
         content = """# Weekly Report
 
