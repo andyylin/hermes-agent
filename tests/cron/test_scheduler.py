@@ -77,6 +77,41 @@ class TestPerJobToolsetMcpMerge:
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
 
+    def test_resolver_explicit_empty_per_job_means_no_tools(self):
+        job = {"enabled_toolsets": []}
+        with patch("hermes_cli.tools_config._get_platform_tools") as m_platform:
+            result = _resolve_cron_enabled_toolsets(job, self.CFG)
+        m_platform.assert_not_called()
+        assert result == []
+
+
+class TestCronRepairGateAlertClassifier:
+    def test_bilingual_mattermost_fetch_failure_is_alert_shaped(self):
+        content = """Mattermost 讀取失敗：3 個可見頻道/DM 的 posts API 都逾時或被重置，這次沒有拿到可編輯候選，未做任何修改。
+
+Mattermost fetch failed: the posts API timed out or was reset on 3 visible channels/DMs, so no editable candidates were returned and no edits were made.
+"""
+
+        assert _looks_like_cron_warning_or_error_alert(content)
+
+    def test_memory_tree_attention_report_is_alert_shaped(self):
+        content = """Attention needed: Memory Tree attention: 1 item(s)
+
+1. [failure] Backup monitor
+   kind: failed_automation
+"""
+
+        assert _looks_like_cron_warning_or_error_alert(content)
+
+    def test_routine_report_with_risk_section_is_not_alert_shaped(self):
+        content = """# Weekly Report
+
+## Risks / caveats
+- One item may need review later.
+"""
+
+        assert not _looks_like_cron_warning_or_error_alert(content)
+
 
 class TestResolveOrigin:
     def test_full_origin(self):
