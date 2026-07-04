@@ -273,6 +273,9 @@ async def test_discord_can_still_require_mentions_when_enabled(adapter, monkeypa
 async def test_discord_free_response_channel_overrides_mention_requirement(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "789,999")
+    # Auto-thread failures correctly skip agent invocation; this test is about
+    # mention gating, not thread creation.
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
 
     message = make_message(channel=FakeTextChannel(channel_id=789), content="allowed without mention")
 
@@ -287,6 +290,8 @@ async def test_discord_free_response_channel_overrides_mention_requirement(adapt
 async def test_discord_free_response_channel_can_come_from_config_extra(adapter, monkeypatch):
     monkeypatch.delenv("DISCORD_REQUIRE_MENTION", raising=False)
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    # Keep the assertion focused on free-response config resolution.
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
     adapter.config.extra["free_response_channels"] = ["789", "999"]
 
     message = make_message(channel=FakeTextChannel(channel_id=789), content="allowed from config")
