@@ -166,15 +166,29 @@ def iter_recent_cron_outputs(home: Path, limit: int) -> Iterable[Path]:
     root = home / "cron" / "output"
     if not root.exists():
         return []
-    files = [p for p in root.glob("*/*.md") if p.is_file()]
-    files.sort(key=lambda p: (p.stat().st_mtime, str(p)), reverse=True)
-    return files[: max(0, limit)]
+    files: list[tuple[float, str, Path]] = []
+    for path in root.glob("*/*.md"):
+        try:
+            if not path.is_file():
+                continue
+            files.append((path.stat().st_mtime, str(path), path))
+        except FileNotFoundError:
+            # Cron output can be pruned while the memory tree build is scanning.
+            # A vanished record is not build-fatal; skip it and keep the pack fresh.
+            continue
+    files.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [path for _, _, path in files[: max(0, limit)]]
 
 
 def collect_cron_records(home: Path, *, limit: int) -> list[SourceRecord]:
     out: list[SourceRecord] = []
     for path in iter_recent_cron_outputs(home, limit):
-        text = path.read_text(encoding="utf-8", errors="replace").strip()
+        try:
+            stat = path.stat()
+            text = path.read_text(encoding="utf-8", errors="replace").strip()
+        except FileNotFoundError:
+            # The output disappeared between discovery and read; skip the stale path.
+            continue
         if not text or text.startswith("[SILENT]"):
             continue
         job_id = path.parent.name
@@ -183,7 +197,7 @@ def collect_cron_records(home: Path, *, limit: int) -> list[SourceRecord]:
                 source_type="cron-output",
                 source_id=f"{job_id}/{path.name}",
                 title=f"cron {job_id} {path.stem}",
-                timestamp=path.stat().st_mtime,
+                timestamp=stat.st_mtime,
                 text=compact_text(str(redact_secrets(text))),
                 metadata={"path": str(path.relative_to(home))},
             )
