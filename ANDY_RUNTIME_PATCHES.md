@@ -12,7 +12,7 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 
 - `fix(discord): auto-thread free-response channels`
   - Keeps free-response channels eligible for auto-threading.
-  - Critical live hunk: `skip_thread = bool(channel_ids & no_thread_channels)`.
+  - Critical live hunk: `skip_thread = bool(channel_keys & no_thread_channels)`.
   - Free-response status must not be part of `skip_thread`.
 
 - `fix: retitle Discord auto threads after first exchange`
@@ -45,7 +45,7 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 Before restarting live Hermes gateway after upstream updates:
 
 1. Confirm branch is `andy-runtime`.
-2. Confirm the Discord adapter has `skip_thread = bool(channel_ids & no_thread_channels)`.
+2. Confirm the Discord adapter has `skip_thread = bool(channel_keys & no_thread_channels)`.
 3. Confirm LINE group allowlist handling remains upstream in `plugins/platforms/line/adapter.py`.
 4. Run focused gateway/title/STT/cron tests.
 5. Restart the gateway and inspect logs for reconnect/errors.

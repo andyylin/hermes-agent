@@ -687,24 +687,28 @@ def test_env_loader_reapplies_bsm_after_second_dotenv_load(tmp_path, monkeypatch
 
     called = {"n": 0}
 
-    def fake_apply(**kwargs):
+    def fake_fetch(**kwargs):
         called["n"] += 1
-        os.environ["API_SERVER_KEY"] = "api-from-bsm"
-        os.environ["DISCORD_BOT_TOKEN"] = "discord-from-bsm"
-        return bw.FetchResult(
-            secrets={
-                "API_SERVER_KEY": "api-from-bsm",
-                "DISCORD_BOT_TOKEN": "discord-from-bsm",
-            },
-            applied=["API_SERVER_KEY", "DISCORD_BOT_TOKEN"],
-        )
+        return {
+            "API_SERVER_KEY": "api-from-bsm",
+            "DISCORD_BOT_TOKEN": "discord-from-bsm",
+        }, []
 
     monkeypatch.setattr(
-        "agent.secret_sources.bitwarden.apply_bitwarden_secrets",
-        fake_apply,
+        "agent.secret_sources.bitwarden.find_bws",
+        lambda **_kw: Path("/fake/bws"),
     )
+    monkeypatch.setattr(
+        "agent.secret_sources.bitwarden.fetch_bitwarden_secrets",
+        fake_fetch,
+    )
+    from agent.secret_sources import registry as reg_module
 
-    from hermes_cli.env_loader import load_hermes_dotenv
+    reg_module._reset_registry_for_tests()
+
+    from hermes_cli.env_loader import load_hermes_dotenv, reset_secret_source_cache
+
+    reset_secret_source_cache()
 
     load_hermes_dotenv(hermes_home=home)
     assert os.environ["API_SERVER_KEY"] == "api-from-bsm"
