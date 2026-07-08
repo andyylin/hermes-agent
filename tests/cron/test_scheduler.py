@@ -1126,12 +1126,12 @@ class TestDeliverResultWrapping:
         send_mock.assert_called_once()
         assert send_mock.call_args.kwargs["thread_id"] == "17585"
 
-    def test_live_adapter_private_telegram_topic_uses_direct_messages_topic_id(self):
-        """Cron deliveries to Telegram DM topics need Bot API topic metadata.
+    def test_live_adapter_private_telegram_topic_probe_failure_uses_thread_id(self):
+        """Ambiguous Telegram topic targets fail safe to message_thread_id.
 
-        A bare message_thread_id for a private DM topic has no live reply
-        anchor, so the Telegram adapter refuses to send outside the requested
-        topic. Cron must pass direct_messages_topic_id for exact thread targets.
+        Without a usable live get_chat_info probe, cron must not guess that a
+        positive chat id plus numeric thread id is a Bot API channel-DM topic;
+        private/forum-style topics are the common case.
         """
         import concurrent.futures
 
@@ -1143,7 +1143,7 @@ class TestDeliverResultWrapping:
         mock_cfg = MagicMock()
         mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
         adapter = MagicMock()
-        adapter.send = MagicMock(return_value=object())
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="42"))
         loop = MagicMock()
         loop.is_running.return_value = True
         def fake_schedule(coro, _loop):
@@ -1169,7 +1169,7 @@ class TestDeliverResultWrapping:
         assert adapter.send.call_args.args[0] == "545944400"
         assert "hello" in adapter.send.call_args.args[1]
         assert adapter.send.call_args.kwargs["metadata"] == {
-            "direct_messages_topic_id": "78807",
+            "thread_id": "78807",
             "job_id": "dm-topic-job",
         }
 

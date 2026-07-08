@@ -5437,19 +5437,13 @@ class DiscordAdapter(BasePlatformAdapter):
         Strip Discord mention syntax (users / roles / channels) so thread
         titles don't show raw <@id>, <@&id>, or <#id> markers — the ID
         isn't meaningful to humans glancing at the thread list (#6336).
-        Real semantic naming is done after the first agent turn, when
-        Hermes has an LLM-generated session title and can safely rename
-        only this newly-created thread.
+        When smart thread titles are enabled, use the deterministic first-clause
+        placeholder; semantic LLM retitling still happens after the first agent
+        turn and is guarded against clobbering human renames.
         """
-        content = (content or "").strip()
-        # <@123>, <@!123>, <@&123>, <#123> — collapse to empty; normalize spaces.
-        content = re.sub(r"<@[!&]?\d+>", "", content)
-        content = re.sub(r"<#\d+>", "", content)
-        content = re.sub(r"\s+", " ", content).strip()
-        thread_name = content[:80] if content else "Hermes"
-        if len(content) > 80:
-            thread_name = thread_name[:77] + "..."
-        return thread_name
+        if _discord_bool_env("DISCORD_SMART_THREAD_TITLES", False):
+            return _build_auto_thread_name(content)
+        return _legacy_auto_thread_name(content)
 
     async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
         """Create a thread from a user message for auto-threading.
@@ -5567,7 +5561,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if edit is None:
             return False
         try:
-            await edit(name=cleaned, reason="Hermes semantic session title")
+            await edit(name=cleaned, reason="Hermes auto-generated conversation title")
             logger.info(
                 "[%s] Renamed Discord thread %s from %r to %r",
                 self.name, thread_id, current_name, cleaned,
