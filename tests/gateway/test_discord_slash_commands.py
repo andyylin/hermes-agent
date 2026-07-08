@@ -1001,6 +1001,31 @@ async def test_rename_thread_guard_allows_gateway_prefixed_expected_name(adapter
 
 
 @pytest.mark.asyncio
+async def test_rename_thread_guard_accepts_multiple_expected_names(adapter):
+    thread = _FakeThreadChannel(
+        channel_id=777,
+        name="How come n8n still sent me a error message email instead of routing through a...",
+    )
+    thread.edit = AsyncMock()
+    adapter._client.get_channel = lambda _id: thread
+
+    result = await adapter.rename_thread(
+        "777",
+        "Appsheet Sync failure and Auto-Repair",
+        only_if_current_name=[
+            "[The user sent a text document: 'message",
+            "How come n8n still sent me a error message email instead of routing through a...",
+        ],
+    )
+
+    assert result is True
+    thread.edit.assert_awaited_once_with(
+        name="Appsheet Sync failure and Auto-Repair",
+        reason="Hermes auto-generated conversation title",
+    )
+
+
+@pytest.mark.asyncio
 async def test_rename_thread_ignores_non_thread_channel(adapter):
     adapter._client.get_channel = lambda _id: _FakeTextChannel(channel_id=777)
 

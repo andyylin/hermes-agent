@@ -13776,6 +13776,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cleaned = _prefix_within_utf16_limit(cleaned, 77).rstrip() + "..."
         return cleaned
 
+    def _discord_thread_name_from_chat_name(self, source: SessionSource) -> str | None:
+        """Extract the visible Discord thread name captured at intake time.
+
+        Auto-thread retitling uses a compare-and-swap guard so we don't
+        overwrite human titles. For document/attachment first turns, the
+        agent-facing message can be enriched with document text before the
+        title callback runs, while Discord created the visible thread from the
+        raw starter text. The source chat name still carries that visible
+        Discord thread name (``guild / #channel / thread``), so keep it as an
+        allowed guard seed.
+        """
+        if source.platform != Platform.DISCORD or source.chat_type != "thread":
+            return None
+        chat_name = str(getattr(source, "chat_name", "") or "").strip()
+        if not chat_name:
+            return None
+        if " / " in chat_name:
+            chat_name = chat_name.rsplit(" / ", 1)[-1].strip()
+        return chat_name or None
+
+    def _discord_auto_thread_guard_names(self, source: SessionSource) -> list[str]:
+        """Return candidate auto-created names for Discord retitle CAS guard."""
+        candidates: list[str] = []
+        for value in (
+            getattr(source, "auto_thread_initial_name", None),
+            self._discord_thread_name_from_chat_name(source),
+        ):
+            cleaned = re.sub(r"\s+", " ", str(value or "")).strip()
+            if cleaned and cleaned not in candidates:
+                candidates.append(cleaned)
+        return candidates
+
     async def _rename_discord_auto_thread_for_session_title(
         self,
         source: SessionSource,
@@ -13796,7 +13828,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await rename_thread(
                 str(source.thread_id),
                 thread_name,
-                only_if_current_name=getattr(source, "auto_thread_initial_name", None),
+                only_if_current_name=self._discord_auto_thread_guard_names(source),
             )
         except Exception:
             logger.debug("Failed to rename Discord auto-thread for generated session title", exc_info=True)

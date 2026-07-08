@@ -77,3 +77,21 @@ async def test_rename_discord_thread_for_session_title_is_gated_by_config(monkey
     await runner._rename_discord_thread_for_session_title(source, "sess-1", "Better Thread Title")
 
     adapter.rename_thread.assert_not_awaited()
+
+def test_discord_auto_thread_guard_names_include_visible_chat_name():
+    runner = _runner_with_discord_adapter(SimpleNamespace())
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="456",
+        chat_name="Guild / #hermes / How come n8n still sent me a error message email instead of routing through a...",
+        chat_type="thread",
+        thread_id="456",
+        parent_chat_id="123",
+        auto_thread_created=True,
+        auto_thread_initial_name="[The user sent a text document: 'message",
+    )
+
+    assert runner._discord_auto_thread_guard_names(source) == [
+        "[The user sent a text document: 'message",
+        "How come n8n still sent me a error message email instead of routing through a...",
+    ]

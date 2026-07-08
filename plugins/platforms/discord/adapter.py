@@ -5507,12 +5507,15 @@ class DiscordAdapter(BasePlatformAdapter):
         thread_id: str,
         name: str,
         *,
-        only_if_current_name: Optional[str] = None,
+        only_if_current_name: Optional[str | list[str] | tuple[str, ...] | set[str]] = None,
     ) -> bool:
         """Best-effort Discord thread rename.
 
         ``only_if_current_name`` prevents overwriting human-renamed or
-        pre-existing threads.  This is intentionally a no-op on mismatch.
+        pre-existing threads.  It may be a single expected seed title or a
+        collection of seed titles when the agent-facing message differs from
+        the raw Discord thread starter (for example text-document injection).
+        This is intentionally a no-op on mismatch.
         """
         if not self._client or not DISCORD_AVAILABLE:
             return False
@@ -5541,11 +5544,14 @@ class DiscordAdapter(BasePlatformAdapter):
 
         current_name = getattr(thread, "name", None)
         if only_if_current_name is not None:
-            raw_expected = str(only_if_current_name or "")
-            expected_names = {
-                raw_expected,
-                _strip_gateway_speaker_prefix(raw_expected),
-            }
+            if isinstance(only_if_current_name, (list, tuple, set)):
+                raw_expected_names = [str(name or "") for name in only_if_current_name]
+            else:
+                raw_expected_names = [str(only_if_current_name or "")]
+            expected_names = set()
+            for raw_expected in raw_expected_names:
+                expected_names.add(raw_expected)
+                expected_names.add(_strip_gateway_speaker_prefix(raw_expected))
             expected_names = {re.sub(r"\s+", " ", name).strip() for name in expected_names}
             expected_names.discard("")
             if current_name not in expected_names:
