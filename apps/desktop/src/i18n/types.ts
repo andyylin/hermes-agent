@@ -1367,6 +1367,9 @@ export interface Translations {
       export: string
       branchFrom: string
       rename: string
+      moveToProject: string
+      movedToProject: (project: string) => string
+      moveToProjectFailed: string
       archive: string
       newWindow: string
       hideTabBar: string
