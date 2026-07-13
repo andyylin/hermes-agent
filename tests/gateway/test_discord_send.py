@@ -487,6 +487,50 @@ async def test_finalize_edit_puts_fenced_code_block_in_standalone_message():
     assert result.message_id == "12"
 
 
+@pytest.mark.asyncio
+async def test_send_attaches_oversized_fenced_block_as_txt():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(
+        id=555,
+        send=AsyncMock(return_value=SimpleNamespace(id=20)),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    content = "```python\n" + ("x = 1\n" * 400) + "```"
+
+    result = await adapter.send("555", content)
+
+    assert result.success is True
+    kwargs = channel.send.await_args.kwargs
+    assert kwargs["content"] == "Code attached as TXT."
+    assert kwargs["file"].filename == "hermes-code-block.txt"
+
+
+@pytest.mark.asyncio
+async def test_finalize_edit_attaches_oversized_fenced_block_as_txt():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    original = SimpleNamespace(id=10, edit=AsyncMock())
+    channel = SimpleNamespace(
+        id=555,
+        fetch_message=AsyncMock(return_value=original),
+        send=AsyncMock(return_value=SimpleNamespace(id=21)),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    content = "```text\n" + ("copy me\n" * 300) + "```"
+
+    result = await adapter.edit_message("555", "10", content, finalize=True)
+
+    assert result.success is True
+    original.edit.assert_awaited_once_with(content="Code attached as TXT.")
+    assert channel.send.await_args.kwargs["file"].filename == "hermes-code-block.txt"
+    assert result.message_id == "21"
+
+
 # ---------------------------------------------------------------------------
 # Typing indicator task lifecycle
 # ---------------------------------------------------------------------------
