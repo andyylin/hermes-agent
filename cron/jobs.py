@@ -1433,16 +1433,23 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
             f"Cannot resume: one-shot time {run_at} is in the past "
             f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire."
         )
-    return update_job(
-        job["id"],
-        {
-            "enabled": True,
-            "state": "scheduled",
-            "paused_at": None,
-            "paused_reason": None,
-            "next_run_at": next_run_at,
-        },
-    )
+    updates = {
+        "enabled": True,
+        "state": "scheduled",
+        "paused_at": None,
+        "paused_reason": None,
+        "next_run_at": next_run_at,
+    }
+    # Resuming a completed bounded job means re-arming the same bounded cycle.
+    # Ordinary paused jobs retain their progress; only terminal completion resets
+    # the exhausted counter and closeout metadata.
+    if job.get("state") == "completed":
+        repeat = job.get("repeat")
+        if isinstance(repeat, dict) and repeat.get("times") is not None:
+            updates["repeat"] = {**repeat, "completed": 0}
+        updates["completed_at"] = None
+        updates["completion_reason"] = None
+    return update_job(job["id"], updates)
 
 
 def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -1490,8 +1497,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     """
     Mark a job as having been run.
     
-    Updates last_run_at, last_status, increments completed count,
-    computes next_run_at, and auto-deletes if repeat limit reached.
+    Updates last_run_at, last_status, increments completed count, and computes
+    next_run_at. One-shot jobs still auto-delete after dispatch; bounded
+    recurring jobs are retained in a disabled ``completed`` state so the user
+    can review and explicitly delete, keep, or re-arm them.
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
@@ -1535,10 +1544,21 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         completed += 1
                         repeat["completed"] = completed
 
-                    # Check if we've hit the repeat limit
+                    # Check if we've hit the repeat limit. One-shot reminders
+                    # remain disposable; retaining every one-off would replace
+                    # useful lifecycle review with a graveyard. Recurring
+                    # bounded jobs, however, need a durable object behind the
+                    # closeout receipt so the user can choose delete/keep/resume.
                     if times is not None and times > 0 and completed >= times:
-                        # Remove the job (limit reached)
-                        jobs.pop(i)
+                        if kind == "once":
+                            jobs.pop(i)
+                            save_jobs(jobs)
+                            return
+                        job["enabled"] = False
+                        job["state"] = "completed"
+                        job["next_run_at"] = None
+                        job["completed_at"] = now
+                        job["completion_reason"] = "run_limit_reached"
                         save_jobs(jobs)
                         return
                 

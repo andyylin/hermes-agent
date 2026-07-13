@@ -1395,6 +1395,45 @@ def _one_shot_delivery_footer(job: dict) -> str:
     return f"This was a one-off {noun}; it will not repeat."
 
 
+def _is_final_bounded_recurring_run(job: dict) -> bool:
+    """Return True when this execution consumes a recurring job's last run."""
+    repeat = job.get("repeat")
+    if not isinstance(repeat, dict):
+        return False
+    times = repeat.get("times")
+    completed = repeat.get("completed", 0)
+    kind = (job.get("schedule") or {}).get("kind")
+    return (
+        kind in {"cron", "interval"}
+        and isinstance(times, int)
+        and times > 0
+        and isinstance(completed, int)
+        and completed + 1 >= times
+    )
+
+
+def _bounded_job_closeout(job: dict, *, success: bool) -> str:
+    """Build the one-time review request appended to a bounded job's final run."""
+    job_id = str(job.get("id") or "")
+    name = str(job.get("name") or job_id or "cron job")
+    repeat = job.get("repeat") or {}
+    times = repeat.get("times")
+    prompt = " ".join(str(job.get("prompt") or "").split())
+    if len(prompt) > 240:
+        prompt = prompt[:237].rstrip() + "..."
+    purpose = prompt or name
+    outcome = "completed its final run" if success else "reached its run limit with a failure"
+    return (
+        f"## Automation closeout\n\n"
+        f"`{name}` {outcome}. It is now disabled and will not run again.\n\n"
+        f"- **Purpose:** {purpose}\n"
+        f"- **Bound:** {times} runs\n"
+        f"- **Job ID:** `{job_id}`\n\n"
+        f"Should I **delete it**, **keep it completed**, or **resume/edit it**? "
+        f"Reply with your choice and the job ID. If you do nothing, it stays safely disabled."
+    )
+
+
 def _append_cron_email_reference_footer(job: dict, body: str) -> str:
     """Add a copy/paste reference code to cron email notifications."""
     from tools.email_rendering import append_notification_reference_footer, make_notification_ref
@@ -3929,6 +3968,15 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # If the agent responded with [SILENT], skip delivery (but
             # output is already saved above).  Failed jobs always deliver.
             deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+            final_bounded_run = _is_final_bounded_recurring_run(job)
+            if final_bounded_run:
+                closeout = _bounded_job_closeout(job, success=success)
+                if success and _is_cron_silence_response(deliver_content):
+                    deliver_content = closeout
+                elif deliver_content.strip():
+                    deliver_content = f"{deliver_content.rstrip()}\n\n{closeout}"
+                else:
+                    deliver_content = closeout
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
@@ -3939,7 +3987,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # a real report that merely quoted "[SILENT]" mid-sentence (#51438,
             # #46917).  Keeps the intentional bracketed-prefix / trailing-line
             # tolerance the cron contract relies on.
-            if should_deliver and success and _is_cron_silence_response(deliver_content):
+            if should_deliver and success and not final_bounded_run and _is_cron_silence_response(deliver_content):
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                 should_deliver = False
 

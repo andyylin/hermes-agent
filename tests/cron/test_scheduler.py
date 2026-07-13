@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _format_cron_delivery_content, _looks_like_cron_warning_or_error_alert
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _format_cron_delivery_content, _looks_like_cron_warning_or_error_alert, _bounded_job_closeout, _is_final_bounded_recurring_run
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -658,6 +658,39 @@ class TestDeliverResultWrapping:
 
         assert "This was a one-off job; it will not repeat." in sent_content
         assert "To stop or manage this job" not in sent_content
+
+    def test_final_bounded_recurring_run_detection_and_closeout(self):
+        job = {
+            "id": "bounded-123",
+            "name": "Check import propagation",
+            "prompt": "Check whether the imported artifact propagated to the remote vault.",
+            "schedule": {"kind": "interval"},
+            "repeat": {"times": 3, "completed": 2},
+        }
+
+        assert _is_final_bounded_recurring_run(job) is True
+        closeout = _bounded_job_closeout(job, success=True)
+        assert "## Automation closeout" in closeout
+        assert "completed its final run" in closeout
+        assert "**Bound:** 3 runs" in closeout
+        assert "`bounded-123`" in closeout
+        assert "delete it" in closeout
+        assert "keep it completed" in closeout
+        assert "resume/edit it" in closeout
+        assert "If you do nothing, it stays safely disabled." in closeout
+
+    def test_nonfinal_and_one_shot_runs_do_not_trigger_closeout(self):
+        recurring = {
+            "schedule": {"kind": "interval"},
+            "repeat": {"times": 3, "completed": 1},
+        }
+        one_shot = {
+            "schedule": {"kind": "once"},
+            "repeat": {"times": 1, "completed": 0},
+        }
+
+        assert _is_final_bounded_recurring_run(recurring) is False
+        assert _is_final_bounded_recurring_run(one_shot) is False
 
     def test_delivery_uses_job_id_when_no_name(self):
         """When a job has no name, the wrapper should fall back to job id."""

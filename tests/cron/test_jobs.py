@@ -450,6 +450,22 @@ class TestPauseResumeJob:
         assert resumed["paused_at"] is None
         assert resumed["paused_reason"] is None
 
+    def test_resume_completed_bounded_job_rearms_counter(self, tmp_cron_dir):
+        job = create_job(prompt="Bounded", schedule="every 1h", repeat=2)
+        mark_job_run(job["id"], success=True)
+        mark_job_run(job["id"], success=True)
+        completed = get_job(job["id"])
+        assert completed["state"] == "completed"
+        assert completed["repeat"]["completed"] == 2
+
+        resumed = resume_job(job["id"])
+
+        assert resumed["enabled"] is True
+        assert resumed["state"] == "scheduled"
+        assert resumed["repeat"] == {"times": 2, "completed": 0}
+        assert resumed["completed_at"] is None
+        assert resumed["completion_reason"] is None
+
     def test_resume_rejects_past_oneshot(self, tmp_cron_dir, monkeypatch):
         """Resuming a paused one-shot whose time is now in the past must raise
         ValueError — the revived job would silently never fire."""
@@ -575,10 +591,19 @@ class TestMarkJobRun:
         assert updated["repeat"]["completed"] == 1
         assert updated["last_status"] == "ok"
 
-    def test_repeat_limit_removes_job(self, tmp_cron_dir):
-        job = create_job(prompt="Once", schedule="30m", repeat=1)
+    def test_repeat_limit_retains_completed_recurring_job(self, tmp_cron_dir):
+        job = create_job(prompt="Bounded", schedule="every 30m", repeat=1)
         mark_job_run(job["id"], success=True)
-        # Job should be removed after hitting repeat limit
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["enabled"] is False
+        assert updated["state"] == "completed"
+        assert updated["completion_reason"] == "run_limit_reached"
+        assert updated["next_run_at"] is None
+
+    def test_one_shot_still_removes_job_at_repeat_limit(self, tmp_cron_dir):
+        job = create_job(prompt="One shot", schedule="1h")
+        mark_job_run(job["id"], success=True)
         assert get_job(job["id"]) is None
 
     def test_repeat_negative_one_is_infinite(self, tmp_cron_dir):
