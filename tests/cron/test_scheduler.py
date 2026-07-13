@@ -2891,11 +2891,31 @@ class TestSilentDelivery:
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
-             patch("cron.scheduler.mark_job_run"):
+             patch("cron.scheduler._deliver_result", return_value=None) as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
             from cron.scheduler import tick
             tick(verbose=False)
         deliver_mock.assert_called_once()
+        receipt = mark_mock.call_args.kwargs["delivery_receipt"]
+        assert receipt["job_id"] == "monitor-job"
+        assert receipt["target"] == "origin"
+        assert receipt["intended_output_delivered"] is False
+
+    def test_successful_report_records_run_correlated_delivery_receipt(self):
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "Dad report", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        receipt = mark_mock.call_args.kwargs["delivery_receipt"]
+        assert receipt["job_id"] == "monitor-job"
+        assert receipt["target"] == "origin"
+        assert receipt["intended_output_delivered"] is True
+        assert receipt["started_at"] <= receipt["completed_at"]
+        assert receipt["run_id"]
 
     def test_output_saved_even_when_delivery_suppressed(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
@@ -2920,12 +2940,15 @@ class TestSilentDelivery:
             tick(verbose=False)
 
         deliver_mock.assert_not_called()
-        mark_mock.assert_called_once_with(
+        args = mark_mock.call_args.args
+        kwargs = mark_mock.call_args.kwargs
+        assert args == (
             "monitor-job",
             False,
             "Agent completed but produced empty response (model error, timeout, or misconfiguration)",
-            delivery_error=None,
         )
+        assert kwargs["delivery_error"] is None
+        assert kwargs["delivery_receipt"]["intended_output_delivered"] is False
 
 
 class TestOneShotDispatchClaim:

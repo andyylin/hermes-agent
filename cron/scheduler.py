@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -3883,6 +3884,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    run_id = uuid.uuid4().hex
+    run_started_at = _hermes_now().isoformat()
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -4022,13 +4025,42 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+            run_completed_at = _hermes_now().isoformat()
+            delivery_receipt = {
+                "run_id": run_id,
+                "job_id": job["id"],
+                "started_at": run_started_at,
+                "completed_at": run_completed_at,
+                "target": job.get("deliver"),
+                # A successfully delivered failure alert is not proof that the
+                # intended job output reached the target.
+                "intended_output_delivered": bool(success and should_deliver and delivery_error is None),
+            }
+            mark_job_run(
+                job["id"],
+                success,
+                error,
+                delivery_error=delivery_error,
+                delivery_receipt=delivery_receipt,
+            )
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], False, str(e))
+            mark_job_run(
+                job["id"],
+                False,
+                str(e),
+                delivery_receipt={
+                    "run_id": run_id,
+                    "job_id": job["id"],
+                    "started_at": run_started_at,
+                    "completed_at": _hermes_now().isoformat(),
+                    "target": job.get("deliver"),
+                    "intended_output_delivered": False,
+                },
+            )
         return False
 
 

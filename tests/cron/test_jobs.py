@@ -651,6 +651,23 @@ class TestMarkJobRun:
         updated = get_job(job["id"])
         assert updated["last_delivery_error"] is None
 
+    def test_delivery_receipt_is_persisted_and_cleared_per_run(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        receipt = {
+            "run_id": "run-1",
+            "job_id": job["id"],
+            "started_at": "2026-07-14T19:30:00+08:00",
+            "completed_at": "2026-07-14T19:30:12+08:00",
+            "target": "telegram:123",
+            "intended_output_delivered": True,
+        }
+
+        mark_job_run(job["id"], success=True, delivery_receipt=receipt)
+        assert get_job(job["id"])["last_delivery_receipt"] == receipt
+
+        mark_job_run(job["id"], success=False, error="later failure")
+        assert get_job(job["id"])["last_delivery_receipt"] is None
+
     def test_both_agent_and_delivery_error(self, tmp_cron_dir):
         """Agent fails AND delivery fails — both errors recorded."""
         job = create_job(prompt="Report", schedule="every 1h")

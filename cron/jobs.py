@@ -1493,7 +1493,8 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 delivery_receipt: Optional[Dict[str, Any]] = None):
     """
     Mark a job as having been run.
     
@@ -1504,6 +1505,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+
+    ``delivery_receipt`` is an execution-scoped proof record. It is replaced
+    on every run (including with ``None``) so a later run cannot accidentally
+    reuse an older run's delivery evidence.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -1515,6 +1520,9 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                # Replace receipt evidence on every run so status and receipt
+                # always describe the same scheduler execution.
+                job["last_delivery_receipt"] = delivery_receipt
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
