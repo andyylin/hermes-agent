@@ -390,6 +390,104 @@ async def test_forum_post_file_creation_failure():
 
 
 # ---------------------------------------------------------------------------
+# Standalone fenced-code messages
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_puts_fenced_code_block_in_standalone_message():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(
+        send=AsyncMock(side_effect=[
+            SimpleNamespace(id=1), SimpleNamespace(id=2), SimpleNamespace(id=3),
+        ]),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send(
+        "555",
+        "Run this: `inline`\n\n```python\nprint('copy me')\n```\n\nThen continue.",
+    )
+
+    assert result.success is True
+    assert [call.kwargs["content"] for call in channel.send.await_args_list] == [
+        "Run this: `inline`",
+        "```python\nprint('copy me')\n```",
+        "Then continue.",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_to_forum_puts_fenced_code_block_in_standalone_message():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    thread_ch = SimpleNamespace(
+        id=555,
+        send=AsyncMock(side_effect=[SimpleNamespace(id=501), SimpleNamespace(id=502)]),
+    )
+    thread = SimpleNamespace(
+        id=555,
+        message=SimpleNamespace(id=500),
+        thread=thread_ch,
+    )
+    forum_channel = _discord_mod.ForumChannel()
+    forum_channel.id = 999
+    forum_channel.name = "ideas"
+    forum_channel.create_thread = AsyncMock(return_value=thread)
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: forum_channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send(
+        "999", "Intro\n\n```text\ncopy me\n```\n\nOutro",
+    )
+
+    assert result.success is True
+    assert forum_channel.create_thread.await_args.kwargs["content"] == "Intro"
+    assert [call.kwargs["content"] for call in thread_ch.send.await_args_list] == [
+        "```text\ncopy me\n```",
+        "Outro",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_finalize_edit_puts_fenced_code_block_in_standalone_message():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    original = SimpleNamespace(
+        id=10,
+        edit=AsyncMock(),
+        to_reference=MagicMock(return_value=None),
+    )
+    channel = SimpleNamespace(
+        id=555,
+        fetch_message=AsyncMock(return_value=original),
+        send=AsyncMock(side_effect=[SimpleNamespace(id=11), SimpleNamespace(id=12)]),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.edit_message(
+        "555",
+        "10",
+        "Intro\n\n```text\ncopy me\n```\n\nOutro",
+        finalize=True,
+    )
+
+    assert result.success is True
+    original.edit.assert_awaited_once_with(content="Intro")
+    assert [call.kwargs["content"] for call in channel.send.await_args_list] == [
+        "```text\ncopy me\n```",
+        "Outro",
+    ]
+    assert result.message_id == "12"
+
+
+# ---------------------------------------------------------------------------
 # Typing indicator task lifecycle
 # ---------------------------------------------------------------------------
 

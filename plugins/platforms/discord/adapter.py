@@ -2102,6 +2102,41 @@ class DiscordAdapter(BasePlatformAdapter):
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
 
+    def _standalone_fenced_chunks(self, content: str) -> List[str]:
+        """Split Discord prose and triple-backtick fences into separate messages.
+
+        Discord mobile exposes a convenient copy action for a standalone fenced
+        block. Inline backticks are deliberately ignored. Each resulting segment
+        still passes through the normal length-aware splitter.
+        """
+        formatted = self.format_message(content)
+        fence_re = re.compile(
+            r"^```[^\n]*(?:\n|$).*?^```[ \t]*(?=\n|$)",
+            re.MULTILINE | re.DOTALL,
+        )
+        segments: List[str] = []
+        cursor = 0
+        for match in fence_re.finditer(formatted):
+            prose = formatted[cursor:match.start()].strip()
+            if prose:
+                segments.extend(
+                    self.truncate_message(prose, self.MAX_MESSAGE_LENGTH)
+                )
+            fence = match.group(0).strip("\n")
+            if fence:
+                segments.extend(
+                    self.truncate_message(fence, self.MAX_MESSAGE_LENGTH)
+                )
+            cursor = match.end()
+
+        tail = formatted[cursor:].strip()
+        if tail:
+            segments.extend(self.truncate_message(tail, self.MAX_MESSAGE_LENGTH))
+
+        if segments:
+            return segments
+        return self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+
     async def send(
         self,
         chat_id: str,
@@ -2146,9 +2181,9 @@ class DiscordAdapter(BasePlatformAdapter):
             if self._is_forum_parent(channel):
                 return await self._send_to_forum(channel, content)
 
-            # Format and split message if needed
-            formatted = self.format_message(content)
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            # Keep triple-backtick blocks in standalone Discord messages. Inline
+            # backticks remain in the surrounding prose.
+            chunks = self._standalone_fenced_chunks(content)
 
             message_ids = []
             reference = None
@@ -2230,8 +2265,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # _derive_forum_thread_name is defined further down in this same
         # module — no cross-module import needed.
 
-        formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        chunks = self._standalone_fenced_chunks(content)
 
         thread_name = _derive_forum_thread_name(content)
 
@@ -2364,6 +2398,20 @@ class DiscordAdapter(BasePlatformAdapter):
             msg = await channel.fetch_message(int(message_id))
             formatted = self.format_message(content)
 
+            # On the final streaming edit, replace the preview with the first
+            # prose/fence segment and send the remaining standalone segments as
+            # continuations. Mid-stream previews stay in one editable message.
+            if finalize:
+                final_chunks = self._standalone_fenced_chunks(content)
+                if len(final_chunks) > 1:
+                    return await self._edit_overflow_split(
+                        channel,
+                        msg,
+                        message_id,
+                        content,
+                        chunks=final_chunks,
+                    )
+
             _preview_key = (str(chat_id), str(message_id))
             _saturated_preview = False
             if finalize:
@@ -2445,11 +2493,13 @@ class DiscordAdapter(BasePlatformAdapter):
         msg: Any,
         message_id: str,
         content: str,
+        *,
+        chunks: Optional[List[str]] = None,
     ) -> SendResult:
-        """Deliver an oversized final edit across message + continuations.
+        """Deliver a segmented final edit across message + continuations.
 
-        Edit the original ``message_id`` with chunk 1 (fence-aware, with the
-        usual ``(1/N)`` indicator), then send chunks 2..N as new messages each
+        Edit the original ``message_id`` with chunk 1, then send chunks 2..N
+        as new messages each
         threaded as a reply to the previous chunk so Discord groups them
         visually.  Returns ``SendResult(success=True, message_id=<last-id>,
         continuation_message_ids=(...))`` so the stream consumer keeps editing
@@ -2464,7 +2514,8 @@ class DiscordAdapter(BasePlatformAdapter):
         returns ``success=False`` (a real adapter problem, not overflow).
         """
         formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        if chunks is None:
+            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         if len(chunks) <= 1:
             # Defensive: caller's pre-flight should guarantee >1 chunk, but if
             # not, just edit normally.
