@@ -13,6 +13,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import inspect
+import io
 import json
 import logging
 import math
@@ -2848,6 +2849,25 @@ class DiscordAdapter(BasePlatformAdapter):
             return segments
         return self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
+    def _oversized_fence_file(self, content: str) -> Optional[Any]:
+        """Return a TXT attachment when the response is one oversized fence."""
+        formatted = self.format_message(content).strip()
+        match = re.fullmatch(
+            r"```[^\n]*(?:\n|$).*\n```[ \t]*",
+            formatted,
+            re.DOTALL,
+        )
+        if not match or len(formatted) <= self.MAX_MESSAGE_LENGTH:
+            return None
+        # Strip only the Markdown fence; preserve the code payload exactly.
+        first_newline = formatted.find("\n")
+        payload = formatted[first_newline + 1:] if first_newline >= 0 else ""
+        payload = re.sub(r"\n```[ \t]*$", "", payload)
+        return discord.File(
+            io.BytesIO(payload.encode("utf-8")),
+            filename="hermes-code-block.txt",
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -2888,6 +2908,20 @@ class DiscordAdapter(BasePlatformAdapter):
                     channel = await self._client.fetch_channel(int(chat_id))
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
+
+            oversized_fence = self._oversized_fence_file(content)
+            if oversized_fence is not None:
+                if self._is_forum_parent(channel):
+                    return await self._forum_post_file(
+                        channel,
+                        content="Code attached as TXT.",
+                        file=oversized_fence,
+                    )
+                msg = await channel.send(
+                    content="Code attached as TXT.",
+                    file=oversized_fence,
+                )
+                return SendResult(success=True, message_id=str(msg.id))
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
@@ -3139,6 +3173,18 @@ class DiscordAdapter(BasePlatformAdapter):
             # prose/fence segment and send the remaining standalone segments as
             # continuations. Mid-stream previews stay in one editable message.
             if finalize:
+                oversized_fence = self._oversized_fence_file(content)
+                if oversized_fence is not None:
+                    await msg.edit(content="Code attached as TXT.")
+                    sent = await channel.send(file=oversized_fence)
+                    sent_id = str(sent.id)
+                    self._last_self_message_id[str(channel.id)] = sent_id
+                    return SendResult(
+                        success=True,
+                        message_id=sent_id,
+                        continuation_message_ids=(sent_id,),
+                    )
+
                 final_chunks = self._standalone_fenced_chunks(content)
                 if len(final_chunks) > 1:
                     return await self._edit_overflow_split(
