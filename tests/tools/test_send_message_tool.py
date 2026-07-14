@@ -768,6 +768,31 @@ class TestSendToPlatformChunking:
         for call in send.await_args_list:
             assert len(call.args[2]) <= 2020  # each chunk fits the limit
 
+    def test_long_forum_message_reuses_created_thread_for_followup_chunks(self):
+        """Standalone fallback must create one forum topic, not one per chunk."""
+        send = AsyncMock(side_effect=[
+            {"success": True, "message_id": "starter", "thread_id": "thread-123"},
+            {"success": True, "message_id": "followup-1"},
+            {"success": True, "message_id": "followup-2"},
+        ])
+        long_msg = "word " * 1000
+
+        with _patch_discord_sender(send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.DISCORD,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "forum-parent",
+                    long_msg,
+                )
+            )
+
+        assert result["success"] is True
+        assert send.await_count == 3
+        assert send.await_args_list[0].kwargs["thread_id"] is None
+        assert send.await_args_list[1].kwargs["thread_id"] == "thread-123"
+        assert send.await_args_list[2].kwargs["thread_id"] == "thread-123"
+
     def test_slack_messages_are_formatted_before_send(self, monkeypatch):
         _ensure_slack_mock(monkeypatch)
 
