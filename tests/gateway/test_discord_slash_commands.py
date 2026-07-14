@@ -700,7 +700,7 @@ async def test_auto_create_thread_uses_message_content_as_name(adapter, monkeypa
     message.create_thread.assert_awaited_once()
     call_kwargs = message.create_thread.await_args[1]
     assert call_kwargs["name"] == "Hello world, how are you?"
-    assert call_kwargs["auto_archive_duration"] == 1440
+    assert call_kwargs["auto_archive_duration"] == 10080
     assert thread._hermes_auto_thread_initial_name == "Hello world, how are you?"
 
 
@@ -798,7 +798,7 @@ async def test_auto_create_thread_falls_back_to_seed_message(adapter):
     message.channel.send.assert_awaited_once_with("🧵 Thread created by Hermes: **Hello**")
     seed_message.create_thread.assert_awaited_once_with(
         name="Hello",
-        auto_archive_duration=1440,
+        auto_archive_duration=10080,
         reason="Auto-threaded from mention by Jezza",
     )
 
@@ -1228,11 +1228,16 @@ def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
     hermes_dir.mkdir()
     config_path = hermes_dir / "config.yaml"
     config_path.write_text(yaml.dump({
-        "discord": {"auto_thread": True, "smart_thread_titles": True},
+        "discord": {
+            "auto_thread": True,
+            "smart_thread_titles": True,
+            "thread_auto_archive_minutes": 10080,
+        },
     }))
 
     monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
     monkeypatch.delenv("DISCORD_SMART_THREAD_TITLES", raising=False)
+    monkeypatch.delenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(hermes_dir))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
@@ -1242,6 +1247,7 @@ def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
     import os
     assert os.getenv("DISCORD_AUTO_THREAD") == "true"
     assert os.getenv("DISCORD_SMART_THREAD_TITLES") == "true"
+    assert os.getenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES") == "10080"
 
 
 def test_discord_smart_thread_titles_config_bridge(monkeypatch, tmp_path):

@@ -1322,6 +1322,8 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
                 if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
                     os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
+                if "thread_auto_archive_minutes" in discord_cfg and not os.getenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES"):
+                    os.environ["DISCORD_THREAD_AUTO_ARCHIVE_MINUTES"] = str(discord_cfg["thread_auto_archive_minutes"])
                 if "smart_thread_titles" in discord_cfg and not os.getenv("DISCORD_SMART_THREAD_TITLES"):
                     os.environ["DISCORD_SMART_THREAD_TITLES"] = str(discord_cfg["smart_thread_titles"]).lower()
                 if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
