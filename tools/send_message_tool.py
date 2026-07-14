@@ -892,17 +892,24 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 return result
             return result
         last_result = None
+        # A standalone Discord send to a forum parent creates a thread and
+        # returns its ID.  Reuse that thread for every remaining chunk.
+        # Otherwise each chunk creates a separate forum topic, quickly hitting
+        # Discord's thread-creation rate limit and leaving a partial delivery.
+        delivery_thread_id = thread_id
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
             result = await entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
                 chunk,
-                thread_id=thread_id,
+                thread_id=delivery_thread_id,
                 media_files=media_files if is_last else [],
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
+            if not delivery_thread_id and isinstance(result, dict):
+                delivery_thread_id = result.get("thread_id") or None
             last_result = result
         return last_result
 
