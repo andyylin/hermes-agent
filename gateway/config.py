@@ -1565,6 +1565,7 @@ def load_gateway_config() -> GatewayConfig:
             # adapter.py::_apply_yaml_config), dispatched in the
             # ``apply_yaml_config_fn`` loop above. #41112 / #3823.
 
+
             # Bridge top-level require_mention to Telegram when the telegram: section
             # does not already provide one.  Users often write "require_mention: true"
             # at the top level alongside group_sessions_per_user, expecting it to work
