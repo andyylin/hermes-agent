@@ -40,6 +40,11 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
   - Archives `LINE_ARCHIVE_GROUPS`, short-circuits `LINE_READ_ONLY_GROUPS`, and requires `LINE_GROUP_PREFIXES` for `LINE_REQUIRE_PREFIX_GROUPS` before agent dispatch.
   - Teaches the generic gateway auth layer that LINE group chats use `LINE_ALLOWED_GROUPS` as a chat allowlist, not sender-only `LINE_ALLOWED_USERS`.
 
+- `feat(projects): complete session move lifecycle` *(temporary pending upstream)*
+  - Source: `andyylin/hermes-agent:contrib/pr-61335-complete`, preserving JuizSpeaking's original commits from upstream PR #61335.
+  - Adds explicit project assignment, explicit `No Project`, profile-safe assign/unassign RPCs, cwd re-anchoring/restoration, and Desktop move/drag behavior.
+  - Retire this overlay once PR #61335 (or an equivalent upstream implementation) lands and the runtime has been reconciled to that upstream version.
+
 ## Operating rule
 
 Before restarting live Hermes gateway after upstream updates:
@@ -48,6 +53,7 @@ Before restarting live Hermes gateway after upstream updates:
 2. Confirm the Discord adapter has `skip_thread = bool(channel_keys & no_thread_channels)`.
 3. Confirm LINE group allowlist handling remains upstream in `plugins/platforms/line/adapter.py`.
 4. Run focused gateway/title/STT/cron tests.
-5. Restart the gateway and inspect logs for reconnect/errors.
+5. Run project/session lifecycle tests plus Desktop typecheck and focused project UI tests while the temporary Projects overlay is active.
+6. Restart the gateway and inspect logs for reconnect/errors.
 
 If upstream `main` later contains any item above, trim the duplicate local patch and update this ledger.
