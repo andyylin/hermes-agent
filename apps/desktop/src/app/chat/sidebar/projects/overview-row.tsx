@@ -69,7 +69,7 @@ interface ProjectOverviewRowProps {
   renderRows?: (sessions: SessionInfo[]) => React.ReactNode
   activeProjectId?: null | string
   previewSessions?: SessionInfo[]
-  onAssignSession?: (sessionId: string, projectId: string) => void
+  onAssignSession?: (sessionId: string, projectId: string, profile?: string) => void
   reorderable?: boolean
   dragging?: boolean
   dragHandleProps?: React.HTMLAttributes<HTMLElement>
@@ -132,7 +132,7 @@ export function ProjectOverviewRow({
           }
 
           event.preventDefault()
-          event.dataTransfer.dropEffect = 'copy'
+          event.dataTransfer.dropEffect = 'move'
         }}
         onDrop={event => {
           if (!onAssignSession || project.isAuto) {
@@ -146,7 +146,7 @@ export function ProjectOverviewRow({
           }
 
           event.preventDefault()
-          onAssignSession(payload.id, project.id)
+          onAssignSession(payload.id, project.id, payload.profile)
         }}
         ref={rowRef}
       >

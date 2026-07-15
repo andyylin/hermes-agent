@@ -19,7 +19,7 @@ export interface SessionDragPayload {
 
 export function writeSessionDrag(transfer: DataTransfer, payload: SessionDragPayload) {
   transfer.setData(HERMES_SESSION_MIME, JSON.stringify(payload))
-  transfer.effectAllowed = 'copy'
+  transfer.effectAllowed = 'copyMove'
 }
 
 export function dragHasSession(transfer: DataTransfer | null) {

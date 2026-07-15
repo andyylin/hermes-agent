@@ -111,7 +111,7 @@ interface SidebarSessionsSectionProps {
   // True while the backend project tree is loading (overview skeleton).
   projectsLoading?: boolean
   onEnterProject?: (id: string) => void
-  onAssignSessionToProject?: (sessionId: string, projectId: string) => void
+  onAssignSessionToProject?: (sessionId: string, projectId: string, profile?: string) => void
   // The entered project's flattened content: main-checkout sessions render
   // directly (no redundant repo/branch header); only linked worktrees nest.
   projectContent?: SidebarProjectTree
@@ -121,7 +121,7 @@ interface SidebarSessionsSectionProps {
   // Live session cache used for optimistic placement inside entered-project lanes.
   liveSessions?: SessionInfo[]
   // Explicit session -> project memberships from the backend tree. These beat cwd inference.
-  sessionProjectAssignments?: Readonly<Record<string, string>>
+  sessionProjectAssignments?: Readonly<Record<string, null | string>>
   // Client-side optimistic eviction layer (deleted/archived ids).
   removedSessionIds?: ReadonlySet<string>
   activeProjectId?: null | string

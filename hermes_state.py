@@ -2226,6 +2226,82 @@ class SessionDB:
 
         self._execute_write(_do)
 
+    def replace_session_cwd(
+        self,
+        session_id: str,
+        cwd: str,
+        git_branch: Optional[str] = None,
+        git_repo_root: Optional[str] = None,
+    ) -> None:
+        """Replace workspace identity, clearing stale git metadata when absent.
+
+        Unlike :meth:`update_session_cwd`, this is for an intentional workspace
+        move. A non-git target must not retain the previous repo/branch and be
+        grouped under the wrong project after the move.
+        """
+        if not session_id or not cwd:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET cwd = ?, git_branch = ?, git_repo_root = ? "
+                "WHERE id = ?",
+                (cwd, git_branch or None, git_repo_root or None, session_id),
+            )
+
+        self._execute_write(_do)
+
+    def restore_session_workspace(
+        self,
+        session_id: str,
+        cwd: Optional[str],
+        git_branch: Optional[str] = None,
+        git_repo_root: Optional[str] = None,
+    ) -> None:
+        """Restore an exact workspace snapshot, including a NULL cwd."""
+        if not session_id:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET cwd = ?, git_branch = ?, git_repo_root = ? "
+                "WHERE id = ?",
+                (cwd or None, git_branch or None, git_repo_root or None, session_id),
+            )
+
+        self._execute_write(_do)
+
+    def update_session_git_meta_if_cwd(
+        self,
+        session_id: str,
+        expected_cwd: str,
+        git_branch: Optional[str] = None,
+        git_repo_root: Optional[str] = None,
+    ) -> None:
+        """Enrich git metadata only if the inspected cwd is still current."""
+        branch = (git_branch or "").strip()
+        repo_root = (git_repo_root or "").strip()
+        if not session_id or not expected_cwd or not (branch or repo_root):
+            return
+
+        sets: List[str] = []
+        params: List[Any] = []
+        if branch:
+            sets.append("git_branch = ?")
+            params.append(branch)
+        if repo_root:
+            sets.append("git_repo_root = ?")
+            params.append(repo_root)
+        params.extend((session_id, expected_cwd))
+
+        def _do(conn):
+            conn.execute(
+                f"UPDATE sessions SET {', '.join(sets)} WHERE id = ? AND cwd = ?",
+                params,
+            )
+
+        self._execute_write(_do)
+
     def backfill_repo_roots(self, cwd_to_root: Dict[str, str]) -> None:
         """Persist resolved git repo roots for cwds that don't have one yet.
 
