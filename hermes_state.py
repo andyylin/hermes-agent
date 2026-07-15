@@ -912,25 +912,45 @@ CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
 
 FTS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    content
+    content,
+    tool_name,
+    tool_calls,
+    content='messages',
+    content_rowid='id'
 );
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts(rowid, content) VALUES (
+    INSERT INTO messages_fts(rowid, content, tool_name, tool_calls) VALUES (
         new.id,
-        COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+        new.content,
+        new.tool_name,
+        new.tool_calls
     );
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
-    DELETE FROM messages_fts WHERE rowid = old.id;
+    INSERT INTO messages_fts(messages_fts, rowid, content, tool_name, tool_calls) VALUES(
+        'delete',
+        old.id,
+        old.content,
+        old.tool_name,
+        old.tool_calls
+    );
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
-    DELETE FROM messages_fts WHERE rowid = old.id;
-    INSERT INTO messages_fts(rowid, content) VALUES (
+    INSERT INTO messages_fts(messages_fts, rowid, content, tool_name, tool_calls) VALUES(
+        'delete',
+        old.id,
+        old.content,
+        old.tool_name,
+        old.tool_calls
+    );
+    INSERT INTO messages_fts(rowid, content, tool_name, tool_calls) VALUES (
         new.id,
-        COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+        new.content,
+        new.tool_name,
+        new.tool_calls
     );
 END;
 """
@@ -948,7 +968,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_insert AFTER INSERT ON messages BEGIN
     INSERT INTO messages_fts_trigram(rowid, content) VALUES (
         new.id,
-        COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+        COALESCE(new.content, '')
     );
 END;
 
@@ -960,7 +980,7 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON message
     DELETE FROM messages_fts_trigram WHERE rowid = old.id;
     INSERT INTO messages_fts_trigram(rowid, content) VALUES (
         new.id,
-        COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+        COALESCE(new.content, '')
     );
 END;
 """
@@ -1181,25 +1201,13 @@ class SessionDB:
         *,
         include_trigram: bool = True,
     ) -> None:
-        cursor.execute("DELETE FROM messages_fts")
-        cursor.execute(
-            "INSERT INTO messages_fts(rowid, content) "
-            "SELECT id, "
-            "COALESCE(content, '') || ' ' || "
-            "COALESCE(tool_name, '') || ' ' || "
-            "COALESCE(tool_calls, '') "
-            "FROM messages"
-        )
+        cursor.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
         if not include_trigram:
             return
         cursor.execute("DELETE FROM messages_fts_trigram")
         cursor.execute(
             "INSERT INTO messages_fts_trigram(rowid, content) "
-            "SELECT id, "
-            "COALESCE(content, '') || ' ' || "
-            "COALESCE(tool_name, '') || ' ' || "
-            "COALESCE(tool_calls, '') "
-            "FROM messages"
+            "SELECT id, COALESCE(content, '') FROM messages"
         )
 
     def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
@@ -1722,22 +1730,28 @@ class SessionDB:
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
             # an earlier no-FTS5 runtime.
-            triggers_need_repair = self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+            base_fts_triggers = (
+                "messages_fts_insert",
+                "messages_fts_delete",
+                "messages_fts_update",
+            )
+            placeholders = ",".join("?" for _ in base_fts_triggers)
+            row = cursor.execute(
+                f"SELECT COUNT(*) FROM sqlite_master "
+                f"WHERE type = 'trigger' AND name IN ({placeholders})",
+                base_fts_triggers,
+            ).fetchone()
+            triggers_need_repair = int(row[0] if not isinstance(row, sqlite3.Row) else row[0]) < len(base_fts_triggers)
             self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
 
-            # Trigram FTS5 for CJK/substring search. This is optional relative
-            # to the main FTS table; if it cannot be created, CJK search falls
-            # back to LIKE.
-            if self._fts_enabled:
-                trigram_enabled = self._ensure_fts_schema(
-                    cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                )
-                self._trigram_available = trigram_enabled
-                if triggers_need_repair:
-                    self._rebuild_fts_indexes(
-                        cursor,
-                        include_trigram=trigram_enabled,
-                    )
+            # Trigram FTS5 is deliberately disabled on this SQLite/runtime path.
+            # The real corpus repeatedly produced globally malformed trigram
+            # indexes even when FTS5's own integrity-check passed. Base FTS stays
+            # enabled for normal/tool-field search; CJK/substring search falls
+            # back to LIKE instead of poisoning PRAGMA integrity_check.
+            self._trigram_available = False
+            if self._fts_enabled and triggers_need_repair:
+                self._rebuild_fts_indexes(cursor, include_trigram=False)
 
         self._conn.commit()
 
