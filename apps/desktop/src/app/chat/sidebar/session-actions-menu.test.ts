@@ -1,3 +1,4 @@
+import { atom } from 'nanostores'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
@@ -24,6 +25,11 @@ vi.mock('@/hermes', () => ({
 
 vi.mock('@/store/gateway', () => ({
   activeGateway: () => activeGateway()
+}))
+
+vi.mock('@/store/profile', () => ({
+  $activeGatewayProfile: atom('default'),
+  normalizeProfileKey: (profile?: string) => profile || 'default'
 }))
 
 const RUNTIME_ID = 'rt-runtime-1'

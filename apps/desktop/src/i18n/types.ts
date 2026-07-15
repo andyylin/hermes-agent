@@ -1368,6 +1368,7 @@ export interface Translations {
       branchFrom: string
       rename: string
       moveToProject: string
+      noProject: string
       movedToProject: (project: string) => string
       moveToProjectFailed: string
       archive: string

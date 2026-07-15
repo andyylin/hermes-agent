@@ -61,7 +61,14 @@ import {
   unpinSession
 } from '@/store/layout'
 import { notify, notifyError } from '@/store/notifications'
-import { $newChatProfile, $profiles, $profileScope, ALL_PROFILES, normalizeProfileKey } from '@/store/profile'
+import {
+  $activeGatewayProfile,
+  $newChatProfile,
+  $profiles,
+  $profileScope,
+  ALL_PROFILES,
+  normalizeProfileKey
+} from '@/store/profile'
 import {
   $activeProjectId,
   $projects,
@@ -294,6 +301,7 @@ export function ChatSidebar({
   const workingSessionIds = useStore($workingSessionIds)
   const profiles = useStore($profiles)
   const profileScope = useStore($profileScope)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
   // Only surface the profile switcher when more than one profile exists, so
   // single-profile users see the unchanged sidebar.
   const multiProfile = profiles.length > 1
@@ -802,10 +810,13 @@ export function ChatSidebar({
   )
 
   const onAssignSessionToProject = useCallback(
-    async (sessionId: string, projectId: string) => {
+    async (sessionId: string, projectId: string, profile?: string) => {
       const project = projectModel.find(node => node.id === projectId)
 
       try {
+        if (normalizeProfileKey(profile) !== normalizeProfileKey(activeGatewayProfile)) {
+          throw new Error('Switch to this session profile before moving it into a project')
+        }
         await assignSessionToProject(sessionId, projectId)
         notify({
           durationMs: 2_000,
@@ -816,7 +827,7 @@ export function ChatSidebar({
         notifyError(err, s.row.moveToProjectFailed)
       }
     },
-    [projectModel, s.projects.sectionLabel, s.row]
+    [activeGatewayProfile, projectModel, s.projects.sectionLabel, s.row]
   )
 
   // The Sessions section is a project switcher in grouped mode: its label reads
@@ -1412,11 +1423,11 @@ export function ChatSidebar({
                 projectRepoWorktrees={inProject ? scopedRepoWorktrees : undefined}
                 projectsLoading={worktreeGroupingActive ? projectTreeLoading : false}
                 removedSessionIds={inProject ? removedSessionIds : undefined}
-                sessionProjectAssignments={inProject ? sessionProjectAssignments : undefined}
                 rootClassName={cn(
                   'min-h-32 flex-1 overflow-hidden p-0',
                   !recentsVirtualizes && 'compact:min-h-0 compact:flex-none compact:overflow-visible'
                 )}
+                sessionProjectAssignments={inProject ? sessionProjectAssignments : undefined}
                 sessions={displayAgentSessions}
                 sortable={!showAllProfiles && agentSessions.length > 1}
                 workingSessionIdSet={workingSessionIdSet}

@@ -1645,6 +1645,7 @@ export const en: Translations = {
       branchFrom: 'Branch',
       rename: 'Rename',
       moveToProject: 'Move to project',
+      noProject: 'No Project',
       movedToProject: project => `Moved to ${project}`,
       moveToProjectFailed: 'Could not move session',
       archive: 'Archive',

@@ -1516,6 +1516,7 @@ export const zhHant = defineLocale({
       branchFrom: '分支',
       rename: '重新命名',
       moveToProject: '移至專案',
+      noProject: '不屬於任何專案',
       movedToProject: project => `已移至 ${project}`,
       moveToProjectFailed: '無法移動工作階段',
       archive: '封存',

@@ -1858,7 +1858,7 @@ def _persist_session_git_meta(session: dict, cwd: str) -> None:
                 return
             with _session_db(db_session) as db:
                 if db is not None:
-                    db.update_session_cwd(session_key, cwd, branch, root)
+                    db.update_session_git_meta_if_cwd(session_key, cwd, branch, root)
         except Exception:
             logger.debug("failed to persist session git metadata", exc_info=True)
 
@@ -3957,17 +3957,23 @@ def _agent_cbs(sid: str) -> dict:
     }
 
 
-def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
-    """Intentional workspace move from the project_* tools: re-anchor the live
-    session's cwd to the chosen project's folder and push session.info so the
-    desktop follows (refresh tree + scope into the project). This is the ONLY
-    auto-cwd path — driven by an explicit tool call, never a terminal `cd`."""
-    if not path:
-        return
+def _resolve_workspace_cwd(path: str) -> str:
+    from hermes_constants import translate_cwd_for_wsl_backend
 
-    # The tool's task_id is the durable session_key, but _sessions is keyed by a
-    # short sid uuid (and the desktop routes events by that sid). Resolve it.
-    key = str(task_id or "")
+    translated = translate_cwd_for_wsl_backend(str(path or ""))
+    resolved = os.path.abspath(os.path.expanduser(translated))
+    if not os.path.isdir(resolved):
+        raise ValueError(f"working directory does not exist: {path}")
+    return resolved
+
+
+def _reanchor_session_workspace(task_id: str, path: str, *, db=None) -> str:
+    """Move persisted and live session state to an intentional workspace."""
+    resolved = _resolve_workspace_cwd(path)
+    key = str(task_id or "").strip()
+    if not key:
+        raise ValueError("session_id required")
+
     sid = ""
     session = None
     with _sessions_lock:
@@ -3979,36 +3985,102 @@ def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
                     sid, session = cand_sid, cand
                     break
 
+    branch = _git_branch_for_cwd(resolved)
+    repo_root = _git_common_repo_root_for_cwd(resolved)
+    target_db = db
+    if target_db is None and session is not None:
+        with _session_db(session) as session_db:
+            if session_db is not None:
+                session_db.replace_session_cwd(key, resolved, branch, repo_root)
+    elif target_db is not None:
+        target_db.replace_session_cwd(key, resolved, branch, repo_root)
+
+    if session is not None:
+        try:
+            session["cwd"] = resolved
+            session["explicit_cwd"] = True
+            _register_session_cwd(session)
+            from tools.terminal_tool import cleanup_vm
+
+            cleanup_vm(session["session_key"])
+        except Exception:
+            logger.debug("failed to refresh live workspace state", exc_info=True)
+        try:
+            agent = session.get("agent")
+            info = (
+                _session_info(agent, session)
+                if agent is not None
+                else {"cwd": resolved, "branch": branch, "lazy": True}
+            )
+            _emit("session.info", sid, info)
+        except Exception:
+            logger.debug("failed to emit session.info after workspace move", exc_info=True)
+    return resolved
+
+
+def _safe_detached_workspace(previous_cwd: str | None) -> str:
+    """Choose the first existing restore target, ending in stable OS fallbacks."""
+    for candidate in (
+        previous_cwd,
+        _default_session_cwd(),
+        os.path.expanduser("~"),
+        os.getcwd(),
+    ):
+        if not candidate:
+            continue
+        with contextlib.suppress(ValueError):
+            return _resolve_workspace_cwd(candidate)
+    raise ValueError("no safe working directory is available")
+
+
+def _restore_session_workspace_snapshot(task_id: str, snapshot: dict, *, db) -> None:
+    """Compensate a failed project write with the exact prior session state."""
+    key = str(task_id or "").strip()
+    old_cwd = snapshot.get("cwd")
+    if not key:
+        return
+    db.restore_session_workspace(
+        key,
+        old_cwd,
+        snapshot.get("git_branch"),
+        snapshot.get("git_repo_root"),
+    )
+
+    sid = ""
+    session = None
+    with _sessions_lock:
+        if key in _sessions:
+            sid, session = key, _sessions[key]
+        else:
+            for cand_sid, cand in _sessions.items():
+                if cand.get("session_key") == key or getattr(cand.get("agent"), "session_id", None) == key:
+                    sid, session = cand_sid, cand
+                    break
     if session is None:
         return
-
-    resolved = os.path.abspath(os.path.expanduser(str(path)))
-    if not os.path.isdir(resolved):
-        return
-
-    session["cwd"] = resolved
-    session["explicit_cwd"] = True
+    if old_cwd:
+        session["cwd"] = str(old_cwd)
+        session["explicit_cwd"] = True
+    else:
+        session.pop("cwd", None)
+        session.pop("explicit_cwd", None)
     _register_session_cwd(session)
-
-    with _session_db(session) as db:
-        if db is not None:
-            try:
-                db.update_session_cwd(session.get("session_key", ""), resolved)
-            except Exception:
-                logger.debug("failed to persist project workspace cwd", exc_info=True)
-
-    _persist_session_git_meta(session, resolved)
-
     try:
         agent = session.get("agent")
-        info = (
-            _session_info(agent, session)
-            if agent is not None
-            else {"cwd": resolved, "branch": _git_branch_for_cwd(resolved), "lazy": True}
-        )
+        info = _session_info(agent, session) if agent is not None else {"cwd": old_cwd, "lazy": True}
         _emit("session.info", sid, info)
     except Exception:
-        logger.debug("failed to emit session.info after project workspace move", exc_info=True)
+        logger.debug("failed to emit session.info after workspace rollback", exc_info=True)
+
+
+def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
+    """Apply the explicit workspace move requested by a project tool call."""
+    if not path:
+        return
+    try:
+        _reanchor_session_workspace(task_id, path)
+    except Exception:
+        logger.debug("failed to apply project workspace move", exc_info=True)
 
 
 def _wire_callbacks(sid: str):
@@ -11048,10 +11120,60 @@ def _(rid, params, pdb, conn) -> dict:
     db = _get_db()
     if db is None:
         raise ValueError("state.db unavailable")
-    if db.get_session(session_id) is None:
+    session_row = db.get_session(session_id)
+    if session_row is None:
         raise ValueError("session not found in active profile")
-    pdb.assign_session(conn, proj.id, session_id)
-    return _ok(rid, {"project_id": proj.id, "session_id": session_id})
+    project_cwd = proj.primary_path or next(
+        (folder.path for folder in proj.folders if folder.is_primary),
+        proj.folders[0].path if proj.folders else None,
+    )
+    if not project_cwd:
+        raise ValueError("project has no workspace folder")
+    old_cwd = str(session_row.get("cwd") or "") or None
+    resolved = _resolve_workspace_cwd(project_cwd)
+    resolved = _reanchor_session_workspace(session_id, resolved, db=db)
+    try:
+        pdb.assign_session(
+            conn,
+            proj.id,
+            session_id,
+            previous_cwd=old_cwd,
+        )
+    except Exception:
+        with contextlib.suppress(Exception):
+            _restore_session_workspace_snapshot(session_id, session_row, db=db)
+        raise
+    return _ok(
+        rid,
+        {"cwd": resolved, "project_id": proj.id, "session_id": session_id},
+    )
+
+
+@_projects_method("projects.unassign_session")
+def _(rid, params, pdb, conn) -> dict:
+    session_id = str(params.get("session_id") or "").strip()
+    if not session_id:
+        raise ValueError("session_id required")
+    db = _get_db()
+    if db is None:
+        raise ValueError("state.db unavailable")
+    session_row = db.get_session(session_id)
+    if session_row is None:
+        raise ValueError("session not found in active profile")
+
+    previous_cwd = pdb.previous_session_cwd(conn, session_id)
+    restored_cwd = _safe_detached_workspace(previous_cwd)
+    restored_cwd = _reanchor_session_workspace(session_id, restored_cwd, db=db)
+    try:
+        pdb.exclude_session(conn, session_id)
+    except Exception:
+        with contextlib.suppress(Exception):
+            _restore_session_workspace_snapshot(session_id, session_row, db=db)
+        raise
+    return _ok(
+        rid,
+        {"cwd": restored_cwd, "project_id": None, "session_id": session_id},
+    )
 
 
 @_projects_method("projects.for_cwd")
@@ -11246,7 +11368,7 @@ def _project_tree_row(r: dict) -> dict:
 
 def _project_tree_inputs(
     db, session_limit: int, *, include_discovered: bool
-) -> tuple[list[dict], list[dict], list[dict], str | None, dict[str, str]]:
+) -> tuple[list[dict], list[dict], list[dict], str | None, dict[str, str | None]]:
     """Gather (sessions, projects, discovered_repos, active_id) for build_tree.
 
     ``include_discovered`` is the zero-session-repo overview tier; the entered

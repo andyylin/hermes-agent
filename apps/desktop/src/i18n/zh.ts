@@ -1821,6 +1821,7 @@ export const zh: Translations = {
       branchFrom: '分支',
       rename: '重命名',
       moveToProject: '移动到项目',
+      noProject: '不属于任何项目',
       movedToProject: project => `已移动到 ${project}`,
       moveToProjectFailed: '无法移动会话',
       archive: '归档',
