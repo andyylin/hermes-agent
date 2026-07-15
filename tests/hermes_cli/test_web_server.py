@@ -585,10 +585,20 @@ class TestWebServerEndpoints:
         import hermes_cli.web_server as web_server
 
         original_dependency_importable = web_server._dependency_importable
+        original_is_configured = web_server._memory_provider_is_configured
         monkeypatch.setattr(
             web_server,
             "_dependency_importable",
             lambda dep: True if dep == "honcho-ai" else original_dependency_importable(dep),
+        )
+        monkeypatch.setattr(
+            web_server,
+            "_memory_provider_is_configured",
+            lambda name, provider: (
+                False
+                if name == "honcho"
+                else original_is_configured(name, provider)
+            ),
         )
 
         resp = self.client.get("/api/memory")
