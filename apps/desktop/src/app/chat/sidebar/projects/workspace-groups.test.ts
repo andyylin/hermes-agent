@@ -693,6 +693,40 @@ describe('overlayLiveLanes', () => {
     expect(overlaid.repos[0].groups).toEqual([])
   })
 
+  it('does not inject an explicitly detached live session through cwd inference', () => {
+    const detached = makeSession('/natural/repo', { git_repo_root: '/natural/repo', id: 'detached' })
+    const natural = projectNode({
+      id: 'p_natural',
+      repos: [{ id: '/natural/repo', label: 'repo', path: '/natural/repo', sessionCount: 0, groups: [] }]
+    })
+
+    const overlaid = overlayLiveLanes(natural, [detached], new Set(), { detached: null })
+
+    expect(overlaid.sessionCount).toBe(0)
+    expect(overlaid.repos[0].groups).toEqual([])
+  })
+
+  it('removes a stale snapshot row immediately after an optimistic detach', () => {
+    const detached = makeSession('/natural/repo', { git_repo_root: '/natural/repo', id: 'detached' })
+    const natural = projectNode({
+      id: 'p_natural',
+      repos: [
+        {
+          groups: [lane({ id: 'main', isMain: true, label: 'main', path: '/natural/repo', sessions: [detached] })],
+          id: '/natural/repo',
+          label: 'repo',
+          path: '/natural/repo',
+          sessionCount: 1
+        }
+      ]
+    })
+
+    const overlaid = overlayLiveLanes(natural, [], new Set(), { detached: null })
+
+    expect(overlaid.sessionCount).toBe(0)
+    expect(overlaid.repos[0].groups).toEqual([])
+  })
+
   it('still injects a reassigned live session into the assigned project', () => {
     const moved = makeSession('/natural/repo', { git_repo_root: '/natural/repo', id: 'moved' })
     const target = projectNode({

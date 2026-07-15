@@ -429,7 +429,7 @@ function liveLaneForRepo(repoRoot: string, session: SessionInfo): null | Sidebar
 }
 
 const NO_REMOVED: ReadonlySet<string> = new Set()
-const NO_ASSIGNMENTS: Readonly<Record<string, string>> = {}
+const NO_ASSIGNMENTS: Readonly<Record<string, null | string>> = {}
 
 /**
  * Reconcile ONE repo's lanes against the live `$sessions` cache: evict
@@ -444,18 +444,22 @@ export function overlayRepoLanes(
   live: SessionInfo[],
   removed: ReadonlySet<string> = NO_REMOVED,
   projectId?: string,
-  sessionProjectAssignments: Readonly<Record<string, string>> = NO_ASSIGNMENTS
+  sessionProjectAssignments: Readonly<Record<string, null | string>> = NO_ASSIGNMENTS
 ): SidebarWorkspaceTree {
   const repoRootKey = pathKey(repo.path)
   let changed = false
 
-  // Snapshot lanes minus anything the user just deleted/archived.
+  // Snapshot lanes minus anything deleted/archived or optimistically moved to
+  // another project. This keeps a stale backend snapshot from duplicating a
+  // row while the authoritative write's refresh is still in flight.
   const lanes = repo.groups.map(g => {
-    if (!removed.size) {
-      return { ...g, sessions: [...g.sessions] }
-    }
-
-    const kept = g.sessions.filter(s => !removed.has(s.id))
+    const kept = g.sessions.filter(s => {
+      if (removed.has(s.id)) {
+        return false
+      }
+      const hasAssignment = Object.prototype.hasOwnProperty.call(sessionProjectAssignments, s.id)
+      return !hasAssignment || sessionProjectAssignments[s.id] === projectId
+    })
 
     changed ||= kept.length !== g.sessions.length
 
@@ -464,9 +468,10 @@ export function overlayRepoLanes(
 
   for (const session of live) {
     const cwd = (session.cwd || '').trim()
+    const hasAssignment = Object.prototype.hasOwnProperty.call(sessionProjectAssignments, session.id)
     const assignedProjectId = sessionProjectAssignments[session.id]
 
-    if (removed.has(session.id) || !cwd || (assignedProjectId && assignedProjectId !== projectId)) {
+    if (removed.has(session.id) || !cwd || (hasAssignment && assignedProjectId !== projectId)) {
       continue
     }
 
@@ -539,7 +544,7 @@ export function overlayLiveLanes(
   project: SidebarProjectTree,
   live: SessionInfo[],
   removed: ReadonlySet<string> = NO_REMOVED,
-  sessionProjectAssignments: Readonly<Record<string, string>> = NO_ASSIGNMENTS
+  sessionProjectAssignments: Readonly<Record<string, null | string>> = NO_ASSIGNMENTS
 ): SidebarProjectTree {
   let changed = false
 
@@ -565,7 +570,7 @@ export function overlayLivePreviews(
   explicitProjects: ProjectInfo[],
   limit: number,
   removed: ReadonlySet<string> = new Set(),
-  sessionProjectAssignments: Readonly<Record<string, string>> = NO_ASSIGNMENTS
+  sessionProjectAssignments: Readonly<Record<string, null | string>> = NO_ASSIGNMENTS
 ): Record<string, SessionInfo[]> {
   const byProject = new Map<string, SessionInfo[]>()
 
@@ -574,7 +579,10 @@ export function overlayLivePreviews(
       continue
     }
 
-    const projectId = sessionProjectAssignments[session.id] ?? liveSessionProjectId(session, explicitProjects)
+    const hasAssignment = Object.prototype.hasOwnProperty.call(sessionProjectAssignments, session.id)
+    const projectId = hasAssignment
+      ? sessionProjectAssignments[session.id]
+      : liveSessionProjectId(session, explicitProjects)
 
     if (!projectId) {
       continue
@@ -593,7 +601,13 @@ export function overlayLivePreviews(
     }
 
     const liveRows = byProject.get(node.id) ?? []
-    const base = (node.previewSessions ?? []).filter(session => !removed.has(session.id))
+    const base = (node.previewSessions ?? []).filter(session => {
+      if (removed.has(session.id)) {
+        return false
+      }
+      const hasAssignment = Object.prototype.hasOwnProperty.call(sessionProjectAssignments, session.id)
+      return !hasAssignment || sessionProjectAssignments[session.id] === node.id
+    })
 
     if (!liveRows.length && !base.length) {
       continue

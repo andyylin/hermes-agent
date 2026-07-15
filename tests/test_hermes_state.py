@@ -169,6 +169,33 @@ class TestSessionLifecycle:
 
         assert db.get_session("s1")["git_repo_root"] == "/work/repo"
 
+    def test_delayed_git_metadata_cannot_revert_a_new_workspace(self, db):
+        db.create_session(session_id="s1", source="cli", cwd="/old")
+        db.replace_session_cwd("s1", "/new")
+
+        db.update_session_git_meta_if_cwd(
+            "s1",
+            "/old",
+            git_branch="stale",
+            git_repo_root="/old",
+        )
+
+        session = db.get_session("s1")
+        assert session["cwd"] == "/new"
+        assert session["git_branch"] is None
+        assert session["git_repo_root"] is None
+
+    def test_restore_session_workspace_can_restore_null_cwd(self, db):
+        db.create_session(session_id="s1", source="cli", cwd="/project")
+        db.update_session_cwd("s1", "/project", git_branch="main", git_repo_root="/project")
+
+        db.restore_session_workspace("s1", None)
+
+        session = db.get_session("s1")
+        assert session["cwd"] is None
+        assert session["git_branch"] is None
+        assert session["git_repo_root"] is None
+
     def test_distinct_session_cwds_aggregates_history(self, db):
         db.create_session("s1", "cli", cwd="/repo")
         db.create_session("s2", "cli", cwd="/repo")

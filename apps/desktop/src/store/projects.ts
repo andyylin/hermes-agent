@@ -28,7 +28,13 @@ export const $activeProjectId = atom<null | string>(null)
 // source of project membership — the desktop no longer derives it.
 export const $projectTree = atom<SidebarProjectTree[]>([])
 export const $projectTreeLoading = atom(false)
-export const $sessionProjectAssignments = atom<Record<string, string>>({})
+export const $sessionProjectAssignments = atom<Record<string, null | string>>({})
+export const $projectSessionAssignmentsAvailable = atom<boolean | null>(null)
+let assignmentMutationGeneration = 0
+const assignmentMutationTokens = new Map<string, number>()
+const assignmentMutationQueues = new Map<string, Promise<void>>()
+const confirmedAssignments = new Map<string, { present: boolean; value: null | string }>()
+const pendingAssignmentIntents = new Map<string, { token: number; value: null | string }>()
 
 // False when the connected backend predates the projects.* JSON-RPC surface
 // (same semver label, older install). Null until the first probe.
@@ -249,13 +255,14 @@ interface ProjectTreePayload {
   projects: SidebarProjectTree[]
   active_id: null | string
   scoped_session_ids: string[]
-  session_project_assignments?: Record<string, string>
+  session_project_assignments?: Record<string, null | string>
 }
 
 // Pull the authoritative project tree (overview structure + counts + preview
 // sessions + the scoped-session-id set). Best-effort: a failure leaves the
 // cached tree intact so the sidebar doesn't flicker.
 export async function refreshProjectTree(): Promise<void> {
+  const mutationGeneration = assignmentMutationGeneration
   $projectTreeLoading.set(true)
 
   try {
@@ -266,7 +273,34 @@ export async function refreshProjectTree(): Promise<void> {
 
     $projectTree.set(res.projects ?? [])
     $activeProjectId.set(res.active_id ?? null)
-    $sessionProjectAssignments.set(res.session_project_assignments ?? {})
+    const hasAssignments = Object.prototype.hasOwnProperty.call(res, 'session_project_assignments')
+    $projectSessionAssignmentsAvailable.set(hasAssignments)
+
+    if (mutationGeneration === assignmentMutationGeneration) {
+      const assignments = res.session_project_assignments ?? {}
+      const visibleAssignments = { ...assignments }
+
+      // A refresh may have started before a queued mutation reached the
+      // backend. Never let that snapshot replace the rollback baseline for a
+      // session with newer local intent still pending.
+      for (const sessionId of [...confirmedAssignments.keys()]) {
+        if (!pendingAssignmentIntents.has(sessionId) && !Object.prototype.hasOwnProperty.call(assignments, sessionId)) {
+          confirmedAssignments.delete(sessionId)
+        }
+      }
+
+      for (const [sessionId, projectId] of Object.entries(assignments)) {
+        if (!pendingAssignmentIntents.has(sessionId)) {
+          confirmedAssignments.set(sessionId, { present: true, value: projectId })
+        }
+      }
+
+      for (const [sessionId, pending] of pendingAssignmentIntents) {
+        visibleAssignments[sessionId] = pending.value
+      }
+
+      $sessionProjectAssignments.set(visibleAssignments)
+    }
 
     // Reconcile the optimistic eviction layer against the fresh snapshot: keep
     // evicting ids the server still lists (delete in flight) and drop the rest
@@ -306,9 +340,98 @@ export async function fetchProjectSessions(projectId: string): Promise<SidebarPr
 }
 
 export async function assignSessionToProject(sessionId: string, projectId: string): Promise<void> {
-  await gatewayRequest('projects.assign_session', { id: projectId, session_id: sessionId })
-  markProjectsRpcSuccess()
-  await Promise.all([refreshProjects(), refreshProjectTree()])
+  await mutateSessionProjectAssignment(sessionId, projectId, 'projects.assign_session', {
+    id: projectId,
+    session_id: sessionId
+  })
+}
+
+export async function unassignSessionFromProject(sessionId: string): Promise<void> {
+  await mutateSessionProjectAssignment(sessionId, null, 'projects.unassign_session', { session_id: sessionId })
+}
+
+async function mutateSessionProjectAssignment(
+  sessionId: string,
+  projectId: null | string,
+  method: string,
+  params: Record<string, unknown>
+): Promise<void> {
+  const before = $sessionProjectAssignments.get()
+  const previousQueue = assignmentMutationQueues.get(sessionId)
+
+  if (!previousQueue && !confirmedAssignments.has(sessionId)) {
+    confirmedAssignments.set(sessionId, {
+      present: Object.prototype.hasOwnProperty.call(before, sessionId),
+      value: before[sessionId] ?? null
+    })
+  }
+
+  assignmentMutationGeneration += 1
+  const token = (assignmentMutationTokens.get(sessionId) ?? 0) + 1
+
+  assignmentMutationTokens.set(sessionId, token)
+  pendingAssignmentIntents.set(sessionId, { token, value: projectId })
+
+  $sessionProjectAssignments.set({ ...before, [sessionId]: projectId })
+
+  const operation = (previousQueue ?? Promise.resolve())
+    .catch(() => undefined)
+    .then(async () => {
+      try {
+        await gatewayRequest(method, params)
+      } catch (err) {
+        if (assignmentMutationTokens.get(sessionId) === token) {
+          pendingAssignmentIntents.delete(sessionId)
+          // Reject every tree request that began while this optimistic intent
+          // was active; its response cannot describe the post-rollback state.
+          assignmentMutationGeneration += 1
+          const rolledBack = { ...$sessionProjectAssignments.get() }
+          const confirmed = confirmedAssignments.get(sessionId)
+
+          if (confirmed?.present) {
+            rolledBack[sessionId] = confirmed.value
+          } else {
+            delete rolledBack[sessionId]
+          }
+
+          $sessionProjectAssignments.set(rolledBack)
+        }
+
+        if (isMissingRpcMethod(err)) {
+          $projectSessionAssignmentsAvailable.set(false)
+        }
+
+        throw err
+      }
+
+      confirmedAssignments.set(sessionId, { present: true, value: projectId })
+      $projectSessionAssignmentsAvailable.set(true)
+      markProjectsRpcSuccess()
+
+      if (assignmentMutationTokens.get(sessionId) === token) {
+        await Promise.all([refreshProjects(), refreshProjectTree()])
+        if (pendingAssignmentIntents.get(sessionId)?.token === token) {
+          pendingAssignmentIntents.delete(sessionId)
+          // A focus/background refresh may still be in flight with the same
+          // generation but an older server snapshot. Invalidate it before the
+          // intent overlay disappears.
+          assignmentMutationGeneration += 1
+        }
+      }
+    })
+  const queueTail = operation.then(
+    () => undefined,
+    () => undefined
+  )
+
+  assignmentMutationQueues.set(sessionId, queueTail)
+  void queueTail.finally(() => {
+    if (assignmentMutationQueues.get(sessionId) === queueTail) {
+      assignmentMutationQueues.delete(sessionId)
+    }
+  })
+
+  await operation
 }
 
 // One filesystem scan per app run: the heavy disk walk happens once, the result

@@ -50,7 +50,7 @@ export function EnteredProjectContent({
   onNewSession?: (path: null | string) => void
   repoWorktrees?: Record<string, HermesGitWorktree[]>
   liveSessions?: SessionInfo[]
-  sessionProjectAssignments?: Readonly<Record<string, string>>
+  sessionProjectAssignments?: Readonly<Record<string, null | string>>
   removedSessionIds?: ReadonlySet<string>
 }) {
   if (!project.repos.length) {
@@ -97,7 +97,7 @@ function RepoFlatSection({
   onNewSession?: (path: null | string) => void
   discoveredWorktrees?: HermesGitWorktree[]
   liveSessions?: SessionInfo[]
-  sessionProjectAssignments?: Readonly<Record<string, string>>
+  sessionProjectAssignments?: Readonly<Record<string, null | string>>
   removedSessionIds?: ReadonlySet<string>
 }) {
   const { t } = useI18n()

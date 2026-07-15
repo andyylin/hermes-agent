@@ -1565,6 +1565,7 @@ export const ja = defineLocale({
       branchFrom: '分岐',
       rename: '名前を変更',
       moveToProject: 'プロジェクトへ移動',
+      noProject: 'プロジェクトなし',
       movedToProject: project => `${project} に移動しました`,
       moveToProjectFailed: 'セッションを移動できませんでした',
       archive: 'アーカイブ',

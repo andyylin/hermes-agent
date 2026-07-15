@@ -38,7 +38,14 @@ import { triggerHaptic } from '@/lib/haptics'
 import { exportSession } from '@/lib/session-export'
 import { activeGateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
-import { $projects, assignSessionToProject } from '@/store/projects'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import {
+  $projects,
+  $projectSessionAssignmentsAvailable,
+  $sessionProjectAssignments,
+  assignSessionToProject,
+  unassignSessionFromProject
+} from '@/store/projects'
 import { $activeSessionId, $selectedStoredSessionId, setSessions } from '@/store/session'
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
@@ -127,14 +134,29 @@ function useSessionActions({
   const { t } = useI18n()
   const r = t.sidebar.row
   const projects = useStore($projects)
+  const assignmentsAvailable = useStore($projectSessionAssignmentsAvailable)
+  const assignments = useStore($sessionProjectAssignments)
+  const activeProfile = useStore($activeGatewayProfile)
   const [renameOpen, setRenameOpen] = useState(false)
-  const assignableProjects = projects.filter(project => !project.archived)
+  const isActiveProfile = normalizeProfileKey(profile) === normalizeProfileKey(activeProfile)
+  const assignableProjects = isActiveProfile ? projects.filter(project => !project.archived) : []
+  const assignedProjectId = assignments[sessionId]
 
   const moveToProject = async (projectId: string, label: string) => {
     try {
       triggerHaptic('selection')
       await assignSessionToProject(sessionId, projectId)
       notify({ durationMs: 2_000, kind: 'success', message: r.movedToProject(label) })
+    } catch (err) {
+      notifyError(err, r.moveToProjectFailed)
+    }
+  }
+
+  const moveToNoProject = async () => {
+    try {
+      triggerHaptic('selection')
+      await unassignSessionFromProject(sessionId)
+      notify({ durationMs: 2_000, kind: 'success', message: r.movedToProject(r.noProject) })
     } catch (err) {
       notifyError(err, r.moveToProjectFailed)
     }
@@ -221,15 +243,23 @@ function useSessionActions({
   )
 
   const renderMoveToProject = (Item: MenuItem, Sub: MenuSub, SubTrigger: MenuSubTrigger, SubContent: MenuSubContent) =>
-    assignableProjects.length ? (
+    isActiveProfile && assignmentsAvailable === true ? (
       <Sub key={r.moveToProject}>
         <SubTrigger disabled={!sessionId}>
           <Codicon name="folder-opened" size="0.875rem" />
           <span>{r.moveToProject}</span>
         </SubTrigger>
         <SubContent className="w-48">
+          <Item disabled={assignedProjectId === null} onSelect={() => void moveToNoProject()}>
+            <Codicon name="root-folder" size="0.875rem" />
+            <span className="truncate">{r.noProject}</span>
+          </Item>
           {assignableProjects.map(project => (
-            <Item key={project.id} onSelect={() => void moveToProject(project.id, project.name)}>
+            <Item
+              disabled={assignedProjectId === project.id}
+              key={project.id}
+              onSelect={() => void moveToProject(project.id, project.name)}
+            >
               <Codicon name={project.icon || 'folder-library'} size="0.875rem" />
               <span className="truncate">{project.name}</span>
             </Item>

@@ -16,7 +16,8 @@ const activeGateway = vi.fn<() => { request: typeof request } | null>(() => ({ r
 
 vi.mock('@/hermes', () => ({
   renameSession: (...args: unknown[]) => renameSession(...(args as [])),
-  HermesGateway: class {}
+  HermesGateway: class {},
+  setApiRequestProfile: vi.fn()
 }))
 
 vi.mock('@/store/gateway', () => ({
