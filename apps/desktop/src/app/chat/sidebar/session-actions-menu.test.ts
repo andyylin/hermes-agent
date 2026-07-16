@@ -13,7 +13,6 @@ import { renameSessionPreferringRpc } from './session-actions-menu'
 
 const renameSession = vi.fn(async () => ({ ok: true, title: 'rest-title' }))
 const request = vi.fn(async () => ({ title: 'rpc-title' }) as never)
-const activeGateway = vi.fn<() => { request: typeof request } | null>(() => ({ request }))
 
 vi.mock('@/hermes', () => ({
   renameSession: (...args: unknown[]) => renameSession(...(args as [])),
@@ -24,13 +23,18 @@ vi.mock('@/hermes', () => ({
 }))
 
 vi.mock('@/store/gateway', () => ({
-  activeGateway: () => activeGateway()
+  $activeGatewayProfile: atom('default'),
+  activeGateway: vi.fn(() => null)
 }))
 
 vi.mock('@/store/profile', () => ({
   $activeGatewayProfile: atom('default'),
   normalizeProfileKey: (profile?: string) => profile || 'default'
 }))
+
+const gateway = await import('@/store/gateway')
+const activeGateway = vi.mocked(gateway.activeGateway)
+activeGateway.mockReturnValue({ request } as never)
 
 const RUNTIME_ID = 'rt-runtime-1'
 const STORED_ID = 'stored-branch-1'
@@ -39,7 +43,7 @@ afterEach(() => {
   renameSession.mockClear()
   request.mockClear()
   activeGateway.mockReset()
-  activeGateway.mockReturnValue({ request })
+  activeGateway.mockReturnValue({ request } as never)
   $activeSessionId.set(null)
   $selectedStoredSessionId.set(null)
 })

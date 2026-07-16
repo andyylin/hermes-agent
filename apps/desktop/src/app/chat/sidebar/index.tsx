@@ -60,7 +60,6 @@ import {
   toggleSidebarMessagingOpen,
   unpinSession
 } from '@/store/layout'
-import { notify, notifyError } from '@/store/notifications'
 import {
   $activeGatewayProfile,
   $newChatProfile,
@@ -79,7 +78,6 @@ import {
   $reposScanning,
   $sessionProjectAssignments,
   ALL_PROJECTS,
-  assignSessionToProject,
   enterProject,
   exitProjectScope,
   fetchProjectSessions,
@@ -809,27 +807,6 @@ export function ChatSidebar({
     [projectModel, syncProjectCwd]
   )
 
-  const onAssignSessionToProject = useCallback(
-    async (sessionId: string, projectId: string, profile?: string) => {
-      const project = projectModel.find(node => node.id === projectId)
-
-      try {
-        if (normalizeProfileKey(profile) !== normalizeProfileKey(activeGatewayProfile)) {
-          throw new Error('Switch to this session profile before moving it into a project')
-        }
-        await assignSessionToProject(sessionId, projectId)
-        notify({
-          durationMs: 2_000,
-          kind: 'success',
-          message: s.row.movedToProject(project?.label ?? s.projects.sectionLabel)
-        })
-      } catch (err) {
-        notifyError(err, s.row.moveToProjectFailed)
-      }
-    },
-    [activeGatewayProfile, projectModel, s.projects.sectionLabel, s.row]
-  )
-
   // The Sessions section is a project switcher in grouped mode: its label reads
   // "Sessions" when flat, "Projects" at the overview, and the project's name
   // once you've entered one.
@@ -1402,7 +1379,6 @@ export function ChatSidebar({
                 }
                 liveSessions={inProject ? agentSessions : undefined}
                 onArchiveSession={onArchiveSession}
-                onAssignSessionToProject={onAssignSessionToProject}
                 onBranchSession={onBranchSession}
                 onDeleteSession={onDeleteSession}
                 onEnterProject={onEnterProject}
