@@ -40,6 +40,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -255,14 +256,21 @@ class WebhookAdapter(BasePlatformAdapter):
         await self._runner.setup()
         # Do not probe only one address family before binding. With the
         # dual-stack default, an IPv6-only listener can already own this port
-        # while 127.0.0.1 still looks free. Also disable SO_REUSEADDR for the
-        # listener: on macOS, two wildcard/specific sockets with SO_REUSEADDR
-        # can silently split traffic while both servers report success.
+        # while 127.0.0.1 still looks free.
+        #
+        # SO_REUSEADDR is platform-dependent:
+        #   - macOS (BSD semantics): two wildcard/specific sockets with
+        #     SO_REUSEADDR can silently split traffic while both servers
+        #     report success — so disable it there.
+        #   - Linux: SO_REUSEADDR only permits rebinding past TIME_WAIT
+        #     (a second live listener needs SO_REUSEPORT, which we never
+        #     set). Disabling it would make a quick gateway restart fail
+        #     to bind for up to ~60s — so keep the default (enabled).
         site = web.TCPSite(
             self._runner,
             self._host,
             self._port,
-            reuse_address=False,
+            reuse_address=False if sys.platform == "darwin" else None,
         )
         try:
             await site.start()
@@ -1236,6 +1244,8 @@ class WebhookAdapter(BasePlatformAdapter):
             # Special token: dump the entire payload as JSON
             if key == "__raw__":
                 return json.dumps(payload, indent=2)[:4000]
+            if key == "event_type":
+                return event_type
             value: Any = payload
             for part in key.split("."):
                 if isinstance(value, dict):
@@ -1384,7 +1394,18 @@ class WebhookAdapter(BasePlatformAdapter):
                 success=False, error=f"Unknown platform: {platform_name}"
             )
 
+        # Default adapters first; multiplex may park Slack/etc. only on a
+        # secondary profile (self._profile_adapters). Fall back so webhook
+        # deliver:slack still works when default has slack disabled.
         adapter = self.gateway_runner.adapters.get(target_platform)
+        if not adapter:
+            for _prof, amap in (getattr(self.gateway_runner, "_profile_adapters", None) or {}).items():
+                if not isinstance(amap, dict):
+                    continue
+                cand = amap.get(target_platform)
+                if cand is not None:
+                    adapter = cand
+                    break
         if not adapter:
             return SendResult(
                 success=False,
