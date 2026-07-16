@@ -10,6 +10,22 @@ import pytest
 import tui_gateway.server as server
 
 
+@pytest.fixture(autouse=True)
+def _isolate_server_runtime_state():
+    """Keep the gateway's module caches bound to each test's HERMES_HOME."""
+    if server._db is not None:
+        server._db.close()
+    server._db = None
+    server._db_error = None
+    server._sessions.clear()
+    yield
+    if server._db is not None:
+        server._db.close()
+    server._db = None
+    server._db_error = None
+    server._sessions.clear()
+
+
 def _call(method, params=None):
     handler = server._methods[method]
     resp = handler(1, params or {})

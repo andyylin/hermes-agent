@@ -75,6 +75,22 @@ def db(tmp_path):
     session_db.close()
 
 
+def test_default_db_path_resolves_hermes_home_at_construction(tmp_path, monkeypatch):
+    """A module imported before HERMES_HOME changes must not retain the old DB."""
+    stale_path = tmp_path / "stale-home" / "state.db"
+    active_home = tmp_path / "active-home"
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", stale_path)
+    monkeypatch.setenv("HERMES_HOME", str(active_home))
+
+    session_db = SessionDB()
+    try:
+        assert session_db.db_path == active_home / "state.db"
+        assert session_db.db_path.exists()
+        assert not stale_path.exists()
+    finally:
+        session_db.close()
+
+
 # =========================================================================
 # Session lifecycle
 # =========================================================================
