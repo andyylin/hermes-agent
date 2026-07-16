@@ -1030,8 +1030,11 @@ class SessionDB:
     _IMPORT_MAX_SESSION_BYTES = 5 * 1024 * 1024
     _IMPORT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
 
-    def __init__(self, db_path: Path = None, read_only: bool = False):
-        self.db_path = db_path or DEFAULT_DB_PATH
+    def __init__(self, db_path: Path | None = None, read_only: bool = False):
+        # Resolve the implicit path at construction time. HERMES_HOME and the
+        # context-local profile override can change after this module is imported
+        # (tests and multiplexed profile routing both rely on that behavior).
+        self.db_path = db_path if db_path is not None else get_hermes_home() / "state.db"
         self.read_only = read_only
 
         self._lock = threading.Lock()
