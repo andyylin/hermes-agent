@@ -17,11 +17,14 @@ import { Textarea } from '@/components/ui/textarea'
 import { useI18n } from '@/i18n'
 import { type ProjectIdeaTemplate, randomIdeaTemplates } from '@/lib/project-idea-templates'
 import { cn } from '@/lib/utils'
+import { $activeGatewayProfile } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
 import {
+  $managedProjectCreateAvailable,
   $projectDialog,
   addProjectFolder,
   closeProjectDialog,
+  createManagedProject,
   createProject,
   generateProjectIdea,
   pickProjectFolder,
@@ -35,21 +38,27 @@ export function ProjectDialog() {
   const { t } = useI18n()
   const p = t.sidebar.projects
   const state = useStore($projectDialog)
+  const activeProfile = useStore($activeGatewayProfile)
+  const managedCreateAvailable = useStore($managedProjectCreateAvailable)
   const open = state !== null
   const mode = state?.mode ?? 'create'
 
   const [name, setName] = useState('')
   const [folders, setFolders] = useState<string[]>([])
+  const [folderMode, setFolderMode] = useState<'existing' | 'managed'>('managed')
   const [idea, setIdea] = useState('')
   const [templates, setTemplates] = useState<ProjectIdeaTemplate[]>([])
   const [generatingIdea, setGeneratingIdea] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const nameRef = useRef<HTMLInputElement>(null)
+  const dialogGeneration = useRef(0)
 
   useEffect(() => {
+    dialogGeneration.current += 1
     if (open) {
       setName(state?.name ?? '')
       setFolders([])
+      setFolderMode(state?.folderMode ?? 'managed')
       setIdea('')
       setTemplates(randomIdeaTemplates())
       setGeneratingIdea(false)
@@ -59,10 +68,16 @@ export function ProjectDialog() {
         window.setTimeout(() => nameRef.current?.select(), 0)
       }
     }
-  }, [open, mode, state?.name])
+  }, [activeProfile, mode, open, state])
+
+  useEffect(() => {
+    if (mode === 'create' && managedCreateAvailable === false) {
+      setFolderMode('existing')
+    }
+  }, [managedCreateAvailable, mode])
 
   const onOpenChange = (next: boolean) => {
-    if (!next) {
+    if (!next && !submitting) {
       closeProjectDialog()
     }
   }
@@ -74,15 +89,23 @@ export function ProjectDialog() {
       return
     }
 
+    const generation = dialogGeneration.current
+    const submittedState = state
     setSubmitting(true)
 
     try {
       await write()
-      closeProjectDialog()
+      if (dialogGeneration.current === generation && $projectDialog.get() === submittedState) {
+        closeProjectDialog()
+      }
     } catch (err) {
-      notifyError(err, p.createFailed)
+      if (dialogGeneration.current === generation && $projectDialog.get() === submittedState) {
+        notifyError(err, p.createFailed)
+      }
     } finally {
-      setSubmitting(false)
+      if (dialogGeneration.current === generation) {
+        setSubmitting(false)
+      }
     }
   }
 
@@ -120,10 +143,14 @@ export function ProjectDialog() {
       return
     }
 
-    // A project owns sessions by folder (cwd-prefix), so creation requires at
-    // least one — a folder-less project couldn't hold a session anyway.
-    if (mode === 'create' && trimmed && folders.length) {
-      await runSubmit(() => createProject({ folders, idea: idea.trim() || undefined, name: trimmed, use: true }))
+    if (mode === 'create' && trimmed) {
+      const input = { idea: idea.trim() || undefined, name: trimmed, use: true }
+
+      if (folderMode === 'managed') {
+        await runSubmit(() => createManagedProject(input))
+      } else if (folders.length) {
+        await runSubmit(() => createProject({ ...input, folders }))
+      }
     }
   }
 
@@ -175,6 +202,54 @@ export function ProjectDialog() {
         )}
 
         {mode === 'create' && (
+          <div aria-label={p.foldersLabel} className="grid grid-cols-2 gap-2" role="radiogroup">
+            <button
+              aria-checked={folderMode === 'managed'}
+              className={cn(
+                'rounded-md border p-2 text-left transition-colors',
+                folderMode === 'managed'
+                  ? 'border-(--ui-accent) bg-(--ui-control-active-background)'
+                  : 'border-(--ui-stroke-tertiary) hover:bg-(--ui-control-hover-background)'
+              )}
+              disabled={submitting || managedCreateAvailable === false}
+              onClick={() => setFolderMode('managed')}
+              role="radio"
+              type="button"
+            >
+              <span className="block text-[0.75rem] font-medium">{p.managedOption}</span>
+              <span className="mt-0.5 block text-[0.6875rem] text-(--ui-text-tertiary)">
+                {p.managedOptionDesc}
+              </span>
+            </button>
+            <button
+              aria-checked={folderMode === 'existing'}
+              className={cn(
+                'rounded-md border p-2 text-left transition-colors',
+                folderMode === 'existing'
+                  ? 'border-(--ui-accent) bg-(--ui-control-active-background)'
+                  : 'border-(--ui-stroke-tertiary) hover:bg-(--ui-control-hover-background)'
+              )}
+              disabled={submitting}
+              onClick={() => setFolderMode('existing')}
+              role="radio"
+              type="button"
+            >
+              <span className="block text-[0.75rem] font-medium">{p.existingOption}</span>
+              <span className="mt-0.5 block text-[0.6875rem] text-(--ui-text-tertiary)">
+                {p.existingOptionDesc}
+              </span>
+            </button>
+          </div>
+        )}
+
+        {mode === 'create' && folderMode === 'managed' && (
+          <div className="flex items-start gap-2 rounded-md bg-(--ui-control-hover-background) p-2 text-[0.75rem] text-(--ui-text-secondary)">
+            <Codicon className="mt-0.5 shrink-0 text-(--ui-text-tertiary)" name="folder-library" size="0.875rem" />
+            <span>{p.managedFolderNote}</span>
+          </div>
+        )}
+
+        {mode === 'create' && folderMode === 'existing' && (
           <div className="flex flex-col gap-1.5">
             <span className="text-[0.6875rem] font-medium text-(--ui-text-tertiary)">{p.foldersLabel}</span>
             {folders.length === 0 ? (
@@ -286,7 +361,9 @@ export function ProjectDialog() {
               {t.common.cancel}
             </Button>
             <Button
-              disabled={submitting || !name.trim() || (mode === 'create' && folders.length === 0)}
+              disabled={
+                submitting || !name.trim() || (mode === 'create' && folderMode === 'existing' && folders.length === 0)
+              }
               onClick={() => void submit()}
               type="button"
             >

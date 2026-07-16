@@ -7,7 +7,7 @@ import { desktopDefaultCwd, selectDesktopPaths, writeDesktopFileText } from '@/l
 import { desktopGit } from '@/lib/desktop-git'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { persistentAtom } from '@/lib/persisted'
-import { activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
+import { $activeGatewayProfile, activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
 import { setSidebarAgentsGrouped } from '@/store/layout'
 import { notify } from '@/store/notifications'
 import { requestFreshSession } from '@/store/profile'
@@ -39,6 +39,32 @@ const pendingAssignmentIntents = new Map<string, { token: number; value: null | 
 // False when the connected backend predates the projects.* JSON-RPC surface
 // (same semver label, older install). Null until the first probe.
 export const $projectsRpcAvailable = atom<boolean | null>(null)
+
+// `projects.create_managed` was added after the rest of projects.*. Track it
+// separately per backend so one older profile falls back to the folder picker
+// without disabling Projects — or poisoning another profile's capability.
+type ProjectGateway = NonNullable<ReturnType<typeof activeGateway>>
+
+const managedCreateCapability = new WeakMap<ProjectGateway, boolean>()
+export const $managedProjectCreateAvailable = atom<boolean | null>(null)
+
+function syncManagedCreateCapability(): boolean | null {
+  const gateway = activeGateway()
+  const available = gateway ? (managedCreateCapability.get(gateway) ?? null) : null
+  $managedProjectCreateAvailable.set(available)
+  return available
+}
+
+function setManagedCreateCapability(gateway: ProjectGateway, available: boolean): void {
+  managedCreateCapability.set(gateway, available)
+  if (gateway === activeGateway()) {
+    $managedProjectCreateAvailable.set(available)
+  }
+}
+
+$activeGatewayProfile.subscribe(() => {
+  syncManagedCreateCapability()
+})
 
 function markProjectsRpcSuccess(): void {
   $projectsRpcAvailable.set(true)
@@ -217,21 +243,33 @@ export async function followActiveSessionCwd(cwd: string): Promise<void> {
   }
 }
 
-// Issue a request on whichever gateway is currently active, reconnecting once
-// if the socket dropped. Projects are per-profile, so they intentionally follow
-// the active gateway just like the session list does.
-async function gatewayRequest<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+interface ProjectGatewayTarget {
+  gateway: ProjectGateway
+  profile: string
+}
+
+async function resolveProjectGatewayTarget(): Promise<ProjectGatewayTarget> {
+  const profile = $activeGatewayProfile.get()
   let gateway = activeGateway()
 
   if (!gateway || gateway.connectionState !== 'open') {
     gateway = await ensureActiveGatewayOpen()
   }
 
-  if (!gateway) {
+  if (!gateway || profile !== $activeGatewayProfile.get() || gateway !== activeGateway()) {
     throw new Error('Hermes gateway is not connected')
   }
 
-  return gateway.request<T>(method, params)
+  return { gateway, profile }
+}
+
+// Issue a request on whichever gateway is currently active, reconnecting once
+// if the socket dropped. Projects are per-profile, so they intentionally follow
+// the active gateway just like the session list does.
+async function gatewayRequest<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+  const target = await resolveProjectGatewayTarget()
+
+  return target.gateway.request<T>(method, params)
 }
 
 function applyPayload(payload: ProjectsPayload): void {
@@ -567,41 +605,65 @@ function projectInfoToTreeNode(project: ProjectInfo): SidebarProjectTree {
   }
 }
 
-export async function createProject(input: CreateProjectInput): Promise<ProjectInfo | null> {
+async function createProjectWithRpc(input: CreateProjectInput, managed: boolean): Promise<ProjectInfo | null> {
   if ($projectsRpcAvailable.get() === false) {
     throw projectsStaleBackendError()
   }
 
+  const method = managed ? 'projects.create_managed' : 'projects.create'
+  const params: Record<string, unknown> = {
+    name: input.name,
+    slug: input.slug,
+    description: input.description,
+    icon: input.icon,
+    color: input.color,
+    board_slug: input.boardSlug,
+    use: input.use ?? false
+  }
+
+  if (!managed) {
+    params.folders = input.folders ?? []
+    params.primary_path = input.primaryPath
+  }
+
+  const target = await resolveProjectGatewayTarget()
   let res: { project: ProjectInfo | null }
 
   try {
-    res = await gatewayRequest<{ project: ProjectInfo | null }>('projects.create', {
-      name: input.name,
-      folders: input.folders ?? [],
-      primary_path: input.primaryPath,
-      slug: input.slug,
-      description: input.description,
-      icon: input.icon,
-      color: input.color,
-      board_slug: input.boardSlug,
-      use: input.use ?? false
-    })
+    res = await target.gateway.request<{ project: ProjectInfo | null }>(method, params)
   } catch (err) {
     if (isMissingRpcMethod(err)) {
-      $projectsRpcAvailable.set(false)
+      if (managed) {
+        setManagedCreateCapability(target.gateway, false)
+        throw new Error(translateNow('sidebar.projects.managedUnsupported'))
+      }
+
+      if (target.profile === $activeGatewayProfile.get() && target.gateway === activeGateway()) {
+        $projectsRpcAvailable.set(false)
+      }
       throw projectsStaleBackendError()
     }
 
     throw err
   }
 
-  markProjectsRpcSuccess()
-
   // Not optimistic (the create awaits the RPC first, so there's nothing to roll
   // back): apply the server's row into the cached list + tree at once, so it
   // (and an entered scope) shows without waiting on the background refreshes
   // that reconcile counts/repos.
   const created = res.project
+
+  // The RPC is bound to the gateway that was active when the request began.
+  // A profile switch while it was in flight must not write IDEA.md, mutate the
+  // new profile's cache, or launch reconciliation against that new backend.
+  if (target.profile !== $activeGatewayProfile.get() || target.gateway !== activeGateway()) {
+    return created
+  }
+
+  if (managed) {
+    setManagedCreateCapability(target.gateway, true)
+  }
+  markProjectsRpcSuccess()
 
   if (created) {
     if (input.idea) {
@@ -626,6 +688,14 @@ export async function createProject(input: CreateProjectInput): Promise<ProjectI
   reconcileProjects()
 
   return created
+}
+
+export async function createProject(input: CreateProjectInput): Promise<ProjectInfo | null> {
+  return createProjectWithRpc(input, false)
+}
+
+export async function createManagedProject(input: CreateProjectInput): Promise<ProjectInfo | null> {
+  return createProjectWithRpc(input, true)
 }
 
 export async function renameProject(id: string, name: string): Promise<void> {
@@ -761,6 +831,7 @@ export async function setActiveProject(id: null | string): Promise<void> {
 // (mirrors $profileCreateRequest).
 export interface ProjectDialogState {
   mode: 'add-folder' | 'create' | 'rename'
+  folderMode?: 'existing' | 'managed'
   projectId?: string
   name?: string
 }
@@ -777,7 +848,10 @@ export function openProjectCreate(): void {
     return
   }
 
-  $projectDialog.set({ mode: 'create' })
+  $projectDialog.set({
+    folderMode: syncManagedCreateCapability() === false ? 'existing' : 'managed',
+    mode: 'create'
+  })
 }
 
 export function openProjectRename(project: { id: string; name: string }): void {

@@ -1300,6 +1300,11 @@ export interface Translations {
       newButton: string
       createTitle: string
       createDesc: string
+      managedOption: string
+      managedOptionDesc: string
+      existingOption: string
+      existingOptionDesc: string
+      managedFolderNote: string
       renameTitle: string
       addFolderTitle: string
       namePlaceholder: string
@@ -1325,6 +1330,7 @@ export interface Translations {
       copyPath: string
       removeFromSidebar: string
       createFailed: string
+      managedUnsupported: string
       staleBackend: string
       deleteConfirm: string
       startWork: string

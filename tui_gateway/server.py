@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import queue
+import stat
 import subprocess
 import sys
 import threading
@@ -10975,6 +10976,10 @@ class _NoProject(Exception):
     """Raised inside a projects handler when ``params['id']`` resolves to None."""
 
 
+class _ManagedProjectFilesystemError(Exception):
+    """Managed-root containment or filesystem failure, not a client argument."""
+
+
 def _projects_payload(conn) -> dict:
     from hermes_cli import projects_db as pdb
 
@@ -11020,6 +11025,98 @@ def _require_project(pdb, conn, params: dict):
     return proj
 
 
+def _managed_projects_root() -> Path:
+    """Return the active profile's non-symlinked managed Projects directory."""
+    from hermes_constants import get_hermes_home
+
+    home = Path(get_hermes_home()).expanduser()
+    home.mkdir(parents=True, exist_ok=True)
+    resolved_home = home.resolve(strict=True)
+    root = home / "projects"
+    if root.is_symlink():
+        raise _ManagedProjectFilesystemError("managed projects root must not be a symlink")
+    root.mkdir(mode=0o700, parents=False, exist_ok=True)
+    resolved_root = root.resolve(strict=True)
+    try:
+        resolved_root.relative_to(resolved_home)
+    except ValueError as exc:
+        raise _ManagedProjectFilesystemError("managed projects root escapes the active profile") from exc
+    if resolved_root.parent != resolved_home:
+        raise _ManagedProjectFilesystemError("managed projects root must be directly under the active profile")
+    return resolved_root
+
+
+def _create_managed_project_folder(root: Path, slug: str) -> Path:
+    """Create one child relative to a no-follow handle for ``root``."""
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if root.is_symlink():
+        raise _ManagedProjectFilesystemError("managed projects root changed into a symlink")
+    candidate = root / slug
+
+    def same_root(opened) -> bool:
+        current = os.stat(root, follow_symlinks=False)
+        return (
+            stat.S_ISDIR(current.st_mode)
+            and current.st_dev == opened.st_dev
+            and current.st_ino == opened.st_ino
+        )
+
+    supports_dir_fd = os.mkdir in os.supports_dir_fd and os.stat in os.supports_dir_fd
+    if supports_dir_fd:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            root_fd = os.open(root, flags)
+        except OSError as exc:
+            raise _ManagedProjectFilesystemError("could not securely open managed projects root") from exc
+        try:
+            opened = os.fstat(root_fd)
+            if not same_root(opened):
+                raise _ManagedProjectFilesystemError("managed projects root changed during creation")
+            created = False
+            try:
+                os.mkdir(slug, mode=0o700, dir_fd=root_fd)
+                created = True
+                if not same_root(opened):
+                    raise _ManagedProjectFilesystemError("managed projects root changed during creation")
+                child = os.stat(slug, dir_fd=root_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(child.st_mode):
+                    raise _ManagedProjectFilesystemError("managed project folder is not a directory")
+                return candidate
+            except Exception:
+                if created:
+                    with contextlib.suppress(OSError):
+                        os.rmdir(slug, dir_fd=root_fd)
+                raise
+        finally:
+            os.close(root_fd)
+
+    # Windows fallback: reject reparse points and compare the stable root
+    # identity before and after mkdir. Python exposes no mkdirat there.
+    opened = os.stat(root, follow_symlinks=False)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    if reparse_flag and getattr(opened, "st_file_attributes", 0) & reparse_flag:
+        raise _ManagedProjectFilesystemError("managed projects root must not be a reparse point")
+    created = False
+    try:
+        candidate.mkdir(mode=0o700, exist_ok=False)
+        created = True
+        current = os.stat(root, follow_symlinks=False)
+        if current.st_dev != opened.st_dev or current.st_ino != opened.st_ino or root.is_symlink():
+            raise _ManagedProjectFilesystemError("managed projects root changed during creation")
+        return candidate
+    except Exception:
+        if created:
+            with contextlib.suppress(OSError):
+                candidate.rmdir()
+        raise
+
+
+def _remove_managed_project_folder(folder: Path) -> None:
+    """Rollback only the empty directory created by this request."""
+    with contextlib.suppress(OSError):
+        folder.rmdir()
+
+
 @_projects_method("projects.list")
 def _(rid, params, pdb, conn) -> dict:
     return _ok(rid, _projects_payload(conn))
@@ -11047,6 +11144,25 @@ def _(rid, params, pdb, conn) -> dict:
         pdb.set_active(conn, pid)
     proj = pdb.get_project(conn, pid)
     return _ok(rid, {"project": proj.to_dict() if proj else None})
+
+
+@_projects_method("projects.create_managed")
+def _(rid, params, pdb, conn) -> dict:
+    name = str(params.get("name") or "").strip()
+    root = _managed_projects_root()
+    project = pdb.create_managed_project(
+        conn,
+        name=name,
+        slug=params.get("slug"),
+        create_folder=lambda candidate: _create_managed_project_folder(root, candidate),
+        remove_folder=_remove_managed_project_folder,
+        description=params.get("description"),
+        icon=params.get("icon"),
+        color=params.get("color"),
+        board_slug=params.get("board_slug"),
+        use=bool(params.get("use")),
+    )
+    return _ok(rid, {"project": project.to_dict()})
 
 
 @_projects_method("projects.update")

@@ -1,9 +1,13 @@
+import { atom } from 'nanostores'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $sidebarAgentsGrouped } from '@/store/layout'
 
 import {
   $activeProjectId,
+  $managedProjectCreateAvailable,
+  $projectDialog,
+  $projects,
   $projectScope,
   $projectSessionAssignmentsAvailable,
   $projectsRpcAvailable,
@@ -11,6 +15,7 @@ import {
   $worktreeRefreshToken,
   ALL_PROJECTS,
   assignSessionToProject,
+  createManagedProject,
   createProject,
   enterProject,
   exitProjectScope,
@@ -21,6 +26,7 @@ import {
   refreshWorktrees,
   unassignSessionFromProject
 } from './projects'
+
 
 vi.mock('@/i18n', () => ({
   translateNow: (key: string) => key
@@ -38,6 +44,7 @@ vi.mock('@/lib/desktop-fs', () => ({
 }))
 
 vi.mock('@/store/gateway', () => ({
+  $activeGatewayProfile: atom('default'),
   activeGateway: vi.fn(),
   ensureActiveGatewayOpen: vi.fn()
 }))
@@ -48,6 +55,7 @@ const isDesktopFsRemoteMode = vi.mocked(fs.isDesktopFsRemoteMode)
 const selectDesktopPaths = vi.mocked(fs.selectDesktopPaths)
 
 const gw = await import('@/store/gateway')
+const activeGatewayProfile = gw.$activeGatewayProfile
 const activeGateway = vi.mocked(gw.activeGateway)
 const notifications = await import('@/store/notifications')
 const notify = vi.mocked(notifications.notify)
@@ -129,11 +137,18 @@ describe('pickProjectFolder', () => {
 })
 
 describe('createProject', () => {
+  let profileNumber = 0
+
   beforeEach(() => {
     vi.clearAllMocks()
     $sidebarAgentsGrouped.set(false)
     $activeProjectId.set(null)
     $projectsRpcAvailable.set(null)
+    $managedProjectCreateAvailable.set(null)
+    $projects.set([])
+    $projectDialog.set(null)
+    profileNumber += 1
+    activeGatewayProfile.set(`test-${profileNumber}`)
   })
 
   it('creates the project and flips into the grouped view so a blank slate shows it', async () => {
@@ -169,6 +184,85 @@ describe('createProject', () => {
       'sidebar.projects.staleBackend'
     )
     expect($projectsRpcAvailable.get()).toBe(false)
+  })
+
+  it('creates a managed project without sending a client-selected folder', async () => {
+    const created = {
+      folders: [{ path: '/profile/projects/demo' }],
+      id: 'p_managed',
+      name: 'Demo',
+      primary_path: '/profile/projects/demo'
+    }
+    const request = vi.fn(async (method: string) => {
+      if (method === 'projects.create_managed') {
+        return { project: created }
+      }
+      return { active_id: 'p_managed', projects: [created], scoped_session_ids: [] }
+    })
+    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+
+    const result = await createManagedProject({ name: 'Demo', use: true })
+
+    expect(result).toEqual(created)
+    expect(request).toHaveBeenCalledWith(
+      'projects.create_managed',
+      expect.not.objectContaining({ folders: expect.anything(), primary_path: expect.anything() })
+    )
+    expect($activeProjectId.get()).toBe('p_managed')
+  })
+
+  it('does not mark all Projects stale when only managed creation is unsupported', async () => {
+    const unsupportedProfile = activeGatewayProfile.get()
+    const unsupportedGateway = {
+      connectionState: 'open',
+      request: vi.fn().mockRejectedValue(new Error('unknown method: projects.create_managed'))
+    } as never
+    activeGateway.mockReturnValue(unsupportedGateway)
+
+    await expect(createManagedProject({ name: 'Demo' })).rejects.toThrow('sidebar.projects.managedUnsupported')
+    expect($projectsRpcAvailable.get()).not.toBe(false)
+    expect($managedProjectCreateAvailable.get()).toBe(false)
+
+    openProjectCreate()
+    expect($projectDialog.get()).toEqual({ folderMode: 'existing', mode: 'create' })
+
+    const newerGateway = { connectionState: 'open', request: vi.fn() } as never
+    activeGateway.mockReturnValue(newerGateway)
+    activeGatewayProfile.set('newer-profile')
+    expect($managedProjectCreateAvailable.get()).toBeNull()
+    activeGateway.mockReturnValue(unsupportedGateway)
+    activeGatewayProfile.set(unsupportedProfile)
+    expect($managedProjectCreateAvailable.get()).toBe(false)
+  })
+
+  it('does not apply a completed create to a profile selected while the request was in flight', async () => {
+    let resolveCreate: ((value: unknown) => void) | undefined
+    const request = vi.fn(
+      () =>
+        new Promise(resolve => {
+          resolveCreate = resolve
+        })
+    )
+    const profileAGateway = { connectionState: 'open', request } as never
+    activeGateway.mockReturnValue(profileAGateway)
+
+    const creating = createManagedProject({ idea: 'Keep this in A', name: 'Profile A', use: true })
+    await vi.waitFor(() => expect(resolveCreate).toBeTypeOf('function'))
+
+    activeGateway.mockReturnValue({ connectionState: 'open', request: vi.fn() } as never)
+    activeGatewayProfile.set('profile-b')
+    resolveCreate?.({
+      project: {
+        folders: [{ path: '/profile-a/projects/a' }],
+        id: 'p_a',
+        name: 'Profile A',
+        primary_path: '/profile-a/projects/a'
+      }
+    })
+
+    await expect(creating).resolves.toEqual(expect.objectContaining({ id: 'p_a' }))
+    expect($projects.get()).toEqual([])
+    expect($activeProjectId.get()).toBeNull()
   })
 })
 

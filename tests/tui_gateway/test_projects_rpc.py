@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -21,6 +22,7 @@ def test_methods_registered():
     for m in (
         "projects.list",
         "projects.create",
+        "projects.create_managed",
         "projects.get",
         "projects.update",
         "projects.add_folder",
@@ -33,6 +35,193 @@ def test_methods_registered():
         "projects.for_cwd",
     ):
         assert m in server._methods
+
+
+def test_create_managed_project_owns_a_profile_folder(tmp_path, monkeypatch):
+    managed_root = tmp_path / "profile" / "projects"
+    monkeypatch.setattr(server, "_managed_projects_root", lambda: managed_root)
+
+    result = _call("projects.create_managed", {"name": "My First Project", "use": True})
+    project = result["project"]
+    expected = managed_root / "my-first-project"
+
+    assert expected.is_dir()
+    assert project["slug"] == "my-first-project"
+    assert project["primary_path"] == str(expected)
+    assert project["folders"][0]["path"] == str(expected)
+
+
+def test_create_managed_project_uses_a_collision_safe_slug(tmp_path, monkeypatch):
+    managed_root = tmp_path / "profile" / "projects"
+    monkeypatch.setattr(server, "_managed_projects_root", lambda: managed_root)
+    _call("projects.create", {"name": "Existing", "slug": "demo", "folders": [str(tmp_path / "elsewhere")]})
+
+    project = _call("projects.create_managed", {"name": "Demo"})["project"]
+
+    assert project["slug"] == "demo-2"
+    assert project["primary_path"] == str(managed_root / "demo-2")
+    assert (managed_root / "demo-2").is_dir()
+
+
+def test_create_managed_project_removes_empty_folder_after_db_failure(tmp_path, monkeypatch):
+    from hermes_cli import projects_db as pdb
+
+    managed_root = tmp_path / "profile" / "projects"
+    monkeypatch.setattr(server, "_managed_projects_root", lambda: managed_root)
+
+    def fail_create(*_args, **_kwargs):
+        raise OSError("database boom")
+
+    monkeypatch.setattr(pdb, "_create_project_locked", fail_create)
+    response = server._methods["projects.create_managed"](1, {"name": "Rollback Me"})
+
+    assert response["error"]["message"] == "database boom"
+    assert not (managed_root / "rollback-me").exists()
+
+
+def test_create_managed_project_cleans_up_if_reserved_slug_races(tmp_path, monkeypatch):
+    managed_root = tmp_path / "profile" / "projects"
+    monkeypatch.setattr(server, "_managed_projects_root", lambda: managed_root)
+    real_create = server._create_managed_project_folder
+
+    def collide_once(root, slug):
+        if slug == "race":
+            (root / slug).mkdir(parents=True)
+            raise FileExistsError(slug)
+        return real_create(root, slug)
+
+    monkeypatch.setattr(server, "_create_managed_project_folder", collide_once)
+
+    project = _call("projects.create_managed", {"name": "Racing Project", "slug": "race"})["project"]
+
+    assert project["slug"] == "race-2"
+    assert (managed_root / "race").is_dir()
+    assert (managed_root / "race-2").is_dir()
+
+
+def test_managed_projects_root_uses_the_active_profile_home(tmp_path, monkeypatch):
+    import hermes_constants
+
+    profile_home = tmp_path / "named-profile"
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: profile_home)
+
+    root = server._managed_projects_root()
+
+    assert root == (profile_home / "projects").resolve()
+    assert root.is_dir()
+
+
+def test_create_managed_project_rejects_traversal_slug(tmp_path, monkeypatch):
+    managed_root = tmp_path / "profile" / "projects"
+    monkeypatch.setattr(server, "_managed_projects_root", lambda: managed_root)
+
+    response = server._methods["projects.create_managed"](1, {"name": "Escape", "slug": "../outside"})
+
+    assert response["error"]["code"] == 5063
+    assert not (tmp_path / "profile" / "outside").exists()
+
+
+def test_create_managed_project_skips_an_existing_directory_without_adopting_it(tmp_path, monkeypatch):
+    managed_root = tmp_path / "profile" / "projects"
+    existing = managed_root / "demo"
+    existing.mkdir(parents=True)
+    marker = existing / "keep.txt"
+    marker.write_text("do not touch")
+    monkeypatch.setattr(server, "_managed_projects_root", lambda: managed_root)
+
+    project = _call("projects.create_managed", {"name": "Demo"})["project"]
+
+    assert project["slug"] == "demo-2"
+    assert project["primary_path"] == str(managed_root / "demo-2")
+    assert (managed_root / "demo-2").is_dir()
+    assert marker.read_text() == "do not touch"
+
+
+def test_create_managed_project_after_delete_preserves_old_folder_and_uses_next_slug(tmp_path, monkeypatch):
+    managed_root = tmp_path / "profile" / "projects"
+    monkeypatch.setattr(server, "_managed_projects_root", lambda: managed_root)
+
+    first = _call("projects.create_managed", {"name": "Demo"})["project"]
+    marker = managed_root / "demo" / "keep.txt"
+    marker.write_text("retained files")
+    _call("projects.delete", {"id": first["id"]})
+
+    second = _call("projects.create_managed", {"name": "Demo"})["project"]
+
+    assert second["slug"] == "demo-2"
+    assert second["primary_path"] == str(managed_root / "demo-2")
+    assert marker.read_text() == "retained files"
+
+
+def test_create_managed_project_rejects_root_symlink_swap(tmp_path, monkeypatch):
+    managed_root = tmp_path / "profile" / "projects"
+    original_root = tmp_path / "profile" / "projects-original"
+    external = tmp_path / "external"
+    managed_root.mkdir(parents=True)
+    external.mkdir()
+
+    def swapped_root():
+        managed_root.rename(original_root)
+        managed_root.symlink_to(external, target_is_directory=True)
+        return managed_root
+
+    monkeypatch.setattr(server, "_managed_projects_root", swapped_root)
+
+    response = server._methods["projects.create_managed"](1, {"name": "Escape"})
+
+    assert response["error"]["code"] == 5061
+    assert "managed projects root" in response["error"]["message"]
+    assert list(external.iterdir()) == []
+
+
+def test_create_managed_project_rolls_back_db_and_folder_if_set_active_fails(tmp_path, monkeypatch):
+    from hermes_cli import projects_db as pdb
+
+    managed_root = tmp_path / "profile" / "projects"
+    monkeypatch.setattr(server, "_managed_projects_root", lambda: managed_root)
+
+    def fail_set_active(*_args, **_kwargs):
+        raise OSError("active pointer boom")
+
+    monkeypatch.setattr(pdb, "_set_active_locked", fail_set_active)
+    response = server._methods["projects.create_managed"](1, {"name": "Rollback Me", "use": True})
+
+    assert response["error"]["message"] == "active pointer boom"
+    assert _call("projects.list")["projects"] == []
+    assert not (managed_root / "rollback-me").exists()
+
+
+def test_concurrent_managed_creates_serialize_slug_and_folder_reservation(tmp_path, monkeypatch):
+    managed_root = tmp_path / "profile" / "projects"
+    monkeypatch.setattr(server, "_managed_projects_root", lambda: managed_root)
+    _call("projects.list")  # initialize this test's projects DB before the race
+
+    handler = server._methods["projects.create_managed"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda _: handler(1, {"name": "Demo"}), range(2)))
+
+    assert all("error" not in response for response in responses), responses
+    slugs = sorted(response["result"]["project"]["slug"] for response in responses)
+    assert slugs == ["demo", "demo-2"]
+    assert (managed_root / "demo").is_dir()
+    assert (managed_root / "demo-2").is_dir()
+
+
+def test_managed_projects_root_rejects_a_symlink_escape(tmp_path, monkeypatch):
+    import hermes_constants
+
+    profile_home = tmp_path / "profile"
+    external = tmp_path / "external"
+    profile_home.mkdir()
+    external.mkdir()
+    (profile_home / "projects").symlink_to(external, target_is_directory=True)
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: profile_home)
+
+    response = server._methods["projects.create_managed"](1, {"name": "Escape"})
+
+    assert response["error"]["code"] == 5061
+    assert "symlink" in response["error"]["message"]
+    assert list(external.iterdir()) == []
 
 
 def test_for_cwd_is_a_long_handler():

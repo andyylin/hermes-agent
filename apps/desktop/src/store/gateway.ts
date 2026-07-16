@@ -61,6 +61,7 @@ interface Secondary {
 const secondaries = new Map<string, Secondary>()
 
 let activeKey = 'default'
+export const $activeGatewayProfile = atom(activeKey)
 
 export function isActivePrimary(): boolean {
   return activeKey === primaryProfile
@@ -92,6 +93,7 @@ function setActive(profile: string): void {
   activeKey = normKey(profile)
   const gateway = activeGateway()
   $gateway.set(gateway)
+  $activeGatewayProfile.set(activeKey)
   setGatewayState(gateway?.connectionState ?? 'closed')
 }
 

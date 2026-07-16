@@ -1496,7 +1496,12 @@ export const ja = defineLocale({
       sectionLabel: 'プロジェクト',
       newButton: '新規プロジェクト',
       createTitle: '新規プロジェクト',
-      createDesc: 'ワークスペースに名前を付け、1つ以上のフォルダを追加します。',
+      createDesc: 'ワークスペースに名前を付け、ファイルの保存場所を選びます。',
+      managedOption: 'フォルダを作成',
+      managedOptionDesc: 'Hermes が管理',
+      existingOption: '既存を使用',
+      existingOptionDesc: 'フォルダを選択',
+      managedFolderNote: 'Hermes がこのプロファイルの projects ディレクトリ内に専用フォルダを作成します。',
       renameTitle: 'プロジェクト名を変更',
       addFolderTitle: 'フォルダを追加',
       namePlaceholder: '例: Skunkworks',
@@ -1522,6 +1527,7 @@ export const ja = defineLocale({
       copyPath: 'パスをコピー',
       removeFromSidebar: 'サイドバーから削除',
       createFailed: 'プロジェクトを作成できませんでした',
+      managedUnsupported: '管理対象プロジェクトフォルダを作成するには Hermes バックエンドを更新してください。',
       staleBackend:
         'プロジェクトを作成するには Hermes バックエンドを更新してください。バックエンドがこのデスクトップアプリより古いです（設定 → 更新 → バックエンド）。',
       deleteConfirm:

@@ -31,7 +31,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing, write_txn
 from hermes_constants import get_hermes_home
@@ -367,7 +367,7 @@ def _unique_slug(conn: sqlite3.Connection, candidate: str) -> str:
     return slug
 
 
-def create_project(
+def _create_project_locked(
     conn: sqlite3.Connection,
     *,
     name: str,
@@ -378,18 +378,15 @@ def create_project(
     icon: Optional[str] = None,
     color: Optional[str] = None,
     board_slug: Optional[str] = None,
+    exact_slug: bool = False,
 ) -> str:
-    """Create a project and return its id.
-
-    ``folders`` are normalized to absolute paths. If ``primary_path`` is given
-    it is added to the folder set (if not already present) and marked primary;
-    otherwise the first folder becomes primary.
-    """
+    """Insert one project while the caller owns the write transaction."""
     name = str(name or "").strip()
     if not name:
         raise ValueError("project name must not be empty")
 
     slug_candidate = normalize_slug(slug) if slug else _slugify(name)
+    assert slug_candidate is not None
     pid = _new_project_id()
     now = _now()
 
@@ -405,33 +402,134 @@ def create_project(
     if primary is None and folder_paths:
         primary = folder_paths[0]
 
-    with write_txn(conn):
-        unique = _unique_slug(conn, slug_candidate)
+    unique = slug_candidate if exact_slug else _unique_slug(conn, slug_candidate)
+    if exact_slug and conn.execute(
+        "SELECT 1 FROM projects WHERE slug = ?", (unique,)
+    ).fetchone() is not None:
+        raise ValueError(f"project slug already exists: {unique}")
+    conn.execute(
+        "INSERT INTO projects "
+        "(id, slug, name, description, icon, color, board_slug, "
+        " primary_path, created_at, archived) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+        (
+            pid,
+            unique,
+            name,
+            description,
+            icon,
+            color,
+            normalize_slug(board_slug) if board_slug else None,
+            primary,
+            now,
+        ),
+    )
+    for path in folder_paths:
         conn.execute(
-            "INSERT INTO projects "
-            "(id, slug, name, description, icon, color, board_slug, "
-            " primary_path, created_at, archived) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
-            (
-                pid,
-                unique,
-                name,
-                description,
-                icon,
-                color,
-                normalize_slug(board_slug) if board_slug else None,
-                primary,
-                now,
-            ),
+            "INSERT INTO project_folders "
+            "(project_id, path, label, is_primary, added_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (pid, path, None, 1 if path == primary else 0, now),
         )
-        for path in folder_paths:
-            conn.execute(
-                "INSERT INTO project_folders "
-                "(project_id, path, label, is_primary, added_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (pid, path, None, 1 if path == primary else 0, now),
-            )
     return pid
+
+
+def create_project(
+    conn: sqlite3.Connection,
+    *,
+    name: str,
+    slug: Optional[str] = None,
+    folders: Optional[Iterable[str]] = None,
+    primary_path: Optional[str] = None,
+    description: Optional[str] = None,
+    icon: Optional[str] = None,
+    color: Optional[str] = None,
+    board_slug: Optional[str] = None,
+    exact_slug: bool = False,
+) -> str:
+    """Create a project and return its id.
+
+    ``folders`` are normalized to absolute paths. If ``primary_path`` is given
+    it is added to the folder set (if not already present) and marked primary;
+    otherwise the first folder becomes primary.
+    """
+    with write_txn(conn):
+        return _create_project_locked(
+            conn,
+            name=name,
+            slug=slug,
+            folders=folders,
+            primary_path=primary_path,
+            description=description,
+            icon=icon,
+            color=color,
+            board_slug=board_slug,
+            exact_slug=exact_slug,
+        )
+
+
+def create_managed_project(
+    conn: sqlite3.Connection,
+    *,
+    name: str,
+    slug: Optional[str],
+    create_folder: Callable[[str], Path],
+    remove_folder: Callable[[Path], None],
+    description: Optional[str] = None,
+    icon: Optional[str] = None,
+    color: Optional[str] = None,
+    board_slug: Optional[str] = None,
+    use: bool = False,
+) -> Project:
+    """Atomically reserve a free DB/filesystem slug and create its project."""
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        raise ValueError("project name must not be empty")
+    base = normalize_slug(slug) if slug else _slugify(clean_name)
+    assert base is not None
+
+    folder: Optional[Path] = None
+    try:
+        with write_txn(conn):
+            suffix = 1
+            while True:
+                candidate = base
+                if suffix > 1:
+                    ending = f"-{suffix}"
+                    candidate = base[: 64 - len(ending)].rstrip("-_") + ending
+                suffix += 1
+                if conn.execute(
+                    "SELECT 1 FROM projects WHERE slug = ?", (candidate,)
+                ).fetchone() is not None:
+                    continue
+                try:
+                    folder = create_folder(candidate)
+                except FileExistsError:
+                    continue
+                break
+
+            pid = _create_project_locked(
+                conn,
+                name=clean_name,
+                slug=candidate,
+                folders=[str(folder)],
+                primary_path=str(folder),
+                description=description,
+                icon=icon,
+                color=color,
+                board_slug=board_slug,
+                exact_slug=True,
+            )
+            if use:
+                _set_active_locked(conn, pid)
+            project = get_project(conn, pid)
+            if project is None:
+                raise RuntimeError("managed project disappeared before commit")
+        return project
+    except Exception:
+        if folder is not None:
+            remove_folder(folder)
+        raise
 
 
 def list_projects(
@@ -727,17 +825,21 @@ def list_session_assignments(conn: sqlite3.Connection) -> dict[str, Optional[str
 _ACTIVE_META_KEY = "active_id"
 
 
+def _set_active_locked(conn: sqlite3.Connection, project_id: Optional[str]) -> None:
+    if project_id is None:
+        conn.execute("DELETE FROM project_meta WHERE key = ?", (_ACTIVE_META_KEY,))
+    else:
+        conn.execute(
+            "INSERT INTO project_meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_ACTIVE_META_KEY, project_id),
+        )
+
+
 def set_active(conn: sqlite3.Connection, project_id: Optional[str]) -> None:
     """Set (or clear, when ``None``) the active project pointer."""
     with write_txn(conn):
-        if project_id is None:
-            conn.execute("DELETE FROM project_meta WHERE key = ?", (_ACTIVE_META_KEY,))
-        else:
-            conn.execute(
-                "INSERT INTO project_meta (key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (_ACTIVE_META_KEY, project_id),
-            )
+        _set_active_locked(conn, project_id)
 
 
 def get_active_id(conn: sqlite3.Connection) -> Optional[str]:
