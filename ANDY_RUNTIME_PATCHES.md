@@ -40,6 +40,9 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
   - Archives `LINE_ARCHIVE_GROUPS`, short-circuits `LINE_READ_ONLY_GROUPS`, and requires `LINE_GROUP_PREFIXES` for `LINE_REQUIRE_PREFIX_GROUPS` before agent dispatch.
   - Teaches the generic gateway auth layer that LINE group chats use `LINE_ALLOWED_GROUPS` as a chat allowlist, not sender-only `LINE_ALLOWED_USERS`.
 
+- `fix(desktop): preserve unsafe config integers`
+  - Serializes large config identifiers without JavaScript precision loss so Discord/channel/account IDs are not silently rounded by Desktop edits.
+
 - `feat(projects): complete session move lifecycle` *(temporary pending upstream)*
   - Source: `andyylin/hermes-agent:contrib/pr-61335-complete`, preserving JuizSpeaking's original commits from upstream PR #61335.
   - Adds explicit project assignment, explicit `No Project`, profile-safe assign/unassign RPCs, cwd re-anchoring/restoration, and Desktop move/drag behavior.
