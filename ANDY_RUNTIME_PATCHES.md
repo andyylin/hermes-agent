@@ -48,6 +48,16 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
   - Adds explicit project assignment, explicit `No Project`, profile-safe assign/unassign RPCs, cwd re-anchoring/restoration, and Desktop move/drag behavior.
   - Retire this overlay once PR #61335 (or an equivalent upstream implementation) lands and the runtime has been reconciled to that upstream version.
 
+## Custom Desktop distribution
+
+Install or repair the canonical macOS/Linux Desktop build with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/andyylin/hermes-agent/andy-runtime/scripts/install-andy-desktop.sh | bash
+```
+
+The bootstrap pins the checkout and in-app updater to `origin/andy-runtime`, builds the native Desktop app, and installs `hermes-custom-update`. It deliberately does not copy credentials or remote-backend authentication. Re-running it is idempotent, but it refuses to proceed over tracked source changes.
+
 ## Operating rule
 
 Before restarting live Hermes gateway after upstream updates:
