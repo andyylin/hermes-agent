@@ -390,12 +390,29 @@ async def test_forum_post_file_creation_failure():
 
 
 # ---------------------------------------------------------------------------
-# Standalone fenced-code messages
+# Selectively standalone fenced-code messages
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_send_puts_fenced_code_block_in_standalone_message():
+async def test_send_keeps_ordinary_fenced_code_with_surrounding_prose():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(id=1)))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    content = "Explain this:\n\n```text\nillustrative output\n```\n\nThen continue."
+
+    result = await adapter.send("555", content)
+
+    assert result.success is True
+    channel.send.assert_awaited_once()
+    assert channel.send.await_args.kwargs["content"] == content
+
+
+@pytest.mark.asyncio
+async def test_send_puts_copy_marked_fenced_code_block_in_standalone_message():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     channel = SimpleNamespace(
         send=AsyncMock(side_effect=[
@@ -409,7 +426,8 @@ async def test_send_puts_fenced_code_block_in_standalone_message():
 
     result = await adapter.send(
         "555",
-        "Run this: `inline`\n\n```python\nprint('copy me')\n```\n\nThen continue.",
+        "Run this: `inline`\n\n<!-- hermes:copy -->\n"
+        "```python\nprint('copy me')\n```\n\nThen continue.",
     )
 
     assert result.success is True
@@ -421,7 +439,35 @@ async def test_send_puts_fenced_code_block_in_standalone_message():
 
 
 @pytest.mark.asyncio
-async def test_send_to_forum_puts_fenced_code_block_in_standalone_message():
+async def test_send_only_isolates_copy_marked_fence_among_multiple_fences():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(
+        send=AsyncMock(side_effect=[SimpleNamespace(id=1), SimpleNamespace(id=2)]),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    content = (
+        "Example:\n```text\nnot independently copyable\n```\n\n"
+        "Paste this:\n<!-- hermes:copy -->\n```bash\nrun-me --now\n```"
+    )
+
+    result = await adapter.send("555", content)
+
+    assert result.success is True
+    assert [call.kwargs["content"] for call in channel.send.await_args_list] == [
+        "Example:\n```text\nnot independently copyable\n```\n\nPaste this:",
+        "```bash\nrun-me --now\n```",
+    ]
+    assert all(
+        "hermes:copy" not in call.kwargs["content"]
+        for call in channel.send.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_to_forum_puts_copy_marked_fenced_code_in_standalone_message():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     thread_ch = SimpleNamespace(
         id=555,
@@ -442,7 +488,7 @@ async def test_send_to_forum_puts_fenced_code_block_in_standalone_message():
     )
 
     result = await adapter.send(
-        "999", "Intro\n\n```text\ncopy me\n```\n\nOutro",
+        "999", "Intro\n\n<!-- hermes:copy -->\n```text\ncopy me\n```\n\nOutro",
     )
 
     assert result.success is True
@@ -454,7 +500,7 @@ async def test_send_to_forum_puts_fenced_code_block_in_standalone_message():
 
 
 @pytest.mark.asyncio
-async def test_finalize_edit_puts_fenced_code_block_in_standalone_message():
+async def test_finalize_edit_puts_copy_marked_fenced_code_in_standalone_message():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     original = SimpleNamespace(
         id=10,
@@ -474,7 +520,7 @@ async def test_finalize_edit_puts_fenced_code_block_in_standalone_message():
     result = await adapter.edit_message(
         "555",
         "10",
-        "Intro\n\n```text\ncopy me\n```\n\nOutro",
+        "Intro\n\n<!-- hermes:copy -->\n```text\ncopy me\n```\n\nOutro",
         finalize=True,
     )
 
@@ -485,6 +531,57 @@ async def test_finalize_edit_puts_fenced_code_block_in_standalone_message():
         "Outro",
     ]
     assert result.message_id == "12"
+
+
+@pytest.mark.asyncio
+async def test_finalize_single_copy_marked_fence_strips_internal_marker():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    original = SimpleNamespace(id=10, edit=AsyncMock())
+    channel = SimpleNamespace(
+        id=555,
+        fetch_message=AsyncMock(return_value=original),
+        send=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.edit_message(
+        "555",
+        "10",
+        "<!-- hermes:copy -->\n```bash\nrun-me --now\n```",
+        finalize=True,
+    )
+
+    assert result.success is True
+    original.edit.assert_awaited_once_with(content="```bash\nrun-me --now\n```")
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_streaming_preview_strips_internal_copy_marker():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    original = SimpleNamespace(id=10, edit=AsyncMock())
+    channel = SimpleNamespace(
+        id=555,
+        fetch_message=AsyncMock(return_value=original),
+        send=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.edit_message(
+        "555",
+        "10",
+        "Intro\n\n<!-- hermes:copy -->\n```bash\nrun-me",
+        finalize=False,
+    )
+
+    assert result.success is True
+    original.edit.assert_awaited_once_with(content="Intro\n\n```bash\nrun-me")
 
 
 @pytest.mark.asyncio
@@ -499,6 +596,27 @@ async def test_send_attaches_oversized_fenced_block_as_txt():
         fetch_channel=AsyncMock(),
     )
     content = "```python\n" + ("x = 1\n" * 400) + "```"
+
+    result = await adapter.send("555", content)
+
+    assert result.success is True
+    kwargs = channel.send.await_args.kwargs
+    assert kwargs["content"] == "Code attached as TXT."
+    assert kwargs["file"].filename == "hermes-code-block.txt"
+
+
+@pytest.mark.asyncio
+async def test_send_attaches_copy_marked_oversized_fenced_block_as_txt():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(
+        id=555,
+        send=AsyncMock(return_value=SimpleNamespace(id=20)),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    content = "<!-- hermes:copy -->\n```python\n" + ("x = 1\n" * 400) + "```"
 
     result = await adapter.send("555", content)
 
