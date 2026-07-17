@@ -48,6 +48,11 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
   - Adds explicit project assignment, explicit `No Project`, profile-safe assign/unassign RPCs, cwd re-anchoring/restoration, and Desktop move/drag behavior.
   - Retire this overlay once PR #61335 (or an equivalent upstream implementation) lands and the runtime has been reconciled to that upstream version.
 
+- `fix(desktop): stop idle renderer animation loops` *(temporary pending upstream)*
+  - Source: `andyylin/hermes-agent:fix/desktop-idle-rendering` / upstream PR #66160, preserving Ho Lim's original commits from PR #61084.
+  - Replaces permanent pet/roam/terminal RAF loops with bounded scheduling while preserving unfocused and occluded transcript streaming.
+  - Retire this overlay once PR #66160 (or an equivalent upstream implementation) lands and the runtime has been reconciled to that upstream version.
+
 ## Custom Desktop distribution
 
 Install or repair the canonical macOS/Linux Desktop build with:
