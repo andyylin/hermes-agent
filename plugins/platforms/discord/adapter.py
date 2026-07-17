@@ -2119,16 +2119,30 @@ class DiscordAdapter(BasePlatformAdapter):
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
 
-    def _standalone_fenced_chunks(self, content: str) -> List[str]:
-        """Split Discord prose and triple-backtick fences into separate messages.
+    @staticmethod
+    def _strip_copy_fence_markers(content: str) -> str:
+        """Remove valid internal copy hints without touching ordinary comments."""
+        return re.sub(
+            r"(?m)^[ \t]*<!--\s*hermes:copy\s*-->[ \t]*\n(?=```)",
+            "",
+            content,
+        )
 
-        Discord mobile exposes a convenient copy action for a standalone fenced
-        block. Inline backticks are deliberately ignored. Each resulting segment
-        still passes through the normal length-aware splitter.
+    def _standalone_fenced_chunks(self, content: str) -> List[str]:
+        """Split only explicitly copy-marked fences into standalone messages.
+
+        ``<!-- hermes:copy -->`` immediately before a triple-backtick fence is
+        an internal delivery hint: Discord mobile exposes a convenient copy
+        action when that fence is its own message.  The marker is removed before
+        delivery.  Unmarked fences stay with the surrounding prose so examples,
+        status output, and illustrative lists do not shatter a coherent answer.
+        Every resulting segment still passes through the normal length-aware
+        splitter, so Discord never receives an oversized text payload.
         """
         formatted = self.format_message(content)
         fence_re = re.compile(
-            r"^```[^\n]*(?:\n|$).*?^```[ \t]*(?=\n|$)",
+            r"^[ \t]*<!--\s*hermes:copy\s*-->[ \t]*\n"
+            r"(?P<fence>^```[^\n]*(?:\n|$).*?^```[ \t]*(?=\n|$))",
             re.MULTILINE | re.DOTALL,
         )
         segments: List[str] = []
@@ -2139,7 +2153,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 segments.extend(
                     self.truncate_message(prose, self.MAX_MESSAGE_LENGTH)
                 )
-            fence = match.group(0).strip("\n")
+            fence = match.group("fence").strip("\n")
             if fence:
                 segments.extend(
                     self.truncate_message(fence, self.MAX_MESSAGE_LENGTH)
@@ -2152,11 +2166,16 @@ class DiscordAdapter(BasePlatformAdapter):
 
         if segments:
             return segments
-        return self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        return self.truncate_message(
+            self._strip_copy_fence_markers(formatted),
+            self.MAX_MESSAGE_LENGTH,
+        )
 
     def _oversized_fence_file(self, content: str) -> Optional[Any]:
         """Return a TXT attachment when the response is one oversized fence."""
-        formatted = self.format_message(content).strip()
+        formatted = self._strip_copy_fence_markers(
+            self.format_message(content).strip()
+        )
         match = re.fullmatch(
             r"```[^\n]*(?:\n|$).*\n```[ \t]*",
             formatted,
@@ -2231,8 +2250,8 @@ class DiscordAdapter(BasePlatformAdapter):
             if self._is_forum_parent(channel):
                 return await self._send_to_forum(channel, content)
 
-            # Keep triple-backtick blocks in standalone Discord messages. Inline
-            # backticks remain in the surrounding prose.
+            # Keep only explicitly copy-marked fences in standalone Discord
+            # messages. Ordinary fences remain with their surrounding prose.
             chunks = self._standalone_fenced_chunks(content)
 
             message_ids = []
@@ -2446,11 +2465,13 @@ class DiscordAdapter(BasePlatformAdapter):
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
             msg = await channel.fetch_message(int(message_id))
-            formatted = self.format_message(content)
+            formatted = self._strip_copy_fence_markers(
+                self.format_message(content)
+            )
 
-            # On the final streaming edit, replace the preview with the first
-            # prose/fence segment and send the remaining standalone segments as
-            # continuations. Mid-stream previews stay in one editable message.
+            # On the final streaming edit, isolate explicitly copy-marked fences
+            # and send any remaining segments as continuations. Mid-stream
+            # previews stay in one editable message.
             if finalize:
                 oversized_fence = self._oversized_fence_file(content)
                 if oversized_fence is not None:
@@ -2575,7 +2596,9 @@ class DiscordAdapter(BasePlatformAdapter):
         saw would be the worse outcome.  Only a first-chunk edit failure
         returns ``success=False`` (a real adapter problem, not overflow).
         """
-        formatted = self.format_message(content)
+        formatted = self._strip_copy_fence_markers(
+            self.format_message(content)
+        )
         if chunks is None:
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         if len(chunks) <= 1:
