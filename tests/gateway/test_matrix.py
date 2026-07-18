@@ -2,6 +2,7 @@
 import asyncio
 import os
 import re
+import sqlite3
 import stat
 import sys
 import time
@@ -11,6 +12,24 @@ from unittest.mock import MagicMock, patch, AsyncMock
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageType
+
+
+@pytest.fixture(autouse=True)
+def _isolate_matrix_environment():
+    """Keep the host's live Matrix config from contaminating unit tests.
+
+    The plugin's YAML compatibility bridge intentionally writes MATRIX_* vars,
+    so tests that exercise it must not leak those values into later cases.
+    """
+    original = {key: value for key, value in os.environ.items() if key.startswith("MATRIX_")}
+    for key in list(os.environ):
+        if key.startswith("MATRIX_"):
+            os.environ.pop(key, None)
+    yield
+    for key in list(os.environ):
+        if key.startswith("MATRIX_"):
+            os.environ.pop(key, None)
+    os.environ.update(original)
 
 
 def _make_fake_mautrix():
@@ -207,12 +226,19 @@ def _make_fake_mautrix():
             self.pickle_key = pickle_key
             self.db = db
             self._device_id = ""
+            self.next_batch = None
 
         async def open(self):
             pass
 
         async def put_device_id(self, device_id):
             self._device_id = device_id
+
+        async def get_next_batch(self):
+            return self.next_batch
+
+        async def put_next_batch(self, token):
+            self.next_batch = token
 
     mautrix_crypto_store_asyncpg.PgCryptoStore = PgCryptoStore
 
@@ -1469,6 +1495,7 @@ class TestMatrixAccessTokenAuth:
         mock_client.device_id = None
         mock_client.state_store = MagicMock()
         mock_client.sync_store = MagicMock()
+        mock_client.sync_store.get_next_batch = AsyncMock(return_value=None)
         mock_client.sync_store.put_next_batch = AsyncMock()
         mock_client.crypto = None
         mock_client.whoami = AsyncMock(
@@ -1680,14 +1707,14 @@ class TestMatrixDeviceId:
 
         assert os.environ["MATRIX_DEVICE_ID"] == "FROM_YAML"
 
-    def test_device_id_env_takes_precedence_over_yaml(self, monkeypatch):
+    def test_device_id_yaml_takes_precedence_over_legacy_env(self, monkeypatch):
         monkeypatch.setenv("MATRIX_DEVICE_ID", "FROM_ENV")
 
         from plugins.platforms.matrix.adapter import _apply_yaml_config
 
         _apply_yaml_config({}, {"device_id": "FROM_YAML"})
 
-        assert os.environ["MATRIX_DEVICE_ID"] == "FROM_ENV"
+        assert os.environ["MATRIX_DEVICE_ID"] == "FROM_YAML"
 
     def test_device_id_from_config_extra(self):
         from plugins.platforms.matrix.adapter import MatrixAdapter
@@ -1871,6 +1898,125 @@ class TestMatrixDeviceIdConfig:
 
         mc = config.platforms[Platform.MATRIX]
         assert "device_id" not in mc.extra
+
+    def test_yaml_device_id_takes_precedence_over_legacy_env(self, monkeypatch):
+        monkeypatch.setenv("MATRIX_ACCESS_TOKEN", "syt_abc123")
+        monkeypatch.setenv("MATRIX_HOMESERVER", "https://matrix.example.org")
+        monkeypatch.setenv("MATRIX_DEVICE_ID", "STALE_ENV_DEVICE")
+
+        from gateway.config import GatewayConfig, PlatformConfig, _apply_env_overrides
+        config = GatewayConfig(
+            platforms={
+                Platform.MATRIX: PlatformConfig(
+                    enabled=True,
+                    extra={"device_id": "ROTATED_YAML_DEVICE"},
+                )
+            }
+        )
+        _apply_env_overrides(config)
+
+        assert config.platforms[Platform.MATRIX].extra["device_id"] == "ROTATED_YAML_DEVICE"
+
+
+class TestMatrixRestartHardening:
+    def test_reads_persisted_crypto_device_id(self, tmp_path):
+        from plugins.platforms.matrix.adapter import _read_crypto_store_device_id
+
+        db_path = tmp_path / "crypto.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE crypto_account "
+            "(account_id TEXT PRIMARY KEY, device_id TEXT, shared INTEGER, "
+            "sync_token TEXT, account BLOB)"
+        )
+        conn.execute(
+            "INSERT INTO crypto_account VALUES (?, ?, 1, '', X'00')",
+            ("@bot:example.org", "STABLE_DEVICE"),
+        )
+        conn.commit()
+        conn.close()
+
+        assert (
+            _read_crypto_store_device_id(db_path, "@bot:example.org")
+            == "STABLE_DEVICE"
+        )
+
+    @pytest.mark.asyncio
+    async def test_initial_sync_reuses_persisted_token(self):
+        from plugins.platforms.matrix.adapter import _matrix_initial_sync_kwargs
+
+        store = MagicMock()
+        store.get_next_batch = AsyncMock(return_value="persisted-token")
+
+        assert await _matrix_initial_sync_kwargs(store) == {
+            "since": "persisted-token",
+            "timeout": 10000,
+            "full_state": True,
+        }
+
+    def test_crypto_store_files_are_owner_only(self, tmp_path):
+        from plugins.platforms.matrix.adapter import _secure_matrix_store_permissions
+
+        store = tmp_path / "store"
+        store.mkdir(mode=0o755)
+        for name in ("crypto.db", "crypto.db-wal", "crypto.db-shm"):
+            path = store / name
+            path.write_bytes(b"test")
+            path.chmod(0o644)
+
+        _secure_matrix_store_permissions(store)
+
+        assert stat.S_IMODE(store.stat().st_mode) == 0o700
+        for name in ("crypto.db", "crypto.db-wal", "crypto.db-shm"):
+            assert stat.S_IMODE((store / name).stat().st_mode) == 0o600
+
+    @pytest.mark.asyncio
+    async def test_fresh_missing_megolm_session_requests_key_and_retries(self):
+        adapter = _make_adapter()
+        adapter._startup_ts = time.time() - 30
+
+        event = MagicMock()
+        event.event_id = "$fresh"
+        event.room_id = "!room:example.org"
+        event.sender = "@andy:example.org"
+        event.timestamp = int(time.time() * 1000)
+        event.source = MagicMock()
+        event.content.session_id = "session-1"
+        event.content.sender_key = "sender-key-1"
+
+        crypto = MagicMock()
+        crypto.crypto_store.get_group_session = AsyncMock(return_value=None)
+        crypto.request_room_key = AsyncMock(return_value=True)
+        decrypted = MagicMock()
+        crypto.decrypt_megolm_event = AsyncMock(return_value=decrypted)
+
+        key_response = MagicMock()
+        key_response.device_keys = {
+            "@andy:example.org": {"ELEMENT_IOS": MagicMock()}
+        }
+        client = MagicMock()
+        client.crypto = crypto
+        client.query_keys = AsyncMock(return_value=key_response)
+        client.dispatch_event = MagicMock(return_value=[])
+        adapter._client = client
+
+        await adapter._on_encrypted_event_recovery(event)
+
+        crypto.request_room_key.assert_awaited_once()
+        crypto.decrypt_megolm_event.assert_awaited_once_with(event)
+        client.dispatch_event.assert_called_once_with(decrypted, event.source)
+
+    @pytest.mark.asyncio
+    async def test_historical_missing_megolm_session_does_not_request_key(self):
+        adapter = _make_adapter()
+        adapter._startup_ts = time.time()
+        event = MagicMock()
+        event.timestamp = int((time.time() - 3600) * 1000)
+        adapter._client = MagicMock()
+
+        await adapter._on_encrypted_event_recovery(event)
+
+        adapter._client.query_keys.assert_not_called()
 
 
 class TestMatrixSyncLoop:

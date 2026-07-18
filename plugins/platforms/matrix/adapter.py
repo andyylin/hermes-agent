@@ -56,6 +56,7 @@ import logging
 import mimetypes
 import os
 import re
+import sqlite3
 import time
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from dataclasses import dataclass, field
@@ -362,6 +363,54 @@ from hermes_constants import get_hermes_dir as _get_hermes_dir
 
 _STORE_DIR = _get_hermes_dir("platforms/matrix/store", "matrix/store")
 _CRYPTO_DB_PATH = _STORE_DIR / "crypto.db"
+
+
+def _read_crypto_store_device_id(db_path: Path, account_id: str) -> Optional[str]:
+    """Read the persisted Matrix device ID without opening the encrypted account.
+
+    This is a restart/rotation guard: PgCryptoStore encrypts the account pickle
+    with a key derived from the configured device ID, so opening a store under a
+    different ID otherwise fails later with the opaque ``BAD_ACCOUNT_KEY``.
+    """
+    if not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+        try:
+            row = conn.execute(
+                "SELECT device_id FROM crypto_account WHERE account_id = ? LIMIT 1",
+                (account_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    return str(row[0]) if row and row[0] else None
+
+
+async def _matrix_initial_sync_kwargs(sync_store: Any) -> Dict[str, Any]:
+    """Build initial sync arguments using the durable crypto-store token."""
+    next_batch = await sync_store.get_next_batch()
+    return {
+        "since": next_batch or None,
+        "timeout": 10000,
+        "full_state": True,
+    }
+
+
+def _secure_matrix_store_permissions(store_dir: Path = _STORE_DIR) -> None:
+    """Keep the E2EE store owner-only, including SQLite WAL sidecars."""
+    try:
+        store_dir.chmod(0o700)
+    except OSError:
+        return
+    for name in ("crypto.db", "crypto.db-wal", "crypto.db-shm"):
+        path = store_dir / name
+        try:
+            if path.exists():
+                path.chmod(0o600)
+        except OSError:
+            logger.warning("Matrix: could not tighten permissions on %s", path)
 
 # Grace period: ignore messages older than this many seconds before startup.
 _STARTUP_GRACE_SECONDS = 5
@@ -869,8 +918,11 @@ class MatrixAdapter(BasePlatformAdapter):
         self._processed_events: deque = deque(maxlen=1000)
         self._processed_events_set: set = set()
 
-        # Buffer for undecrypted events pending key receipt.
-        # Each entry: (room_id, event, timestamp)
+        # Bounded dedupe for live-event Megolm recovery requests. This is
+        # separate from normal event dedupe so a recovered event can still be
+        # dispatched through _on_room_message exactly once.
+        self._key_recovery_events: deque = deque(maxlen=500)
+        self._key_recovery_events_set: set = set()
 
         # Thread participation tracking (for require_mention bypass)
         self._threads = ThreadParticipationTracker("matrix")
@@ -1191,8 +1243,21 @@ class MatrixAdapter(BasePlatformAdapter):
             logger.error("Matrix: homeserver URL not configured")
             return False
 
+        if (
+            self._encryption
+            and self._password
+            and not self._access_token
+            and not self._device_id
+        ):
+            logger.error(
+                "Matrix: E2EE password login requires a stable device_id in "
+                "config.yaml; refusing a restart-unsafe generated device identity"
+            )
+            return False
+
         # Ensure store dir exists for E2EE key persistence.
         _STORE_DIR.mkdir(parents=True, exist_ok=True)
+        _secure_matrix_store_permissions()
 
         # Create the HTTP API layer.
         client_session = _create_matrix_session(self._proxy_url)
@@ -1344,6 +1409,27 @@ class MatrixAdapter(BasePlatformAdapter):
                         return False
             if self._encryption:
                 try:
+                    persisted_device_id = _read_crypto_store_device_id(
+                        _CRYPTO_DB_PATH,
+                        self._user_id or "hermes",
+                    )
+                    effective_device_id = str(client.device_id or "")
+                    if (
+                        persisted_device_id
+                        and effective_device_id
+                        and persisted_device_id != effective_device_id
+                    ):
+                        logger.error(
+                            "Matrix: crypto store belongs to device %s but config/login "
+                            "resolved device %s. Refusing to open it under the wrong "
+                            "pickle key. Preserve and move the whole store directory "
+                            "before an intentional device rotation.",
+                            persisted_device_id,
+                            effective_device_id,
+                        )
+                        await api.session.close()
+                        return False
+
                     # Remove legacy pickle file from pre-SQLite era.
                     legacy_pickle = _STORE_DIR / "crypto_store.pickle"
                     if legacy_pickle.exists():
@@ -1370,6 +1456,12 @@ class MatrixAdapter(BasePlatformAdapter):
 
                     if client.device_id:
                         await crypto_store.put_device_id(client.device_id)
+
+                    # PgCryptoStore persists next_batch in crypto_account. Reuse
+                    # it across gateway restarts instead of replaying the entire
+                    # room timeline through a fresh MemorySyncStore each time.
+                    client.sync_store = crypto_store
+                    _secure_matrix_store_permissions()
 
                     crypto_state = _CryptoStateStore(state_store, self._joined_rooms)
                     olm = OlmMachine(client, crypto_store, crypto_state)
@@ -1493,6 +1585,12 @@ class MatrixAdapter(BasePlatformAdapter):
             self._on_reaction,
             wait_sync=True,
         )
+        if self._encryption and getattr(client, "crypto", None):
+            client.add_event_handler(
+                EventType.ROOM_ENCRYPTED,
+                self._on_encrypted_event_recovery,
+                wait_sync=True,
+            )
         client.add_event_handler(
             IntEvt.INVITE,
             self._on_invite,
@@ -1509,7 +1607,9 @@ class MatrixAdapter(BasePlatformAdapter):
         self._closing = False
 
         try:
-            sync_data = await client.sync(timeout=10000, full_state=True)
+            sync_data = await client.sync(
+                **(await _matrix_initial_sync_kwargs(client.sync_store))
+            )
             if isinstance(sync_data, dict):
                 self._last_sync_ts = time.time()
                 rooms_join = sync_data.get("rooms", {}).get("join", {})
@@ -1586,9 +1686,15 @@ class MatrixAdapter(BasePlatformAdapter):
         # Close the SQLite crypto store database.
         if hasattr(self, "_crypto_db") and self._crypto_db:
             try:
+                await self._crypto_db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception as exc:
+                logger.warning("Matrix: crypto DB checkpoint failed on disconnect: %s", exc)
+            try:
                 await self._crypto_db.stop()
             except Exception as exc:
                 logger.debug("Matrix: could not close crypto DB on disconnect: %s", exc)
+            self._crypto_db = None
+            _secure_matrix_store_permissions()
 
         if self._client:
             try:
@@ -2434,6 +2540,91 @@ class MatrixAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Event callbacks
     # ------------------------------------------------------------------
+
+    async def _on_encrypted_event_recovery(self, event: Any) -> None:
+        """Request a missing Megolm key for a fresh event, then retry once.
+
+        mautrix's built-in decryption dispatcher logs ``Session not found`` and
+        drops the event. That is fine for ancient backfill, but it made a
+        transient key-share race after a gateway restart look exactly like a
+        dead bot. This sibling handler only touches fresh events, asks the
+        sender's current devices for the missing key, and redispatches the
+        decrypted event if the key arrives.
+        """
+        event_ts = _matrix_event_timestamp_seconds(event)
+        if not event_ts or event_ts < self._startup_ts - _STARTUP_GRACE_SECONDS:
+            return
+
+        event_id = str(getattr(event, "event_id", ""))
+        if event_id and event_id in self._key_recovery_events_set:
+            return
+        if event_id:
+            if len(self._key_recovery_events) == self._key_recovery_events.maxlen:
+                oldest = self._key_recovery_events.popleft()
+                self._key_recovery_events_set.discard(oldest)
+            self._key_recovery_events.append(event_id)
+            self._key_recovery_events_set.add(event_id)
+
+        client = self._client
+        crypto = getattr(client, "crypto", None) if client else None
+        content = getattr(event, "content", None)
+        room_id = str(getattr(event, "room_id", ""))
+        sender = str(getattr(event, "sender", ""))
+        session_id = str(getattr(content, "session_id", ""))
+        sender_key = str(getattr(content, "sender_key", ""))
+        if not crypto or not all((room_id, sender, session_id, sender_key)):
+            return
+
+        try:
+            existing = await crypto.crypto_store.get_group_session(room_id, session_id)
+            if existing is not None:
+                return
+
+            key_response = await client.query_keys({UserID(sender): []})
+            device_keys = getattr(key_response, "device_keys", {}) or {}
+            sender_devices = device_keys.get(sender) or {}
+            device_ids = [str(device_id) for device_id in sender_devices]
+            if not device_ids:
+                logger.warning(
+                    "Matrix: cannot recover Megolm session %s for %s: sender has no devices",
+                    session_id,
+                    event_id or "unknown event",
+                )
+                return
+
+            logger.warning(
+                "Matrix: requesting missing Megolm session %s for fresh event %s",
+                session_id,
+                event_id or "unknown",
+            )
+            received = await crypto.request_room_key(
+                RoomID(room_id),
+                sender_key,
+                session_id,
+                {UserID(sender): device_ids},
+                timeout=10,
+            )
+            if not received:
+                logger.warning(
+                    "Matrix: key request timed out for fresh event %s",
+                    event_id or "unknown",
+                )
+                return
+
+            decrypted = await crypto.decrypt_megolm_event(event)
+            tasks = client.dispatch_event(decrypted, getattr(event, "source", None))
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            logger.info(
+                "Matrix: recovered and redispatched fresh encrypted event %s",
+                event_id or "unknown",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Matrix: live Megolm recovery failed for event %s: %s",
+                event_id or "unknown",
+                exc,
+            )
 
     async def _dispatch_sync(self, sync_data: Dict[str, Any]) -> None:
         """Dispatch a sync response through the mautrix event machinery."""
@@ -4662,7 +4853,9 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
     """
     if "require_mention" in matrix_cfg and not os.getenv("MATRIX_REQUIRE_MENTION"):
         os.environ["MATRIX_REQUIRE_MENTION"] = str(matrix_cfg["require_mention"]).lower()
-    if "device_id" in matrix_cfg and not os.getenv("MATRIX_DEVICE_ID"):
+    # device_id is behavioral state, not a secret. YAML must be able to rotate
+    # a stale legacy .env device identity after an E2EE ratchet failure.
+    if "device_id" in matrix_cfg:
         os.environ["MATRIX_DEVICE_ID"] = str(matrix_cfg["device_id"])
     au = matrix_cfg.get("allowed_users")
     if au is not None and not os.getenv("MATRIX_ALLOWED_USERS"):

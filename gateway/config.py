@@ -1840,7 +1840,10 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if matrix_e2ee_mode:
             matrix_config.extra["e2ee_mode"] = matrix_e2ee_mode
         matrix_device_id = getenv("MATRIX_DEVICE_ID", "")
-        if matrix_device_id:
+        # MATRIX_DEVICE_ID is behavioral state, not a secret.  Preserve an
+        # explicitly configured YAML device_id so operators can rotate a
+        # broken E2EE identity without editing the legacy .env bridge.
+        if matrix_device_id and not matrix_config.extra.get("device_id"):
             matrix_config.extra["device_id"] = matrix_device_id
     matrix_home = getenv("MATRIX_HOME_ROOM")
     if matrix_home and Platform.MATRIX in config.platforms:
