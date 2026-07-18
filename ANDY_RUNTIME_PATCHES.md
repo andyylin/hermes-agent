@@ -4,6 +4,11 @@ This branch (`andy-runtime`) is the live Hermes runtime branch for Andy's Raspbe
 
 Do not assume a fix exists live just because it exists in a PR branch. Verify this checkout and the running service before restart.
 
+## Integrated upstream baseline
+
+- `7fd419e5e6a0ac53f934a69226262c41ba130a2c` (2026-07-18)
+- Temporary overlays below were re-audited against this cutoff; Projects PR #61335 and idle-rendering PR #66160 remain open and unmerged.
+
 ## Active runtime patches
 
 - `fix(discord): add smart auto-thread titles`
