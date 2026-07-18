@@ -370,6 +370,60 @@ async def test_send_home_channel_startup_notification_ignores_false_send_result(
     adapter.send.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_home_startup_notification_waits_for_adapter_delivery_readiness(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+
+    class _ReadinessAdapter(type(adapter)):
+        async def wait_until_send_ready(self):
+            self.readiness_checked = True
+            return True
+
+    adapter.__class__ = _ReadinessAdapter
+    adapter.readiness_checked = False
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="home"))
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert adapter.readiness_checked is True
+    assert delivered == {("telegram", "home-42", None)}
+
+
+@pytest.mark.asyncio
+async def test_home_startup_notification_skips_send_when_delivery_not_ready(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+
+    class _UnavailableAdapter(type(adapter)):
+        async def wait_until_send_ready(self):
+            return False
+
+    adapter.__class__ = _UnavailableAdapter
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="home"))
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert delivered == set()
+    adapter.send.assert_not_awaited()
+
+
 # ── _send_restart_notification ───────────────────────────────────────────
 
 
@@ -395,6 +449,34 @@ async def test_send_restart_notification_delivers_and_cleans_up(tmp_path, monkey
     assert call_args[0][0] == "42"  # chat_id
     assert "restarted" in call_args[0][1].lower()
     assert call_args[1].get("metadata") is None  # no thread
+    assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_send_restart_notification_skips_send_when_delivery_not_ready(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+    }))
+
+    runner, adapter = make_restart_runner()
+
+    class _UnavailableAdapter(type(adapter)):
+        async def wait_until_send_ready(self):
+            return False
+
+    adapter.__class__ = _UnavailableAdapter
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="restart"))
+
+    delivered_target = await runner._send_restart_notification()
+
+    assert delivered_target is None
+    adapter.send.assert_not_awaited()
     assert not notify_path.exists()
 
 

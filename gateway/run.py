@@ -16284,6 +16284,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return None
 
+            if not await self._wait_for_lifecycle_delivery_ready(adapter, platform):
+                return None
+
             metadata = self._thread_metadata_for_target(
                 platform,
                 chat_id,
@@ -16355,6 +16358,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             try:
+                if not await self._wait_for_lifecycle_delivery_ready(adapter, platform):
+                    continue
                 metadata = self._thread_metadata_for_target(
                     platform,
                     home.chat_id,
