@@ -264,6 +264,28 @@ def test_block_and_respond(capture):
     assert result[0] == "my_answer"
 
 
+def test_desktop_clarify_callback_uses_canonical_timeout(capture, monkeypatch):
+    server, _ = capture
+    called = {}
+
+    def fake_block(event, sid, payload, timeout=300):
+        called.update(event=event, sid=sid, payload=payload, timeout=timeout)
+        return "answer"
+
+    monkeypatch.setattr(server, "_block", fake_block)
+    monkeypatch.setattr("tools.clarify_gateway.get_clarify_timeout", lambda: 3600)
+
+    result = server._agent_cbs("desktop-session")["clarify_callback"]("Ship it?", ["yes", "no"])
+
+    assert result == "answer"
+    assert called == {
+        "event": "clarify.request",
+        "sid": "desktop-session",
+        "payload": {"question": "Ship it?", "choices": ["yes", "no"]},
+        "timeout": 3600,
+    }
+
+
 @pytest.mark.parametrize("event", ["secret.request", "sudo.request"])
 def test_sensitive_prompt_timeout_emits_expiry(capture, event):
     server, buf = capture
