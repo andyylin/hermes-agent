@@ -45,6 +45,11 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
   - Archives `LINE_ARCHIVE_GROUPS`, short-circuits `LINE_READ_ONLY_GROUPS`, and requires `LINE_GROUP_PREFIXES` for `LINE_REQUIRE_PREFIX_GROUPS` before agent dispatch.
   - Teaches the generic gateway auth layer that LINE group chats use `LINE_ALLOWED_GROUPS` as a chat allowlist, not sender-only `LINE_ALLOWED_USERS`.
 
+- `feat(matrix): auto-thread selected rooms`
+  - Adds `matrix.auto_thread_rooms` / `MATRIX_AUTO_THREAD_ROOMS` so selected room root messages become native Matrix thread roots even while global `session_scope` remains `room`.
+  - Existing Matrix threads and DM policy retain precedence; add a room to `free_response_rooms` too when every message should be handled without an `@mention`.
+  - Retire this overlay once upstream Matrix supports an equivalent per-room thread policy.
+
 - `fix(desktop): preserve unsafe config integers`
   - Serializes large config identifiers without JavaScript precision loss so Discord/channel/account IDs are not silently rounded by Desktop edits.
 
