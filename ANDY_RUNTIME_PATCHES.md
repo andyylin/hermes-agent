@@ -6,7 +6,7 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 
 ## Integrated upstream baseline
 
-- `af6b41b18b449507831a23a6a0abc24e2ec75245` (2026-07-18)
+- `e6327692699f05d83f80c06103bc871bc61a048c` (2026-07-18)
 - Temporary overlays below were re-audited against this cutoff; Projects PR #61335 and idle-rendering PR #66160 remain open and unmerged.
 
 ## Active runtime patches
