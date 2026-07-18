@@ -37,6 +37,8 @@ Environment variables:
     MATRIX_TOOLS_ALLOW_ROOM_CREATE
                               Allow Matrix room creation tool execution (default: false)
     MATRIX_AUTO_THREAD          Auto-create threads for room messages (default: true)
+    MATRIX_AUTO_THREAD_ROOMS    Comma-separated room IDs whose root messages always
+                                become thread roots, even with session_scope=room
     MATRIX_DM_AUTO_THREAD       Auto-create threads for DM messages (default: false)
     MATRIX_RECOVERY_KEY         Recovery key for cross-signing verification after device key rotation
     MATRIX_DM_MENTION_THREADS   Create a thread when bot is @mentioned in a DM (default: false)
@@ -947,6 +949,21 @@ class MatrixAdapter(BasePlatformAdapter):
             "1",
             "yes",
         )
+        auto_thread_rooms_raw = config.extra.get("auto_thread_rooms")
+        if auto_thread_rooms_raw is None:
+            auto_thread_rooms_raw = os.getenv("MATRIX_AUTO_THREAD_ROOMS", "")
+        if isinstance(auto_thread_rooms_raw, list):
+            self._auto_thread_rooms: Set[str] = {
+                str(room).strip()
+                for room in auto_thread_rooms_raw
+                if str(room).strip()
+            }
+        else:
+            self._auto_thread_rooms = {
+                room.strip()
+                for room in str(auto_thread_rooms_raw).split(",")
+                if room.strip()
+            }
         self._dm_auto_thread: bool = os.getenv(
             "MATRIX_DM_AUTO_THREAD", "false"
         ).lower() in {"true", "1", "yes"}
@@ -2807,6 +2824,9 @@ class MatrixAdapter(BasePlatformAdapter):
                 if self._dm_auto_thread:
                     thread_id = event_id
                     self._threads.mark(thread_id)
+            elif room_id in self._auto_thread_rooms:
+                thread_id = event_id
+                self._threads.mark(thread_id)
             elif self._matrix_session_scope == "room":
                 thread_id = None
             elif self._matrix_session_scope == "thread":
@@ -4726,6 +4746,11 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
         os.environ["MATRIX_SESSION_SCOPE"] = str(matrix_cfg["session_scope"]).lower()
     if "auto_thread" in matrix_cfg and not os.getenv("MATRIX_AUTO_THREAD"):
         os.environ["MATRIX_AUTO_THREAD"] = str(matrix_cfg["auto_thread"]).lower()
+    auto_thread_rooms = matrix_cfg.get("auto_thread_rooms")
+    if auto_thread_rooms is not None and not os.getenv("MATRIX_AUTO_THREAD_ROOMS"):
+        if isinstance(auto_thread_rooms, list):
+            auto_thread_rooms = ",".join(str(v) for v in auto_thread_rooms)
+        os.environ["MATRIX_AUTO_THREAD_ROOMS"] = str(auto_thread_rooms)
     if "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):
         os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
     if "max_message_length" in matrix_cfg and not os.getenv("MATRIX_MAX_MESSAGE_LENGTH"):

@@ -4531,6 +4531,78 @@ class TestMatrixClockSkewWarning:
 
 
 # ---------------------------------------------------------------------------
+# Room auto-thread allowlist
+# ---------------------------------------------------------------------------
+
+class TestMatrixRoomAutoThreadAllowlist:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._is_dm_room = AsyncMock(return_value=False)
+        self.adapter._get_display_name = AsyncMock(return_value="Alice")
+        self.adapter._background_read_receipt = MagicMock()
+        self.adapter._require_mention = False
+        self.adapter._matrix_session_scope = "room"
+        self.adapter._auto_thread = False
+        self.adapter._auto_thread_rooms = {"!threaded:ex"}
+
+    async def _context(self, room_id: str, event_id: str):
+        return await self.adapter._resolve_message_context(
+            room_id=room_id,
+            sender="@alice:ex",
+            event_id=event_id,
+            body="hello",
+            source_content={"body": "hello"},
+            relates_to={},
+        )
+
+    @pytest.mark.asyncio
+    async def test_selected_room_creates_thread_despite_room_session_scope(self):
+        ctx = await self._context("!threaded:ex", "$thread-root")
+
+        assert ctx is not None
+        _body, _is_dm, _chat_type, thread_id, _display, source = ctx
+        assert thread_id == "$thread-root"
+        assert source.thread_id == "$thread-root"
+
+    @pytest.mark.asyncio
+    async def test_unselected_room_remains_room_scoped(self):
+        ctx = await self._context("!plain:ex", "$plain-message")
+
+        assert ctx is not None
+        _body, _is_dm, _chat_type, thread_id, _display, source = ctx
+        assert thread_id is None
+        assert source.thread_id is None
+
+    def test_yaml_room_list_bridges_to_matrix_environment(self, monkeypatch):
+        from plugins.platforms.matrix.adapter import _apply_yaml_config
+
+        monkeypatch.delenv("MATRIX_AUTO_THREAD_ROOMS", raising=False)
+        _apply_yaml_config(
+            {},
+            {"auto_thread_rooms": ["!one:ex", "!two:ex"]},
+        )
+
+        assert os.environ["MATRIX_AUTO_THREAD_ROOMS"] == "!one:ex,!two:ex"
+
+    def test_adapter_reads_room_list_from_platform_config(self):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        adapter = MatrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="syt_test_token",
+                extra={
+                    "homeserver": "https://matrix.example.org",
+                    "user_id": "@bot:example.org",
+                    "auto_thread_rooms": ["!one:ex", "!two:ex"],
+                },
+            )
+        )
+
+        assert adapter._auto_thread_rooms == {"!one:ex", "!two:ex"}
+
+
+# ---------------------------------------------------------------------------
 # DM auto-thread
 # ---------------------------------------------------------------------------
 
