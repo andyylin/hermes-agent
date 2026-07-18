@@ -370,6 +370,34 @@ async def test_send_home_channel_startup_notification_ignores_false_send_result(
     adapter.send.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_home_startup_notification_waits_for_adapter_delivery_readiness(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+
+    class _ReadinessAdapter(type(adapter)):
+        async def wait_until_send_ready(self):
+            self.readiness_checked = True
+            return True
+
+    adapter.__class__ = _ReadinessAdapter
+    adapter.readiness_checked = False
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="home"))
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert adapter.readiness_checked is True
+    assert delivered == {("telegram", "home-42", None)}
+
+
 # ── _send_restart_notification ───────────────────────────────────────────
 
 

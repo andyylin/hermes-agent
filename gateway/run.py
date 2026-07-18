@@ -15557,6 +15557,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return None
 
+            await self._wait_for_lifecycle_delivery_ready(adapter, platform)
+
             metadata = self._thread_metadata_for_target(
                 platform,
                 chat_id,
@@ -15595,6 +15597,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         finally:
             notify_path.unlink(missing_ok=True)
 
+    @staticmethod
+    async def _wait_for_lifecycle_delivery_ready(adapter, platform: Platform) -> bool:
+        """Give adapters with explicit health gating time to become send-ready."""
+        # Resolve on the class so permissive mocks do not manufacture a waiter.
+        waiter = getattr(type(adapter), "wait_until_send_ready", None)
+        if not callable(waiter):
+            return True
+        try:
+            ready = await waiter(adapter)
+        except Exception as exc:
+            logger.warning(
+                "Lifecycle delivery readiness check failed for %s: %s",
+                platform.value,
+                exc,
+            )
+            return False
+        if not ready:
+            logger.warning(
+                "Lifecycle delivery path did not become ready for %s before timeout",
+                platform.value,
+            )
+        return bool(ready)
+
     async def _send_home_channel_startup_notifications(
         self,
         *,
@@ -15628,6 +15653,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             try:
+                await self._wait_for_lifecycle_delivery_ready(adapter, platform)
                 metadata = self._thread_metadata_for_target(
                     platform,
                     home.chat_id,
