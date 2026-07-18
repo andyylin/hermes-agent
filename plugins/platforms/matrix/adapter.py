@@ -4662,6 +4662,8 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
     """
     if "require_mention" in matrix_cfg and not os.getenv("MATRIX_REQUIRE_MENTION"):
         os.environ["MATRIX_REQUIRE_MENTION"] = str(matrix_cfg["require_mention"]).lower()
+    if "device_id" in matrix_cfg and not os.getenv("MATRIX_DEVICE_ID"):
+        os.environ["MATRIX_DEVICE_ID"] = str(matrix_cfg["device_id"])
     au = matrix_cfg.get("allowed_users")
     if au is not None and not os.getenv("MATRIX_ALLOWED_USERS"):
         if isinstance(au, list):

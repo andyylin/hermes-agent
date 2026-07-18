@@ -1,5 +1,6 @@
 """Tests for Matrix platform adapter (mautrix-python backend)."""
 import asyncio
+import os
 import re
 import stat
 import sys
@@ -1669,6 +1670,24 @@ class TestMatrixE2EEHardFail:
 
 class TestMatrixDeviceId:
     """MATRIX_DEVICE_ID should be used for stable device identity."""
+
+    def test_device_id_from_yaml_config(self, monkeypatch):
+        monkeypatch.delenv("MATRIX_DEVICE_ID", raising=False)
+
+        from plugins.platforms.matrix.adapter import _apply_yaml_config
+
+        _apply_yaml_config({}, {"device_id": "FROM_YAML"})
+
+        assert os.environ["MATRIX_DEVICE_ID"] == "FROM_YAML"
+
+    def test_device_id_env_takes_precedence_over_yaml(self, monkeypatch):
+        monkeypatch.setenv("MATRIX_DEVICE_ID", "FROM_ENV")
+
+        from plugins.platforms.matrix.adapter import _apply_yaml_config
+
+        _apply_yaml_config({}, {"device_id": "FROM_YAML"})
+
+        assert os.environ["MATRIX_DEVICE_ID"] == "FROM_ENV"
 
     def test_device_id_from_config_extra(self):
         from plugins.platforms.matrix.adapter import MatrixAdapter
