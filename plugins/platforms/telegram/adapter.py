@@ -2038,6 +2038,38 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count = 0
         self._send_path_degraded = False
 
+    async def wait_until_send_ready(
+        self, timeout: float = _POLLING_PROGRESS_TIMEOUT
+    ) -> bool:
+        """Wait for the current polling generation to make real progress.
+
+        Lifecycle notifications are sent immediately after ``connect()``.  An
+        idle Telegram long poll can still be in flight then, so ``send()`` is
+        intentionally gated even though the adapter connected successfully.
+        Waiting on the generation event avoids dropping those one-shot
+        notifications while preserving the fail-fast behavior of normal sends.
+        """
+        if not self._send_path_degraded:
+            return True
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        while self._send_path_degraded:
+            if self.has_fatal_error or getattr(self, "_polling_teardown_started", False):
+                return False
+            progress = self._polling_progress_event
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            try:
+                await asyncio.wait_for(progress.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return False
+            # A reconnect may have replaced the generation while the old event
+            # was being observed. Loop and wait on the current event in that case.
+
+        return True
+
     def _observe_polling_request_result(self, request, generation, result):
         """Record getUpdates progress from an observed do_request result.
 
