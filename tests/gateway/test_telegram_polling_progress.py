@@ -228,6 +228,29 @@ async def test_current_polling_generation_success_records_progress():
 
 
 @pytest.mark.asyncio
+async def test_wait_until_send_ready_unblocks_on_current_polling_progress():
+    adapter = _make_adapter()
+    generation, _progress = adapter._begin_polling_generation()
+
+    waiter = asyncio.create_task(adapter.wait_until_send_ready())
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    adapter._record_polling_progress(generation)
+
+    assert await asyncio.wait_for(waiter, timeout=1) is True
+
+
+@pytest.mark.asyncio
+async def test_wait_until_send_ready_rejects_inactive_polling_generation():
+    adapter = _make_adapter()
+    adapter._send_path_degraded = True
+    adapter._polling_progress_accepting = False
+
+    assert await adapter.wait_until_send_ready() is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
 async def test_unsuccessful_polling_request_does_not_record_progress(error_type):
     adapter = _make_adapter()

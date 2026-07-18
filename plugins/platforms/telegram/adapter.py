@@ -2038,6 +2038,29 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count = 0
         self._send_path_degraded = False
 
+    async def wait_until_send_ready(self) -> bool:
+        """Wait for the polling path to prove healthy before lifecycle sends.
+
+        ``connect()`` intentionally returns before the first long-poll response
+        so a slow Telegram bootstrap cannot stall the whole gateway.  Startup
+        notifications are different: sending them while the adapter's guarded
+        send path is still degraded deterministically drops the notification.
+        Let those bounded callers wait for the same progress signal used by
+        the polling verifier instead of guessing with another fixed sleep.
+        """
+        if not getattr(self, "_send_path_degraded", False):
+            return True
+        progress = getattr(self, "_polling_progress_event", None)
+        if progress is None or not getattr(self, "_polling_progress_accepting", False):
+            return False
+        try:
+            await asyncio.wait_for(
+                progress.wait(), timeout=_POLLING_PROGRESS_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            return False
+        return not getattr(self, "_send_path_degraded", False)
+
     def _observe_polling_request_result(self, request, generation, result):
         """Record getUpdates progress from an observed do_request result.
 

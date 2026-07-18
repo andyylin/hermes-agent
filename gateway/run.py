@@ -15526,6 +15526,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             try:
+                # Telegram deliberately reports connected before its first
+                # successful getUpdates response, while guarding sends until
+                # that response proves the polling path healthy.  Lifecycle
+                # notifications must wait for that readiness signal rather
+                # than being deterministically dropped during the startup
+                # window.  Resolve on the class so MagicMock-based adapters do
+                # not manufacture a fake awaitable method.
+                wait_until_send_ready = getattr(
+                    type(adapter), "wait_until_send_ready", None
+                )
+                if callable(wait_until_send_ready):
+                    send_ready = await wait_until_send_ready(adapter)
+                    if not send_ready:
+                        logger.warning(
+                            "Home-channel startup notification deferred path did not become ready for %s:%s",
+                            platform.value,
+                            home.chat_id,
+                        )
+                        continue
                 metadata = self._thread_metadata_for_target(
                     platform,
                     home.chat_id,
