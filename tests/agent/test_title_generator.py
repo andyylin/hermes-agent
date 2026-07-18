@@ -396,10 +396,13 @@ class TestMaybeAutoTitle:
         ]
 
         with patch("agent.title_generator.auto_title_session") as mock_auto:
+            import threading
+            called = threading.Event()
+            mock_auto.side_effect = lambda *a, **k: called.set()
             maybe_auto_title(db, "sess-1", "hello", "hi there", history)
-            # Wait for the daemon thread to complete
-            import time
-            time.sleep(0.3)
+            # Event-based wait: sleep-sync flaked when the daemon thread
+            # wasn't scheduled within the fixed nap on a loaded runner.
+            assert called.wait(timeout=10), "auto_title thread never ran"
             mock_auto.assert_called_once_with(
                 db,
                 "sess-1",
@@ -441,9 +444,11 @@ class TestMaybeAutoTitle:
             pass
 
         with patch("agent.title_generator.auto_title_session") as mock_auto:
+            import threading
+            called = threading.Event()
+            mock_auto.side_effect = lambda *a, **k: called.set()
             maybe_auto_title(db, "sess-1", "hello", "hi there", history, failure_callback=_cb)
-            import time
-            time.sleep(0.3)
+            assert called.wait(timeout=10), "auto_title thread never ran"
             mock_auto.assert_called_once_with(
                 db,
                 "sess-1",
@@ -592,8 +597,10 @@ class TestRuntimeValidator:
             return True
 
         with patch("agent.title_generator.auto_title_session") as mock_auto:
+            import threading
+            called = threading.Event()
+            mock_auto.side_effect = lambda *a, **k: called.set()
             maybe_auto_title(db, "sess-1", "hello", "hi there", history, runtime_validator=_v)
-            import time
-            time.sleep(0.3)
+            assert called.wait(timeout=10), "auto_title thread never ran"
             kwargs = mock_auto.call_args.kwargs
             assert kwargs["runtime_validator"] is _v
