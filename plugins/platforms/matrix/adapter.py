@@ -389,12 +389,66 @@ def _resolve_max_message_length(config) -> int:
 # Back-compat alias for callers/tests that import the module constant.
 MAX_MESSAGE_LENGTH = DEFAULT_MAX_MESSAGE_LENGTH
 
-# Store directory for E2EE keys and sync state.
-# Uses get_hermes_home() so each profile gets its own Matrix store.
+# Store directory for E2EE keys and sync state. Resolve it lazily so importing
+# the plugin before a profile scope selects HERMES_HOME cannot pin another
+# profile's encrypted state for the lifetime of the process.
 from hermes_constants import get_hermes_dir as _get_hermes_dir
 
-_STORE_DIR = _get_hermes_dir("platforms/matrix/store", "matrix/store")
-_CRYPTO_DB_PATH = _STORE_DIR / "crypto.db"
+
+def _get_matrix_store_dir() -> Path:
+    return _get_hermes_dir("platforms/matrix/store", "matrix/store")
+
+
+def _get_matrix_crypto_db_path(store_dir: Optional[Path] = None) -> Path:
+    return (store_dir or _get_matrix_store_dir()) / "crypto.db"
+
+def _read_crypto_store_device_id(db_path: Path, account_id: str) -> Optional[str]:
+    """Read the persisted Matrix device ID without opening the encrypted account.
+
+    This is a restart/rotation guard: PgCryptoStore encrypts the account pickle
+    with a key derived from the configured device ID, so opening a store under a
+    different ID otherwise fails later with the opaque ``BAD_ACCOUNT_KEY``.
+    """
+    if not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+        try:
+            row = conn.execute(
+                "SELECT device_id FROM crypto_account WHERE account_id = ? LIMIT 1",
+                (account_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    return str(row[0]) if row and row[0] else None
+
+
+async def _matrix_initial_sync_kwargs(sync_store: Any) -> Dict[str, Any]:
+    """Build initial sync arguments using the durable crypto-store token."""
+    next_batch = await sync_store.get_next_batch()
+    return {
+        "since": next_batch or None,
+        "timeout": 10000,
+        "full_state": True,
+    }
+
+
+def _secure_matrix_store_permissions(store_dir: Optional[Path] = None) -> None:
+    """Keep the E2EE store owner-only, including SQLite WAL sidecars."""
+    store_dir = store_dir or _get_matrix_store_dir()
+    try:
+        store_dir.chmod(0o700)
+    except OSError:
+        return
+    for name in ("crypto.db", "crypto.db-wal", "crypto.db-shm"):
+        path = store_dir / name
+        try:
+            if path.exists():
+                path.chmod(0o600)
+        except OSError:
+            logger.warning("Matrix: could not tighten permissions on %s", path)
 
 # Grace period: ignore messages older than this many seconds before startup.
 _STARTUP_GRACE_SECONDS = 5
@@ -873,6 +927,8 @@ class MatrixAdapter(BasePlatformAdapter):
 
         self._client: Any = None  # mautrix.client.Client
         self._crypto_db: Any = None  # mautrix.util.async_db.Database
+        self._store_dir: Optional[Path] = None
+        self._crypto_db_path: Optional[Path] = None
         self._sync_task: Optional[asyncio.Task] = None
         self._invite_join_tasks: Dict[str, asyncio.Task] = {}
         self._closing = False
@@ -1190,7 +1246,7 @@ class MatrixAdapter(BasePlatformAdapter):
                     "Matrix: server has different identity keys for device %s — "
                     "local crypto state is stale. Delete %s and restart.",
                     client.device_id,
-                    _CRYPTO_DB_PATH,
+                    self._crypto_db_path or _get_matrix_crypto_db_path(),
                 )
                 return False
 
@@ -1247,7 +1303,12 @@ class MatrixAdapter(BasePlatformAdapter):
             return False
 
         # Ensure store dir exists for E2EE key persistence.
-        _STORE_DIR.mkdir(parents=True, exist_ok=True)
+        store_dir = _get_matrix_store_dir()
+        crypto_db_path = _get_matrix_crypto_db_path(store_dir)
+        self._store_dir = store_dir
+        self._crypto_db_path = crypto_db_path
+        store_dir.mkdir(parents=True, exist_ok=True)
+        _secure_matrix_store_permissions(store_dir)
 
         # Create the HTTP API layer.
         client_session = _create_matrix_session(self._proxy_url)
@@ -1379,7 +1440,7 @@ class MatrixAdapter(BasePlatformAdapter):
                     from mautrix.crypto.store.asyncpg import PgCryptoStore
                     from mautrix.util.async_db import Database
 
-                    _STORE_DIR.mkdir(parents=True, exist_ok=True)
+                    store_dir.mkdir(parents=True, exist_ok=True)
                 except Exception as exc:
                     if self._e2ee_mode == "optional":
                         logger.warning(
@@ -1399,8 +1460,29 @@ class MatrixAdapter(BasePlatformAdapter):
                         return False
             if self._encryption:
                 try:
+                    persisted_device_id = _read_crypto_store_device_id(
+                        crypto_db_path,
+                        self._user_id or "hermes",
+                    )
+                    effective_device_id = str(client.device_id or "")
+                    if (
+                        persisted_device_id
+                        and effective_device_id
+                        and persisted_device_id != effective_device_id
+                    ):
+                        logger.error(
+                            "Matrix: crypto store belongs to device %s but config/login "
+                            "resolved device %s. Refusing to open it under the wrong "
+                            "pickle key. Preserve and move the whole store directory "
+                            "before an intentional device rotation.",
+                            persisted_device_id,
+                            effective_device_id,
+                        )
+                        await api.session.close()
+                        return False
+
                     # Remove legacy pickle file from pre-SQLite era.
-                    legacy_pickle = _STORE_DIR / "crypto_store.pickle"
+                    legacy_pickle = store_dir / "crypto_store.pickle"
                     if legacy_pickle.exists():
                         logger.info(
                             "Matrix: removing legacy crypto_store.pickle (migrated to SQLite)"
@@ -1408,7 +1490,7 @@ class MatrixAdapter(BasePlatformAdapter):
                         legacy_pickle.unlink()
 
                     crypto_db = Database.create(
-                        f"sqlite:///{_CRYPTO_DB_PATH}",
+                        f"sqlite:///{crypto_db_path}",
                         upgrade_table=PgCryptoStore.upgrade_table,
                     )
                     await crypto_db.start()
@@ -1425,6 +1507,12 @@ class MatrixAdapter(BasePlatformAdapter):
 
                     if client.device_id:
                         await crypto_store.put_device_id(client.device_id)
+
+                    # PgCryptoStore persists next_batch in crypto_account. Reuse
+                    # it across gateway restarts instead of replaying the entire
+                    # room timeline through a fresh MemorySyncStore each time.
+                    client.sync_store = crypto_store
+                    _secure_matrix_store_permissions(store_dir)
 
                     crypto_state = _CryptoStateStore(state_store, self._joined_rooms)
                     olm = OlmMachine(client, crypto_store, crypto_state)
@@ -1510,7 +1598,7 @@ class MatrixAdapter(BasePlatformAdapter):
                     client.crypto = olm
                     logger.info(
                         "Matrix: E2EE enabled (store: %s%s)",
-                        str(_CRYPTO_DB_PATH),
+                        str(crypto_db_path),
                         f", device_id={client.device_id}" if client.device_id else "",
                     )
                 except Exception as exc:
@@ -1644,6 +1732,8 @@ class MatrixAdapter(BasePlatformAdapter):
                 await self._crypto_db.stop()
             except Exception as exc:
                 logger.debug("Matrix: could not close crypto DB on disconnect: %s", exc)
+            self._crypto_db = None
+            _secure_matrix_store_permissions(self._store_dir)
 
         if self._client:
             try:
@@ -1753,7 +1843,9 @@ class MatrixAdapter(BasePlatformAdapter):
                 "mode": self._e2ee_mode,
                 "enabled": bool(self._encryption),
                 "deps_available": _check_e2ee_deps(),
-                "crypto_store_path": str(_CRYPTO_DB_PATH),
+                "crypto_store_path": str(
+                    self._crypto_db_path or _get_matrix_crypto_db_path()
+                ),
                 "recovery_key_configured": bool(os.getenv("MATRIX_RECOVERY_KEY", "").strip()),
             },
             "policy": {

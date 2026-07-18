@@ -316,6 +316,18 @@ def _print_active_jobs_summary(jobs) -> None:
         print("  No active jobs")
 
 
+def cron_export_definitions(args):
+    """Export deterministic cron job definitions."""
+    from cron.jobs import export_definitions_file, get_cron_definitions_file
+
+    output = getattr(args, "output", None)
+    path = Path(output).expanduser() if output else get_cron_definitions_file()
+    changed = export_definitions_file(output_path=path)
+    print(color(f"Exported cron definitions: {path}", Colors.GREEN))
+    print(f"  Changed: {'yes' if changed else 'no'}")
+    return 0
+
+
 def cron_create(args):
     # The gateway-lifecycle guard lives in cron.jobs.create_job so it fires on
     # every job-creation path (this CLI subcommand AND the agent's `cronjob`
