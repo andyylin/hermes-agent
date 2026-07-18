@@ -1217,6 +1217,16 @@ class TestMatrixDisplayName:
 # ---------------------------------------------------------------------------
 
 class TestMatrixModuleImport:
+    def test_store_path_follows_hermes_home_set_after_import(
+        self, tmp_path, monkeypatch
+    ):
+        import plugins.platforms.matrix.adapter as matrix_mod
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        expected = tmp_path.resolve() / "platforms" / "matrix" / "store"
+        assert matrix_mod._get_matrix_store_dir() == expected
+
     def test_module_importable_without_mautrix(self):
         """plugins.platforms.matrix.adapter must be importable even when mautrix is
         not installed — otherwise the gateway crashes for ALL platforms.

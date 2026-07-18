@@ -318,10 +318,10 @@ def _print_active_jobs_summary(jobs) -> None:
 
 def cron_export_definitions(args):
     """Export deterministic cron job definitions."""
-    from cron.jobs import DEFINITIONS_FILE, export_definitions_file
+    from cron.jobs import export_definitions_file, get_cron_definitions_file
 
     output = getattr(args, "output", None)
-    path = Path(output).expanduser() if output else DEFINITIONS_FILE
+    path = Path(output).expanduser() if output else get_cron_definitions_file()
     changed = export_definitions_file(output_path=path)
     print(color(f"Exported cron definitions: {path}", Colors.GREEN))
     print(f"  Changed: {'yes' if changed else 'no'}")

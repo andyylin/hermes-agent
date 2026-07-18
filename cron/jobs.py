@@ -79,6 +79,8 @@ TICKER_HEARTBEAT_FILE = CRON_DIR / "ticker_heartbeat"
 # Last tick that completed WITHOUT raising. Distinguishing this from the plain
 # heartbeat lets status detect a ticker that is alive but failing every tick.
 TICKER_SUCCESS_FILE = CRON_DIR / "ticker_last_success"
+_IMPORT_TICKER_HEARTBEAT_FILE = TICKER_HEARTBEAT_FILE
+_IMPORT_TICKER_SUCCESS_FILE = TICKER_SUCCESS_FILE
 # Default ticker loop interval (seconds). The single source of truth shared by
 # the in-process ticker (cron/scheduler_provider.py) and the staleness
 # threshold in `hermes cron status` (hermes_cli/cron.py), so the two never
@@ -174,6 +176,20 @@ def use_cron_store(home: Union[str, Path]):
 def get_cron_output_dir() -> Path:
     """Return the output directory for the active cron store context."""
     return _current_cron_store().output_dir
+
+
+def get_cron_definitions_file() -> Path:
+    """Return the deterministic export path for the active cron store."""
+    from cron.definitions_export import definitions_path_for_jobs_file
+
+    return definitions_path_for_jobs_file(_current_cron_store().jobs_file)
+
+
+def _current_ticker_file(path: Path, import_path: Path, filename: str) -> Path:
+    """Resolve a ticker marker without breaking patched compatibility constants."""
+    if path != import_path:
+        return path
+    return _current_cron_store().cron_dir / filename
 
 
 # Fallback stale-recovery window for a one-shot's running-claim (#59229) when
@@ -820,12 +836,24 @@ def record_ticker_heartbeat(success: bool = False) -> None:
     Best-effort: a write failure must never disrupt the tick loop.
     """
     try:
-        _atomic_write_epoch(TICKER_HEARTBEAT_FILE)
+        _atomic_write_epoch(
+            _current_ticker_file(
+                TICKER_HEARTBEAT_FILE,
+                _IMPORT_TICKER_HEARTBEAT_FILE,
+                "ticker_heartbeat",
+            )
+        )
     except Exception:
         pass
     if success:
         try:
-            _atomic_write_epoch(TICKER_SUCCESS_FILE)
+            _atomic_write_epoch(
+                _current_ticker_file(
+                    TICKER_SUCCESS_FILE,
+                    _IMPORT_TICKER_SUCCESS_FILE,
+                    "ticker_last_success",
+                )
+            )
         except Exception:
             pass
 
@@ -844,12 +872,24 @@ def get_ticker_heartbeat_age() -> Optional[float]:
     None = heartbeat file missing/unreadable (older build, never ran, or a
     torn read). Callers treat None as "cannot determine", not "dead".
     """
-    return _epoch_file_age(TICKER_HEARTBEAT_FILE)
+    return _epoch_file_age(
+        _current_ticker_file(
+            TICKER_HEARTBEAT_FILE,
+            _IMPORT_TICKER_HEARTBEAT_FILE,
+            "ticker_heartbeat",
+        )
+    )
 
 
 def get_ticker_success_age() -> Optional[float]:
     """Seconds since the ticker last completed a tick WITHOUT raising, or None."""
-    return _epoch_file_age(TICKER_SUCCESS_FILE)
+    return _epoch_file_age(
+        _current_ticker_file(
+            TICKER_SUCCESS_FILE,
+            _IMPORT_TICKER_SUCCESS_FILE,
+            "ticker_last_success",
+        )
+    )
 
 
 # =============================================================================
