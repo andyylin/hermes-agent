@@ -4615,6 +4615,14 @@ class TestMatrixDmAutoThread:
         # Disable require_mention so DMs pass gating
         self.adapter._require_mention = False
 
+    def test_yaml_dm_auto_thread_bridges_to_matrix_environment(self, monkeypatch):
+        from plugins.platforms.matrix.adapter import _apply_yaml_config
+
+        monkeypatch.delenv("MATRIX_DM_AUTO_THREAD", raising=False)
+        _apply_yaml_config({}, {"dm_auto_thread": True})
+
+        assert os.environ["MATRIX_DM_AUTO_THREAD"] == "true"
+
     @pytest.mark.asyncio
     async def test_dm_auto_thread_enabled_creates_thread(self):
         """When dm_auto_thread is True, DM messages get auto-threaded."""
