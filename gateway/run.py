@@ -18762,7 +18762,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if _streaming_enabled:
             try:
-                from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+                from gateway.stream_consumer import (
+                    GatewayStreamConsumer,
+                    StreamConsumerConfig,
+                    StreamDeliveryContext,
+                )
                 _adapter = self._adapter_for_source(source)
                 if _adapter:
                     _pause_typing_before_finalize = None
@@ -18804,6 +18808,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=event_message_id,
                         run_still_current=_run_still_current,
+                        delivery_context=(
+                            StreamDeliveryContext(
+                                session_key=session_key,
+                                message_ref=event_message_id,
+                                platform=source.platform.value,
+                                thread_id=getattr(source, "thread_id", None),
+                            )
+                            if session_key and event_message_id
+                            else None
+                        ),
                     )
             except Exception as _sc_err:
                 logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
@@ -18909,7 +18923,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         finally:
             # Finalize stream consumer
             if _stream_consumer:
-                _stream_consumer.finish()
+                _stream_consumer.finish(full_response)
             if stream_task:
                 try:
                     await asyncio.wait_for(stream_task, timeout=5.0)
@@ -20219,7 +20233,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
                 try:
-                    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+                    from gateway.stream_consumer import (
+                        GatewayStreamConsumer,
+                        StreamConsumerConfig,
+                        StreamDeliveryContext,
+                    )
                     _adapter = self._adapter_for_source(source)
                     if _adapter:
                         _pause_typing_before_finalize = None
@@ -20276,6 +20294,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             on_before_finalize=_pause_typing_before_finalize,
                             initial_reply_to_id=event_message_id,
                             run_still_current=_run_still_current,
+                            delivery_context=(
+                                StreamDeliveryContext(
+                                    session_key=session_key,
+                                    message_ref=event_message_id,
+                                    platform=source.platform.value,
+                                    thread_id=getattr(source, "thread_id", None),
+                                )
+                                if session_key and event_message_id
+                                else None
+                            ),
                         )
                         if _want_stream_deltas:
                             def _stream_delta_cb(text: str) -> None:
@@ -21146,12 +21174,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reset_current_session_key(_approval_session_token)
             result_holder[0] = result
 
-            # Signal the stream consumer that the agent is done
-            if _stream_consumer is not None:
-                _stream_consumer.finish()
-            
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
+
+            # Signal the stream consumer that the agent is done
+            if _stream_consumer is not None:
+                _stream_consumer.finish(
+                    "" if result.get("response_transformed") else final_response
+                )
 
             # Extract actual token counts from the agent instance used for this run
             _last_prompt_toks = 0
@@ -22301,19 +22331,79 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # existing streamed message instead of sending a duplicate.
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
+                    _transformed_obligation_id = None
                     try:
-                        await _sc.adapter.edit_message(
+                        from gateway.delivery_ledger import (
+                            compute_obligation_id,
+                            ledger_enabled,
+                            mark_attempting,
+                            record_obligation,
+                        )
+
+                        if ledger_enabled() and session_key and event_message_id:
+                            _transformed_content = str(response["final_response"])
+                            _transformed_obligation_id = compute_obligation_id(
+                                session_key,
+                                event_message_id,
+                                _transformed_content,
+                            )
+                            record_obligation(
+                                obligation_id=_transformed_obligation_id,
+                                session_key=session_key,
+                                platform=source.platform.value,
+                                chat_id=source.chat_id,
+                                thread_id=getattr(source, "thread_id", None),
+                                content=_transformed_content,
+                            )
+                            mark_attempting(_transformed_obligation_id)
+                    except Exception:
+                        logger.debug(
+                            "Could not record transformed stream delivery obligation",
+                            exc_info=True,
+                        )
+                    try:
+                        _edit_result = await _sc.adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if getattr(_edit_result, "success", False):
+                            response["already_sent"] = True
+                            if _transformed_obligation_id:
+                                from gateway.delivery_ledger import mark_delivered
+
+                                mark_delivered(_transformed_obligation_id)
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
+                        else:
+                            if _transformed_obligation_id:
+                                from gateway.delivery_ledger import mark_failed
+
+                                mark_failed(
+                                    _transformed_obligation_id,
+                                    getattr(_edit_result, "error", None)
+                                    or "transformed stream edit failed",
+                                )
+                            logger.warning(
+                                "Failed to edit streamed message %s for session %s: %s",
+                                _sc_msg_id,
+                                session_key or "?",
+                                getattr(_edit_result, "error", None) or "unknown error",
+                            )
                     except Exception as _edit_err:
+                        if _transformed_obligation_id:
+                            try:
+                                from gateway.delivery_ledger import mark_failed
+
+                                mark_failed(_transformed_obligation_id, str(_edit_err))
+                            except Exception:
+                                logger.debug(
+                                    "Could not update transformed stream delivery obligation",
+                                    exc_info=True,
+                                )
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",
                             session_key or "?", _edit_err,

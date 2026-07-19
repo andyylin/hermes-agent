@@ -35,6 +35,7 @@ const assignmentMutationTokens = new Map<string, number>()
 const assignmentMutationQueues = new Map<string, Promise<void>>()
 const confirmedAssignments = new Map<string, { present: boolean; value: null | string }>()
 const pendingAssignmentIntents = new Map<string, { token: number; value: null | string }>()
+let projectStateEpoch = 0
 
 // False when the connected backend predates the projects.* JSON-RPC surface
 // (same semver label, older install). Null until the first probe.
@@ -118,6 +119,27 @@ export const $projectScope = persistentAtom<string>(PROJECT_SCOPE_KEY, ALL_PROJE
   decode: raw => raw || ALL_PROJECTS,
   encode: value => value || ALL_PROJECTS
 })
+
+export function resetProjectStateForGatewaySwitch(): void {
+  projectStateEpoch += 1
+  assignmentMutationGeneration += 1
+  assignmentMutationTokens.clear()
+  assignmentMutationQueues.clear()
+  confirmedAssignments.clear()
+  pendingAssignmentIntents.clear()
+  didScanRepos = false
+
+  $projects.set([])
+  $activeProjectId.set(null)
+  $projectTree.set([])
+  $projectTreeLoading.set(false)
+  $sessionProjectAssignments.set({})
+  $projectSessionAssignmentsAvailable.set(null)
+  $projectsRpcAvailable.set(null)
+  $removedSessionIds.set(new Set())
+  $reposScanning.set(false)
+  $projectScope.set(ALL_PROJECTS)
+}
 
 // Enter a project: scope the sidebar to it and make it the active project
 // (best-effort — the durable pointer is nice-to-have, the view scope is the
@@ -280,11 +302,20 @@ function applyPayload(payload: ProjectsPayload): void {
 // Pull the full project list + active pointer. Best-effort: a failure (gateway
 // not up yet) leaves the cached atoms intact so the sidebar doesn't flicker.
 export async function refreshProjects(): Promise<void> {
+  const stateEpoch = projectStateEpoch
   try {
-    applyPayload(await gatewayRequest<ProjectsPayload>('projects.list'))
+    const payload = await gatewayRequest<ProjectsPayload>('projects.list')
+
+    if (stateEpoch !== projectStateEpoch) {
+      return
+    }
+
+    applyPayload(payload)
     markProjectsRpcSuccess()
   } catch (err) {
-    markProjectsRpcFailure(err)
+    if (stateEpoch === projectStateEpoch) {
+      markProjectsRpcFailure(err)
+    }
     // Backend may not be ready; keep the last known list.
   }
 }
@@ -300,11 +331,17 @@ interface ProjectTreePayload {
 // sessions + the scoped-session-id set). Best-effort: a failure leaves the
 // cached tree intact so the sidebar doesn't flicker.
 export async function refreshProjectTree(): Promise<void> {
+  const stateEpoch = projectStateEpoch
   const mutationGeneration = assignmentMutationGeneration
   $projectTreeLoading.set(true)
 
   try {
     const res = await gatewayRequest<ProjectTreePayload>('projects.tree', { preview_limit: 3 })
+
+    if (stateEpoch !== projectStateEpoch) {
+      return
+    }
+
     // The flat Sessions list shows everything; scoped ids are only used here to
     // reconcile the optimistic eviction layer against what the server still lists.
     const scoped = new Set(res.scoped_session_ids ?? [])
@@ -355,10 +392,14 @@ export async function refreshProjectTree(): Promise<void> {
 
     markProjectsRpcSuccess()
   } catch (err) {
-    markProjectsRpcFailure(err)
+    if (stateEpoch === projectStateEpoch) {
+      markProjectsRpcFailure(err)
+    }
     // Backend may not be ready; keep the last known tree.
   } finally {
-    $projectTreeLoading.set(false)
+    if (stateEpoch === projectStateEpoch) {
+      $projectTreeLoading.set(false)
+    }
   }
 }
 
@@ -394,6 +435,7 @@ async function mutateSessionProjectAssignment(
   method: string,
   params: Record<string, unknown>
 ): Promise<void> {
+  const stateEpoch = projectStateEpoch
   const before = $sessionProjectAssignments.get()
   const previousQueue = assignmentMutationQueues.get(sessionId)
 
@@ -418,7 +460,7 @@ async function mutateSessionProjectAssignment(
       try {
         await gatewayRequest(method, params)
       } catch (err) {
-        if (assignmentMutationTokens.get(sessionId) === token) {
+        if (stateEpoch === projectStateEpoch && assignmentMutationTokens.get(sessionId) === token) {
           pendingAssignmentIntents.delete(sessionId)
           // Reject every tree request that began while this optimistic intent
           // was active; its response cannot describe the post-rollback state.
@@ -435,11 +477,15 @@ async function mutateSessionProjectAssignment(
           $sessionProjectAssignments.set(rolledBack)
         }
 
-        if (isMissingRpcMethod(err)) {
+        if (stateEpoch === projectStateEpoch && isMissingRpcMethod(err)) {
           $projectSessionAssignmentsAvailable.set(false)
         }
 
         throw err
+      }
+
+      if (stateEpoch !== projectStateEpoch) {
+        return
       }
 
       confirmedAssignments.set(sessionId, { present: true, value: projectId })

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from gateway import delivery_ledger as dl
 import gateway.platforms.base as base_platform
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
@@ -746,6 +747,7 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    event_message_id=None,
 ):
     if config_data:
         import yaml
@@ -791,6 +793,7 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        event_message_id=event_message_id,
     )
     return adapter, result
 
@@ -1046,6 +1049,7 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
     transformed content (so plugins like content filters / appenders reach the
     user) and still mark already_sent=True (no duplicate send).
     """
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "state.db")
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
@@ -1060,6 +1064,7 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
         chat_type="group",
         thread_id="$thread",
         adapter_cls=MetadataEditProgressCaptureAdapter,
+        event_message_id="$event-transformed",
     )
 
     # Final delivery happened (no duplicate send fallback).
@@ -1070,6 +1075,11 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
     assert any("[plugin appended this]" in text for text in edited_texts), (
         f"expected transformed text in adapter.edits, got: {edited_texts!r}"
     )
+    with dl._connect() as conn:
+        rows = conn.execute(
+            "SELECT state, content FROM delivery_obligations"
+        ).fetchall()
+    assert rows == [("delivered", "original answer\n\n[plugin appended this]")]
 
 
 @pytest.mark.asyncio

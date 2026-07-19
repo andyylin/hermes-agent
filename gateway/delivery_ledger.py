@@ -166,11 +166,12 @@ def record_obligation(
     pid, started = _owner_stamp()
     with _DB_LOCK, _connect() as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO delivery_obligations
+            """INSERT INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
+               ON CONFLICT(obligation_id) DO NOTHING""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
              pid, started),

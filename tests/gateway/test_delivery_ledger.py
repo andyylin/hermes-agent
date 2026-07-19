@@ -81,8 +81,17 @@ class TestStateMachine:
     def test_rerecord_same_id_is_idempotent(self):
         _record()
         dl.mark_attempting("ob-1")
-        _record()  # INSERT OR REPLACE resets to pending — same turn re-record
-        assert _row("ob-1")["state"] == "pending"
+        _record()
+        assert _row("ob-1")["state"] == "attempting"
+
+    def test_rerecord_delivered_id_preserves_terminal_state(self):
+        _record()
+        dl.mark_attempting("ob-1")
+        dl.mark_delivered("ob-1")
+
+        _record()
+
+        assert _row("ob-1")["state"] == "delivered"
 
 
 class TestObligationId:

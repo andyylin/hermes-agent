@@ -22,6 +22,7 @@ import {
   refreshProjects,
   refreshProjectTree,
   refreshWorktrees,
+  resetProjectStateForGatewaySwitch,
   unassignSessionFromProject
 } from './projects'
 
@@ -294,6 +295,32 @@ describe('project session assignment cache', () => {
     expect($sessionProjectAssignments.get()).toEqual({ existing: 'p_old', s1: 'p_new' })
     await expect(write).rejects.toThrow('write failed')
     expect($sessionProjectAssignments.get()).toEqual({ existing: 'p_old' })
+  })
+
+  it('ignores an assignment completion from the profile that was reset', async () => {
+    let resolveWrite: ((value: unknown) => void) | undefined
+    activeGateway.mockReturnValue({
+      connectionState: 'open',
+      request: vi.fn((method: string) => {
+        if (method === 'projects.assign_session') {
+          return new Promise(resolve => {
+            resolveWrite = resolve
+          })
+        }
+        return Promise.resolve({ projects: [] })
+      })
+    } as never)
+
+    const write = assignSessionToProject('shared', 'p_default')
+    await vi.waitFor(() => expect(resolveWrite).toBeTypeOf('function'))
+    resetProjectStateForGatewaySwitch()
+    $sessionProjectAssignments.set({ wife_session: 'p_wife' })
+
+    resolveWrite?.({})
+    await write
+
+    expect($sessionProjectAssignments.get()).toEqual({ wife_session: 'p_wife' })
+    expect($projectSessionAssignmentsAvailable.get()).toBeNull()
   })
 
   it('rolls back one failed session without clobbering a newer session move', async () => {

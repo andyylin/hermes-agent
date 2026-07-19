@@ -178,6 +178,22 @@ def test_delete_pool_only_credential_still_cleans_up(hermes_home):
     assert "zai" not in store.get("credential_pool", {})
 
 
+def test_delete_pool_only_credential_scrubs_matching_config_mirror(hermes_home):
+    """A missing .env line must not hide the pool value needed to remove a
+    higher-precedence config.yaml mirror."""
+    _write_env(hermes_home)
+    _write_auth(hermes_home, {"zai": [_zai_pool_fixture()["zai"][0]]})
+    _write_config(hermes_home, f"model:\n  provider: custom\n  api_key: {FAKE_ZAI_KEY}\n")
+
+    resp = client.request(
+        "DELETE", "/api/env", json={"key": "ZAI_API_KEY"}, headers=HEADERS
+    )
+
+    assert resp.status_code == 200
+    assert "model.api_key" in resp.json()["config_scrubbed"]
+    assert FAKE_ZAI_KEY not in hermes_home.joinpath("config.yaml").read_text(encoding="utf-8")
+
+
 def test_delete_unknown_key_404s(hermes_home):
     _write_env(hermes_home)
     resp = client.request(

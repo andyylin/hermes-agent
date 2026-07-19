@@ -2,6 +2,7 @@ import { atom } from 'nanostores'
 
 import { invalidateProfileScopedQueries } from '@/lib/query-client'
 import { resetSessionsLimit } from '@/store/layout'
+import { resetProjectStateForGatewaySwitch } from '@/store/projects'
 import {
   $unreadFinishedSessionIds,
   setActiveSessionId,
@@ -37,6 +38,7 @@ export const $gatewaySwitching = atom(false)
  * alone so the user stays where they were (e.g. mid-Gateway settings).
  */
 export function wipeSessionListsForGatewaySwitch(): void {
+  resetProjectStateForGatewaySwitch()
   setSessions([])
   setSessionsTotal(0)
   setSessionProfileTotals({})
