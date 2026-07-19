@@ -1591,10 +1591,11 @@ def load_gateway_config_for_runner() -> "GatewayConfig":
 
 
 def _platform_has_bot_credential(platform: "Platform", platform_config: "PlatformConfig") -> bool:
-    """Return True when a token-authenticated platform has a usable bot credential.
+    """Return True when a token-authenticated platform has a usable credential.
 
     Platforms that do not use ``PlatformConfig.token`` always return True so we
     never skip them here (Signal session paths, port-binding HTTP adapters, etc.).
+    Matrix also supports password auth when no access token is configured.
     """
     from gateway.config import PLATFORM_TOKEN_ENV_NAMES
 
@@ -1607,6 +1608,11 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
     api_key = getattr(platform_config, "api_key", None) or ""
     if isinstance(api_key, str) and api_key.strip():
         return True
+    if platform.value == "matrix":
+        extra = getattr(platform_config, "extra", None) or {}
+        password = extra.get("password", "") or os.getenv("MATRIX_PASSWORD", "")
+        if isinstance(password, str) and password.strip():
+            return True
     return False
 
 

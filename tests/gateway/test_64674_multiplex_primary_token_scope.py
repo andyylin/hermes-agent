@@ -97,6 +97,31 @@ class TestPlatformHasBotCredential:
             Platform.TELEGRAM, PlatformConfig(enabled=True, token="123:abc")
         ) is True
 
+    def test_matrix_password_auth_true(self, monkeypatch):
+        from gateway.run import _platform_has_bot_credential
+
+        monkeypatch.setenv("MATRIX_PASSWORD", "password-auth-is-valid")
+        assert _platform_has_bot_credential(
+            Platform.MATRIX, PlatformConfig(enabled=True, token="")
+        ) is True
+        monkeypatch.delenv("MATRIX_PASSWORD")
+        assert _platform_has_bot_credential(
+            Platform.MATRIX,
+            PlatformConfig(
+                enabled=True,
+                token="",
+                extra={"password": "config-password-is-valid"},
+            ),
+        ) is True
+
+    def test_matrix_without_token_or_password_false(self, monkeypatch):
+        from gateway.run import _platform_has_bot_credential
+
+        monkeypatch.delenv("MATRIX_PASSWORD", raising=False)
+        assert _platform_has_bot_credential(
+            Platform.MATRIX, PlatformConfig(enabled=True, token="")
+        ) is False
+
     def test_non_token_platform_always_true(self):
         from gateway.run import _platform_has_bot_credential
 
