@@ -14,7 +14,7 @@ test('discovers disk plugins from the Desktop-local Hermes home', async () => {
     profile: {
       get: vi.fn().mockResolvedValue({
         profile: null,
-        hermes_home: '/Users/andy/.hermes'
+        hermes_home: '/Users/andy/.hermes/'
       })
     },
     readDir
