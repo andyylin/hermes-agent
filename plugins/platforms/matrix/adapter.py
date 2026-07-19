@@ -613,6 +613,15 @@ def _resolve_e2ee_mode(extra: Optional[Dict[str, Any]] = None) -> str:
     return "required" if legacy_enabled else "off"
 
 
+def _matrix_bool(value: Any, default: bool = False) -> bool:
+    """Parse a Matrix boolean from profile-local config or an env string."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"true", "1", "yes", "on"}
+
+
 def _redact_matrix_value(value: Any) -> str:
     """Return a safe, non-reversible preview for Matrix diagnostics."""
     text = str(value or "").strip()
@@ -967,10 +976,9 @@ class MatrixAdapter(BasePlatformAdapter):
         self._allow_room_mentions: bool = os.getenv(
             "MATRIX_ALLOW_ROOM_MENTIONS", "false"
         ).lower() in ("true", "1", "yes")
-        self._auto_thread: bool = os.getenv("MATRIX_AUTO_THREAD", "true").lower() in (
-            "true",
-            "1",
-            "yes",
+        self._auto_thread: bool = _matrix_bool(
+            config.extra.get("auto_thread", os.getenv("MATRIX_AUTO_THREAD", "true")),
+            default=True,
         )
         auto_thread_rooms_raw = config.extra.get("auto_thread_rooms")
         if auto_thread_rooms_raw is None:
@@ -987,19 +995,29 @@ class MatrixAdapter(BasePlatformAdapter):
                 for room in str(auto_thread_rooms_raw).split(",")
                 if room.strip()
             }
-        self._dm_auto_thread: bool = os.getenv(
-            "MATRIX_DM_AUTO_THREAD", "false"
-        ).lower() in {"true", "1", "yes"}
-        self._dm_mention_threads: bool = os.getenv(
-            "MATRIX_DM_MENTION_THREADS", "false"
-        ).lower() in ("true", "1", "yes")
-        raw_session_scope = os.getenv("MATRIX_SESSION_SCOPE", "auto").strip().lower()
+        self._dm_auto_thread: bool = _matrix_bool(
+            config.extra.get(
+                "dm_auto_thread", os.getenv("MATRIX_DM_AUTO_THREAD", "false")
+            )
+        )
+        self._dm_mention_threads: bool = _matrix_bool(
+            config.extra.get(
+                "dm_mention_threads", os.getenv("MATRIX_DM_MENTION_THREADS", "false")
+            )
+        )
+        raw_session_scope = str(
+            config.extra.get(
+                "session_scope", os.getenv("MATRIX_SESSION_SCOPE", "auto")
+            )
+        ).strip().lower()
         self._matrix_session_scope = (
             raw_session_scope if raw_session_scope in {"auto", "room", "thread"} else "auto"
         )
-        self._process_notices: bool = os.getenv(
-            "MATRIX_PROCESS_NOTICES", "false"
-        ).lower() in ("true", "1", "yes")
+        self._process_notices: bool = _matrix_bool(
+            config.extra.get(
+                "process_notices", os.getenv("MATRIX_PROCESS_NOTICES", "false")
+            )
+        )
 
         # Reactions: configurable via MATRIX_REACTIONS (default: true).
         self._reactions_enabled: bool = os.getenv(
@@ -4927,7 +4945,32 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
         os.environ["MATRIX_AUTO_THREAD_ROOMS"] = str(auto_thread_rooms)
     if "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):
         os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
-    return None
+
+    # Return profile-local values as PlatformConfig.extra in addition to the
+    # legacy env bridge. Multiplexed gateways host several Matrix bots in one
+    # process, so process-global MATRIX_* variables cannot safely represent
+    # room allowlists or thread policy for every profile.
+    profile_local_keys = (
+        "homeserver",
+        "user_id",
+        "require_mention",
+        "thread_require_mention",
+        "free_response_rooms",
+        "allowed_rooms",
+        "allowed_users",
+        "ignore_user_patterns",
+        "process_notices",
+        "session_scope",
+        "auto_thread",
+        "dm_auto_thread",
+        "auto_thread_rooms",
+        "dm_mention_threads",
+        "device_id",
+        "e2ee_mode",
+        "encryption",
+        "home_room",
+    )
+    return {key: matrix_cfg[key] for key in profile_local_keys if key in matrix_cfg}
 
 
 def _is_connected(config) -> bool:

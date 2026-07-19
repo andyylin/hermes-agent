@@ -2501,8 +2501,12 @@ def _gateway_config_home() -> Path:
     return _hermes_home
 
 
-def _load_gateway_config() -> dict:
-    """Load and parse ~/.hermes/config.yaml, returning {} on any error.
+def _load_gateway_config(*, strict: bool = False) -> dict:
+    """Load and parse ~/.hermes/config.yaml.
+
+    The default remains fail-open for legacy callers. ``strict=True`` is used by
+    workspace binding enforcement so an unreadable or malformed config cannot
+    silently erase configured bindings and restore a broader fallback cwd.
 
     Uses the module-level ``_hermes_home`` (so tests that monkeypatch it
     still see their fixture) and shares the mtime-keyed raw-yaml cache
@@ -2514,6 +2518,42 @@ def _load_gateway_config() -> dict:
     """
     config_home = _gateway_config_home()
     config_path = config_home / 'config.yaml'
+    if strict:
+        from gateway.workspace_bindings import WorkspaceBindingError
+
+        try:
+            if not config_path.exists():
+                return {}
+            import yaml
+
+            with open(config_path, 'r', encoding='utf-8') as f:
+                loaded = yaml.safe_load(f)
+        except Exception as exc:
+            raise WorkspaceBindingError(
+                f"cannot read workspace binding config from {config_path}"
+            ) from exc
+        if loaded is None:
+            raw = {}
+        elif isinstance(loaded, dict):
+            raw = loaded
+        else:
+            raise WorkspaceBindingError(
+                f"workspace binding config {config_path} is not a mapping"
+            )
+        try:
+            from hermes_cli import managed_scope
+
+            overlaid = managed_scope.apply_managed_overlay(raw)
+        except Exception as exc:
+            raise WorkspaceBindingError(
+                f"cannot apply managed workspace binding config from {config_path}"
+            ) from exc
+        if not isinstance(overlaid, dict):
+            raise WorkspaceBindingError(
+                f"managed workspace binding config {config_path} is not a mapping"
+            )
+        return overlaid
+
     raw: dict = {}
     used_canonical = False
     try:
@@ -11878,6 +11918,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
+
+        # Bind configured conversation scopes (Matrix rooms initially) to a
+        # first-class Hermes Project before prompt/context-file construction or
+        # tool execution. Invalid configured bindings fail closed instead of
+        # inheriting the gateway's broad default working directory.
+        try:
+            await self._apply_workspace_binding(context)
+        except Exception as exc:
+            from gateway.workspace_bindings import WorkspaceBindingError
+
+            if isinstance(exc, WorkspaceBindingError):
+                logger.error(
+                    "Workspace binding refused for %s:%s: %s",
+                    source.platform.value,
+                    source.chat_id,
+                    exc,
+                )
+                adapter = self._adapter_for_source(source)
+                if adapter:
+                    await adapter.send(
+                        source.chat_id,
+                        "⚠️ This project room's workspace binding is invalid, so "
+                        "Hermes refused to run with a broader fallback folder. "
+                        "Fix the room-to-project binding and try again.",
+                        metadata=self._thread_metadata_for_source(source),
+                    )
+                return None
+            raise
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
@@ -16156,6 +16224,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return delivered
 
+    async def _apply_workspace_binding(self, context: SessionContext):
+        """Resolve, persist, and apply a conversation-scope Project binding.
+
+        Configured-but-invalid bindings raise ``WorkspaceBindingError`` so the
+        caller can refuse the turn instead of falling back to the gateway's
+        broad default cwd.
+        """
+        from gateway.workspace_bindings import (
+            assign_session_to_workspace,
+            resolve_workspace_binding,
+        )
+
+        previous_cwd = None
+        if self._session_db is not None and context.session_id:
+            row = await self._session_db.get_session(context.session_id)
+            if isinstance(row, dict):
+                previous_cwd = str(row.get("cwd") or "") or None
+
+        def _resolve_and_assign():
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                profile_home = self._resolve_profile_home_for_source(context.source)
+                with _profile_runtime_scope(profile_home):
+                    config = _load_gateway_config(strict=True)
+                    binding = resolve_workspace_binding(config, context.source)
+                    if binding is not None:
+                        assign_session_to_workspace(
+                            binding,
+                            context.session_id,
+                            previous_cwd=previous_cwd,
+                        )
+                    return binding
+            config = _load_gateway_config(strict=True)
+            binding = resolve_workspace_binding(config, context.source)
+            if binding is not None:
+                assign_session_to_workspace(
+                    binding,
+                    context.session_id,
+                    previous_cwd=previous_cwd,
+                )
+            return binding
+
+        binding = await asyncio.to_thread(_resolve_and_assign)
+        if binding is None:
+            return None
+
+        if self._session_db is not None:
+            await self._session_db.replace_session_cwd(
+                context.session_id,
+                binding.cwd,
+            )
+
+        context.workspace_project_id = binding.project_id
+        context.workspace_project_slug = binding.project_slug
+        context.workspace_project_name = binding.project_name
+        context.workspace_cwd = binding.cwd
+        context.workspace_allowed_folders = binding.allowed_folders
+        return binding
+
     def _set_session_env(self, context: SessionContext) -> list:
         """Set session context variables for the current async task.
 
@@ -16186,6 +16312,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            cwd=context.workspace_cwd,
             async_delivery=_async_delivery,
         )
 
