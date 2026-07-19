@@ -77,7 +77,7 @@ declare global {
         // Persists the desktop's profile choice and relaunches the local
         // backend under the new HERMES_HOME (reloads the window). Pass null to
         // clear the preference.
-        set: (name: string | null) => Promise<DesktopActiveProfile>
+        set: (name: string | null) => Promise<DesktopProfileSelection>
       }
       api: <T>(request: HermesApiRequest) => Promise<T>
       notify: (payload: HermesNotification) => Promise<boolean>
@@ -419,10 +419,16 @@ export interface HermesWindowState {
   windowButtonPosition: { x: number; y: number } | null
 }
 
-export interface DesktopActiveProfile {
+export interface DesktopProfileSelection {
   // The desktop's stored profile preference, or null when unset (legacy launch
   // that defers to the sticky active_profile / default).
   profile: string | null
+}
+
+export interface DesktopActiveProfile extends DesktopProfileSelection {
+  // Machine-local Hermes home owned by Electron. Filesystem plugin discovery
+  // must use this path rather than a remote gateway's reported home.
+  hermes_home: string
 }
 
 export interface DesktopConnectionConfig {
