@@ -71,6 +71,40 @@ def test_err_envelope(server):
     }
 
 
+def test_session_list_exposes_generic_workspace_metadata(server, monkeypatch):
+    db = MagicMock()
+    db.list_sessions_rich.return_value = [
+        {
+            "id": "session-1",
+            "title": "Build the thing",
+            "preview": "Working",
+            "started_at": 10,
+            "last_active": 20,
+            "message_count": 3,
+            "source": "desktop",
+            "cwd": "/work/forge/apps/desktop",
+            "parent_session_id": "parent-1",
+            "profile_name": "default",
+        }
+    ]
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    response = server._methods["session.list"]("workspace-metadata", {"limit": 20})
+
+    assert response["result"]["sessions"][0] == {
+        "id": "session-1",
+        "title": "Build the thing",
+        "preview": "Working",
+        "started_at": 10,
+        "last_active": 20,
+        "message_count": 3,
+        "source": "desktop",
+        "cwd": "/work/forge/apps/desktop",
+        "parent_session_id": "parent-1",
+        "profile_name": "default",
+    }
+
+
 # ── write_json ───────────────────────────────────────────────────────
 
 
