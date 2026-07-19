@@ -6,7 +6,7 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 
 ## Integrated upstream baseline
 
-- `e6327692699f05d83f80c06103bc871bc61a048c` (2026-07-18)
+- `36f2a966c7f9f69987494b867c3dcf96b69a5766` (2026-07-19)
 - Temporary overlays below were re-audited against this cutoff; Projects PR #61335 and idle-rendering PR #66160 remain open and unmerged.
 
 ## Active runtime patches
@@ -60,6 +60,7 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 - `feat(projects): complete session move lifecycle` *(temporary pending upstream)*
   - Source: `andyylin/hermes-agent:contrib/pr-61335-complete`, preserving JuizSpeaking's original commits from upstream PR #61335.
   - Adds explicit project assignment, explicit `No Project`, profile-safe assign/unassign RPCs, cwd re-anchoring/restoration, and Desktop move/drag behavior.
+  - Explicit assignments remain authoritative over upstream cwd-based project inference, including inherited session colors.
   - Retire this overlay once PR #61335 (or an equivalent upstream implementation) lands and the runtime has been reconciled to that upstream version.
 
 - `fix(desktop): stop idle renderer animation loops` *(temporary pending upstream)*
