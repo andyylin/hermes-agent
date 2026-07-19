@@ -50,6 +50,10 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
   - Existing Matrix threads and DM policy retain precedence; add a room to `free_response_rooms` too when every message should be handled without an `@mention`.
   - Retire this overlay once upstream Matrix supports an equivalent per-room thread policy.
 
+- `fix(matrix): preserve password-auth reconnect eligibility`
+  - Treats `MATRIX_PASSWORD` and `matrix.password` as valid Matrix credentials when no access token is configured.
+  - Prevents a temporary Synapse startup outage from permanently removing password-auth Matrix from the gateway reconnect queue.
+
 - `fix(desktop): preserve unsafe config integers`
   - Serializes large config identifiers without JavaScript precision loss so Discord/channel/account IDs are not silently rounded by Desktop edits.
 
