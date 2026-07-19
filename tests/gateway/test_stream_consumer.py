@@ -68,6 +68,37 @@ async def test_final_stream_send_is_ledgered_before_transport(tmp_path, monkeypa
     assert row == ("delivered", "final answer")
 
 
+@pytest.mark.asyncio
+async def test_definitive_final_stream_failure_marks_ledger_failed(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(dl, "_db_path", lambda: home / "state.db")
+
+    adapter = MagicMock()
+    adapter.send = AsyncMock(
+        return_value=SimpleNamespace(success=False, message_id=None, error="rejected")
+    )
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    consumer = GatewayStreamConsumer(
+        adapter=adapter,
+        chat_id="C1",
+        config=StreamConsumerConfig(buffer_only=True, cursor=""),
+        delivery_context=StreamDeliveryContext(
+            session_key="agent:main:slack:channel:C1",
+            message_ref="msg-failed",
+            platform="slack",
+        ),
+    )
+    consumer.on_delta("final answer")
+    consumer.finish("final answer")
+
+    await consumer.run()
+
+    with dl._connect() as conn:
+        row = conn.execute("SELECT state FROM delivery_obligations").fetchone()
+    assert row == ("failed",)
+
+
 # ── _clean_for_display unit tests ────────────────────────────────────────
 
 

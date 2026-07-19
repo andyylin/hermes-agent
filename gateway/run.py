@@ -7037,7 +7037,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
 
-    async def _redeliver_pending_obligations(self) -> int:
+    async def _redeliver_pending_obligations(
+        self,
+        platform: Optional[Platform] = None,
+    ) -> int:
         """Redeliver final responses recorded in the delivery ledger by a
         previous (now dead) gateway process.
 
@@ -7059,12 +7062,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ledger_enabled,
                 mark_delivered,
                 mark_failed,
+                release_unattempted_claim,
                 sweep_recoverable,
             )
 
             if not ledger_enabled():
                 return 0
-            claimed = await asyncio.to_thread(sweep_recoverable)
+            claimed = await asyncio.to_thread(
+                sweep_recoverable,
+                platform=platform.value if platform is not None else None,
+            )
         except Exception:
             logger.debug("delivery ledger sweep failed", exc_info=True)
             return 0
@@ -7083,8 +7090,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             adapter = self.adapters.get(platform)
             if adapter is None:
-                # Platform not connected this boot — leave the row claimed;
-                # attempts cap + stale cutoff bound the retries on later boots.
+                # No transport attempt occurred. Release the live-process claim
+                # so this platform's reconnect hook can retry immediately.
+                release_unattempted_claim(row["obligation_id"])
                 continue
             content = row["content"]
             if row.get("needs_marker"):
@@ -8679,6 +8687,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             await build_channel_directory(self.adapters)
                         except Exception:
                             pass
+
+                        # Deliver already-produced final responses before any
+                        # interrupted turn is resumed on this newly-live platform.
+                        try:
+                            await self._redeliver_pending_obligations(platform=platform)
+                        except Exception:
+                            logger.debug(
+                                "delivery-ledger retry after %s reconnect failed",
+                                platform.value,
+                                exc_info=True,
+                            )
 
                         # A platform that was offline at gateway startup never
                         # got its restart-interrupted sessions auto-resumed —
@@ -22317,7 +22336,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _final,
                 previewed=_previewed,
             )
-            if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered):
+            if (
+                event_message_id
+                and not _is_empty_sentinel
+                and not _transformed
+                and (_streamed or _content_delivered)
+            ):
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",
@@ -22326,7 +22350,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _content_delivered,
                 )
                 response["already_sent"] = True
-            elif not _is_empty_sentinel and _transformed and _sc is not None:
+            elif (
+                event_message_id
+                and not _is_empty_sentinel
+                and _transformed
+                and _sc is not None
+            ):
                 # Plugin hooks transformed the response after streaming — edit the
                 # existing streamed message instead of sending a duplicate.
                 _sc_msg_id = _sc.message_id

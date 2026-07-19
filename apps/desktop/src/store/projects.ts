@@ -10,7 +10,7 @@ import { persistentAtom } from '@/lib/persisted'
 import { activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
 import { setSidebarAgentsGrouped } from '@/store/layout'
 import { notify } from '@/store/notifications'
-import { requestFreshSession } from '@/store/profile'
+import { $activeGatewayProfile, requestFreshSession } from '@/store/profile'
 import { $selectedStoredSessionId, $sessions, sessionMatchesStoredId, workspaceCwdForNewSession } from '@/store/session'
 import type { ProjectInfo, ProjectsPayload } from '@/types/hermes'
 
@@ -139,6 +139,12 @@ export function resetProjectStateForGatewaySwitch(): void {
   $removedSessionIds.set(new Set())
   $reposScanning.set(false)
   $projectScope.set(ALL_PROJECTS)
+  $projectDialog.set(null)
+  $startWorkSessionRequest.set(null)
+  $newWorktreeRequest.set(0)
+  $worktreeRefreshToken.set(0)
+  didScanRepos = false
+  startWorkToken = 0
 }
 
 // Enter a project: scope the sidebar to it and make it the active project
@@ -260,7 +266,12 @@ export async function followActiveSessionCwd(cwd: string): Promise<void> {
     return
   }
 
-  await Promise.all([refreshProjects(), refreshProjectTree()])
+  const context = await captureProjectOperation()
+  await Promise.all([refreshProjects(context), refreshProjectTree(context)])
+
+  if (!projectOperationIsCurrent(context)) {
+    return
+  }
 
   // Resolve only after the refresh, so a just-created/auto project is in the tree.
   const projectId = projectIdForCwd(target)
@@ -277,10 +288,15 @@ export async function followActiveSessionCwd(cwd: string): Promise<void> {
   }
 }
 
-// Issue a request on whichever gateway is currently active, reconnecting once
-// if the socket dropped. Projects are per-profile, so they intentionally follow
-// the active gateway just like the session list does.
-async function gatewayRequest<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+type ProjectGateway = NonNullable<ReturnType<typeof activeGateway>>
+
+interface ProjectOperationContext {
+  epoch: number
+  gateway: ProjectGateway
+}
+
+async function captureProjectOperation(): Promise<ProjectOperationContext> {
+  const epoch = projectStateEpoch
   let gateway = activeGateway()
 
   if (!gateway || gateway.connectionState !== 'open') {
@@ -291,7 +307,29 @@ async function gatewayRequest<T>(method: string, params: Record<string, unknown>
     throw new Error('Hermes gateway is not connected')
   }
 
-  return gateway.request<T>(method, params)
+  if (epoch !== projectStateEpoch) {
+    throw new Error('Project operation superseded by a profile switch')
+  }
+
+  return { epoch, gateway }
+}
+
+function captureProjectOperationNow(): ProjectOperationContext | null {
+  const gateway = activeGateway()
+
+  return gateway?.connectionState === 'open' ? { epoch: projectStateEpoch, gateway } : null
+}
+
+const projectOperationIsCurrent = (context: ProjectOperationContext): boolean => context.epoch === projectStateEpoch
+
+async function gatewayRequest<T>(
+  method: string,
+  params: Record<string, unknown> = {},
+  context?: ProjectOperationContext
+): Promise<T> {
+  const operation = context ?? (await captureProjectOperation())
+
+  return operation.gateway.request<T>(method, params)
 }
 
 function applyPayload(payload: ProjectsPayload): void {
@@ -301,19 +339,20 @@ function applyPayload(payload: ProjectsPayload): void {
 
 // Pull the full project list + active pointer. Best-effort: a failure (gateway
 // not up yet) leaves the cached atoms intact so the sidebar doesn't flicker.
-export async function refreshProjects(): Promise<void> {
-  const stateEpoch = projectStateEpoch
+export async function refreshProjects(operation?: ProjectOperationContext): Promise<void> {
+  let context = operation
   try {
-    const payload = await gatewayRequest<ProjectsPayload>('projects.list')
+    context ??= await captureProjectOperation()
+    const payload = await gatewayRequest<ProjectsPayload>('projects.list', {}, context)
 
-    if (stateEpoch !== projectStateEpoch) {
+    if (!projectOperationIsCurrent(context)) {
       return
     }
 
     applyPayload(payload)
     markProjectsRpcSuccess()
   } catch (err) {
-    if (stateEpoch === projectStateEpoch) {
+    if (!context || projectOperationIsCurrent(context)) {
       markProjectsRpcFailure(err)
     }
     // Backend may not be ready; keep the last known list.
@@ -330,15 +369,16 @@ interface ProjectTreePayload {
 // Pull the authoritative project tree (overview structure + counts + preview
 // sessions + the scoped-session-id set). Best-effort: a failure leaves the
 // cached tree intact so the sidebar doesn't flicker.
-export async function refreshProjectTree(): Promise<void> {
-  const stateEpoch = projectStateEpoch
+export async function refreshProjectTree(operation?: ProjectOperationContext): Promise<void> {
+  let context = operation
   const mutationGeneration = assignmentMutationGeneration
   $projectTreeLoading.set(true)
 
   try {
-    const res = await gatewayRequest<ProjectTreePayload>('projects.tree', { preview_limit: 3 })
+    context ??= await captureProjectOperation()
+    const res = await gatewayRequest<ProjectTreePayload>('projects.tree', { preview_limit: 3 }, context)
 
-    if (stateEpoch !== projectStateEpoch) {
+    if (!projectOperationIsCurrent(context)) {
       return
     }
 
@@ -392,12 +432,12 @@ export async function refreshProjectTree(): Promise<void> {
 
     markProjectsRpcSuccess()
   } catch (err) {
-    if (stateEpoch === projectStateEpoch) {
+    if (!context || projectOperationIsCurrent(context)) {
       markProjectsRpcFailure(err)
     }
     // Backend may not be ready; keep the last known tree.
   } finally {
-    if (stateEpoch === projectStateEpoch) {
+    if (!context || projectOperationIsCurrent(context)) {
       $projectTreeLoading.set(false)
     }
   }
@@ -407,12 +447,16 @@ export async function refreshProjectTree(): Promise<void> {
 // when the user enters it. Same backend grouping as `projects.tree`, so ids and
 // membership match exactly.
 export async function fetchProjectSessions(projectId: string): Promise<SidebarProjectTree | null> {
+  let context: ProjectOperationContext | null = null
   try {
-    const res = await gatewayRequest<{ project: SidebarProjectTree | null }>('projects.project_sessions', {
-      project_id: projectId
-    })
+    context = await captureProjectOperation()
+    const res = await gatewayRequest<{ project: SidebarProjectTree | null }>(
+      'projects.project_sessions',
+      { project_id: projectId },
+      context
+    )
 
-    return res.project ?? null
+    return projectOperationIsCurrent(context) ? (res.project ?? null) : null
   } catch {
     return null
   }
@@ -435,7 +479,7 @@ async function mutateSessionProjectAssignment(
   method: string,
   params: Record<string, unknown>
 ): Promise<void> {
-  const stateEpoch = projectStateEpoch
+  const context = captureProjectOperationNow() ?? (await captureProjectOperation())
   const before = $sessionProjectAssignments.get()
   const previousQueue = assignmentMutationQueues.get(sessionId)
 
@@ -458,9 +502,9 @@ async function mutateSessionProjectAssignment(
     .catch(() => undefined)
     .then(async () => {
       try {
-        await gatewayRequest(method, params)
+        await gatewayRequest(method, params, context)
       } catch (err) {
-        if (stateEpoch === projectStateEpoch && assignmentMutationTokens.get(sessionId) === token) {
+        if (projectOperationIsCurrent(context) && assignmentMutationTokens.get(sessionId) === token) {
           pendingAssignmentIntents.delete(sessionId)
           // Reject every tree request that began while this optimistic intent
           // was active; its response cannot describe the post-rollback state.
@@ -477,14 +521,14 @@ async function mutateSessionProjectAssignment(
           $sessionProjectAssignments.set(rolledBack)
         }
 
-        if (stateEpoch === projectStateEpoch && isMissingRpcMethod(err)) {
+        if (projectOperationIsCurrent(context) && isMissingRpcMethod(err)) {
           $projectSessionAssignmentsAvailable.set(false)
         }
 
         throw err
       }
 
-      if (stateEpoch !== projectStateEpoch) {
+      if (!projectOperationIsCurrent(context)) {
         return
       }
 
@@ -493,7 +537,7 @@ async function mutateSessionProjectAssignment(
       markProjectsRpcSuccess()
 
       if (assignmentMutationTokens.get(sessionId) === token) {
-        await Promise.all([refreshProjects(), refreshProjectTree()])
+        await Promise.all([refreshProjects(context), refreshProjectTree(context)])
         if (pendingAssignmentIntents.get(sessionId)?.token === token) {
           pendingAssignmentIntents.delete(sessionId)
           // A focus/background refresh may still be in flight with the same
@@ -530,18 +574,26 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
     return
   }
 
+  const context = captureProjectOperationNow() ?? (await captureProjectOperation())
   didScanRepos = true
   $reposScanning.set(true)
 
   try {
     const repos = await scan([])
-    await gatewayRequest('projects.record_repos', { repos })
+    if (!projectOperationIsCurrent(context)) {
+      return
+    }
+    await gatewayRequest('projects.record_repos', { repos }, context)
     // The disk scan may surface new zero-session repos; refold them into the tree.
-    await refreshProjectTree()
+    await refreshProjectTree(context)
   } catch {
-    didScanRepos = false // let a later open retry a failed scan
+    if (projectOperationIsCurrent(context)) {
+      didScanRepos = false // let a later open retry a failed scan
+    }
   } finally {
-    $reposScanning.set(false)
+    if (projectOperationIsCurrent(context)) {
+      $reposScanning.set(false)
+    }
   }
 }
 
@@ -564,15 +616,20 @@ export interface CreateProjectInput {
 // leave the field untouched. The "🎲" affordance in the new-project dialog.
 export async function generateProjectIdea(name: string): Promise<string> {
   try {
-    const res = await gatewayRequest<{ text: string }>('llm.oneshot', {
-      instructions:
-        'You generate a single, concrete project idea as a short IDEA.md body: a one-line summary, ' +
-        'then 3-5 bullet goals. No preamble, no code fences, under 120 words.',
-      input: name.trim() ? `Project name: ${name.trim()}` : 'Surprise me with a fun project.',
-      temperature: 1.0
-    })
+    const context = captureProjectOperationNow() ?? (await captureProjectOperation())
+    const res = await gatewayRequest<{ text: string }>(
+      'llm.oneshot',
+      {
+        instructions:
+          'You generate a single, concrete project idea as a short IDEA.md body: a one-line summary, ' +
+          'then 3-5 bullet goals. No preamble, no code fences, under 120 words.',
+        input: name.trim() ? `Project name: ${name.trim()}` : 'Surprise me with a fun project.',
+        temperature: 1.0
+      },
+      context
+    )
 
-    return (res.text || '').trim()
+    return projectOperationIsCurrent(context) ? (res.text || '').trim() : ''
   } catch {
     return ''
   }
@@ -620,18 +677,26 @@ const restoreProjects = ({ projects, tree, active }: ProjectsSnapshot): void => 
 }
 
 // Await an already-applied optimistic write; restore the snapshot if it throws.
-async function persistOrRollback(snap: ProjectsSnapshot, write: () => Promise<void>): Promise<void> {
+async function persistOrRollback(
+  context: ProjectOperationContext,
+  snap: ProjectsSnapshot,
+  write: () => Promise<void>
+): Promise<void> {
   try {
     await write()
   } catch (err) {
-    restoreProjects(snap)
-    throw err
+    if (projectOperationIsCurrent(context)) {
+      restoreProjects(snap)
+      throw err
+    }
   }
 }
 
-const reconcileProjects = (): void => {
-  void refreshProjects()
-  void refreshProjectTree()
+const reconcileProjects = (context: ProjectOperationContext): void => {
+  if (projectOperationIsCurrent(context)) {
+    void refreshProjects(context)
+    void refreshProjectTree(context)
+  }
 }
 
 // Map a ProjectInfo (list shape) onto a minimal overview tree node so a created
@@ -656,27 +721,39 @@ export async function createProject(input: CreateProjectInput): Promise<ProjectI
     throw projectsStaleBackendError()
   }
 
+  const context = captureProjectOperationNow() ?? (await captureProjectOperation())
   let res: { project: ProjectInfo | null }
 
   try {
-    res = await gatewayRequest<{ project: ProjectInfo | null }>('projects.create', {
-      name: input.name,
-      folders: input.folders ?? [],
-      primary_path: input.primaryPath,
-      slug: input.slug,
-      description: input.description,
-      icon: input.icon,
-      color: input.color,
-      board_slug: input.boardSlug,
-      use: input.use ?? false
-    })
+    res = await gatewayRequest<{ project: ProjectInfo | null }>(
+      'projects.create',
+      {
+        name: input.name,
+        folders: input.folders ?? [],
+        primary_path: input.primaryPath,
+        slug: input.slug,
+        description: input.description,
+        icon: input.icon,
+        color: input.color,
+        board_slug: input.boardSlug,
+        use: input.use ?? false
+      },
+      context
+    )
   } catch (err) {
+    if (!projectOperationIsCurrent(context)) {
+      return null
+    }
     if (isMissingRpcMethod(err)) {
       $projectsRpcAvailable.set(false)
       throw projectsStaleBackendError()
     }
 
     throw err
+  }
+
+  if (!projectOperationIsCurrent(context)) {
+    return null
   }
 
   markProjectsRpcSuccess()
@@ -707,7 +784,7 @@ export async function createProject(input: CreateProjectInput): Promise<ProjectI
     setSidebarAgentsGrouped(true)
   }
 
-  reconcileProjects()
+  reconcileProjects(context)
 
   return created
 }
@@ -723,6 +800,7 @@ export async function updateProject(
   id: string,
   patch: { name?: string; color?: null | string; icon?: null | string }
 ): Promise<void> {
+  const context = captureProjectOperationNow() ?? (await captureProjectOperation())
   const snap = snapshotProjects()
 
   $projectTree.set(
@@ -741,13 +819,17 @@ export async function updateProject(
 
   // Backend treats null/undefined as "leave unchanged"; "" clears (stores NULL).
   // Map explicit null → "" so "no color"/"no icon" actually clear.
-  await persistOrRollback(snap, () =>
-    gatewayRequest('projects.update', {
-      id,
-      ...patch,
-      ...(patch.color === null && { color: '' }),
-      ...(patch.icon === null && { icon: '' })
-    })
+  await persistOrRollback(context, snap, () =>
+    gatewayRequest(
+      'projects.update',
+      {
+        id,
+        ...patch,
+        ...(patch.color === null && { color: '' }),
+        ...(patch.icon === null && { icon: '' })
+      },
+      context
+    )
   )
 }
 
@@ -788,6 +870,7 @@ export async function addProjectFolder(
   path: string,
   opts: { label?: string; isPrimary?: boolean } = {}
 ): Promise<void> {
+  const context = captureProjectOperationNow() ?? (await captureProjectOperation())
   const snap = snapshotProjects()
   const trimmed = path.trim()
 
@@ -817,10 +900,10 @@ export async function addProjectFolder(
     }
   }
 
-  await persistOrRollback(snap, () =>
-    gatewayRequest('projects.add_folder', { id, path, label: opts.label, is_primary: opts.isPrimary ?? false })
+  await persistOrRollback(context, snap, () =>
+    gatewayRequest('projects.add_folder', { id, path, label: opts.label, is_primary: opts.isPrimary ?? false }, context)
   )
-  reconcileProjects()
+  reconcileProjects(context)
 }
 
 // True when the session currently open in the main pane belongs to `projectId`.
@@ -842,6 +925,7 @@ function openSessionBelongsToProject(projectId: string, projects: ProjectInfo[])
 // clicked (the entered-scope effect exits if you deleted the project you were
 // inside), reconciling from the server payload. A failed delete restores both.
 export async function deleteProject(id: string): Promise<void> {
+  const context = captureProjectOperationNow() ?? (await captureProjectOperation())
   const snap = snapshotProjects()
   // Capture membership BEFORE removal — the project's folders (which determine
   // ownership) are gone once it's dropped from the cache.
@@ -860,15 +944,23 @@ export async function deleteProject(id: string): Promise<void> {
     requestFreshSession()
   }
 
-  await persistOrRollback(snap, async () => {
-    applyPayload(await gatewayRequest<ProjectsPayload>('projects.delete', { id }))
+  await persistOrRollback(context, snap, async () => {
+    const payload = await gatewayRequest<ProjectsPayload>('projects.delete', { id }, context)
+    if (projectOperationIsCurrent(context)) {
+      applyPayload(payload)
+    }
   })
-  void refreshProjectTree()
+  if (projectOperationIsCurrent(context)) {
+    void refreshProjectTree(context)
+  }
 }
 
 export async function setActiveProject(id: null | string): Promise<void> {
-  const res = await gatewayRequest<{ active_id: null | string }>('projects.set_active', { id })
-  $activeProjectId.set(res.active_id ?? null)
+  const context = captureProjectOperationNow() ?? (await captureProjectOperation())
+  const res = await gatewayRequest<{ active_id: null | string }>('projects.set_active', { id }, context)
+  if (projectOperationIsCurrent(context)) {
+    $activeProjectId.set(res.active_id ?? null)
+  }
 }
 
 // ── Project management dialog ────────────────────────────────────────────────
@@ -1047,6 +1139,18 @@ export async function copyPath(path: null | string): Promise<void> {
     await window.hermesDesktop?.writeClipboard?.(path)
   }
 }
+
+// A live profile activation swaps the underlying gateway without using the
+// connection-mode switch helper. Reset synchronously when that authoritative
+// profile pointer changes so no target-bearing project UI survives the re-home.
+let projectStateProfile = $activeGatewayProfile.get()
+
+$activeGatewayProfile.subscribe(profile => {
+  if (profile !== projectStateProfile) {
+    projectStateProfile = profile
+    resetProjectStateForGatewaySwitch()
+  }
+})
 
 // Pick a project folder via the remote-aware picker: a remote gateway browses
 // the backend filesystem (seeded at its default cwd) where sessions run; local

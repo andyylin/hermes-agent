@@ -747,7 +747,7 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
-    event_message_id=None,
+    event_message_id="evt-test-message",
 ):
     if config_data:
         import yaml
@@ -1080,6 +1080,29 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
             "SELECT state, content FROM delivery_obligations"
         ).fetchall()
     assert rows == [("delivered", "original answer\n\n[plugin appended this]")]
+
+
+@pytest.mark.asyncio
+async def test_stream_without_message_id_does_not_suppress_normal_send(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TransformedStreamAgent,
+        session_id="sess-stream-no-message-id",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        platform=Platform.MATRIX,
+        chat_id="!room:matrix.example.org",
+        chat_type="group",
+        thread_id="$thread",
+        adapter_cls=MetadataEditProgressCaptureAdapter,
+        event_message_id=None,
+    )
+
+    assert adapter.sent, "stream preview should remain available"
+    assert result.get("already_sent") is not True
 
 
 @pytest.mark.asyncio

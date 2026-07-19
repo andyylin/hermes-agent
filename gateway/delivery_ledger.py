@@ -191,6 +191,19 @@ def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
 
 
+def release_unattempted_claim(obligation_id: str) -> None:
+    """Release a sweep claim when no transport adapter was available."""
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _connect() as conn:
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET owner_pid=NULL, owner_started_at=NULL,
+                   attempts=MAX(0, attempts-1), updated_at=?
+               WHERE obligation_id=? AND owner_pid=? AND owner_started_at=?""",
+            (time.time(), obligation_id, pid, started),
+        )
+
+
 def _update_state(obligation_id: str, state: str, error: str = "") -> None:
     with _DB_LOCK, _connect() as conn:
         conn.execute(
@@ -201,7 +214,10 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
         )
 
 
-def sweep_recoverable(now: Optional[float] = None) -> List[Dict[str, Any]]:
+def sweep_recoverable(
+    now: Optional[float] = None,
+    platform: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Claim undelivered rows owned by dead processes; return them for
     redelivery.
 
@@ -215,13 +231,18 @@ def sweep_recoverable(now: Optional[float] = None) -> List[Dict[str, Any]]:
     pid, started = _owner_stamp()
     claimed: List[Dict[str, Any]] = []
     with _DB_LOCK, _connect() as conn:
-        rows = conn.execute(
+        query = (
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
                       owner_pid, owner_started_at
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
-        ).fetchall()
+        )
+        params: tuple[Any, ...] = ()
+        if platform is not None:
+            query += " AND platform=?"
+            params = (platform,)
+        rows = conn.execute(query, params).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
              attempts, created_at, owner_pid, owner_started_at) in rows:
             if _owner_alive(owner_pid, owner_started_at):

@@ -158,6 +158,7 @@ class GatewayStreamConsumer:
         self._delivery_context = delivery_context
         self._delivery_obligation_id: Optional[str] = None
         self._final_delivery_content: Optional[str] = None
+        self._final_transport_definitively_failed = False
         self._queue: queue.Queue = queue.Queue()
         self._accumulated = ""
         self._message_id: Optional[str] = None
@@ -303,13 +304,21 @@ class GatewayStreamConsumer:
             logger.debug("stream delivery ledger record failed", exc_info=True)
 
     def _sync_final_delivery_obligation(self) -> None:
-        """Mark the obligation delivered only after final content is confirmed."""
-        if self._delivery_obligation_id is None or not self._final_content_delivered:
+        """Persist a confirmed terminal outcome; leave ambiguous sends attempting."""
+        if self._delivery_obligation_id is None:
             return
         try:
-            from gateway.delivery_ledger import mark_delivered
+            if self._final_content_delivered:
+                from gateway.delivery_ledger import mark_delivered
 
-            mark_delivered(self._delivery_obligation_id)
+                mark_delivered(self._delivery_obligation_id)
+            elif self._final_transport_definitively_failed:
+                from gateway.delivery_ledger import mark_failed
+
+                mark_failed(
+                    self._delivery_obligation_id,
+                    "stream final transport returned success=false",
+                )
         except Exception:
             logger.debug("stream delivery ledger update failed", exc_info=True)
 
@@ -1015,6 +1024,8 @@ class GatewayStreamConsumer:
                 self._notify_new_message()
                 return str(result.message_id)
             else:
+                if final:
+                    self._final_transport_definitively_failed = True
                 self._edit_supported = False
                 return reply_to_id
         except Exception as e:
@@ -1167,6 +1178,8 @@ class GatewayStreamConsumer:
                     break  # non-flood error, long flood wait, or second failure
 
             if not result or not result.success:
+                if result is not None:
+                    self._final_transport_definitively_failed = True
                 if sent_any_chunk:
                     # Some continuation text already reached the user, but not
                     # the full response. Do NOT set _final_response_sent — the
@@ -1880,6 +1893,8 @@ class GatewayStreamConsumer:
                         self._flood_strikes = 0
                         return True
                     else:
+                        if finalize and is_turn_final:
+                            self._final_transport_definitively_failed = True
                         immediate_final_fallback = False
                         if (
                             finalize
@@ -2031,6 +2046,8 @@ class GatewayStreamConsumer:
                     return True
                 else:
                     # Initial send failed — disable streaming for this session
+                    if finalize:
+                        self._final_transport_definitively_failed = True
                     self._edit_supported = False
                     return False
         except Exception as e:
