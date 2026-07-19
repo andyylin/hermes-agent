@@ -414,6 +414,9 @@ export interface DesktopActiveProfile {
   // The desktop's stored profile preference, or null when unset (legacy launch
   // that defers to the sticky active_profile / default).
   profile: string | null
+  // Machine-local Hermes home owned by Electron. Filesystem plugin discovery
+  // must use this path rather than a remote gateway's reported home.
+  hermes_home: string
 }
 
 export interface DesktopConnectionConfig {
