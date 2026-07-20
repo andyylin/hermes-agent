@@ -9,15 +9,21 @@ import { resetProjectTreeState } from './files/use-project-tree'
 import { RightSidebarPane } from './index'
 
 const readDir = vi.fn<(path: string) => Promise<HermesReadDirResult>>()
+const getConnection = vi.fn().mockResolvedValue({ mode: 'local' })
 
 function installBridge() {
-  ;(window as unknown as { hermesDesktop: { readDir: typeof readDir } }).hermesDesktop = { readDir }
+  ;(
+    window as unknown as {
+      hermesDesktop: { getConnection: typeof getConnection; readDir: typeof readDir }
+    }
+  ).hermesDesktop = { getConnection, readDir }
 }
 
 describe('RightSidebarPane', () => {
   beforeEach(() => {
     $connection.set(null)
     resetProjectTreeState()
+    getConnection.mockClear()
     readDir.mockReset()
     readDir.mockResolvedValue({ entries: [{ isDirectory: false, name: 'README.md', path: '/repo/README.md' }] })
     installBridge()
