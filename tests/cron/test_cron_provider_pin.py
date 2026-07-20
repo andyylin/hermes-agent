@@ -169,7 +169,7 @@ class TestCreateJobSnapshot:
 
         monkeypatch.setattr(jobs, "_jobs_lock", _noop_lock, raising=True)
         monkeypatch.setattr(jobs, "load_jobs", lambda: [], raising=True)
-        monkeypatch.setattr(jobs, "save_jobs", lambda j: None, raising=True)
+        monkeypatch.setattr(jobs, "save_jobs", lambda j, **kwargs: None, raising=True)
         return jobs
 
     def test_unpinned_job_captures_snapshot(self, monkeypatch):
