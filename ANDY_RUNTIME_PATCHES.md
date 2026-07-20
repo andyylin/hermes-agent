@@ -56,6 +56,11 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
   - Upstream Projects remains the only membership authority: grouping is inferred from cwd and no parallel assignment table is written.
   - Configured-but-invalid bindings fail closed rather than running from a broader fallback directory.
 
+- `fix(state): retire unstable trigram FTS writes`
+  - Removes the disabled `messages_fts_trigram` table and its synchronization triggers so it cannot continue corrupting `state.db` behind the fallback path.
+  - Keeps base FTS5 enabled and uses the existing `LIKE` fallback for CJK/substring search.
+  - Repair procedure: take a coherent SQLite online backup, copy canonical rows logically, rebuild ordinary indexes and base FTS, and do not recreate trigram.
+
 - `fix(matrix): preserve password-auth reconnect eligibility`
   - Treats `MATRIX_PASSWORD` and `matrix.password` as valid Matrix credentials when no access token is configured.
   - Prevents a temporary Synapse startup outage from permanently removing password-auth Matrix from the gateway reconnect queue.

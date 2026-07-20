@@ -196,14 +196,17 @@ _last_init_error_lock = threading.Lock()
 _wal_fallback_warned_paths: set[str] = set()
 _wal_fallback_warned_lock = threading.Lock()
 
-_FTS_TRIGGERS = (
+_BASE_FTS_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
     "messages_fts_update",
+)
+_TRIGRAM_FTS_TRIGGERS = (
     "messages_fts_trigram_insert",
     "messages_fts_trigram_delete",
     "messages_fts_trigram_update",
 )
+_FTS_TRIGGERS = _BASE_FTS_TRIGGERS + _TRIGRAM_FTS_TRIGGERS
 
 
 def _set_last_init_error(msg: Optional[str]) -> None:
@@ -1209,6 +1212,26 @@ class SessionDB:
             except sqlite3.OperationalError:
                 pass
 
+    def _retire_trigram_fts(self, cursor: sqlite3.Cursor) -> None:
+        """Detach disabled trigram FTS so it cannot poison message writes.
+
+        Dropping the write triggers is mandatory.  Dropping the virtual table is
+        best-effort because an already-corrupt FTS shadow tree can make SQLite
+        reject ``DROP TABLE``; with the triggers gone, canonical message writes
+        remain safe and CJK/substring search uses the existing LIKE fallback.
+        """
+        for trigger in _TRIGRAM_FTS_TRIGGERS:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        try:
+            cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+        except sqlite3.DatabaseError as exc:
+            logger.warning(
+                "Detached legacy trigram FTS triggers for %s but could not drop "
+                "the table; LIKE fallback remains active: %s",
+                self.db_path,
+                exc,
+            )
+
     @staticmethod
     def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
         placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
@@ -1671,61 +1694,36 @@ class SessionDB:
                 else:
                     fts_migrations_complete = False
             if current_version < 11:
-                # v11: re-index FTS5 tables to cover tool_name + tool_calls and
-                # switch from external-content to inline mode. Existing DBs have
-                # old-schema FTS tables and triggers that IF NOT EXISTS won't
-                # overwrite, so we drop them explicitly and let the post-migration
-                # existence checks (below) recreate them from FTS_SQL /
-                # FTS_TRIGRAM_SQL, then backfill every message row. Fixes #16751.
+                # v11: re-index base FTS to cover tool_name + tool_calls and
+                # switch to the current external-content schema. Existing DBs
+                # may still have obsolete base/trigram tables and triggers, so
+                # retire trigram, recreate base FTS, and backfill canonical rows.
                 if fts5_available:
                     self._drop_fts_triggers(cursor)
-                    for _tbl in ("messages_fts", "messages_fts_trigram"):
-                        try:
-                            cursor.execute(f"DROP TABLE IF EXISTS {_tbl}")
-                        except sqlite3.OperationalError as exc:
-                            if not self._is_fts5_unavailable_error(exc):
-                                raise
-                            if self._is_trigram_unavailable_error(exc):
-                                self._warn_trigram_unavailable(exc)
-                            else:
-                                self._warn_fts5_unavailable(exc)
-                                fts5_available = False
-                                fts_migrations_complete = False
-                            break
+                    self._retire_trigram_fts(cursor)
+                    try:
+                        cursor.execute("DROP TABLE IF EXISTS messages_fts")
+                    except sqlite3.OperationalError as exc:
+                        if not self._is_fts5_unavailable_error(exc):
+                            raise
+                        self._warn_fts5_unavailable(exc)
+                        fts5_available = False
+                        fts_migrations_complete = False
 
                     if fts5_available:
-                        # Recreate virtual tables + triggers with the new inline-mode
-                        # schema that indexes content || tool_name || tool_calls.
-                        # Handle base and trigram independently — a missing
-                        # trigram tokenizer should not prevent base FTS backfill.
+                        # Recreate and backfill only the supported base index.
+                        # Trigram is retired on this runtime; CJK/substring
+                        # search deliberately uses the LIKE fallback.
                         base_fts_ok = self._ensure_fts_schema(
                             cursor, "messages_fts", FTS_SQL
                         )
                         if base_fts_ok:
-                            cursor.execute(
-                                "INSERT INTO messages_fts(rowid, content) "
-                                "SELECT id, "
-                                "COALESCE(content, '') || ' ' || "
-                                "COALESCE(tool_name, '') || ' ' || "
-                                "COALESCE(tool_calls, '') "
-                                "FROM messages"
+                            self._rebuild_fts_indexes(
+                                cursor, include_trigram=False
                             )
-                        trigram_ok = self._ensure_fts_schema(
-                            cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                        )
-                        if trigram_ok:
-                            cursor.execute(
-                                "INSERT INTO messages_fts_trigram(rowid, content) "
-                                "SELECT id, "
-                                "COALESCE(content, '') || ' ' || "
-                                "COALESCE(tool_name, '') || ' ' || "
-                                "COALESCE(tool_calls, '') "
-                                "FROM messages"
-                            )
-                        if not base_fts_ok:
+                        else:
                             fts_migrations_complete = False
-                        # Track trigram availability for CJK LIKE fallback.
-                        self._trigram_available = trigram_ok
+                        self._trigram_available = False
                     else:
                         fts_migrations_complete = False
                 else:
@@ -1939,11 +1937,12 @@ class SessionDB:
             triggers_need_repair = int(row[0] if not isinstance(row, sqlite3.Row) else row[0]) < len(base_fts_triggers)
             self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
 
-            # Trigram FTS5 is deliberately disabled on this SQLite/runtime path.
+            # Trigram FTS5 is deliberately retired on this SQLite/runtime path.
             # The real corpus repeatedly produced globally malformed trigram
-            # indexes even when FTS5's own integrity-check passed. Base FTS stays
-            # enabled for normal/tool-field search; CJK/substring search falls
-            # back to LIKE instead of poisoning PRAGMA integrity_check.
+            # indexes. Remove its write triggers and table so a disabled index
+            # cannot continue poisoning message writes; CJK/substring search
+            # falls back to LIKE.
+            self._retire_trigram_fts(cursor)
             self._trigram_available = False
             if self._fts_enabled and triggers_need_repair:
                 self._rebuild_fts_indexes(cursor, include_trigram=False)
