@@ -1770,7 +1770,8 @@ class MatrixAdapter(BasePlatformAdapter):
 
         last_event_id = None
         for i, chunk in enumerate(chunks):
-            msg_content = self._build_text_message_content(chunk)
+            msgtype = "m.notice" if (metadata or {}).get("silent_notification") else "m.text"
+            msg_content = self._build_text_message_content(chunk, msgtype=msgtype)
 
             self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
 
@@ -1896,14 +1897,21 @@ class MatrixAdapter(BasePlatformAdapter):
 
 
     async def edit_message(
-        self, chat_id: str, message_id: str, content: str, *, finalize: bool = False
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit an existing message (via m.replace)."""
 
         formatted = self.format_message(content)
-        new_content = self._build_text_message_content(formatted)
+        msgtype = "m.notice" if (metadata or {}).get("silent_notification") else "m.text"
+        new_content = self._build_text_message_content(formatted, msgtype=msgtype)
         msg_content: Dict[str, Any] = {
-            "msgtype": "m.text",
+            "msgtype": msgtype,
             "body": f"* {formatted}",
             "m.new_content": new_content,
         }
