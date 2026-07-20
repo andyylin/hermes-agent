@@ -6,7 +6,7 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 
 ## Integrated upstream baseline
 
-- `e89bc58a5ba80ec6be19b43beca37cbb03091afd` (2026-07-20)
+- `31c08a9aad6e83ded5d0e55dc7d41b94a99f08a1` (2026-07-20 frozen rollout cutoff)
 - Upstream Projects is canonical. The former explicit session-assignment and Desktop move-to-Project overlay was retired against this cutoff.
 - Temporary overlays below were re-audited against this cutoff; idle-rendering PR #66160 remains external to upstream.
 
