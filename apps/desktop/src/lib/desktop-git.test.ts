@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $connection } from '@/store/session'
 
-import { desktopGit, scanDesktopReposForProfile } from './desktop-git'
+import { desktopGit, desktopGitForProfile, scanDesktopReposForProfile } from './desktop-git'
 
 const repoStatus = vi.fn(async () => ({ branch: 'main' }))
 const scanRepos = vi.fn(async () => [{ label: 'Repo', root: '/repo' }])
@@ -103,5 +103,20 @@ describe('desktop git facade', () => {
     getConnection.mockResolvedValueOnce({ mode: 'remote', profile: 'beta' } as never)
     await expect(scanDesktopReposForProfile('beta')).resolves.toEqual([])
     expect(scanRepos).toHaveBeenCalledTimes(1)
+  })
+
+  it('binds remote git operations to the requested profile instead of the foreground connection', async () => {
+    $connection.set({ mode: 'local', profile: 'foreground-alpha' } as never)
+    getConnection.mockResolvedValueOnce({ mode: 'remote', profile: 'remote-beta' } as never)
+
+    const git = await desktopGitForProfile('remote-beta')
+    await git?.repoStatus('/srv/work')
+
+    expect(getConnection).toHaveBeenCalledWith('remote-beta')
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/git/status?path=%2Fsrv%2Fwork',
+      profile: 'remote-beta'
+    })
+    expect(repoStatus).not.toHaveBeenCalled()
   })
 })

@@ -8,7 +8,7 @@ import {
   selectDesktopPathsForProfile,
   writeDesktopFileTextForProfile
 } from '@/lib/desktop-fs'
-import { desktopGit, scanDesktopReposForProfile } from '@/lib/desktop-git'
+import { desktopGitForProfile, scanDesktopReposForProfile } from '@/lib/desktop-git'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
 import { setSidebarAgentsGrouped } from '@/store/layout'
@@ -914,6 +914,15 @@ $activeGatewayProfile.subscribe(value => {
 export const $worktreeRefreshToken = atom(0)
 const bumpWorktrees = () => $worktreeRefreshToken.set($worktreeRefreshToken.get() + 1)
 
+async function captureProjectGitContext() {
+  const context = await captureProjectRequestContext()
+  assertProjectContextCurrent(context)
+  const git = await desktopGitForProfile(context.profile)
+  assertProjectContextCurrent(context)
+
+  return { context, git }
+}
+
 // Re-run the visual `git worktree list` probe without the heavy projects.tree
 // scan. Desktop-initiated add/remove already bumps the token inline; this is for
 // OUT-OF-BAND changes the renderer can't see: the agent runs `git worktree
@@ -932,52 +941,106 @@ export async function startWorkInRepo(
   repoPath: string,
   options?: { name?: string; branch?: string; base?: string; existingBranch?: string }
 ): Promise<null | { path: string; branch: string }> {
-  const git = desktopGit()
-
-  if (!git || !repoPath) {
+  if (!repoPath) {
     return null
   }
 
-  const result = await git.worktreeAdd(repoPath, options)
-  bumpWorktrees()
+  try {
+    const { context, git } = await captureProjectGitContext()
 
-  return { branch: result.branch, path: result.path }
+    if (!git) {
+      return null
+    }
+
+    const result = await git.worktreeAdd(repoPath, options)
+    assertProjectContextCurrent(context)
+    bumpWorktrees()
+
+    return { branch: result.branch, path: result.path }
+  } catch (err) {
+    if (err instanceof StaleProjectProfileError) {
+      return null
+    }
+
+    throw err
+  }
 }
 
 // Local branches for the composer's "convert a branch into a worktree" picker.
 // Empty on a remote backend / non-repo (the Electron probe can't run).
 export async function listRepoBranches(repoPath: string): Promise<HermesGitBranch[]> {
-  const git = desktopGit()
-
-  if (!git?.branchList || !repoPath) {
+  if (!repoPath) {
     return []
   }
 
-  return git.branchList(repoPath)
+  try {
+    const { context, git } = await captureProjectGitContext()
+
+    if (!git?.branchList) {
+      return []
+    }
+
+    const branches = await git.branchList(repoPath)
+    assertProjectContextCurrent(context)
+
+    return branches
+  } catch (err) {
+    if (err instanceof StaleProjectProfileError) {
+      return []
+    }
+
+    throw err
+  }
 }
 
 // Local + remote-tracking branches for the base-branch picker in the
 // new-worktree dialog. The remote default (origin/HEAD) is flagged so the
 // UI can preselect it. Empty on a remote backend / non-repo.
 export async function listBaseBranches(repoPath: string): Promise<HermesGitBaseBranch[]> {
-  const git = desktopGit()
-
-  if (!git?.baseBranchList || !repoPath) {
+  if (!repoPath) {
     return []
   }
 
-  return git.baseBranchList(repoPath)
+  try {
+    const { context, git } = await captureProjectGitContext()
+
+    if (!git?.baseBranchList) {
+      return []
+    }
+
+    const branches = await git.baseBranchList(repoPath)
+    assertProjectContextCurrent(context)
+
+    return branches
+  } catch (err) {
+    if (err instanceof StaleProjectProfileError) {
+      return []
+    }
+
+    throw err
+  }
 }
 
 export async function switchBranchInRepo(repoPath: string, branch: string): Promise<void> {
-  const git = desktopGit()
-
-  if (!git || !repoPath || !branch.trim()) {
+  if (!repoPath || !branch.trim()) {
     return
   }
 
-  await git.branchSwitch(repoPath, branch)
-  bumpWorktrees()
+  try {
+    const { context, git } = await captureProjectGitContext()
+
+    if (!git) {
+      return
+    }
+
+    await git.branchSwitch(repoPath, branch)
+    assertProjectContextCurrent(context)
+    bumpWorktrees()
+  } catch (err) {
+    if (!(err instanceof StaleProjectProfileError)) {
+      throw err
+    }
+  }
 }
 
 // A composer-driven "branch off into a new worktree" hand-off. The composer
@@ -1023,14 +1086,21 @@ export async function removeWorktreePath(
   worktreePath: string,
   options?: { force?: boolean }
 ): Promise<void> {
-  const git = desktopGit()
+  try {
+    const { context, git } = await captureProjectGitContext()
 
-  if (!git) {
-    return
+    if (!git) {
+      return
+    }
+
+    await git.worktreeRemove(repoPath, worktreePath, options)
+    assertProjectContextCurrent(context)
+    bumpWorktrees()
+  } catch (err) {
+    if (!(err instanceof StaleProjectProfileError)) {
+      throw err
+    }
   }
-
-  await git.worktreeRemove(repoPath, worktreePath, options)
-  bumpWorktrees()
 }
 
 // Reveal a project/worktree path in the OS file manager (git-GUI standard).
