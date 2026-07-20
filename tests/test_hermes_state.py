@@ -789,6 +789,41 @@ class TestSessionLifecycle:
         finally:
             db.close()
 
+    def test_open_retires_legacy_trigram_table_and_triggers(self, tmp_path):
+        """Disabled trigram FTS must not keep indexing writes behind the scenes."""
+        db_path = tmp_path / "state.db"
+        seeded = SessionDB(db_path=db_path)
+        try:
+            seeded.create_session(session_id="s1", source="cli")
+            seeded.append_message("s1", role="user", content="大别山项目计划书")
+            # Simulate a legacy database that still owns the trigram table and
+            # write triggers even though the runtime has disabled trigram search.
+            seeded._conn.executescript(hermes_state.FTS_TRIGRAM_SQL)
+            seeded._conn.execute(
+                "INSERT OR REPLACE INTO messages_fts_trigram(rowid, content) "
+                "SELECT id, COALESCE(content, '') FROM messages"
+            )
+            seeded._conn.commit()
+            assert seeded._fts_table_exists("messages_fts_trigram") is True
+        finally:
+            seeded.close()
+
+        restored = SessionDB(db_path=db_path)
+        try:
+            assert restored._fts_enabled is True
+            assert restored._trigram_available is False
+            assert restored._fts_table_exists("messages_fts_trigram") is False
+            trigram_triggers = restored._conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'messages_fts_trigram_%'"
+            ).fetchone()[0]
+            assert trigram_triggers == 0
+            assert len(restored.search_messages("大别山")) == 1
+            restored.append_message("s1", role="assistant", content="后续计划")
+            assert restored._conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        finally:
+            restored.close()
+
     def test_v11_migration_backfills_base_fts_when_trigram_unavailable(
         self, tmp_path, monkeypatch
     ):
@@ -3748,12 +3783,12 @@ class TestSchemaInit:
 
         migrated_db.close()
 
-    def test_v9_migration_skips_v10_trigram_backfill_before_v11_rebuild(self, tmp_path, monkeypatch):
-        """Direct v9→current migration should do only the v11 FTS rebuild.
+    def test_v9_migration_rebuilds_base_fts_and_retires_trigram(self, tmp_path, monkeypatch):
+        """Direct v9→current migration rebuilds base FTS without trigram work.
 
-        v10 backfilled ``messages_fts_trigram`` with content-only rows. Current
-        v11+ migration immediately drops and rebuilds both FTS tables with
-        content + tool metadata, so running the v10 insert first is wasted work.
+        Legacy trigram indexing is retired because it can corrupt the global
+        database. Base FTS still indexes content and tool metadata, while CJK
+        and substring search use the LIKE fallback.
         """
         db_path = tmp_path / "v9_fts.db"
         conn = sqlite3.connect(str(db_path))
@@ -3795,13 +3830,14 @@ class TestSchemaInit:
             assert trigram_content_only_inserts == []
             version = migrated_db._conn.execute("SELECT version FROM schema_version").fetchone()[0]
             assert version == SCHEMA_VERSION
-            normal_count = migrated_db._conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
-            trigram_count = migrated_db._conn.execute("SELECT COUNT(*) FROM messages_fts_trigram").fetchone()[0]
+            normal_count = migrated_db._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts"
+            ).fetchone()[0]
             assert normal_count == 1
-            assert trigram_count == 1
+            assert migrated_db._fts_table_exists("messages_fts_trigram") is False
             tool_hit = migrated_db._conn.execute(
-                "SELECT COUNT(*) FROM messages_fts_trigram "
-                "WHERE messages_fts_trigram MATCH 'browser_snapshot'"
+                "SELECT COUNT(*) FROM messages_fts "
+                "WHERE messages_fts MATCH 'browser_snapshot'"
             ).fetchone()[0]
             assert tool_hit == 1
         finally:
