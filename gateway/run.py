@@ -229,6 +229,20 @@ def _non_conversational_metadata(
     return merged
 
 
+def _silent_progress_metadata(
+    metadata: Optional[Dict[str, Any]] = None,
+    *,
+    platform: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Mark Matrix progress/status events as visible, non-pushing notices."""
+    merged = _non_conversational_metadata(metadata, platform=platform)
+    if _gateway_platform_value(platform) != "matrix":
+        return merged
+    merged = dict(merged or {})
+    merged["silent_notification"] = True
+    return merged
+
+
 def _is_transient_network_error(exc: BaseException) -> bool:
     """Return True for transient network errors safe to log + swallow.
 
@@ -17105,7 +17119,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             await adapter.send(
                                 chat_id,
                                 message_text,
-                                metadata=_non_conversational_metadata(send_meta, platform=platform_name),
+                                metadata=_silent_progress_metadata(send_meta, platform=platform_name),
                             )
                         except Exception as e:
                             logger.error("Watcher delivery error: %s", e)
@@ -17135,7 +17149,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await adapter.send(
                             chat_id,
                             message_text,
-                            metadata=_non_conversational_metadata(send_meta, platform=platform_name),
+                            metadata=_silent_progress_metadata(send_meta, platform=platform_name),
                         )
                     except Exception as e:
                         logger.error("Watcher delivery error: %s", e)
@@ -18996,7 +19010,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _progress_thread_id == source.thread_id
             else {"thread_id": _progress_thread_id}
         ) if _progress_thread_id else None
-        _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
+        _progress_metadata = _silent_progress_metadata(_progress_metadata, platform=source.platform)
         _progress_reply_to = (
             event_message_id
             if source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id
@@ -19450,6 +19464,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }
         else:
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
+        _silent_status_metadata = _silent_progress_metadata(
+            _status_thread_metadata,
+            platform=source.platform,
+        )
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -19468,7 +19486,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
             _fut = safe_schedule_threadsafe(
-                _send_or_update_status_coro(_status_adapter, _status_chat_id, event_type, prepared_message, _status_thread_metadata),
+                _send_or_update_status_coro(_status_adapter, _status_chat_id, event_type, prepared_message, _silent_status_metadata),
                 _loop_for_step,
                 logger=logger,
                 log_message=f"status_callback ({event_type}) scheduling error",
@@ -19631,7 +19649,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             adapter=_adapter,
                             chat_id=source.chat_id,
                             config=_consumer_cfg,
-                            metadata=_status_thread_metadata,
+                            metadata=_silent_status_metadata,
                             on_new_message=(
                                 (lambda: progress_queue.put(("__reset__",)))
                                 if progress_queue is not None
@@ -19665,7 +19683,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _status_adapter.send(
                         _status_chat_id,
                         display_text,
-                        metadata=_status_thread_metadata,
+                        metadata=_silent_status_metadata,
                     ),
                     _loop_for_step,
                     logger=logger,
@@ -20002,7 +20020,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _status_adapter.send(
                         _status_chat_id,
                         message,
-                        metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
+                        metadata=_silent_status_metadata,
                     ),
                     _loop_for_step,
                     logger=logger,
