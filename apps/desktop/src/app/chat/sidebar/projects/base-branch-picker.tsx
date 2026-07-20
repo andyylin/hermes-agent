@@ -8,6 +8,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import type { HermesGitBaseBranch } from '@/global'
 import { useI18n } from '@/i18n'
 import { $repoStatus } from '@/store/coding-status'
+import { activeGatewayProfileContextIsCurrent, captureActiveGatewayProfileContext } from '@/store/profile'
 import { listBaseBranches } from '@/store/projects'
 
 // Filterable combobox for picking the base branch of a new worktree. Lists
@@ -40,10 +41,16 @@ export function BaseBranchPicker({
       return
     }
 
+    const context = captureActiveGatewayProfileContext()
     setLoading(true)
 
     try {
       const list = await listBaseBranches(repoPath)
+
+      if (!activeGatewayProfileContextIsCurrent(context)) {
+        return
+      }
+
       setBranches(list)
 
       // Default to the remote default (origin/HEAD). Fall back to the local
@@ -57,9 +64,13 @@ export function BaseBranchPicker({
         onValueChange(list[0]?.name ?? '')
       }
     } catch {
-      setBranches([])
+      if (activeGatewayProfileContextIsCurrent(context)) {
+        setBranches([])
+      }
     } finally {
-      setLoading(false)
+      if (activeGatewayProfileContextIsCurrent(context)) {
+        setLoading(false)
+      }
     }
   }, [repoPath, onValueChange])
 

@@ -325,10 +325,10 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
     // ensureGatewayForProfile opens (or reuses) the target's socket and points
     // the active gateway at it — without closing the profile you came from.
     await ensureGatewayForProfile(target)
-    $activeGatewayProfile.set(target)
     // The active backend just changed; resync $connection so remote-aware
     // paths (image.attach_bytes vs image.attach, /api/fs/*, /api/media) follow.
     await syncConnectionToActiveProfile(target)
+    $activeGatewayProfile.set(target)
   })()
 
   try {
@@ -375,11 +375,11 @@ export function selectProfile(name: string): void {
   $showAllProfiles.set(false)
   $newChatProfile.set(target)
 
-  if (switching) {
-    requestFreshSession()
-  }
-
-  void ensureGatewayProfile(target)
+  void ensureGatewayProfile(target).then(() => {
+    if (switching && normalizeProfileKey($activeGatewayProfile.get()) === target) {
+      requestFreshSession()
+    }
+  })
 }
 
 // Start a fresh session in `name` WITHOUT collapsing the "All profiles" browse
@@ -391,8 +391,11 @@ export function selectProfile(name: string): void {
 export function newSessionInProfile(name: string): void {
   const target = normalizeProfileKey(name)
   $newChatProfile.set(target)
-  requestFreshSession()
-  void ensureGatewayProfile(target)
+  void ensureGatewayProfile(target).then(() => {
+    if (normalizeProfileKey($activeGatewayProfile.get()) === target) {
+      requestFreshSession()
+    }
+  })
 }
 
 export function setShowAllProfiles(value: boolean): void {

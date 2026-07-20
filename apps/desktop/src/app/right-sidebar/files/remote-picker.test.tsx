@@ -1,4 +1,4 @@
-import { act, cleanup, render } from '@testing-library/react'
+import { act, cleanup, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider } from '@/i18n'
@@ -6,6 +6,16 @@ import { selectDesktopPaths, selectDesktopPathsForProfile } from '@/lib/desktop-
 import { $activeGatewayProfile } from '@/store/profile'
 
 import { RemoteFolderPicker } from './remote-picker'
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+
+  const promise = new Promise<T>(res => {
+    resolve = res
+  })
+
+  return { promise, resolve }
+}
 
 function renderPicker() {
   return render(
@@ -27,6 +37,7 @@ describe('RemoteFolderPicker profile lifecycle', () => {
 
   afterEach(() => {
     cleanup()
+    vi.unstubAllGlobals()
     delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
   })
 
@@ -70,5 +81,31 @@ describe('RemoteFolderPicker profile lifecycle', () => {
     })
 
     await expect(pending).resolves.toEqual([])
+  })
+
+  it('does not paint an old directory listing after an alpha to beta to alpha swap', async () => {
+    const listing = deferred<{ entries: Array<{ isDirectory: boolean; name: string; path: string }>; path: string }>()
+
+    const apiMock = vi.fn(() => listing.promise)
+
+    ;(window as unknown as { hermesDesktop: { api: typeof apiMock } }).hermesDesktop.api = apiMock
+
+    renderPicker()
+    void selectDesktopPathsForProfile('alpha', { directories: true })
+
+    await vi.waitFor(() => expect(apiMock).toHaveBeenCalled())
+    $activeGatewayProfile.set('beta')
+    $activeGatewayProfile.set('alpha')
+    listing.resolve({
+      entries: [{ isDirectory: true, name: 'stale-alpha', path: '/stale-alpha' }],
+      path: '/'
+    })
+
+    await act(async () => {
+      await listing.promise
+      await Promise.resolve()
+    })
+
+    expect(screen.queryByText('stale-alpha')).toBeNull()
   })
 })

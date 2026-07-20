@@ -1,15 +1,15 @@
 import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
+import { activeGatewayProfileContextIsCurrent, captureActiveGatewayProfileContext } from '@/store/profile'
 import {
+  $startWorkSessionCommitted,
   $startWorkSessionRequest,
-  $startWorkSessionCommittedToken,
   listRepoBranches,
   requestStartWorkSession,
   startWorkInRepo,
   switchBranchInRepo
 } from '@/store/projects'
-import { captureActiveGatewayProfileContext } from '@/store/profile'
 
 import { useComposerScope } from '../scope'
 
@@ -29,24 +29,33 @@ interface UseComposerBranchOptions {
 export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBranchOptions) {
   const scope = useComposerScope()
   const owner = captureActiveGatewayProfileContext()
-  const committedToken = useStore($startWorkSessionCommittedToken)
-  const pendingClearRef = useRef<null | { text: string; token: number }>(null)
+  const committed = useStore($startWorkSessionCommitted)
+  const pendingClearRef = useRef<null | { generation: number; profile: string; text: string; token: number }>(null)
 
   useEffect(() => {
     const pending = pendingClearRef.current
 
-    if (!pending || pending.token !== committedToken) {
+    if (
+      !pending ||
+      pending.token !== committed?.token ||
+      pending.profile !== committed.profile ||
+      pending.generation !== committed.generation
+    ) {
       return
     }
 
     pendingClearRef.current = null
+
+    if (!activeGatewayProfileContextIsCurrent(pending)) {
+      return
+    }
 
     if (draftRef.current === pending.text) {
       clearDraft()
     }
 
     scope.attachments.clear()
-  }, [clearDraft, committedToken, draftRef, scope.attachments])
+  }, [clearDraft, committed, draftRef, scope.attachments])
 
   // Hand a worktree off to the controller: open a fresh session anchored there,
   // carrying the composer draft as its first turn. Clearing here means the draft
@@ -65,7 +74,12 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
       const accepted = $startWorkSessionRequest.get()
 
       if (accepted) {
-        pendingClearRef.current = { text, token: accepted.token }
+        pendingClearRef.current = {
+          generation: accepted.generation,
+          profile: accepted.profile,
+          text,
+          token: accepted.token
+        }
       }
     },
     [draftRef, owner.generation, owner.profile]

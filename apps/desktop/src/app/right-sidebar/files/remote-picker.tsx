@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -48,6 +48,14 @@ export function RemoteFolderPicker() {
   const [entries, setEntries] = useState<Array<{ name: string; path: string }>>([])
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+
+  const ownsPending = useCallback(
+    (request: PendingSelection) =>
+      pendingRef.current === request &&
+      normalizeProfileKey(request.profile) === normalizeProfileKey($activeGatewayProfile.get()) &&
+      request.generation === $activeGatewayProfileGeneration.get(),
+    []
+  )
 
   useEffect(() => {
     setDesktopFsRemotePicker({
@@ -121,7 +129,7 @@ export function RemoteFolderPicker() {
 
     void readDir
       .then(result => {
-        if (!active || pendingRef.current !== pending) {
+        if (!active || !ownsPending(pending)) {
           return
         }
 
@@ -137,13 +145,13 @@ export function RemoteFolderPicker() {
         )
       })
       .catch(err => {
-        if (active && pendingRef.current === pending) {
+        if (active && ownsPending(pending)) {
           setError(err instanceof Error ? err.message : String(err))
           setEntries([])
         }
       })
       .finally(() => {
-        if (active && pendingRef.current === pending) {
+        if (active && ownsPending(pending)) {
           setLoading(false)
         }
       })
@@ -151,7 +159,7 @@ export function RemoteFolderPicker() {
     return () => {
       active = false
     }
-  }, [currentPath, pending])
+  }, [currentPath, ownsPending, pending])
 
   const crumbs = useMemo(() => {
     const parts = clean(currentPath).split('/').filter(Boolean)

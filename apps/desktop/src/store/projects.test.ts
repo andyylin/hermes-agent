@@ -22,7 +22,7 @@ import {
   $projectTree,
   $projectTreeLoading,
   $removedSessionIds,
-  $startWorkSessionCommittedToken,
+  $startWorkSessionCommitted,
   $startWorkSessionRequest,
   $worktreeRefreshToken,
   ALL_PROJECTS,
@@ -184,14 +184,17 @@ describe('profile isolation', () => {
     $activeGatewayProfile.set('handoff-commit')
     requestStartWorkSession('/repo/worktree', 'draft')
     const request = $startWorkSessionRequest.get()
-    const before = $startWorkSessionCommittedToken.get()
 
     expect(request).not.toBeNull()
     markStartWorkSessionCommitted((request?.token ?? 0) + 1)
-    expect($startWorkSessionCommittedToken.get()).toBe(before)
+    expect($startWorkSessionCommitted.get()).toBeNull()
 
     markStartWorkSessionCommitted(request?.token ?? 0)
-    expect($startWorkSessionCommittedToken.get()).toBe(request?.token)
+    expect($startWorkSessionCommitted.get()).toMatchObject({
+      generation: request?.generation,
+      profile: request?.profile,
+      token: request?.token
+    })
   })
 
   it('drops an old alpha response after a rapid alpha to beta to alpha swap', async () => {
@@ -535,7 +538,7 @@ describe('worktree refresh', () => {
     await expect(result).resolves.toBeNull()
   })
 
-  it('drops a stale branch list instead of rendering alpha branches in beta', async () => {
+  it('rejects a stale branch list instead of disguising it as a valid empty result', async () => {
     const listed = deferred<Array<{ current: boolean; name: string }>>()
     const git = { branchList: vi.fn(() => listed.promise) }
     const gatewayA = { connectionState: 'open', request: vi.fn() }
@@ -551,7 +554,7 @@ describe('worktree refresh', () => {
     activeGateway.mockReturnValue(gatewayB as never)
     listed.resolve([{ current: true, name: 'alpha-only' }])
 
-    await expect(result).resolves.toEqual([])
+    await expect(result).rejects.toThrow('stale profile context')
     expect(desktopGitForProfile).toHaveBeenCalledWith('branches-alpha')
   })
 })
@@ -655,6 +658,7 @@ describe('createProject', () => {
   it('does not publish a resolved create across an A to B to A generation swap', async () => {
     const created = { ...project('alpha-created', 'Alpha'), primary_path: '/alpha' }
     const pending = deferred<{ project: ProjectInfo | null }>()
+
     const gateway = {
       connectionState: 'open',
       request: vi.fn((method: string) =>

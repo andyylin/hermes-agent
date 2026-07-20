@@ -15,10 +15,16 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 - `fix(discord): isolate multiplex profile policy`
   - Keeps Discord authorization, mention, channel, thread, and reply policy adapter-local under profile multiplexing.
   - Disables legacy YAML-to-environment policy bridges in multiplex mode so one profile cannot inherit another profile's settings.
+  - Activates multiplex isolation before the first platform YAML hook and preserves explicit environment-over-YAML precedence in legacy single-profile gateways.
+
+- `fix(matrix): isolate multiplex profile policy`
+  - Keeps Matrix room/user authorization, mentions, reactions, threading, notices, and public-room policy adapter-local.
+  - Disables Matrix's legacy YAML-to-environment bridge while multiplexing so secondary profiles cannot contaminate process-global policy.
 
 - `fix(desktop): close profile-generation handoff gaps`
-  - Revalidates project RPC continuations, review reads, filesystem routing, branch/worktree consumers, and session startup against the initiating profile generation.
-  - Defers composer draft cleanup until the profile-owned worktree session is committed, preventing stale or failed handoffs from eating the draft.
+  - Revalidates project RPC continuations, review reads, filesystem routing/previews, picker listings, branch/worktree consumers, and session startup against the initiating profile generation.
+  - Publishes profile activation only after connection synchronization and delays fresh-session reset until activation settles.
+  - Binds composer commitment and draft/attachment cleanup to the owning profile generation, preventing stale or failed handoffs from eating another profile's draft.
 
 - `fix(discord): add smart auto-thread titles`
   - Adds deterministic Discord auto-thread title cleanup/summarization.

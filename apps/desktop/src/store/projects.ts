@@ -457,6 +457,7 @@ export async function refreshProjectTree(): Promise<void> {
 export async function fetchProjectSessions(projectId: string): Promise<SidebarProjectTree | null> {
   try {
     const context = await captureProjectRequestContext()
+
     const res = await gatewayRequest<{ project: SidebarProjectTree | null }>(
       'projects.project_sessions',
       { project_id: projectId },
@@ -532,6 +533,7 @@ export interface CreateProjectInput {
 export async function generateProjectIdea(name: string): Promise<string> {
   try {
     const context = await captureProjectRequestContext()
+
     const res = await gatewayRequest<{ text: string }>(
       'llm.oneshot',
       {
@@ -1024,24 +1026,16 @@ export async function listRepoBranches(repoPath: string): Promise<HermesGitBranc
     return []
   }
 
-  try {
-    const { context, git } = await captureProjectGitContext()
+  const { context, git } = await captureProjectGitContext()
 
-    if (!git?.branchList) {
-      return []
-    }
-
-    const branches = await git.branchList(repoPath)
-    assertProjectContextCurrent(context)
-
-    return branches
-  } catch (err) {
-    if (err instanceof StaleProjectProfileError) {
-      return []
-    }
-
-    throw err
+  if (!git?.branchList) {
+    return []
   }
+
+  const branches = await git.branchList(repoPath)
+  assertProjectContextCurrent(context)
+
+  return branches
 }
 
 // Local + remote-tracking branches for the base-branch picker in the
@@ -1052,24 +1046,16 @@ export async function listBaseBranches(repoPath: string): Promise<HermesGitBaseB
     return []
   }
 
-  try {
-    const { context, git } = await captureProjectGitContext()
+  const { context, git } = await captureProjectGitContext()
 
-    if (!git?.baseBranchList) {
-      return []
-    }
-
-    const branches = await git.baseBranchList(repoPath)
-    assertProjectContextCurrent(context)
-
-    return branches
-  } catch (err) {
-    if (err instanceof StaleProjectProfileError) {
-      return []
-    }
-
-    throw err
+  if (!git?.baseBranchList) {
+    return []
   }
+
+  const branches = await git.baseBranchList(repoPath)
+  assertProjectContextCurrent(context)
+
+  return branches
 }
 
 export async function switchBranchInRepo(
@@ -1122,7 +1108,7 @@ export interface StartWorkSessionRequest {
 }
 
 export const $startWorkSessionRequest = atom<StartWorkSessionRequest | null>(null)
-export const $startWorkSessionCommittedToken = atom(0)
+export const $startWorkSessionCommitted = atom<StartWorkSessionRequest | null>(null)
 
 $activeGatewayProfileGeneration.subscribe(() => $startWorkSessionRequest.set(null))
 
@@ -1165,8 +1151,10 @@ export function requestStartWorkSession(
 }
 
 export function markStartWorkSessionCommitted(token: number): void {
-  if ($startWorkSessionRequest.get()?.token === token) {
-    $startWorkSessionCommittedToken.set(token)
+  const request = $startWorkSessionRequest.get()
+
+  if (request?.token === token && activeGatewayProfileContextIsCurrent(request)) {
+    $startWorkSessionCommitted.set(request)
   }
 }
 

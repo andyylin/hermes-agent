@@ -973,9 +973,12 @@ class MatrixAdapter(BasePlatformAdapter):
             self._allowed_rooms: Set[str] = {
                 r.strip() for r in str(allowed_rooms_raw).split(",") if r.strip()
             }
-        self._allow_room_mentions: bool = os.getenv(
-            "MATRIX_ALLOW_ROOM_MENTIONS", "false"
-        ).lower() in ("true", "1", "yes")
+        self._allow_room_mentions: bool = _matrix_bool(
+            config.extra.get(
+                "allow_room_mentions", os.getenv("MATRIX_ALLOW_ROOM_MENTIONS", "false")
+            ),
+            default=False,
+        )
         self._auto_thread: bool = _matrix_bool(
             config.extra.get("auto_thread", os.getenv("MATRIX_AUTO_THREAD", "true")),
             default=True,
@@ -1020,9 +1023,16 @@ class MatrixAdapter(BasePlatformAdapter):
         )
 
         # Reactions: configurable via MATRIX_REACTIONS (default: true).
-        self._reactions_enabled: bool = os.getenv(
-            "MATRIX_REACTIONS", "true"
-        ).lower() not in {"false", "0", "no"}
+        self._reactions_enabled: bool = _matrix_bool(
+            config.extra.get("reactions", os.getenv("MATRIX_REACTIONS", "true")),
+            default=True,
+        )
+        self._allow_public_rooms: bool = _matrix_bool(
+            config.extra.get(
+                "allow_public_rooms", os.getenv("MATRIX_ALLOW_PUBLIC_ROOMS", "false")
+            ),
+            default=False,
+        )
         self._pending_reactions: dict[tuple[str, str], str] = {}
         # Delay before redacting reactions so Matrix homeservers have time to
         # deliver the final message event without tripping "missing event"
@@ -1063,9 +1073,12 @@ class MatrixAdapter(BasePlatformAdapter):
         }
         self._approval_prompts_by_event: Dict[str, _MatrixApprovalPrompt] = {}
         self._approval_prompt_by_session: Dict[str, str] = {}
-        self._approval_require_sender: bool = os.getenv(
-            "MATRIX_APPROVAL_REQUIRE_SENDER", "true"
-        ).lower() in ("true", "1", "yes")
+        self._approval_require_sender: bool = _matrix_bool(
+            config.extra.get(
+                "approval_require_sender", os.getenv("MATRIX_APPROVAL_REQUIRE_SENDER", "true")
+            ),
+            default=True,
+        )
         try:
             self._approval_timeout_seconds = int(
                 os.getenv("MATRIX_APPROVAL_TIMEOUT_SECONDS", "300")
@@ -1074,14 +1087,20 @@ class MatrixAdapter(BasePlatformAdapter):
             self._approval_timeout_seconds = 300
         self._model_picker_prompts_by_event: Dict[str, _MatrixModelPickerPrompt] = {}
         self._choice_picker_prompts_by_event: Dict[str, _MatrixChoicePickerPrompt] = {}
-        allowed_users_raw = os.getenv("MATRIX_ALLOWED_USERS", "")
+        allowed_users_raw = config.extra.get("allowed_users", os.getenv("MATRIX_ALLOWED_USERS", ""))
+        if isinstance(allowed_users_raw, list):
+            allowed_users_raw = ",".join(str(value) for value in allowed_users_raw)
         self._allowed_user_ids: Set[str] = {
-            u.strip() for u in allowed_users_raw.split(",") if u.strip()
+            u.strip() for u in str(allowed_users_raw).split(",") if u.strip()
         }
         self._allowed_room_ids: Set[str] = set(self._allowed_rooms)
-        ignore_patterns_raw = os.getenv("MATRIX_IGNORE_USER_PATTERNS", "")
+        ignore_patterns_raw = config.extra.get(
+            "ignore_user_patterns", os.getenv("MATRIX_IGNORE_USER_PATTERNS", "")
+        )
+        if isinstance(ignore_patterns_raw, list):
+            ignore_patterns_raw = ",".join(str(value) for value in ignore_patterns_raw)
         self._ignored_user_patterns: list[re.Pattern[str]] = []
-        for pattern in (p.strip() for p in ignore_patterns_raw.split(",") if p.strip()):
+        for pattern in (p.strip() for p in str(ignore_patterns_raw).split(",") if p.strip()):
             try:
                 self._ignored_user_patterns.append(re.compile(pattern))
             except re.error as exc:
@@ -1865,8 +1884,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 "free_response_room_count": len(self._free_rooms),
                 "allow_room_mentions": self._allow_room_mentions,
                 "process_notices": self._process_notices,
-                "allow_public_rooms": os.getenv("MATRIX_ALLOW_PUBLIC_ROOMS", "").lower()
-                in ("true", "1", "yes"),
+                "allow_public_rooms": self._allow_public_rooms,
             },
             "media": {
                 "max_media_bytes": self._max_media_bytes,
@@ -3958,11 +3976,7 @@ class MatrixAdapter(BasePlatformAdapter):
         """Create a new Matrix room."""
         if not self._client:
             return None
-        if preset == "public_chat" and os.getenv("MATRIX_ALLOW_PUBLIC_ROOMS", "").lower() not in (
-            "true",
-            "1",
-            "yes",
-        ):
+        if preset == "public_chat" and not self._allow_public_rooms:
             logger.warning("Matrix: refusing to create public room without MATRIX_ALLOW_PUBLIC_ROOMS=true")
             return None
         try:
@@ -4912,46 +4926,50 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
     matrix_cfg block from gateway/config.py::load_gateway_config(). Env vars
     take precedence over YAML. Returns None — everything flows through env.
     """
-    if "require_mention" in matrix_cfg and not os.getenv("MATRIX_REQUIRE_MENTION"):
+    from agent.secret_scope import is_multiplex_active
+
+    legacy_env_bridge = not is_multiplex_active()
+
+    if legacy_env_bridge and "require_mention" in matrix_cfg and not os.getenv("MATRIX_REQUIRE_MENTION"):
         os.environ["MATRIX_REQUIRE_MENTION"] = str(matrix_cfg["require_mention"]).lower()
     # device_id is behavioral state, not a secret. YAML must be able to rotate
     # a stale legacy .env device identity after an E2EE ratchet failure.
-    if "device_id" in matrix_cfg:
+    if legacy_env_bridge and "device_id" in matrix_cfg:
         os.environ["MATRIX_DEVICE_ID"] = str(matrix_cfg["device_id"])
     au = matrix_cfg.get("allowed_users")
-    if au is not None and not os.getenv("MATRIX_ALLOWED_USERS"):
+    if legacy_env_bridge and au is not None and not os.getenv("MATRIX_ALLOWED_USERS"):
         if isinstance(au, list):
             au = ",".join(str(v) for v in au)
         os.environ["MATRIX_ALLOWED_USERS"] = str(au)
     frc = matrix_cfg.get("free_response_rooms")
-    if frc is not None and not os.getenv("MATRIX_FREE_RESPONSE_ROOMS"):
+    if legacy_env_bridge and frc is not None and not os.getenv("MATRIX_FREE_RESPONSE_ROOMS"):
         if isinstance(frc, list):
             frc = ",".join(str(v) for v in frc)
         os.environ["MATRIX_FREE_RESPONSE_ROOMS"] = str(frc)
     ar = matrix_cfg.get("allowed_rooms")
-    if ar is not None and not os.getenv("MATRIX_ALLOWED_ROOMS"):
+    if legacy_env_bridge and ar is not None and not os.getenv("MATRIX_ALLOWED_ROOMS"):
         if isinstance(ar, list):
             ar = ",".join(str(v) for v in ar)
         os.environ["MATRIX_ALLOWED_ROOMS"] = str(ar)
     ignore_patterns = matrix_cfg.get("ignore_user_patterns")
-    if ignore_patterns is not None and not os.getenv("MATRIX_IGNORE_USER_PATTERNS"):
+    if legacy_env_bridge and ignore_patterns is not None and not os.getenv("MATRIX_IGNORE_USER_PATTERNS"):
         if isinstance(ignore_patterns, list):
             ignore_patterns = ",".join(str(v) for v in ignore_patterns)
         os.environ["MATRIX_IGNORE_USER_PATTERNS"] = str(ignore_patterns)
-    if "process_notices" in matrix_cfg and not os.getenv("MATRIX_PROCESS_NOTICES"):
+    if legacy_env_bridge and "process_notices" in matrix_cfg and not os.getenv("MATRIX_PROCESS_NOTICES"):
         os.environ["MATRIX_PROCESS_NOTICES"] = str(matrix_cfg["process_notices"]).lower()
-    if "session_scope" in matrix_cfg and not os.getenv("MATRIX_SESSION_SCOPE"):
+    if legacy_env_bridge and "session_scope" in matrix_cfg and not os.getenv("MATRIX_SESSION_SCOPE"):
         os.environ["MATRIX_SESSION_SCOPE"] = str(matrix_cfg["session_scope"]).lower()
-    if "auto_thread" in matrix_cfg and not os.getenv("MATRIX_AUTO_THREAD"):
+    if legacy_env_bridge and "auto_thread" in matrix_cfg and not os.getenv("MATRIX_AUTO_THREAD"):
         os.environ["MATRIX_AUTO_THREAD"] = str(matrix_cfg["auto_thread"]).lower()
-    if "dm_auto_thread" in matrix_cfg and not os.getenv("MATRIX_DM_AUTO_THREAD"):
+    if legacy_env_bridge and "dm_auto_thread" in matrix_cfg and not os.getenv("MATRIX_DM_AUTO_THREAD"):
         os.environ["MATRIX_DM_AUTO_THREAD"] = str(matrix_cfg["dm_auto_thread"]).lower()
     auto_thread_rooms = matrix_cfg.get("auto_thread_rooms")
-    if auto_thread_rooms is not None and not os.getenv("MATRIX_AUTO_THREAD_ROOMS"):
+    if legacy_env_bridge and auto_thread_rooms is not None and not os.getenv("MATRIX_AUTO_THREAD_ROOMS"):
         if isinstance(auto_thread_rooms, list):
             auto_thread_rooms = ",".join(str(v) for v in auto_thread_rooms)
         os.environ["MATRIX_AUTO_THREAD_ROOMS"] = str(auto_thread_rooms)
-    if "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):
+    if legacy_env_bridge and "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):
         os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
 
     # Return profile-local values as PlatformConfig.extra in addition to the
@@ -4968,6 +4986,10 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
         "allowed_users",
         "ignore_user_patterns",
         "process_notices",
+        "allow_room_mentions",
+        "allow_public_rooms",
+        "approval_require_sender",
+        "reactions",
         "session_scope",
         "auto_thread",
         "dm_auto_thread",

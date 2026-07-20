@@ -1184,7 +1184,7 @@ class GatewayConfig:
         return "public"
 
 
-def load_gateway_config() -> GatewayConfig:
+def load_gateway_config(*, prepare_multiplex: bool = False) -> GatewayConfig:
     """
     Load gateway configuration from multiple sources.
 
@@ -1522,6 +1522,21 @@ def load_gateway_config() -> GatewayConfig:
                     # instead of re-enabling them on token/SDK presence. #41112.
                     extra["_enabled_explicit"] = True
                 extra.update(bridged)
+
+            if prepare_multiplex:
+                # Platform YAML hooks run below and historically bridge policy
+                # into process-global environment variables. Multiplex mode must
+                # be active before the first hook executes, not after the fully
+                # loaded GatewayConfig reaches GatewayRunner.__init__.
+                from agent.secret_scope import set_multiplex_active
+
+                env_multiplex = _env_multiplex_profiles_override()
+                configured_multiplex = _coerce_bool(
+                    gw_data.get("multiplex_profiles"), default=False
+                )
+                set_multiplex_active(
+                    configured_multiplex if env_multiplex is None else env_multiplex
+                )
 
             # Plugin-owned YAML→env config bridges (#24836).  See
             # ``PlatformEntry.apply_yaml_config_fn`` for the hook contract.

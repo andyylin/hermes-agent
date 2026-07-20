@@ -423,6 +423,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // A profile switch/create drops to a fresh new-session draft so the
   // previously open session doesn't bleed across contexts. Skip initial value.
   const freshSessionRequest = useStore($freshSessionRequest)
+  const freshSessionConnection = useStore($connection)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
   const lastFreshRef = useRef(freshSessionRequest)
 
   useEffect(() => {
@@ -430,14 +432,17 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       return
     }
 
+    if (normalizeProfileKey(freshSessionConnection?.profile) !== normalizeProfileKey(activeGatewayProfile)) {
+      return
+    }
+
     lastFreshRef.current = freshSessionRequest
     startFreshSessionDraft()
-  }, [freshSessionRequest, startFreshSessionDraft])
+  }, [activeGatewayProfile, freshSessionConnection?.profile, freshSessionRequest, startFreshSessionDraft])
 
   // Swapping the live gateway to another profile must re-pull that profile's
   // global model + active-profile pill (both are nanostores — the blanket
   // invalidateQueries on swap doesn't touch them).
-  const activeGatewayProfile = useStore($activeGatewayProfile)
   const lastGatewayProfileRef = useRef(activeGatewayProfile)
 
   useEffect(() => {

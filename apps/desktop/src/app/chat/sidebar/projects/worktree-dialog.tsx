@@ -16,8 +16,8 @@ import type { HermesGitBranch } from '@/global'
 import { useI18n } from '@/i18n'
 import { gitRef } from '@/lib/sanitize'
 import { notifyError } from '@/store/notifications'
+import { activeGatewayProfileContextIsCurrent, captureActiveGatewayProfileContext } from '@/store/profile'
 import { listRepoBranches, startWorkInRepo, switchBranchInRepo } from '@/store/projects'
-import { captureActiveGatewayProfileContext } from '@/store/profile'
 
 import { BaseBranchPicker } from './base-branch-picker'
 
@@ -86,14 +86,23 @@ export function WorktreeDialog({ repoPath, onStarted, open, onOpenChange, initia
       return
     }
 
+    const context = captureActiveGatewayProfileContext()
     setBranchesLoading(true)
 
     try {
-      setBranches(await listRepoBranches(repoPath))
+      const next = await listRepoBranches(repoPath)
+
+      if (activeGatewayProfileContextIsCurrent(context)) {
+        setBranches(next)
+      }
     } catch {
-      setBranches([])
+      if (activeGatewayProfileContextIsCurrent(context)) {
+        setBranches([])
+      }
     } finally {
-      setBranchesLoading(false)
+      if (activeGatewayProfileContextIsCurrent(context)) {
+        setBranchesLoading(false)
+      }
     }
   }, [repoPath])
 

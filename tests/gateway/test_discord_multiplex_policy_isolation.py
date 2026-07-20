@@ -92,3 +92,19 @@ def test_multiplex_yaml_bridge_does_not_mutate_process_environment(monkeypatch):
     assert "DISCORD_ALLOWED_USERS" not in os.environ
     assert "DISCORD_REQUIRE_MENTION" not in os.environ
     assert adapter._discord_env("DISCORD_ALLOWED_CHANNELS", "") == "private-channel"
+
+
+def test_single_profile_explicit_environment_overrides_yaml_snapshot(monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "environment-channel")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    set_multiplex_active(False)
+
+    adapter = _adapter(
+        {
+            "allowed_channels": ["yaml-channel"],
+            "require_mention": False,
+        }
+    )
+
+    assert adapter._discord_env("DISCORD_ALLOWED_CHANNELS", "") == "environment-channel"
+    assert adapter._discord_require_mention() is True

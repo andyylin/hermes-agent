@@ -1101,15 +1101,17 @@ class DiscordAdapter(BasePlatformAdapter):
         config = getattr(self, "config", None)
         extra = config.extra if isinstance(getattr(config, "extra", None), dict) else {}
         policy = extra.get("_discord_env")
+
+        from agent.secret_scope import is_multiplex_active
+
+        if not is_multiplex_active():
+            return os.getenv(name, default)
+
         if isinstance(policy, dict) and name in policy:
             value = policy[name]
             return default if value is None else str(value)
 
-        from agent.secret_scope import is_multiplex_active
-
-        if is_multiplex_active():
-            return default
-        return os.getenv(name, default)
+        return default
 
     def _finite_positive_config_float(
         self, key: str, default: float, *, env_key: Optional[str] = None
@@ -1470,7 +1472,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             if other_bots_mentioned and not raw_self_mention:
                 return False, False
-            ignore_no_mention = os.getenv(
+            ignore_no_mention = self._discord_env(
                 "DISCORD_IGNORE_NO_MENTION", "true"
             ).lower() in {"true", "1", "yes"}
             if ignore_no_mention and not raw_self_mention and not other_bots_mentioned:
@@ -9756,6 +9758,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         "hide_slash_commands": "DISCORD_HIDE_SLASH_COMMANDS",
         "history_backfill": "DISCORD_HISTORY_BACKFILL",
         "history_backfill_limit": "DISCORD_HISTORY_BACKFILL_LIMIT",
+        "ignore_no_mention": "DISCORD_IGNORE_NO_MENTION",
         "ignored_channels": "DISCORD_IGNORED_CHANNELS",
         "max_attachment_bytes": "DISCORD_MAX_ATTACHMENT_BYTES",
         "no_thread_channels": "DISCORD_NO_THREAD_CHANNELS",

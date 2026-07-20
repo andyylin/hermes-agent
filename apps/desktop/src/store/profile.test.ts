@@ -19,8 +19,15 @@ vi.mock('@/hermes', () => ({
 vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
 vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
 
-const { $activeGatewayProfile, $profiles, ensureGatewayProfile, prewarmProfileBackend, refreshProfiles } =
-  await import('./profile')
+const {
+  $activeGatewayProfile,
+  $freshSessionRequest,
+  $profiles,
+  ensureGatewayProfile,
+  prewarmProfileBackend,
+  refreshProfiles,
+  selectProfile
+} = await import('./profile')
 
 const { $connection } = await import('./session')
 const { invalidateProfileScopedQueries } = await import('@/lib/query-client')
@@ -43,6 +50,16 @@ const localConn = (over: Partial<HermesConnection> = {}): HermesConnection =>
   ({ baseUrl: '', mode: 'local', profile: 'default', ...over }) as HermesConnection
 
 const getConnection = vi.fn<(profile?: string | null) => Promise<HermesConnection>>()
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+
+  const promise = new Promise<T>(res => {
+    resolve = res
+  })
+
+  return { promise, resolve }
+}
 
 beforeEach(() => {
   getConnection.mockReset()
@@ -76,6 +93,35 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
     expect(getConnection).toHaveBeenCalledWith('vps-remote')
     expect($connection.get()?.mode).toBe('remote')
     expect($connection.get()?.profile).toBe('vps-remote')
+  })
+
+  it('publishes the active profile only after its connection descriptor is current', async () => {
+    getConnection.mockResolvedValue(remoteConn())
+    const seen: Array<null | string> = []
+
+    const unsubscribe = $activeGatewayProfile.subscribe(value => {
+      if (value === 'vps-remote') {
+        seen.push($connection.get()?.profile ?? null)
+      }
+    })
+
+    await ensureGatewayProfile('vps-remote')
+    unsubscribe()
+
+    expect(seen).toEqual(['vps-remote'])
+  })
+
+  it('defers a profile fresh-session request until connection activation finishes', async () => {
+    const connection = deferred<HermesConnection>()
+    getConnection.mockReturnValue(connection.promise)
+    const before = $freshSessionRequest.get()
+
+    selectProfile('vps-remote')
+    await Promise.resolve()
+
+    expect($freshSessionRequest.get()).toBe(before)
+    connection.resolve(remoteConn())
+    await vi.waitFor(() => expect($freshSessionRequest.get()).toBe(before + 1))
   })
 
   it('resyncs $connection back to local when returning to the default profile', async () => {

@@ -1623,7 +1623,7 @@ def load_gateway_config_for_runner() -> "GatewayConfig":
     Single-profile gateways never set ``multiplex_profiles``, so they keep the
     unscoped load and are unaffected.
     """
-    cfg = load_gateway_config()
+    cfg = load_gateway_config(prepare_multiplex=True)
     if not getattr(cfg, "multiplex_profiles", False):
         return cfg
     try:
