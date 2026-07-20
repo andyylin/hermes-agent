@@ -7,7 +7,7 @@ import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/compone
 import { useI18n } from '@/i18n'
 import { readDesktopDir, readDesktopDirForProfile, setDesktopFsRemotePicker } from '@/lib/desktop-fs'
 import { cn } from '@/lib/utils'
-import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import { $activeGatewayProfile, $activeGatewayProfileGeneration, normalizeProfileKey } from '@/store/profile'
 
 function clean(path: string) {
   return path.replace(/\/+$/, '') || '/'
@@ -31,6 +31,7 @@ function pathName(path: string) {
 
 interface PendingSelection {
   defaultPath: string
+  generation: number
   profile?: string
   resolve: (paths: string[]) => void
   title: string
@@ -40,6 +41,7 @@ export function RemoteFolderPicker() {
   const { t } = useI18n()
   const r = t.rightSidebar
   const activeProfile = normalizeProfileKey(useStore($activeGatewayProfile))
+  const activeProfileGeneration = useStore($activeGatewayProfileGeneration)
   const [pending, setPending] = useState<PendingSelection | null>(null)
   const pendingRef = useRef<PendingSelection | null>(null)
   const [currentPath, setCurrentPath] = useState('/')
@@ -49,16 +51,29 @@ export function RemoteFolderPicker() {
 
   useEffect(() => {
     setDesktopFsRemotePicker({
-      selectPaths: (options, profile) =>
+      selectPaths: (options, profile, generation) =>
         new Promise(resolve => {
-          if (profile && normalizeProfileKey(profile) !== normalizeProfileKey($activeGatewayProfile.get())) {
+          const requestProfile = normalizeProfileKey(profile || $activeGatewayProfile.get())
+          const requestGeneration = generation ?? $activeGatewayProfileGeneration.get()
+
+          if (
+            requestProfile !== normalizeProfileKey($activeGatewayProfile.get()) ||
+            requestGeneration !== $activeGatewayProfileGeneration.get()
+          ) {
             resolve([])
 
             return
           }
 
           const defaultPath = clean(options?.defaultPath || '/')
-          const next = { defaultPath, profile, resolve, title: options?.title || r.remotePickerTitle }
+
+          const next = {
+            defaultPath,
+            generation: requestGeneration,
+            profile: requestProfile,
+            resolve,
+            title: options?.title || r.remotePickerTitle
+          }
 
           // There is one global picker surface. Replacing a request must settle
           // the previous caller instead of leaving its promise pending forever.
@@ -79,14 +94,17 @@ export function RemoteFolderPicker() {
   useEffect(() => {
     const request = pendingRef.current
 
-    if (request?.profile && normalizeProfileKey(request.profile) !== activeProfile) {
+    if (
+      request &&
+      (normalizeProfileKey(request.profile) !== activeProfile || request.generation !== activeProfileGeneration)
+    ) {
       request.resolve([])
       pendingRef.current = null
       setPending(null)
       setEntries([])
       setError(null)
     }
-  }, [activeProfile])
+  }, [activeProfile, activeProfileGeneration])
 
   useEffect(() => {
     if (!pending) {

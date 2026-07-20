@@ -10,7 +10,7 @@ import {
   $sidebarWorkspaceOrderIds,
   $sidebarWorkspaceParentOrderIds
 } from '@/store/layout'
-import { $activeGatewayProfile } from '@/store/profile'
+import { $activeGatewayProfile, $activeGatewayProfileGeneration } from '@/store/profile'
 import type { ProjectInfo } from '@/types/hermes'
 
 import {
@@ -39,6 +39,7 @@ import {
   requestStartWorkSession,
   scanAndRecordRepos,
   startWorkInRepo,
+  switchBranchInRepo,
   tombstoneSessions,
   updateProject
 } from './projects'
@@ -163,7 +164,18 @@ describe('profile isolation', () => {
     $activeGatewayProfile.set('handoff-beta')
     requestStartWorkSession('/alpha/late', 'stale', 'handoff-alpha')
 
-    expect($startWorkSessionRequest.get()).toBe(alpha)
+    expect($startWorkSessionRequest.get()).toBeNull()
+  })
+
+  it('rejects an old handoff generation after an alpha to beta to alpha swap', () => {
+    $activeGatewayProfile.set('handoff-rapid-alpha')
+    const generation = $activeGatewayProfileGeneration.get()
+
+    $activeGatewayProfile.set('handoff-rapid-beta')
+    $activeGatewayProfile.set('handoff-rapid-alpha')
+    requestStartWorkSession('/alpha/stale', 'stale', 'handoff-rapid-alpha', generation)
+
+    expect($startWorkSessionRequest.get()).toBeNull()
   })
 
   it('drops an old alpha response after a rapid alpha to beta to alpha swap', async () => {
@@ -489,6 +501,22 @@ describe('worktree refresh', () => {
     await expect(result).resolves.toBeNull()
     expect(desktopGitForProfile).toHaveBeenCalledWith('git-alpha')
     expect($worktreeRefreshToken.get()).toBe(before)
+  })
+
+  it('returns no committed handoff when a branch switch becomes profile-stale', async () => {
+    const switched = deferred<void>()
+    const git = { branchSwitch: vi.fn(() => switched.promise) }
+
+    desktopGitForProfile.mockResolvedValue(git)
+    $activeGatewayProfile.set('switch-alpha')
+    activeGateway.mockReturnValue({ connectionState: 'open', request: vi.fn() } as never)
+    const result = switchBranchInRepo('/repo', 'main')
+    await vi.waitFor(() => expect(git.branchSwitch).toHaveBeenCalled())
+
+    $activeGatewayProfile.set('switch-beta')
+    switched.resolve()
+
+    await expect(result).resolves.toBeNull()
   })
 
   it('drops a stale branch list instead of rendering alpha branches in beta', async () => {

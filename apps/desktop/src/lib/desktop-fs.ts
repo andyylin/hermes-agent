@@ -4,10 +4,15 @@ import type {
   HermesReadFileTextResult,
   HermesSelectPathsOptions
 } from '@/global'
+import {
+  activeGatewayProfileContextIsCurrent,
+  captureActiveGatewayProfileContext,
+  normalizeProfileKey
+} from '@/store/profile'
 import { $connection } from '@/store/session'
 
 export interface DesktopFsRemotePicker {
-  selectPaths: (options?: HermesSelectPathsOptions, profile?: string) => Promise<string[]>
+  selectPaths: (options?: HermesSelectPathsOptions, profile?: string, generation?: number) => Promise<string[]>
 }
 
 let remotePicker: DesktopFsRemotePicker | null = null
@@ -224,16 +229,22 @@ export async function desktopFileDiff(repoRoot: string, filePath: string): Promi
 
 export async function selectDesktopPaths(options?: HermesSelectPathsOptions): Promise<string[]> {
   const desktop = bridge()
+  const context = captureActiveGatewayProfileContext()
+  const connection = await desktop.getConnection(context.profile)
 
-  if (!isDesktopFsRemoteMode()) {
-    return desktop.selectPaths(options)
+  if (!activeGatewayProfileContextIsCurrent(context)) {
+    return []
   }
 
-  if (!options?.directories) {
-    return desktop.selectPaths(options)
+  if (connection.mode !== 'remote' || !options?.directories) {
+    const paths = await desktop.selectPaths(options)
+
+    return activeGatewayProfileContextIsCurrent(context) ? paths : []
   }
 
-  return remotePicker ? remotePicker.selectPaths({ ...options, multiple: false }) : []
+  return remotePicker
+    ? remotePicker.selectPaths({ ...options, multiple: false }, context.profile, context.generation)
+    : []
 }
 
 export async function selectDesktopPathsForProfile(
@@ -241,11 +252,23 @@ export async function selectDesktopPathsForProfile(
   options?: HermesSelectPathsOptions
 ): Promise<string[]> {
   const desktop = bridge()
-  const connection = await desktop.getConnection(profile)
+  const context = captureActiveGatewayProfileContext()
 
-  if (connection.mode !== 'remote' || !options?.directories) {
-    return desktop.selectPaths(options)
+  if (normalizeProfileKey(profile) !== context.profile) {
+    return []
   }
 
-  return remotePicker ? remotePicker.selectPaths({ ...options, multiple: false }, profile) : []
+  const connection = await desktop.getConnection(profile)
+
+  if (!activeGatewayProfileContextIsCurrent(context)) {
+    return []
+  }
+
+  if (connection.mode !== 'remote' || !options?.directories) {
+    const paths = await desktop.selectPaths(options)
+
+    return activeGatewayProfileContextIsCurrent(context) ? paths : []
+  }
+
+  return remotePicker ? remotePicker.selectPaths({ ...options, multiple: false }, profile, context.generation) : []
 }

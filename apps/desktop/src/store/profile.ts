@@ -150,6 +150,40 @@ export async function switchProfile(name: string): Promise<void> {
 // to the primary (window) backend's profile on boot.
 export const $activeGatewayProfile = atom<string>('default')
 
+export interface ActiveGatewayProfileContext {
+  generation: number
+  profile: string
+}
+
+export const $activeGatewayProfileGeneration = atom(0)
+
+let generationProfile = normalizeProfileKey($activeGatewayProfile.get())
+
+$activeGatewayProfile.subscribe(value => {
+  const profile = normalizeProfileKey(value)
+
+  if (profile === generationProfile) {
+    return
+  }
+
+  generationProfile = profile
+  $activeGatewayProfileGeneration.set($activeGatewayProfileGeneration.get() + 1)
+})
+
+export function captureActiveGatewayProfileContext(): ActiveGatewayProfileContext {
+  return {
+    generation: $activeGatewayProfileGeneration.get(),
+    profile: normalizeProfileKey($activeGatewayProfile.get())
+  }
+}
+
+export function activeGatewayProfileContextIsCurrent(context: ActiveGatewayProfileContext): boolean {
+  return (
+    context.generation === $activeGatewayProfileGeneration.get() &&
+    context.profile === normalizeProfileKey($activeGatewayProfile.get())
+  )
+}
+
 // Profile for the NEXT new chat (chosen via the new-chat picker). null = primary
 // / default, so single-profile users are unaffected.
 export const $newChatProfile = atom<string | null>(null)

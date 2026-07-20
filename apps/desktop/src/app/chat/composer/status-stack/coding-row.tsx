@@ -37,7 +37,7 @@ interface CodingStatusRowProps {
   /** Open the review pane (changed files + diffs). */
   onOpen?: () => void
   /** Jump into an existing worktree (open a fresh session anchored there). */
-  onOpenWorktree?: (path: string) => void
+  onOpenWorktree?: (path: string, profile?: string, generation?: number) => void
   /** Switch the current repo checkout to another branch. */
   onSwitchBranch?: (branch: string) => Promise<void>
   /** Repo root path for the worktree dialog. */

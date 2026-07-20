@@ -118,7 +118,13 @@ export function WorkspaceMenu({ path, onRemove }: { path: null | string; onRemov
 // inside it. Naming is explicit — no auto-generated `hermes/work-<ts>` trees.
 // The base branch defaults to the remote default (origin/HEAD); the user can
 // pick any local or remote-tracking branch via a filterable combobox.
-export function StartWorkButton({ repoPath, onStarted }: { repoPath: string; onStarted: (path: string) => void }) {
+export function StartWorkButton({
+  repoPath,
+  onStarted
+}: {
+  repoPath: string
+  onStarted: (path: string, profile?: string, generation?: number) => void
+}) {
   const { t } = useI18n()
   const p = t.sidebar.projects
   const [open, setOpen] = useState(false)

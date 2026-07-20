@@ -3,9 +3,15 @@ import { useEffect, useMemo, useState } from 'react'
 
 import type { HermesGitWorktree } from '@/global'
 import type { SessionInfo } from '@/hermes'
-import { desktopGit } from '@/lib/desktop-git'
+import { desktopGitForProfile } from '@/lib/desktop-git'
 import { mapPool } from '@/lib/pool'
 import { $sidebarWorkspaceCollapsedIds, toggleWorkspaceNodeCollapsed } from '@/store/layout'
+import {
+  $activeGatewayProfile,
+  $activeGatewayProfileGeneration,
+  activeGatewayProfileContextIsCurrent,
+  normalizeProfileKey
+} from '@/store/profile'
 import { $worktreeRefreshToken } from '@/store/projects'
 
 import { sessionRecency, type SidebarProjectTree } from './workspace-groups'
@@ -87,11 +93,11 @@ export function useRepoWorktreeMap(
   const key = useMemo(() => pathListKey(repoPaths), [repoPaths])
   // Refetch when a worktree is added/removed so a new lane shows immediately.
   const refreshToken = useStore($worktreeRefreshToken)
+  const profile = normalizeProfileKey(useStore($activeGatewayProfile))
+  const generation = useStore($activeGatewayProfileGeneration)
 
   useEffect(() => {
-    const git = desktopGit()
-
-    if (!enabled || !repoPaths.length || !git?.worktreeList) {
+    if (!enabled || !repoPaths.length) {
       setMap({})
       setLoading(false)
 
@@ -99,23 +105,35 @@ export function useRepoWorktreeMap(
     }
 
     let cancelled = false
+    const context = { generation, profile }
 
     setLoading(true)
-    // Bounded so a many-repo project doesn't spawn a `git` process per repo at once.
-    void mapPool(repoPaths, WORKTREE_PROBE_CONCURRENCY, async repoPath => {
-      try {
-        return [repoPath, await git.worktreeList(repoPath)] as const
-      } catch {
-        return [repoPath, []] as const
-      }
-    })
-      .then(entries => void (cancelled || setMap(Object.fromEntries(entries))))
+    void desktopGitForProfile(profile)
+      .then(async git => {
+        if (!git?.worktreeList || cancelled || !activeGatewayProfileContextIsCurrent(context)) {
+          return []
+        }
+
+        // Bounded so a many-repo project doesn't spawn a `git` process per repo at once.
+        return mapPool(repoPaths, WORKTREE_PROBE_CONCURRENCY, async repoPath => {
+          try {
+            return [repoPath, await git.worktreeList(repoPath)] as const
+          } catch {
+            return [repoPath, []] as const
+          }
+        })
+      })
+      .then(entries => {
+        if (!cancelled && activeGatewayProfileContextIsCurrent(context)) {
+          setMap(Object.fromEntries(entries))
+        }
+      })
       .finally(() => void (cancelled || setLoading(false)))
 
     return () => {
       cancelled = true
     }
-  }, [enabled, key, repoPaths, refreshToken])
+  }, [enabled, generation, key, profile, repoPaths, refreshToken])
 
   return [map, loading]
 }

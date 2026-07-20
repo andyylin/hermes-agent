@@ -13,7 +13,14 @@ import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
 import { resetProfileBoundWorkspaceLayout, setSidebarAgentsGrouped } from '@/store/layout'
 import { notify } from '@/store/notifications'
-import { $activeGatewayProfile, normalizeProfileKey, requestFreshSession } from '@/store/profile'
+import {
+  $activeGatewayProfile,
+  $activeGatewayProfileGeneration,
+  activeGatewayProfileContextIsCurrent,
+  captureActiveGatewayProfileContext,
+  normalizeProfileKey,
+  requestFreshSession
+} from '@/store/profile'
 import { $selectedStoredSessionId, $sessions, sessionMatchesStoredId, workspaceCwdForNewSession } from '@/store/session'
 import type { ProjectInfo, ProjectsPayload } from '@/types/hermes'
 
@@ -940,12 +947,13 @@ export function refreshWorktrees(): void {
 export async function startWorkInRepo(
   repoPath: string,
   options?: { name?: string; branch?: string; base?: string; existingBranch?: string }
-): Promise<null | { path: string; branch: string; profile: string }> {
+): Promise<null | { path: string; branch: string; profile: string; generation: number }> {
   if (!repoPath) {
     return null
   }
 
   try {
+    const handoff = captureActiveGatewayProfileContext()
     const { context, git } = await captureProjectGitContext()
 
     if (!git) {
@@ -954,9 +962,14 @@ export async function startWorkInRepo(
 
     const result = await git.worktreeAdd(repoPath, options)
     assertProjectContextCurrent(context)
+
+    if (!activeGatewayProfileContextIsCurrent(handoff)) {
+      return null
+    }
+
     bumpWorktrees()
 
-    return { branch: result.branch, path: result.path, profile: context.profile }
+    return { branch: result.branch, generation: handoff.generation, path: result.path, profile: handoff.profile }
   } catch (err) {
     if (err instanceof StaleProjectProfileError) {
       return null
@@ -1021,25 +1034,38 @@ export async function listBaseBranches(repoPath: string): Promise<HermesGitBaseB
   }
 }
 
-export async function switchBranchInRepo(repoPath: string, branch: string): Promise<void> {
+export async function switchBranchInRepo(
+  repoPath: string,
+  branch: string
+): Promise<null | { generation: number; profile: string }> {
   if (!repoPath || !branch.trim()) {
-    return
+    return null
   }
 
   try {
+    const handoff = captureActiveGatewayProfileContext()
     const { context, git } = await captureProjectGitContext()
 
     if (!git) {
-      return
+      return null
     }
 
     await git.branchSwitch(repoPath, branch)
     assertProjectContextCurrent(context)
+
+    if (!activeGatewayProfileContextIsCurrent(handoff)) {
+      return null
+    }
+
     bumpWorktrees()
+
+    return handoff
   } catch (err) {
     if (!(err instanceof StaleProjectProfileError)) {
       throw err
     }
+
+    return null
   }
 }
 
@@ -1051,12 +1077,15 @@ export async function switchBranchInRepo(repoPath: string, branch: string): Prom
 // effect even if the path repeats.
 export interface StartWorkSessionRequest {
   draft?: string
+  generation: number
   path: string
   profile: string
   token: number
 }
 
 export const $startWorkSessionRequest = atom<StartWorkSessionRequest | null>(null)
+
+$activeGatewayProfileGeneration.subscribe(() => $startWorkSessionRequest.set(null))
 
 // Keyboard-driven "spin up a new worktree" intent. The composer's coding rail
 // owns the name dialog (it has the active repo + branch context), so a global
@@ -1071,17 +1100,25 @@ export function requestNewWorktree(): void {
 
 let startWorkToken = 0
 
-export function requestStartWorkSession(path: string, draft?: string, profile?: string): void {
+export function requestStartWorkSession(
+  path: string,
+  draft?: string,
+  profile?: string,
+  generation?: number
+): void {
   const target = path.trim()
-  const owner = normalizeProfileKey(profile ?? $activeGatewayProfile.get())
+  const current = captureActiveGatewayProfileContext()
+  const owner = normalizeProfileKey(profile ?? current.profile)
+  const ownerGeneration = generation ?? current.generation
 
-  if (!target || owner !== normalizeProfileKey($activeGatewayProfile.get())) {
+  if (!target || owner !== current.profile || ownerGeneration !== current.generation) {
     return
   }
 
   startWorkToken += 1
   $startWorkSessionRequest.set({
     draft: draft?.trim() || undefined,
+    generation: ownerGeneration,
     path: target,
     profile: owner,
     token: startWorkToken

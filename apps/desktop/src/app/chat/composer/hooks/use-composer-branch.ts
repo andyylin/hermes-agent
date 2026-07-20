@@ -1,6 +1,12 @@
 import { type MutableRefObject, useCallback } from 'react'
 
-import { listRepoBranches, requestStartWorkSession, startWorkInRepo, switchBranchInRepo } from '@/store/projects'
+import {
+  $startWorkSessionRequest,
+  listRepoBranches,
+  requestStartWorkSession,
+  startWorkInRepo,
+  switchBranchInRepo
+} from '@/store/projects'
 
 import { useComposerScope } from '../scope'
 
@@ -24,11 +30,18 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
   // carrying the composer draft as its first turn. Clearing here means the draft
   // travels to the new session instead of getting stashed under this one.
   const openInWorktree = useCallback(
-    (path: string, profile?: string) => {
+    (path: string, profile?: string, generation?: number) => {
       const text = draftRef.current
+      const before = $startWorkSessionRequest.get()
+
+      requestStartWorkSession(path, text, profile, generation)
+
+      if ($startWorkSessionRequest.get() === before) {
+        return
+      }
+
       clearDraft()
       scope.attachments.clear()
-      requestStartWorkSession(path, text, profile)
     },
     [clearDraft, draftRef, scope.attachments]
   )
@@ -42,7 +55,7 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
       const result = repoPath && (await startWorkInRepo(repoPath, { base, branch, name: branch }))
 
       if (result) {
-        openInWorktree(result.path, result.profile)
+        openInWorktree(result.path, result.profile, result.generation)
       }
     },
     [cwd, openInWorktree]
@@ -62,8 +75,11 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
       const repoPath = cwd?.trim()
 
       if (repoPath && isDefault) {
-        await switchBranchInRepo(repoPath, branch)
-        openInWorktree(repoPath)
+        const switched = await switchBranchInRepo(repoPath, branch)
+
+        if (switched) {
+          openInWorktree(repoPath, switched.profile, switched.generation)
+        }
 
         return
       }
@@ -71,7 +87,7 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
       const result = repoPath && (await startWorkInRepo(repoPath, { existingBranch: branch }))
 
       if (result) {
-        openInWorktree(result.path, result.profile)
+        openInWorktree(result.path, result.profile, result.generation)
       }
     },
     [cwd, openInWorktree]

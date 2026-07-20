@@ -79,8 +79,9 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 - `fix(desktop): isolate upstream Projects state by live profile`
   - Captures the concrete profile generation and gateway for every asynchronous Projects RPC so stale A results and writes cannot publish through B.
   - Binds repo discovery, folder-picker browsing, and post-create `IDEA.md` writes to the initiating profile's filesystem transport.
-  - Settles replaced/unmounted remote folder pickers and cancels profile-stale requests and directory results.
-  - Carries profile ownership through worktree creation and new-session handoff, rejecting stale `config.get` and composer routing.
+  - Settles replaced/unmounted remote folder pickers and generation-binds both generic and explicit picker requests, including rapid A→B→A swaps.
+  - Carries profile plus generation ownership through worktree creation, branch switching, and new-session handoff, rejecting stale `config.get`, draft clearing, and composer routing.
+  - Binds project-drill-in worktree probes to the initiating profile generation so stale lanes cannot repaint after a swap.
   - Binds coding-status and review results to both cwd and profile, and refuses Git operations while the active profile and foreground connection disagree.
   - Clears filesystem-bound worktree/project order, collapse, and dismissal state on profile swap until those persisted keys are profile-namespaced.
   - Resets profile-bound Projects caches, optimistic state, dialogs, tombstones, and loading flags on a live profile swap.

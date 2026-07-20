@@ -34,6 +34,8 @@ import {
   $activeGatewayProfile,
   $freshSessionRequest,
   $profileScope,
+  activeGatewayProfileContextIsCurrent,
+  captureActiveGatewayProfileContext,
   normalizeProfileKey,
   refreshActiveProfile
 } from '@/store/profile'
@@ -451,14 +453,19 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // Seeds cwd + branch from the clicked workspace; an explicit worktree path
   // also drills the sidebar into that project so the new lane is visible.
   const startSessionInWorkspace = useCallback(
-    (path: null | string, expectedProfile = normalizeProfileKey($activeGatewayProfile.get())) => {
-      const ownsRequest = () => normalizeProfileKey($activeGatewayProfile.get()) === expectedProfile
+    async (path: null | string, expectedProfile?: string, expectedGeneration?: number): Promise<boolean> => {
+      const current = captureActiveGatewayProfileContext()
 
-      if (!ownsRequest()) {
-        return
+      const context = {
+        generation: expectedGeneration ?? current.generation,
+        profile: normalizeProfileKey(expectedProfile ?? current.profile)
       }
 
-      startFreshSessionDraft()
+      const ownsRequest = () => activeGatewayProfileContextIsCurrent(context)
+
+      if (!ownsRequest()) {
+        return false
+      }
 
       // A worktree lane carries its own path; the trunk "+" can be path-less
       // (the main checkout is implicit), so fall back to the active project's
@@ -466,27 +473,34 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       const target = path?.trim() || resolveNewSessionCwd()
 
       if (!target) {
-        return
+        return false
       }
 
+      startFreshSessionDraft()
       setCurrentCwd(target)
-      void requestGateway<{ branch?: string; cwd?: string }>('config.get', { key: 'project', cwd: target })
-        .then(info => {
-          if (!ownsRequest()) {
-            return
-          }
+      let info: { branch?: string; cwd?: string }
 
-          const resolved = info.cwd || target
+      try {
+        info = await requestGateway<{ branch?: string; cwd?: string }>('config.get', { key: 'project', cwd: target })
+      } catch {
+        return ownsRequest()
+      }
 
-          setCurrentCwd(resolved)
-          setCurrentBranch(info.branch || '')
+      if (!ownsRequest()) {
+        return false
+      }
 
-          if (path?.trim()) {
-            restoreWorktree(resolved)
-            void followActiveSessionCwd(resolved)
-          }
-        })
-        .catch(() => undefined)
+      const resolved = info.cwd || target
+
+      setCurrentCwd(resolved)
+      setCurrentBranch(info.branch || '')
+
+      if (path?.trim()) {
+        restoreWorktree(resolved)
+        void followActiveSessionCwd(resolved)
+      }
+
+      return true
     },
     [requestGateway, startFreshSessionDraft]
   )
@@ -503,15 +517,24 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
     lastStartWorkTokenRef.current = startWorkSessionRequest.token
 
-    if (normalizeProfileKey($activeGatewayProfile.get()) !== startWorkSessionRequest.profile) {
+    const request = startWorkSessionRequest
+
+    if (
+      !activeGatewayProfileContextIsCurrent({
+        generation: request.generation,
+        profile: request.profile
+      })
+    ) {
       return
     }
 
-    startSessionInWorkspace(startWorkSessionRequest.path, startWorkSessionRequest.profile)
+    void startSessionInWorkspace(request.path, request.profile, request.generation).then(committed => {
+      if (!committed || $startWorkSessionRequest.get()?.token !== request.token || !request.draft) {
+        return
+      }
 
-    if (startWorkSessionRequest.draft) {
-      requestComposerInsert(startWorkSessionRequest.draft, { target: 'main' })
-    }
+      requestComposerInsert(request.draft, { target: 'main' })
+    })
   }, [startSessionInWorkspace, startWorkSessionRequest])
 
   const composer = useComposerActions({ activeSessionId, currentCwd, requestGateway })

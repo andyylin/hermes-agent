@@ -2,7 +2,7 @@ import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider } from '@/i18n'
-import { selectDesktopPathsForProfile } from '@/lib/desktop-fs'
+import { selectDesktopPaths, selectDesktopPathsForProfile } from '@/lib/desktop-fs'
 import { $activeGatewayProfile } from '@/store/profile'
 
 import { RemoteFolderPicker } from './remote-picker'
@@ -54,5 +54,21 @@ describe('RemoteFolderPicker profile lifecycle', () => {
     view.unmount()
 
     await expect(unmounted).resolves.toEqual([])
+  })
+
+  it('cancels a generic request across a rapid alpha to beta to alpha swap', async () => {
+    renderPicker()
+    const pending = selectDesktopPaths({ directories: true })
+
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    act(() => {
+      $activeGatewayProfile.set('beta')
+      $activeGatewayProfile.set('alpha')
+    })
+
+    await expect(pending).resolves.toEqual([])
   })
 })

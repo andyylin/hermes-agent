@@ -38,7 +38,7 @@ export interface WorktreeDialogProps {
   /** Repo root path for git operations. */
   repoPath: string
   /** Called with the new/converted worktree path on success. */
-  onStarted: (path: string) => void
+  onStarted: (path: string, profile?: string, generation?: number) => void
   /** Controlled open state. */
   open: boolean
   /** Called when the user requests the dialog to close (cancel, Esc, backdrop). */
@@ -108,7 +108,7 @@ export function WorktreeDialog({ repoPath, onStarted, open, onOpenChange, initia
       const result = await startWorkInRepo(repoPath, { base: selectedBase || undefined, branch, name: branch })
 
       if (result) {
-        onStarted(result.path)
+        onStarted(result.path, result.profile, result.generation)
         onOpenChange(false)
         setName('')
       }
@@ -127,19 +127,21 @@ export function WorktreeDialog({ repoPath, onStarted, open, onOpenChange, initia
     setPending(true)
 
     try {
-      let result: null | { branch: string; path: string }
+      let result: null | { branch: string; generation?: number; path: string; profile?: string }
 
       if (branch.worktreePath) {
         result = { branch: branch.name, path: branch.worktreePath }
       } else if (branch.isDefault) {
-        await switchBranchInRepo(repoPath, branch.name)
-        result = { branch: branch.name, path: repoPath }
+        const switched = await switchBranchInRepo(repoPath, branch.name)
+        result = switched
+          ? { branch: branch.name, generation: switched.generation, path: repoPath, profile: switched.profile }
+          : null
       } else {
         result = await startWorkInRepo(repoPath, { existingBranch: branch.name })
       }
 
       if (result) {
-        onStarted(result.path)
+        onStarted(result.path, result.profile, result.generation)
         onOpenChange(false)
       }
     } catch (err) {

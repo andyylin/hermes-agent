@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { $activeGatewayProfile, $activeGatewayProfileGeneration } from '@/store/profile'
 import { $connection } from '@/store/session'
 
 import {
@@ -75,6 +76,7 @@ function stubBridge() {
 describe('desktop filesystem facade', () => {
   beforeEach(() => {
     stubBridge()
+    $activeGatewayProfile.set('default')
     $connection.set(null)
   })
 
@@ -136,6 +138,7 @@ describe('desktop filesystem facade', () => {
 
   it('routes profile-bound picker and writes through the requested profile', async () => {
     const remoteSelect = vi.fn(async () => ['/remote/project'])
+    $activeGatewayProfile.set('beta')
     getConnection.mockResolvedValue({ mode: 'remote', profile: 'beta' } as never)
     setDesktopFsRemotePicker({ selectPaths: remoteSelect })
 
@@ -154,7 +157,11 @@ describe('desktop filesystem facade', () => {
     })
 
     expect(getConnection).toHaveBeenCalledWith('beta')
-    expect(remoteSelect).toHaveBeenCalledWith({ directories: true, multiple: false }, 'beta')
+    expect(remoteSelect).toHaveBeenCalledWith(
+      { directories: true, multiple: false },
+      'beta',
+      $activeGatewayProfileGeneration.get()
+    )
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/list?path=%2Fbackend%2Fproject', profile: 'beta' })
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/default-cwd', profile: 'beta' })
     expect(api).toHaveBeenCalledWith({
@@ -182,7 +189,11 @@ describe('desktop filesystem facade', () => {
       '/remote/project'
     ])
 
-    expect(remoteSelect).toHaveBeenCalledWith({ defaultPath: '/remote', directories: true, multiple: false })
+    expect(remoteSelect).toHaveBeenCalledWith(
+      { defaultPath: '/remote', directories: true, multiple: false },
+      'default',
+      $activeGatewayProfileGeneration.get()
+    )
     expect(selectPaths).not.toHaveBeenCalled()
   })
 
@@ -204,7 +215,11 @@ describe('desktop filesystem facade', () => {
 
     await expect(selectDesktopPaths({ directories: true })).resolves.toEqual(['/remote/project'])
 
-    expect(remoteSelect).toHaveBeenCalledWith({ directories: true, multiple: false })
+    expect(remoteSelect).toHaveBeenCalledWith(
+      { directories: true, multiple: false },
+      'default',
+      $activeGatewayProfileGeneration.get()
+    )
     expect(selectPaths).not.toHaveBeenCalled()
   })
 })
