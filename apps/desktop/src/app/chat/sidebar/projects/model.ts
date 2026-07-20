@@ -123,6 +123,7 @@ export function useRepoWorktreeMap(
           }
         })
       })
+      .catch(() => [])
       .then(entries => {
         if (!cancelled && activeGatewayProfileContextIsCurrent(context)) {
           setMap(Object.fromEntries(entries))
