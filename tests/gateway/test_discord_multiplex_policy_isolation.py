@@ -108,3 +108,12 @@ def test_single_profile_explicit_environment_overrides_yaml_snapshot(monkeypatch
 
     assert adapter._discord_env("DISCORD_ALLOWED_CHANNELS", "") == "environment-channel"
     assert adapter._discord_require_mention() is True
+
+
+def test_multiplex_discord_ignores_global_gateway_allow_all(monkeypatch):
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+    set_multiplex_active(True)
+    adapter = _adapter({})
+    adapter._is_pairing_approved_user = lambda _user_id: False
+
+    assert adapter._is_allowed_user("poisoned-user", author=None, guild=None, is_dm=True) is False

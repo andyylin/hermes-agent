@@ -28,6 +28,7 @@ import { getLogs } from '@/hermes'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { cn } from '@/lib/utils'
 import { $filePreviewTarget, $previewTarget, setCurrentSessionPreviewTarget } from '@/store/preview'
+import { activeGatewayProfileContextIsCurrent, captureActiveGatewayProfileContext } from '@/store/profile'
 import { $currentCwd } from '@/store/session'
 
 // ---------------------------------------------------------------------------
@@ -106,9 +107,11 @@ export function PreviewRailPane() {
 
 /** Open a file from the tree in the real preview pipeline. */
 function previewFile(path: string) {
+  const context = captureActiveGatewayProfileContext()
+
   void normalizeOrLocalPreviewTarget(path, $currentCwd.get() || undefined)
     .then(target => {
-      if (target) {
+      if (target && activeGatewayProfileContextIsCurrent(context)) {
         setCurrentSessionPreviewTarget(target, 'file-browser', path)
       }
     })

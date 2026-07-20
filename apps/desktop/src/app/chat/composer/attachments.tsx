@@ -9,6 +9,7 @@ import { cn } from '@/lib/utils'
 import type { ComposerAttachment } from '@/store/composer'
 import { notifyError } from '@/store/notifications'
 import { setCurrentSessionPreviewTarget } from '@/store/preview'
+import { activeGatewayProfileContextIsCurrent, captureActiveGatewayProfileContext } from '@/store/profile'
 import { $currentCwd } from '@/store/session'
 
 export function AttachmentList({
@@ -56,7 +57,12 @@ function AttachmentPill({ attachment, onRemove }: { attachment: ComposerAttachme
     }
 
     try {
+      const context = captureActiveGatewayProfileContext()
       const preview = await normalizeOrLocalPreviewTarget(target, cwd || undefined)
+
+      if (!activeGatewayProfileContextIsCurrent(context)) {
+        return
+      }
 
       if (!preview) {
         throw new Error(c.couldNotPreview(attachment.label))

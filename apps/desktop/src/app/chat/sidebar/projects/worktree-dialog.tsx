@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -67,6 +67,7 @@ export function WorktreeDialog({ repoPath, onStarted, open, onOpenChange, initia
   const [convertMode, setConvertMode] = useState(false)
   const [branches, setBranches] = useState<HermesGitBranch[]>([])
   const [branchesLoading, setBranchesLoading] = useState(false)
+  const branchRequestRef = useRef(0)
   const [selectedBase, setSelectedBase] = useState('')
 
   // Reset to a fresh state each time the dialog opens, applying any pre-selected
@@ -87,20 +88,21 @@ export function WorktreeDialog({ repoPath, onStarted, open, onOpenChange, initia
     }
 
     const context = captureActiveGatewayProfileContext()
+    const request = ++branchRequestRef.current
     setBranchesLoading(true)
 
     try {
       const next = await listRepoBranches(repoPath)
 
-      if (activeGatewayProfileContextIsCurrent(context)) {
+      if (branchRequestRef.current === request && activeGatewayProfileContextIsCurrent(context)) {
         setBranches(next)
       }
     } catch {
-      if (activeGatewayProfileContextIsCurrent(context)) {
+      if (branchRequestRef.current === request && activeGatewayProfileContextIsCurrent(context)) {
         setBranches([])
       }
     } finally {
-      if (activeGatewayProfileContextIsCurrent(context)) {
+      if (branchRequestRef.current === request) {
         setBranchesLoading(false)
       }
     }

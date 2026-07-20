@@ -22,6 +22,7 @@ import { $renamingPath, copyFilePath, revealFile, toRelativePath } from '@/store
 import { $sidebarWorkspaceCollapsedIds, revealFileInTree, toggleWorkspaceNodeCollapsed } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
 import { setCurrentSessionPreviewTarget } from '@/store/preview'
+import { activeGatewayProfileContextIsCurrent, captureActiveGatewayProfileContext } from '@/store/profile'
 import {
   $reviewFiles,
   $reviewLoading,
@@ -270,11 +271,13 @@ function ReviewFileRow({ node, depth }: { node: ReviewTreeNode; depth: number })
   }
 
   const openInPreview = () => {
+    const context = captureActiveGatewayProfileContext()
+
     void (async () => {
       try {
         const preview = await normalizeOrLocalPreviewTarget(dragPath)
 
-        if (preview) {
+        if (preview && activeGatewayProfileContextIsCurrent(context)) {
           setCurrentSessionPreviewTarget(preview, 'file-browser', dragPath)
         }
       } catch (error) {

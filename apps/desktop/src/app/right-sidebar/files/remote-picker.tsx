@@ -1,4 +1,3 @@
-import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
@@ -40,8 +39,7 @@ interface PendingSelection {
 export function RemoteFolderPicker() {
   const { t } = useI18n()
   const r = t.rightSidebar
-  const activeProfile = normalizeProfileKey(useStore($activeGatewayProfile))
-  const activeProfileGeneration = useStore($activeGatewayProfileGeneration)
+
   const [pending, setPending] = useState<PendingSelection | null>(null)
   const pendingRef = useRef<PendingSelection | null>(null)
   const [currentPath, setCurrentPath] = useState('/')
@@ -58,6 +56,23 @@ export function RemoteFolderPicker() {
   )
 
   useEffect(() => {
+    const invalidateStalePending = () => {
+      const request = pendingRef.current
+
+      if (request && !ownsPending(request)) {
+        request.resolve([])
+        pendingRef.current = null
+        setPending(null)
+        setEntries([])
+        setError(null)
+        setLoading(false)
+      }
+    }
+
+    const unsubscribeProfile = $activeGatewayProfile.subscribe(invalidateStalePending)
+
+    const unsubscribeGeneration = $activeGatewayProfileGeneration.subscribe(invalidateStalePending)
+
     setDesktopFsRemotePicker({
       selectPaths: (options, profile, generation) =>
         new Promise(resolve => {
@@ -83,6 +98,15 @@ export function RemoteFolderPicker() {
             title: options?.title || r.remotePickerTitle
           }
 
+          if (
+            requestProfile !== normalizeProfileKey($activeGatewayProfile.get()) ||
+            requestGeneration !== $activeGatewayProfileGeneration.get()
+          ) {
+            resolve([])
+
+            return
+          }
+
           // There is one global picker surface. Replacing a request must settle
           // the previous caller instead of leaving its promise pending forever.
           pendingRef.current?.resolve([])
@@ -93,29 +117,20 @@ export function RemoteFolderPicker() {
     })
 
     return () => {
+      unsubscribeGeneration()
+      unsubscribeProfile()
       pendingRef.current?.resolve([])
       pendingRef.current = null
       setDesktopFsRemotePicker(null)
     }
-  }, [r.remotePickerTitle])
-
-  useEffect(() => {
-    const request = pendingRef.current
-
-    if (
-      request &&
-      (normalizeProfileKey(request.profile) !== activeProfile || request.generation !== activeProfileGeneration)
-    ) {
-      request.resolve([])
-      pendingRef.current = null
-      setPending(null)
-      setEntries([])
-      setError(null)
-    }
-  }, [activeProfile, activeProfileGeneration])
+  }, [ownsPending, r.remotePickerTitle])
 
   useEffect(() => {
     if (!pending) {
+      return
+    }
+
+    if (!ownsPending(pending)) {
       return
     }
 
@@ -175,11 +190,25 @@ export function RemoteFolderPicker() {
   }, [currentPath])
 
   const close = (paths: string[] = []) => {
-    pendingRef.current?.resolve(paths)
+    const request = pendingRef.current
+
+    if (!request || !ownsPending(request)) {
+      return
+    }
+
+    request.resolve(paths)
     pendingRef.current = null
     setPending(null)
     setEntries([])
     setError(null)
+  }
+
+  const setCurrentOwnedPath = (path: string) => {
+    const request = pendingRef.current
+
+    if (request && ownsPending(request)) {
+      setCurrentPath(path)
+    }
   }
 
   return (
@@ -199,7 +228,7 @@ export function RemoteFolderPicker() {
                   index === crumbs.length - 1 && 'text-foreground'
                 )}
                 key={crumb.path}
-                onClick={() => setCurrentPath(crumb.path)}
+                onClick={() => setCurrentOwnedPath(crumb.path)}
                 type="button"
               >
                 {crumb.label}
@@ -211,7 +240,7 @@ export function RemoteFolderPicker() {
             <FolderRow
               disabled={currentPath === '/'}
               name=".."
-              onClick={() => setCurrentPath(parentDir(currentPath))}
+              onClick={() => setCurrentOwnedPath(parentDir(currentPath))}
             />
             {loading ? (
               <div className="flex items-center gap-2 px-2 py-3 text-xs text-muted-foreground">
@@ -224,7 +253,7 @@ export function RemoteFolderPicker() {
               <div className="px-2 py-3 text-xs text-muted-foreground">{r.emptyBody}</div>
             ) : (
               entries.map(entry => (
-                <FolderRow key={entry.path} name={pathName(entry.path)} onClick={() => setCurrentPath(entry.path)} />
+                <FolderRow key={entry.path} name={pathName(entry.path)} onClick={() => setCurrentOwnedPath(entry.path)} />
               ))
             )}
           </div>

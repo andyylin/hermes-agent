@@ -622,6 +622,16 @@ def _matrix_bool(value: Any, default: bool = False) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes", "on"}
 
 
+def _matrix_policy_value(extra: dict[str, Any], key: str, env_name: str, default: Any) -> Any:
+    """Resolve adapter policy without inheriting process globals while multiplexing."""
+    if key in extra:
+        return extra[key]
+
+    from agent.secret_scope import is_multiplex_active
+
+    return default if is_multiplex_active() else os.getenv(env_name, default)
+
+
 def _redact_matrix_value(value: Any) -> str:
     """Return a safe, non-reversible preview for Matrix diagnostics."""
     text = str(value or "").strip()
@@ -950,9 +960,9 @@ class MatrixAdapter(BasePlatformAdapter):
         # Mention/thread gating — parsed once from config.extra or env vars.
         self._require_mention: bool = self._parse_require_mention(config)
         self._thread_require_mention: bool = self._parse_thread_require_mention(config)
-        free_rooms_raw = config.extra.get("free_response_rooms")
-        if free_rooms_raw is None:
-            free_rooms_raw = os.getenv("MATRIX_FREE_RESPONSE_ROOMS", "")
+        free_rooms_raw = _matrix_policy_value(
+            config.extra, "free_response_rooms", "MATRIX_FREE_RESPONSE_ROOMS", ""
+        )
         if isinstance(free_rooms_raw, list):
             self._free_rooms: Set[str] = {
                 str(r).strip() for r in free_rooms_raw if str(r).strip()
@@ -962,9 +972,9 @@ class MatrixAdapter(BasePlatformAdapter):
                 r.strip() for r in str(free_rooms_raw).split(",") if r.strip()
             }
         # If non-empty, bot ONLY responds in these rooms (whitelist); DMs exempt.
-        allowed_rooms_raw = config.extra.get("allowed_rooms")
-        if allowed_rooms_raw is None:
-            allowed_rooms_raw = os.getenv("MATRIX_ALLOWED_ROOMS", "")
+        allowed_rooms_raw = _matrix_policy_value(
+            config.extra, "allowed_rooms", "MATRIX_ALLOWED_ROOMS", ""
+        )
         if isinstance(allowed_rooms_raw, list):
             self._allowed_rooms: Set[str] = {
                 str(r).strip() for r in allowed_rooms_raw if str(r).strip()
@@ -974,18 +984,18 @@ class MatrixAdapter(BasePlatformAdapter):
                 r.strip() for r in str(allowed_rooms_raw).split(",") if r.strip()
             }
         self._allow_room_mentions: bool = _matrix_bool(
-            config.extra.get(
-                "allow_room_mentions", os.getenv("MATRIX_ALLOW_ROOM_MENTIONS", "false")
+            _matrix_policy_value(
+                config.extra, "allow_room_mentions", "MATRIX_ALLOW_ROOM_MENTIONS", "false"
             ),
             default=False,
         )
         self._auto_thread: bool = _matrix_bool(
-            config.extra.get("auto_thread", os.getenv("MATRIX_AUTO_THREAD", "true")),
+            _matrix_policy_value(config.extra, "auto_thread", "MATRIX_AUTO_THREAD", "true"),
             default=True,
         )
-        auto_thread_rooms_raw = config.extra.get("auto_thread_rooms")
-        if auto_thread_rooms_raw is None:
-            auto_thread_rooms_raw = os.getenv("MATRIX_AUTO_THREAD_ROOMS", "")
+        auto_thread_rooms_raw = _matrix_policy_value(
+            config.extra, "auto_thread_rooms", "MATRIX_AUTO_THREAD_ROOMS", ""
+        )
         if isinstance(auto_thread_rooms_raw, list):
             self._auto_thread_rooms: Set[str] = {
                 str(room).strip()
@@ -999,37 +1009,31 @@ class MatrixAdapter(BasePlatformAdapter):
                 if room.strip()
             }
         self._dm_auto_thread: bool = _matrix_bool(
-            config.extra.get(
-                "dm_auto_thread", os.getenv("MATRIX_DM_AUTO_THREAD", "false")
-            )
+            _matrix_policy_value(config.extra, "dm_auto_thread", "MATRIX_DM_AUTO_THREAD", "false")
         )
         self._dm_mention_threads: bool = _matrix_bool(
-            config.extra.get(
-                "dm_mention_threads", os.getenv("MATRIX_DM_MENTION_THREADS", "false")
+            _matrix_policy_value(
+                config.extra, "dm_mention_threads", "MATRIX_DM_MENTION_THREADS", "false"
             )
         )
         raw_session_scope = str(
-            config.extra.get(
-                "session_scope", os.getenv("MATRIX_SESSION_SCOPE", "auto")
-            )
+            _matrix_policy_value(config.extra, "session_scope", "MATRIX_SESSION_SCOPE", "auto")
         ).strip().lower()
         self._matrix_session_scope = (
             raw_session_scope if raw_session_scope in {"auto", "room", "thread"} else "auto"
         )
         self._process_notices: bool = _matrix_bool(
-            config.extra.get(
-                "process_notices", os.getenv("MATRIX_PROCESS_NOTICES", "false")
-            )
+            _matrix_policy_value(config.extra, "process_notices", "MATRIX_PROCESS_NOTICES", "false")
         )
 
         # Reactions: configurable via MATRIX_REACTIONS (default: true).
         self._reactions_enabled: bool = _matrix_bool(
-            config.extra.get("reactions", os.getenv("MATRIX_REACTIONS", "true")),
+            _matrix_policy_value(config.extra, "reactions", "MATRIX_REACTIONS", "true"),
             default=True,
         )
         self._allow_public_rooms: bool = _matrix_bool(
-            config.extra.get(
-                "allow_public_rooms", os.getenv("MATRIX_ALLOW_PUBLIC_ROOMS", "false")
+            _matrix_policy_value(
+                config.extra, "allow_public_rooms", "MATRIX_ALLOW_PUBLIC_ROOMS", "false"
             ),
             default=False,
         )
@@ -1074,8 +1078,8 @@ class MatrixAdapter(BasePlatformAdapter):
         self._approval_prompts_by_event: Dict[str, _MatrixApprovalPrompt] = {}
         self._approval_prompt_by_session: Dict[str, str] = {}
         self._approval_require_sender: bool = _matrix_bool(
-            config.extra.get(
-                "approval_require_sender", os.getenv("MATRIX_APPROVAL_REQUIRE_SENDER", "true")
+            _matrix_policy_value(
+                config.extra, "approval_require_sender", "MATRIX_APPROVAL_REQUIRE_SENDER", "true"
             ),
             default=True,
         )
@@ -1087,15 +1091,22 @@ class MatrixAdapter(BasePlatformAdapter):
             self._approval_timeout_seconds = 300
         self._model_picker_prompts_by_event: Dict[str, _MatrixModelPickerPrompt] = {}
         self._choice_picker_prompts_by_event: Dict[str, _MatrixChoicePickerPrompt] = {}
-        allowed_users_raw = config.extra.get("allowed_users", os.getenv("MATRIX_ALLOWED_USERS", ""))
+        allowed_users_raw = _matrix_policy_value(
+            config.extra, "allowed_users", "MATRIX_ALLOWED_USERS", ""
+        )
         if isinstance(allowed_users_raw, list):
             allowed_users_raw = ",".join(str(value) for value in allowed_users_raw)
         self._allowed_user_ids: Set[str] = {
             u.strip() for u in str(allowed_users_raw).split(",") if u.strip()
         }
+        self._gateway_allow_all_users = _matrix_bool(
+            _matrix_policy_value(
+                config.extra, "allow_all_users", "GATEWAY_ALLOW_ALL_USERS", "false"
+            )
+        )
         self._allowed_room_ids: Set[str] = set(self._allowed_rooms)
-        ignore_patterns_raw = config.extra.get(
-            "ignore_user_patterns", os.getenv("MATRIX_IGNORE_USER_PATTERNS", "")
+        ignore_patterns_raw = _matrix_policy_value(
+            config.extra, "ignore_user_patterns", "MATRIX_IGNORE_USER_PATTERNS", ""
         )
         if isinstance(ignore_patterns_raw, list):
             ignore_patterns_raw = ",".join(str(value) for value in ignore_patterns_raw)
@@ -1109,6 +1120,18 @@ class MatrixAdapter(BasePlatformAdapter):
                     pattern,
                     exc,
                 )
+
+    def _gateway_allow_all_users_enabled(self) -> bool:
+        """Return profile-local open access, with legacy global fallback outside multiplex."""
+        configured = getattr(self, "_gateway_allow_all_users", None)
+        if configured is not None:
+            return bool(configured)
+
+        from agent.secret_scope import is_multiplex_active
+
+        return not is_multiplex_active() and _matrix_bool(
+            os.getenv("GATEWAY_ALLOW_ALL_USERS", "false")
+        )
 
     def _is_duplicate_event(self, event_id) -> bool:
         """Return True if this event was already processed. Tracks the ID otherwise."""
@@ -1138,8 +1161,8 @@ class MatrixAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
-        return os.getenv(
-            "MATRIX_REQUIRE_MENTION", "true"
+        return str(
+            _matrix_policy_value(config.extra, "require_mention", "MATRIX_REQUIRE_MENTION", "true")
         ).lower() not in {"false", "0", "no", "off"}
 
     @staticmethod
@@ -1159,8 +1182,10 @@ class MatrixAdapter(BasePlatformAdapter):
                 return configured.lower() not in {"false", "0", "no", "off"}
             # int, float, etc. — truthiness fallback
             return bool(configured)
-        return os.getenv(
-            "MATRIX_THREAD_REQUIRE_MENTION", "false"
+        return str(
+            _matrix_policy_value(
+                config.extra, "thread_require_mention", "MATRIX_THREAD_REQUIRE_MENTION", "false"
+            )
         ).lower() in {"true", "1", "yes", "on"}
 
     # ------------------------------------------------------------------
@@ -3357,11 +3382,7 @@ class MatrixAdapter(BasePlatformAdapter):
         # federated Matrix user could invite the bot into arbitrary rooms,
         # exposing its presence and metadata. Mirrors the allow-list gate
         # used on the message/reaction paths.
-        allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {
-            "true",
-            "1",
-            "yes",
-        }
+        allow_all = self._gateway_allow_all_users_enabled()
         if not allow_all and not (
             self._allowed_user_ids and inviter in self._allowed_user_ids
         ):
@@ -3728,11 +3749,7 @@ class MatrixAdapter(BasePlatformAdapter):
         prompt: Any,
         prompt_label: str,
     ) -> bool:
-        allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {
-            "true",
-            "1",
-            "yes",
-        }
+        allow_all = self._gateway_allow_all_users_enabled()
         if not allow_all and not (
             self._allowed_user_ids and sender in self._allowed_user_ids
         ):
@@ -4989,6 +5006,7 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
         "allow_room_mentions",
         "allow_public_rooms",
         "approval_require_sender",
+        "allow_all_users",
         "reactions",
         "session_scope",
         "auto_thread",

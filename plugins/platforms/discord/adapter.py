@@ -4422,6 +4422,8 @@ class DiscordAdapter(BasePlatformAdapter):
             channel_ids: Resolved text-channel ids for guild traffic when an
                 upstream gate has already scoped the message to a channel.
         """
+        from agent.secret_scope import is_multiplex_active
+
         # ``getattr`` fallbacks here guard against test fixtures that build
         # an adapter via ``object.__new__(DiscordAdapter)`` and skip __init__
         # (see AGENTS.md pitfall #17 — same pattern as gateway.run).
@@ -4440,7 +4442,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if not has_users and not has_roles:
             if self._discord_env("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
                 return True
-            if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+            if not is_multiplex_active() and os.getenv(
+                "GATEWAY_ALLOW_ALL_USERS", ""
+            ).strip().lower() in {"true", "1", "yes"}:
                 return True
             # Channel-scoped guild access requires validated channel context.
             # Do not treat DISCORD_ALLOWED_CHANNELS alone as a user-wide bypass
@@ -4507,6 +4511,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _warn_if_fail_closed_default(self) -> None:
         """Log once when Discord is rejecting traffic with no allowlist set."""
+        from agent.secret_scope import is_multiplex_active
+
         if getattr(self, "_warned_fail_closed_default", False):
             return
         allowed_users = getattr(self, "_allowed_user_ids", set()) or set()
@@ -4517,7 +4523,9 @@ class DiscordAdapter(BasePlatformAdapter):
             return
         if self._discord_env("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
             return
-        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+        if not is_multiplex_active() and os.getenv(
+            "GATEWAY_ALLOW_ALL_USERS", ""
+        ).strip().lower() in {"true", "1", "yes"}:
             return
         self._warned_fail_closed_default = True
         logger.warning(
@@ -7975,16 +7983,18 @@ def _component_check_auth(
         "DISCORD_ALLOW_ALL_USERS", ""
     ).strip().lower() in {"true", "1", "yes"}:
         return True
-    if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+    if not is_multiplex_active() and os.getenv(
+        "GATEWAY_ALLOW_ALL_USERS", ""
+    ).strip().lower() in {"true", "1", "yes"}:
         return True
 
     user_set = {str(uid).strip() for uid in (allowed_user_ids or set()) if str(uid).strip()}
-    global_allowed = {
-        uid.strip()
-        for uid in os.getenv("GATEWAY_ALLOWED_USERS", "").split(",")
-        if uid.strip()
-    }
-    user_set.update(global_allowed)
+    if not is_multiplex_active():
+        user_set.update(
+            uid.strip()
+            for uid in os.getenv("GATEWAY_ALLOWED_USERS", "").split(",")
+            if uid.strip()
+        )
     role_set = set(allowed_role_ids or set())
     has_users = bool(user_set)
     has_roles = bool(role_set)

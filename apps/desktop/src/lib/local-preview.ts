@@ -1,5 +1,6 @@
 import { isDesktopFsRemoteMode, readDesktopFileText } from '@/lib/desktop-fs'
 import type { PreviewTarget } from '@/store/preview'
+import { activeGatewayProfileContextIsCurrent, captureActiveGatewayProfileContext } from '@/store/profile'
 
 const HTML_EXTENSIONS = new Set(['.htm', '.html'])
 const IMAGE_EXTENSIONS = new Set(['.bmp', '.gif', '.jpeg', '.jpg', '.png', '.svg', '.webp'])
@@ -133,16 +134,30 @@ export async function normalizeOrLocalPreviewTarget(
   rawTarget: string,
   cwd?: string | null
 ): Promise<PreviewTarget | null> {
+  const context = captureActiveGatewayProfileContext()
+
   try {
     const normalized = await window.hermesDesktop?.normalizePreviewTarget?.(rawTarget, cwd || undefined)
 
+    if (!activeGatewayProfileContextIsCurrent(context)) {
+      return null
+    }
+
     if (normalized) {
-      return enrichPreviewTarget(normalized)
+      const enriched = await enrichPreviewTarget(normalized)
+
+      return activeGatewayProfileContextIsCurrent(context) ? enriched : null
     }
   } catch {
+    if (!activeGatewayProfileContextIsCurrent(context)) {
+      return null
+    }
+
     // Running Electron may still have the old HTML-only preview IPC. Fall
     // through to renderer-side local classification so text/images still open.
   }
 
-  return enrichPreviewTarget(localPreviewTarget(rawTarget, cwd))
+  const enriched = await enrichPreviewTarget(localPreviewTarget(rawTarget, cwd))
+
+  return activeGatewayProfileContextIsCurrent(context) ? enriched : null
 }

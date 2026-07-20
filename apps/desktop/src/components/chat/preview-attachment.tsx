@@ -12,6 +12,7 @@ import {
   type PreviewRecordSource,
   setCurrentSessionPreviewTarget
 } from '@/store/preview'
+import { activeGatewayProfileContextIsCurrent, captureActiveGatewayProfileContext } from '@/store/profile'
 import { $currentCwd } from '@/store/session'
 
 export function PreviewAttachment({ source = 'manual', target }: { source?: PreviewRecordSource; target: string }) {
@@ -59,6 +60,7 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
     const requestToken = ++requestTokenRef.current
     const requestTarget = target
     const requestCwd = cwd
+    const requestContext = captureActiveGatewayProfileContext()
 
     setOpening(true)
 
@@ -69,7 +71,8 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
         !mountedRef.current ||
         requestTokenRef.current !== requestToken ||
         targetRef.current !== requestTarget ||
-        cwdRef.current !== requestCwd
+        cwdRef.current !== requestCwd ||
+        !activeGatewayProfileContextIsCurrent(requestContext)
       ) {
         return
       }
@@ -90,7 +93,8 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
         !mountedRef.current ||
         requestTokenRef.current !== requestToken ||
         targetRef.current !== requestTarget ||
-        cwdRef.current !== requestCwd
+        cwdRef.current !== requestCwd ||
+        !activeGatewayProfileContextIsCurrent(requestContext)
       ) {
         return
       }

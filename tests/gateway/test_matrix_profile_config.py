@@ -70,3 +70,28 @@ def test_matrix_yaml_bridge_returns_profile_local_settings(monkeypatch):
     assert adapter._allow_room_mentions is False
     assert adapter._reactions_enabled is False
     set_multiplex_active(False)
+
+
+def test_matrix_multiplex_absent_policy_ignores_process_environment(monkeypatch):
+    monkeypatch.setenv("MATRIX_ALLOWED_USERS", "@poison:example.com")
+    monkeypatch.setenv("MATRIX_ALLOWED_ROOMS", "!poison:example.com")
+    monkeypatch.setenv("MATRIX_FREE_RESPONSE_ROOMS", "!poison:example.com")
+    monkeypatch.setenv("MATRIX_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("MATRIX_THREAD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("MATRIX_ALLOW_ROOM_MENTIONS", "true")
+    monkeypatch.setenv("MATRIX_REACTIONS", "false")
+    monkeypatch.setenv("MATRIX_ALLOW_PUBLIC_ROOMS", "true")
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+    set_multiplex_active(True)
+
+    adapter = MatrixAdapter(PlatformConfig(enabled=True, extra={}))
+
+    assert adapter._allowed_user_ids == set()
+    assert adapter._allowed_rooms == set()
+    assert adapter._free_rooms == set()
+    assert adapter._require_mention is True
+    assert adapter._thread_require_mention is False
+    assert adapter._allow_room_mentions is False
+    assert adapter._reactions_enabled is True
+    assert adapter._allow_public_rooms is False
+    assert adapter._gateway_allow_all_users is False

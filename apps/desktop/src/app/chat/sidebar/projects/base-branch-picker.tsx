@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -33,6 +33,7 @@ export function BaseBranchPicker({
   const [branches, setBranches] = useState<HermesGitBaseBranch[]>([])
   const [loading, setLoading] = useState(false)
   const [open, setOpen] = useState(false)
+  const branchRequestRef = useRef(0)
 
   const currentBranch = repoStatus?.detached ? null : (repoStatus?.branch ?? null)
 
@@ -42,12 +43,13 @@ export function BaseBranchPicker({
     }
 
     const context = captureActiveGatewayProfileContext()
+    const request = ++branchRequestRef.current
     setLoading(true)
 
     try {
       const list = await listBaseBranches(repoPath)
 
-      if (!activeGatewayProfileContextIsCurrent(context)) {
+      if (branchRequestRef.current !== request || !activeGatewayProfileContextIsCurrent(context)) {
         return
       }
 
@@ -64,11 +66,11 @@ export function BaseBranchPicker({
         onValueChange(list[0]?.name ?? '')
       }
     } catch {
-      if (activeGatewayProfileContextIsCurrent(context)) {
+      if (branchRequestRef.current === request && activeGatewayProfileContextIsCurrent(context)) {
         setBranches([])
       }
     } finally {
-      if (activeGatewayProfileContextIsCurrent(context)) {
+      if (branchRequestRef.current === request) {
         setLoading(false)
       }
     }
