@@ -19,6 +19,7 @@ import {
   createProject,
   enterProject,
   exitProjectScope,
+  followActiveSessionCwd,
   openProjectCreate,
   pickProjectFolder,
   projectNameForCwd,
@@ -219,6 +220,42 @@ describe('profile isolation', () => {
     await refresh
 
     expect($projectTreeLoading.get()).toBe(false)
+  })
+
+  it('does not enter a beta project using an alpha cwd after refresh', async () => {
+    const listA = deferred<{ active_id: null; projects: ProjectInfo[] }>()
+    const treeA = deferred<{ active_id: null; projects: SidebarProjectTree[]; scoped_session_ids: string[] }>()
+
+    const gatewayA = {
+      connectionState: 'open',
+      request: vi.fn((method: string) => (method === 'projects.list' ? listA.promise : treeA.promise))
+    }
+
+    const gatewayB = { connectionState: 'open', request: vi.fn() }
+
+    $activeGatewayProfile.set('follow-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    const follow = followActiveSessionCwd('/shared')
+
+    await vi.waitFor(() => expect(gatewayA.request).toHaveBeenCalledTimes(2))
+
+    $activeGatewayProfile.set('follow-beta')
+    activeGateway.mockReturnValue(gatewayB as never)
+    $projectTree.set([
+      {
+        id: 'p_beta',
+        isAuto: false,
+        label: 'Beta',
+        path: '/shared',
+        repos: [],
+        sessionCount: 0
+      }
+    ])
+    listA.resolve({ active_id: null, projects: [] })
+    treeA.resolve({ active_id: null, projects: [], scoped_session_ids: [] })
+    await follow
+
+    expect($projectScope.get()).toBe(ALL_PROJECTS)
   })
 
   it('persists project scope independently per profile', () => {

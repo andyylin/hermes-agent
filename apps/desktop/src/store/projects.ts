@@ -255,7 +255,16 @@ export async function followActiveSessionCwd(cwd: string): Promise<void> {
     return
   }
 
-  await Promise.all([refreshProjects(), refreshProjectTree()])
+  let context: ProjectRequestContext
+
+  try {
+    context = await captureProjectRequestContext()
+    assertProjectContextCurrent(context)
+    await Promise.all([refreshProjects(), refreshProjectTree()])
+    assertProjectContextCurrent(context)
+  } catch {
+    return
+  }
 
   // Resolve only after the refresh, so a just-created/auto project is in the tree.
   const projectId = projectIdForCwd(target)
