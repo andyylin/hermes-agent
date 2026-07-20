@@ -522,6 +522,28 @@ describe('worktree refresh', () => {
     expect($worktreeRefreshToken.get()).toBe(before)
   })
 
+  it('refuses stale producer ownership before starting a git mutation', async () => {
+    vi.clearAllMocks()
+    $activeGatewayProfile.set('producer-alpha')
+
+    const owner = {
+      generation: $activeGatewayProfileGeneration.get(),
+      profile: 'producer-alpha'
+    }
+
+    $activeGatewayProfile.set('producer-beta')
+
+    await expect(
+      startWorkInRepo('/alpha/repo', {
+        branch: 'feature',
+        generation: owner.generation,
+        profile: owner.profile
+      })
+    ).resolves.toBeNull()
+    await expect(switchBranchInRepo('/alpha/repo', 'main', owner)).resolves.toBeNull()
+    expect(desktopGitForProfile).not.toHaveBeenCalled()
+  })
+
   it('returns no committed handoff when a branch switch becomes profile-stale', async () => {
     const switched = deferred<void>()
     const git = { branchSwitch: vi.fn(() => switched.promise) }

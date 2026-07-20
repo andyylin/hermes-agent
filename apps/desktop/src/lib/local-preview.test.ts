@@ -1,7 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { $activeGatewayProfile, $activeGatewayProfileGeneration } from '@/store/profile'
+import { $connection } from '@/store/session'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -19,7 +20,13 @@ describe('profile-bound local preview normalization', () => {
     $activeGatewayProfileGeneration.set(1)
   })
 
+  afterEach(() => {
+    $connection.set(null)
+  })
+
   it('drops an alpha preview after an alpha to beta to alpha generation swap', async () => {
+    const api = vi.fn()
+
     const normalized = deferred<{
       kind: 'file'
       label: string
@@ -31,8 +38,9 @@ describe('profile-bound local preview normalization', () => {
 
     Object.defineProperty(window, 'hermesDesktop', {
       configurable: true,
-      value: { normalizePreviewTarget: vi.fn(() => normalized.promise) }
+      value: { api, normalizePreviewTarget: vi.fn(() => normalized.promise) }
     })
+    $connection.set({ mode: 'remote', profile: 'alpha' } as never)
 
     const result = normalizeOrLocalPreviewTarget('/alpha/notes.txt')
     $activeGatewayProfile.set('beta')
@@ -49,5 +57,6 @@ describe('profile-bound local preview normalization', () => {
     })
 
     await expect(result).resolves.toBeNull()
+    expect(api).not.toHaveBeenCalled()
   })
 })

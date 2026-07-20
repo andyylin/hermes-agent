@@ -1324,7 +1324,7 @@ export function ChatSidebar({
                   inProject && enteredProject ? (
                     <div className="group/workspace flex shrink-0 items-center gap-0.5">
                       {enteredProject.path && (
-                        <StartWorkButton onStarted={onNewSessionInWorkspace} repoPath={enteredProject.path} />
+                        <StartWorkButton onStarted={onOwnedNewSessionInWorkspace} repoPath={enteredProject.path} />
                       )}
                       <ProjectMenu
                         isActive={enteredProject.id === activeProjectId}

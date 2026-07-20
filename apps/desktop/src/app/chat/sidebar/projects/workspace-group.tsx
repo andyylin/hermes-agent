@@ -5,7 +5,7 @@ import { Codicon } from '@/components/ui/codicon'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { notifyError } from '@/store/notifications'
-import { newSessionInProfile } from '@/store/profile'
+import { captureActiveGatewayProfileContext, newSessionInProfile } from '@/store/profile'
 import { switchBranchInRepo } from '@/store/projects'
 
 import { countLabel, SidebarRowStack } from '../chrome'
@@ -27,6 +27,7 @@ interface SidebarWorkspaceGroupProps {
 export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemove }: SidebarWorkspaceGroupProps) {
   const { t } = useI18n()
   const s = t.sidebar
+  const owner = captureActiveGatewayProfileContext()
   const isProfileGroup = group.mode === 'profile'
   // Empty worktree/branch lanes start collapsed — they only show a "No sessions
   // yet" placeholder, so defaulting them open just adds noise. Profile lanes and
@@ -83,7 +84,7 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
     // currently sits on (`test0`, etc.), so explicitly switch first.
     if (group.isMain && group.path && group.label) {
       try {
-        const switched = await switchBranchInRepo(group.path, group.label)
+        const switched = await switchBranchInRepo(group.path, group.label, owner)
 
         if (!switched) {
           return

@@ -5144,11 +5144,12 @@ class DiscordAdapter(BasePlatformAdapter):
         if to_resolve:
             print(f"[{self.name}] Could not resolve usernames: {', '.join(to_resolve)}")
 
-        # Update internal set and env var so gateway auth checks use IDs
+        # Keep resolved authorization profile-local. Multiplexed adapters share
+        # one process, so writing this into os.environ would leak one profile's
+        # resolved IDs into every other profile.
         self._allowed_user_ids = numeric_ids
-        os.environ["DISCORD_ALLOWED_USERS"] = ",".join(sorted(numeric_ids))
         if resolved_count:
-            print(f"[{self.name}] Updated DISCORD_ALLOWED_USERS with {resolved_count} resolved ID(s)")
+            print(f"[{self.name}] Updated resolved Discord allowlist with {resolved_count} ID(s)")
 
     def format_message(self, content: str) -> str:
         """Format message for Discord.

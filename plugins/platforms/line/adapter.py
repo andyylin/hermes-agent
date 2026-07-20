@@ -81,7 +81,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote as _urlquote
 
+from agent.secret_scope import get_secret
+
 logger = logging.getLogger(__name__)
+
+
+def _scoped_env(name: str, default: str = "") -> str:
+    value = get_secret(name, default)
+    return default if value is None or str(value) == "" else str(value)
 
 # ---------------------------------------------------------------------------
 # Lazy / function-level imports for gateway internals are NOT used here —
@@ -635,8 +642,10 @@ def _csv_list(value: str) -> List[str]:
 
 
 def _truthy_env(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
+    v = _scoped_env(name)
     if v is None:
+        return default
+    if v == "":
         return default
     return v.strip().lower() in {"1", "true", "yes", "on"}
 
@@ -690,25 +699,25 @@ class LineAdapter(BasePlatformAdapter):
             "LINE_ALLOW_ALL_USERS", bool(extra.get("allow_all_users", False))
         )
         self.allowed_users = _csv_set(
-            os.getenv("LINE_ALLOWED_USERS", "")
+            _scoped_env("LINE_ALLOWED_USERS")
         ) | set(extra.get("allowed_users", []))
         self.allowed_groups = _csv_set(
-            os.getenv("LINE_ALLOWED_GROUPS", "")
+            _scoped_env("LINE_ALLOWED_GROUPS")
         ) | set(extra.get("allowed_groups", []))
         self.read_only_groups = _csv_set(
-            os.getenv("LINE_READ_ONLY_GROUPS", "")
+            _scoped_env("LINE_READ_ONLY_GROUPS")
         ) | set(extra.get("read_only_groups", []))
         self.archive_groups = _csv_set(
-            os.getenv("LINE_ARCHIVE_GROUPS", "")
+            _scoped_env("LINE_ARCHIVE_GROUPS")
         ) | set(extra.get("archive_groups", []))
         self.require_prefix_groups = _csv_set(
-            os.getenv("LINE_REQUIRE_PREFIX_GROUPS", "")
+            _scoped_env("LINE_REQUIRE_PREFIX_GROUPS")
         ) | set(extra.get("require_prefix_groups", []))
         self.group_prefixes = _csv_list(
-            os.getenv("LINE_GROUP_PREFIXES", "")
+            _scoped_env("LINE_GROUP_PREFIXES")
         ) or list(extra.get("group_prefixes", [])) or ["Hermes:"]
         self.allowed_rooms = _csv_set(
-            os.getenv("LINE_ALLOWED_ROOMS", "")
+            _scoped_env("LINE_ALLOWED_ROOMS")
         ) | set(extra.get("allowed_rooms", []))
 
         # Slow-LLM postback button threshold

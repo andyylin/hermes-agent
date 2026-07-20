@@ -109,7 +109,14 @@ export function localPreviewTarget(rawTarget: string, cwd?: string | null): Prev
   }
 }
 
-async function enrichPreviewTarget(target: PreviewTarget | null): Promise<PreviewTarget | null> {
+async function enrichPreviewTarget(
+  target: PreviewTarget | null,
+  context: ReturnType<typeof captureActiveGatewayProfileContext>
+): Promise<PreviewTarget | null> {
+  if (!activeGatewayProfileContextIsCurrent(context)) {
+    return null
+  }
+
   if (!isDesktopFsRemoteMode() || !target || target.kind !== 'file' || target.previewKind === 'image') {
     return target
   }
@@ -144,7 +151,7 @@ export async function normalizeOrLocalPreviewTarget(
     }
 
     if (normalized) {
-      const enriched = await enrichPreviewTarget(normalized)
+      const enriched = await enrichPreviewTarget(normalized, context)
 
       return activeGatewayProfileContextIsCurrent(context) ? enriched : null
     }
@@ -157,7 +164,7 @@ export async function normalizeOrLocalPreviewTarget(
     // through to renderer-side local classification so text/images still open.
   }
 
-  const enriched = await enrichPreviewTarget(localPreviewTarget(rawTarget, cwd))
+  const enriched = await enrichPreviewTarget(localPreviewTarget(rawTarget, cwd), context)
 
   return activeGatewayProfileContextIsCurrent(context) ? enriched : null
 }

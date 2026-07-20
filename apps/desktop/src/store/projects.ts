@@ -986,21 +986,47 @@ export function refreshWorktrees(): void {
 // truth; the caller starts a session in the returned path.
 export async function startWorkInRepo(
   repoPath: string,
-  options?: { name?: string; branch?: string; base?: string; existingBranch?: string }
+  options?: {
+    name?: string
+    branch?: string
+    base?: string
+    existingBranch?: string
+    profile?: string
+    generation?: number
+  }
 ): Promise<null | { path: string; branch: string; profile: string; generation: number }> {
   if (!repoPath) {
     return null
   }
 
   try {
-    const handoff = captureActiveGatewayProfileContext()
-    const { context, git } = await captureProjectGitContext()
+    const current = captureActiveGatewayProfileContext()
 
-    if (!git) {
+    const handoff = {
+      generation: options?.generation ?? current.generation,
+      profile: options?.profile ?? current.profile
+    }
+
+    if (!activeGatewayProfileContextIsCurrent(handoff)) {
       return null
     }
 
-    const result = await git.worktreeAdd(repoPath, options)
+    const { context, git } = await captureProjectGitContext()
+
+    if (!git || !activeGatewayProfileContextIsCurrent(handoff)) {
+      return null
+    }
+
+    const worktreeOptions = options
+      ? {
+          base: options.base,
+          branch: options.branch,
+          existingBranch: options.existingBranch,
+          name: options.name
+        }
+      : undefined
+
+    const result = await git.worktreeAdd(repoPath, worktreeOptions)
     assertProjectContextCurrent(context)
 
     if (!activeGatewayProfileContextIsCurrent(handoff)) {
@@ -1060,17 +1086,23 @@ export async function listBaseBranches(repoPath: string): Promise<HermesGitBaseB
 
 export async function switchBranchInRepo(
   repoPath: string,
-  branch: string
+  branch: string,
+  owner?: { generation: number; profile: string }
 ): Promise<null | { generation: number; profile: string }> {
   if (!repoPath || !branch.trim()) {
     return null
   }
 
   try {
-    const handoff = captureActiveGatewayProfileContext()
+    const handoff = owner ?? captureActiveGatewayProfileContext()
+
+    if (!activeGatewayProfileContextIsCurrent(handoff)) {
+      return null
+    }
+
     const { context, git } = await captureProjectGitContext()
 
-    if (!git) {
+    if (!git || !activeGatewayProfileContextIsCurrent(handoff)) {
       return null
     }
 

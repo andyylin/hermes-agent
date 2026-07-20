@@ -63,6 +63,11 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
 
 logger = logging.getLogger(__name__)
 
+
+def _scoped_env(name: str, default: str = "") -> str:
+    value = get_secret(name, default)
+    return default if value is None or str(value) == "" else str(value)
+
 # ContextVar carrying the user_id of the slash-command invoker.
 # Set in _handle_slash_command, read in send() to match the correct
 # stashed response_url when multiple users issue commands on the same
@@ -3122,7 +3127,7 @@ class SlackAdapter(BasePlatformAdapter):
         if event.get("bot_id") or event.get("subtype") == "bot_message":
             allow_bots = self.config.extra.get("allow_bots", "")
             if not allow_bots:
-                allow_bots = os.getenv("SLACK_ALLOW_BOTS", "none")
+                allow_bots = _scoped_env("SLACK_ALLOW_BOTS", "none")
             allow_bots = str(allow_bots).lower().strip()
             if allow_bots == "none":
                 return
@@ -4003,20 +4008,11 @@ class SlackAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
 
-        if os.getenv("SLACK_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+        if _scoped_env("SLACK_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
             return True
 
         def _env(name: str) -> str:
-            # Multiplex: profile .env is in secret_scope, not process environ.
-            try:
-                from agent.secret_scope import get_secret
-
-                val = get_secret(name)
-                if val is not None and str(val).strip():
-                    return str(val).strip()
-            except Exception:
-                pass
-            return (os.getenv(name) or "").strip()
+            return _scoped_env(name).strip()
 
         allowed_ids = set()
         platform_allowlist = _env("SLACK_ALLOWED_USERS")

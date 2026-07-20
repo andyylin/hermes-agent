@@ -141,9 +141,15 @@ export function WorktreeDialog({ repoPath, onStarted, open, onOpenChange, initia
     setPending(true)
 
     try {
-      const result = await startWorkInRepo(repoPath, { base: selectedBase || undefined, branch, name: branch })
+      const result = await startWorkInRepo(repoPath, {
+        base: selectedBase || undefined,
+        branch,
+        generation: owner.generation,
+        name: branch,
+        profile: owner.profile
+      })
 
-      if (result) {
+      if (result && activeGatewayProfileContextIsCurrent(owner)) {
         onStarted(result.path, result.profile, result.generation)
         onOpenChange(false)
         setName('')
@@ -173,15 +179,19 @@ export function WorktreeDialog({ repoPath, onStarted, open, onOpenChange, initia
           profile: owner.profile
         }
       } else if (branch.isDefault) {
-        const switched = await switchBranchInRepo(repoPath, branch.name)
+        const switched = await switchBranchInRepo(repoPath, branch.name, owner)
         result = switched
           ? { branch: branch.name, generation: switched.generation, path: repoPath, profile: switched.profile }
           : null
       } else {
-        result = await startWorkInRepo(repoPath, { existingBranch: branch.name })
+        result = await startWorkInRepo(repoPath, {
+          existingBranch: branch.name,
+          generation: owner.generation,
+          profile: owner.profile
+        })
       }
 
-      if (result) {
+      if (result && activeGatewayProfileContextIsCurrent(owner)) {
         onStarted(result.path, result.profile, result.generation)
         onOpenChange(false)
       }
