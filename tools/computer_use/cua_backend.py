@@ -1250,6 +1250,7 @@ def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         window_id_int = _positive_int(w.get("window_id"))
         if pid_int is None or window_id_int is None:
             continue
+        title = w.get("title", "")
         z_raw = w.get("z_index")
         z_index = z_raw if isinstance(z_raw, (int, float)) and not isinstance(z_raw, bool) else 0
         windows.append({
@@ -1257,7 +1258,7 @@ def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "pid": pid_int,
             "window_id": window_id_int,
             "off_screen": not w.get("is_on_screen", True),
-            "title": w.get("title", ""),
+            "title": title,
             "z_index": z_index,
         })
     return windows
@@ -2504,4 +2505,3 @@ class CuaDriverBackend(ComputerUseBackend):
             meta.update(structured)
         return _action_result_from(name, ok, message, meta, structured,
                                    requested_delivery=args.get("delivery_mode"))
-

@@ -808,6 +808,30 @@ def _infer_type(value: Any) -> str:
     return "string"
 
 
+_JS_MAX_SAFE_INTEGER = 9_007_199_254_740_991
+
+
+def _json_safe_config_value(value: Any) -> Any:
+    """Return a config value that can survive a JavaScript JSON round-trip.
+
+    The Desktop config editor receives `/api/config` as JSON and keeps a local
+    JavaScript object draft before autosaving it back. JSON itself permits
+    arbitrary-size integers, but JavaScript `Number` does not: Discord
+    snowflakes and similar IDs are rounded as soon as `JSON.parse()` sees them.
+    Stringify only integers outside JS's safe range so unchanged config values
+    preserve their exact scalar text across GET → PUT.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and abs(value) > _JS_MAX_SAFE_INTEGER:
+        return str(value)
+    if isinstance(value, list):
+        return [_json_safe_config_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_safe_config_value(item) for key, item in value.items()}
+    return value
+
+
 def _build_schema_from_config(
     config: Dict[str, Any],
     prefix: str = "",
@@ -4735,7 +4759,7 @@ def _normalize_config_for_web(config: Dict[str, Any]) -> Dict[str, Any]:
         config["model_context_length"] = ctx_len if isinstance(ctx_len, int) else 0
     else:
         config["model_context_length"] = 0
-    return config
+    return _json_safe_config_value(config)
 
 
 # ── Memory provider config: one generic GET/PUT pair, dispatching on storage ──
@@ -16132,6 +16156,36 @@ def _ws_client_is_allowed(ws: "WebSocket") -> bool:
     return client_host in _LOOPBACK_HOSTS
 
 
+def _ws_origin_is_accepted(origin_netloc: str, bound_host: str) -> bool:
+    """Return True when a browser Origin is allowed for WS upgrades."""
+    if _is_accepted_host(origin_netloc, bound_host):
+        return True
+
+    # Cloudflare Tunnel / reverse-proxy deployments commonly rewrite the
+    # origin-facing Host header to the loopback upstream (e.g.
+    # ``httpHostHeader: 127.0.0.1:9119``) while the browser correctly sends
+    # ``Origin: https://hermes.example.com``. That is not a rebinding attack
+    # when the operator explicitly configured dashboard.public_url; it is the
+    # declared public origin. Keep the relief valve explicit so random public
+    # hostnames still die here.
+    try:
+        from hermes_cli.dashboard_auth.prefix import resolve_public_url
+
+        public_url = resolve_public_url()
+    except Exception:
+        public_url = ""
+
+    if not public_url:
+        return False
+
+    try:
+        public = urllib.parse.urlparse(public_url)
+    except ValueError:
+        return False
+
+    return bool(public.netloc) and origin_netloc.lower() == public.netloc.lower()
+
+
 def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     """Return a Host/Origin rejection reason, or None when allowed.
 
@@ -16155,13 +16209,12 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     if parsed.scheme not in {"http", "https"}:
         # Non-web origin (packaged Electron: file://, null, app://). The
         # upstream credential check is the real auth boundary; trust it.
-        # See _ws_host_origin_is_allowed for the full rationale.
         return None
 
     if not parsed.netloc:
         return f"origin_mismatch origin={origin} bound={bound_host}"
 
-    if not _is_accepted_host(parsed.netloc, bound_host):
+    if not _ws_origin_is_accepted(parsed.netloc, bound_host):
         return f"origin_mismatch origin={origin} bound={bound_host}"
     return None
 
@@ -16171,9 +16224,9 @@ def _ws_host_origin_is_allowed(ws: "WebSocket") -> bool:
 
     FastAPI HTTP middleware does not run for WebSocket routes, so the
     DNS-rebinding Host check used for normal dashboard HTTP requests must be
-    repeated here before accepting the upgrade.  Browsers also send an Origin
-    header on WebSocket handshakes; when present, require it to target the
-    same bound dashboard host.
+    repeated here before accepting the upgrade. Browsers also send an Origin
+    header on WebSocket handshakes; when present, require it to target either
+    the same bound dashboard host or the operator-declared public URL.
     """
     return _ws_host_origin_reason(ws) is None
 
@@ -17419,6 +17472,9 @@ async def pub_ws(ws: WebSocket) -> None:
         pass
 
 
+_EVENTS_WS_HEARTBEAT_SECONDS = 25.0
+
+
 @app.websocket("/api/events")
 async def events_ws(ws: WebSocket) -> None:
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
@@ -17446,10 +17502,19 @@ async def events_ws(ws: WebSocket) -> None:
 
     try:
         while True:
-            # Subscribers don't speak — the receive() just blocks until
-            # disconnect so the connection stays open as long as the
-            # browser holds it.
-            await ws.receive_text()
+            # Subscribers don't speak. Keep the read side open to detect browser
+            # disconnects, but send periodic JSON heartbeats so Cloudflare and
+            # other reverse proxies do not reap the otherwise-idle WebSocket
+            # before the next tool-call event. The React sidebar ignores unknown
+            # event types, so this is wire-compatible with current clients.
+            try:
+                await asyncio.wait_for(
+                    ws.receive_text(), timeout=_EVENTS_WS_HEARTBEAT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                await ws.send_text(
+                    '{"method":"event","params":{"type":"heartbeat","payload":{}}}'
+                )
     except WebSocketDisconnect:
         pass
     finally:

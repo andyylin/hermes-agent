@@ -215,6 +215,7 @@ def auto_title_session(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
+    on_title: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
 ) -> None:
     """Generate and set a session title if one doesn't already exist.
@@ -225,6 +226,11 @@ def auto_title_session(
     - session already has a title (user-set or previously auto-generated)
     - title generation fails
     - runtime_validator returns False (model was switched)
+
+    ``title_callback`` (or legacy alias ``on_title``) is invoked after the DB
+    title is stored. Gateway adapters use it for best-effort visible retitles
+    (for example editing a Discord thread name) without coupling this module to
+    any platform SDK.
 
     Never lets an exception escape: this is a daemon-thread target, and an
     escaping exception would spray a raw traceback into the user's terminal
@@ -244,6 +250,7 @@ def auto_title_session(
             failure_callback=failure_callback,
             main_runtime=main_runtime,
             title_callback=title_callback,
+            on_title=on_title,
             runtime_validator=runtime_validator,
         )
     except Exception as e:
@@ -270,6 +277,7 @@ def _auto_title_session(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
+    on_title: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
 ) -> None:
     """Body of :func:`auto_title_session` — see its docstring."""
@@ -318,13 +326,15 @@ def _auto_title_session(
         if persisted is None:
             return
         logger.debug("Auto-generated session title: %s", persisted)
-        if title_callback is not None:
+        callback = title_callback or on_title
+        if callback is not None:
             try:
-                title_callback(persisted)
+                callback(persisted)
             except Exception:
                 logger.debug("Auto-title callback failed", exc_info=True)
     except Exception as e:
         logger.debug("Failed to set auto-generated title: %s", e)
+        return
 
 
 def maybe_auto_title(

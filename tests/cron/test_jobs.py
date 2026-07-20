@@ -1,5 +1,6 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import json
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
@@ -8,6 +9,7 @@ from cron.jobs import (
     parse_duration,
     parse_schedule,
     compute_next_run,
+    _compute_grace_seconds,
     create_job,
     load_jobs,
     save_jobs,
@@ -224,6 +226,9 @@ class TestComputeNextRun:
 
     def test_unknown_kind_returns_none(self):
         assert compute_next_run({"kind": "unknown"}) is None
+
+    def test_recurring_catch_up_grace_is_capped_at_30_minutes(self):
+        assert _compute_grace_seconds({"kind": "interval", "minutes": 24 * 60}) == 30 * 60
 
 
 # =========================================================================
@@ -445,6 +450,22 @@ class TestPauseResumeJob:
         assert resumed["paused_at"] is None
         assert resumed["paused_reason"] is None
 
+    def test_resume_completed_bounded_job_rearms_counter(self, tmp_cron_dir):
+        job = create_job(prompt="Bounded", schedule="every 1h", repeat=2)
+        mark_job_run(job["id"], success=True)
+        mark_job_run(job["id"], success=True)
+        completed = get_job(job["id"])
+        assert completed["state"] == "completed"
+        assert completed["repeat"]["completed"] == 2
+
+        resumed = resume_job(job["id"])
+
+        assert resumed["enabled"] is True
+        assert resumed["state"] == "scheduled"
+        assert resumed["repeat"] == {"times": 2, "completed": 0}
+        assert resumed["completed_at"] is None
+        assert resumed["completion_reason"] is None
+
     def test_resume_rejects_past_oneshot(self, tmp_cron_dir, monkeypatch):
         """Resuming a paused one-shot whose time is now in the past must raise
         ValueError — the revived job would silently never fire."""
@@ -570,10 +591,19 @@ class TestMarkJobRun:
         assert updated["repeat"]["completed"] == 1
         assert updated["last_status"] == "ok"
 
-    def test_repeat_limit_removes_job(self, tmp_cron_dir):
-        job = create_job(prompt="Once", schedule="30m", repeat=1)
+    def test_repeat_limit_retains_completed_recurring_job(self, tmp_cron_dir):
+        job = create_job(prompt="Bounded", schedule="every 30m", repeat=1)
         mark_job_run(job["id"], success=True)
-        # Job should be removed after hitting repeat limit
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["enabled"] is False
+        assert updated["state"] == "completed"
+        assert updated["completion_reason"] == "run_limit_reached"
+        assert updated["next_run_at"] is None
+
+    def test_one_shot_still_removes_job_at_repeat_limit(self, tmp_cron_dir):
+        job = create_job(prompt="One shot", schedule="1h")
+        mark_job_run(job["id"], success=True)
         assert get_job(job["id"]) is None
 
     def test_repeat_negative_one_is_infinite(self, tmp_cron_dir):
@@ -620,6 +650,23 @@ class TestMarkJobRun:
         mark_job_run(job["id"], success=True, delivery_error=None)
         updated = get_job(job["id"])
         assert updated["last_delivery_error"] is None
+
+    def test_delivery_receipt_is_persisted_and_cleared_per_run(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        receipt = {
+            "run_id": "run-1",
+            "job_id": job["id"],
+            "started_at": "2026-07-14T19:30:00+08:00",
+            "completed_at": "2026-07-14T19:30:12+08:00",
+            "target": "telegram:123",
+            "intended_output_delivered": True,
+        }
+
+        mark_job_run(job["id"], success=True, delivery_receipt=receipt)
+        assert get_job(job["id"])["last_delivery_receipt"] == receipt
+
+        mark_job_run(job["id"], success=False, error="later failure")
+        assert get_job(job["id"])["last_delivery_receipt"] is None
 
     def test_both_agent_and_delivery_error(self, tmp_cron_dir):
         """Agent fails AND delivery fails — both errors recorded."""
@@ -802,7 +849,7 @@ class TestGetDueJobs:
     def test_past_due_within_window_returned(self, tmp_cron_dir):
         """Jobs within the dynamic grace window are still considered due (not stale).
 
-        For an hourly job, grace = 30 min (half the period, clamped to [120s, 2h]).
+        For an hourly job, grace = 30 min (half the period, clamped to [120s, 30m]).
         """
         job = create_job(prompt="Due now", schedule="every 1h")
         # Force next_run_at to 10 minutes ago (within the 30-min grace for hourly)
@@ -1946,6 +1993,86 @@ class TestClaimDispatch:
         loaded = {j["id"]: j for j in load_jobs()}
         assert "good" in loaded
 
+# =============================================================================
+# Deterministic cron definition export
+# =============================================================================
+
+
+class TestCronDefinitionsExport:
+    def test_create_job_exports_stable_definition(self, tmp_cron_dir, monkeypatch):
+        from cron.jobs import create_job
+
+        monkeypatch.setattr("cron.jobs._resolve_default_model_snapshot", lambda: "test-model")
+        job = create_job(
+            "Say hi",
+            "every 30m",
+            name="demo",
+            deliver="local",
+            skills=["watchers"],
+            enabled_toolsets=["web"],
+            attach_to_session=True,
+        )
+
+        export_path = tmp_cron_dir / "cron" / "jobs.definitions.json"
+        assert export_path.exists()
+        data = json.loads(export_path.read_text())
+        assert data["version"] == 1
+        assert data["source"] == "cron/jobs.json"
+        exported = data["jobs"][0]
+        assert exported["id"] == job["id"]
+        assert exported["name"] == "demo"
+        assert exported["prompt"] == "Say hi"
+        assert exported["deliver"] == "local"
+        assert exported["skills"] == ["watchers"]
+        assert exported["enabled_toolsets"] == ["web"]
+        assert exported["attach_to_session"] is True
+        assert "next_run_at" not in exported
+        assert "last_run_at" not in exported
+
+    def test_update_and_remove_refresh_export(self, tmp_cron_dir, monkeypatch):
+        from cron.jobs import create_job, update_job, remove_job
+
+        monkeypatch.setattr("cron.jobs._resolve_default_model_snapshot", lambda: None)
+        job = create_job("old", "every 5m", name="old-name")
+        export_path = tmp_cron_dir / "cron" / "jobs.definitions.json"
+
+        update_job(job["id"], {"prompt": "new", "name": "new-name"})
+        data = json.loads(export_path.read_text())
+        assert data["jobs"][0]["prompt"] == "new"
+        assert data["jobs"][0]["name"] == "new-name"
+
+        assert remove_job(job["id"]) is True
+        data = json.loads(export_path.read_text())
+        assert data["jobs"] == []
+
+    def test_export_definitions_file_reports_no_change(self, tmp_cron_dir, monkeypatch):
+        from cron.jobs import create_job, export_definitions_file
+
+        monkeypatch.setattr("cron.jobs._resolve_default_model_snapshot", lambda: None)
+        create_job("same", "every 5m", name="same-name")
+        assert export_definitions_file() is False
+
+
+    def test_email_subject_template_is_preserved_in_definition_export(self):
+        from cron.definitions_export import render_cron_definitions
+
+        rendered = render_cron_definitions([
+            {
+                "id": "brief",
+                "name": "brief",
+                "enabled": True,
+                "schedule": {"kind": "interval", "minutes": 30},
+                "prompt": "Brief",
+                "email_subject_template": "Joi Morning Briefing - {date}",
+                "email_thread_key": "joi-morning-briefing",
+                "next_run_at": "2026-01-01T00:30:00+00:00",
+            }
+        ])
+        job = json.loads(rendered)["jobs"][0]
+        assert job["email_subject_template"] == "Joi Morning Briefing - {date}"
+        assert job["email_thread_key"] == "joi-morning-briefing"
+        assert "next_run_at" not in job
+
 
 class TestLateEnvRepointScopesStore:
     """A HERMES_HOME set AFTER cron.jobs import must scope the store even
@@ -1963,6 +2090,29 @@ class TestLateEnvRepointScopesStore:
         assert store.output_dir == expected / "output"
         # the import-time compatibility constants are untouched
         assert jobs.JOBS_FILE != store.jobs_file
+
+    def test_late_env_repoint_scopes_ticker_files(self, tmp_path, monkeypatch):
+        import cron.jobs as jobs
+
+        written = []
+        read = []
+        monkeypatch.setattr(jobs, "_atomic_write_epoch", written.append)
+        monkeypatch.setattr(jobs, "_epoch_file_age", lambda path: read.append(path) or 0.0)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        jobs.record_ticker_heartbeat(success=True)
+        assert jobs.get_ticker_heartbeat_age() == 0.0
+        assert jobs.get_ticker_success_age() == 0.0
+
+        cron_dir = tmp_path.resolve() / "cron"
+        assert written == [
+            cron_dir / "ticker_heartbeat",
+            cron_dir / "ticker_last_success",
+        ]
+        assert read == [
+            cron_dir / "ticker_heartbeat",
+            cron_dir / "ticker_last_success",
+        ]
 
     def test_unchanged_home_returns_import_time_constants(self, monkeypatch):
         import cron.jobs as jobs

@@ -425,6 +425,45 @@ class TestBuildSkillsSystemPrompt:
         assert "Debug Python scripts" in result
         assert "available_skills" in result
 
+    def test_skills_index_uses_disciplined_description_only(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "productivity" / "pdf"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: pdf\n"
+            "description: Read, OCR, split, merge, edit, secure, and export PDFs.\n"
+            "metadata:\n"
+            "  hermes:\n"
+            "    prompt_summary: Redundant routing copy that must not override description.\n"
+            "---\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "pdf" in result
+        assert "Read, OCR, split, merge, edit, secure, and export PDFs." in result
+        assert "Redundant routing copy" not in result
+
+    def test_skills_index_fallback_description_stays_tightly_capped(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "tools" / "long-description"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: long-description\n"
+            "description: " + ("description " * 20) + "\n"
+            "---\n"
+        )
+
+        result = build_skills_system_prompt()
+        entry = next(line for line in result.splitlines() if "- long-description:" in line)
+
+        assert entry.endswith("...")
+        assert len(entry.split(": ", 1)[1]) <= 60
+
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"

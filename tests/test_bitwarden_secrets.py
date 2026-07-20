@@ -664,6 +664,62 @@ def test_env_loader_calls_bsm_when_enabled(tmp_path, monkeypatch):
     assert os.environ.get("MY_BSM_KEY") == "from-bsm"
 
 
+def test_env_loader_reapplies_bsm_after_second_dotenv_load(tmp_path, monkeypatch):
+    """A later dotenv reload must not clobber already-fetched BSM values."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / ".env").write_text(
+        "BWS_ACCESS_TOKEN=0.t\n"
+        "API_SERVER_KEY=\n"
+        "DISCORD_BOT_TOKEN=\n"
+    )
+    (home / "config.yaml").write_text(
+        "secrets:\n"
+        "  bitwarden:\n"
+        "    enabled: true\n"
+        "    project_id: 'proj-1'\n"
+        "    access_token_env: 'BWS_ACCESS_TOKEN'\n"
+        "    cache_ttl_seconds: 300\n"
+        "    override_existing: true\n"
+        "    auto_install: false\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    called = {"n": 0}
+
+    def fake_fetch(**kwargs):
+        called["n"] += 1
+        return {
+            "API_SERVER_KEY": "api-from-bsm",
+            "DISCORD_BOT_TOKEN": "discord-from-bsm",
+        }, []
+
+    monkeypatch.setattr(
+        "agent.secret_sources.bitwarden.find_bws",
+        lambda **_kw: Path("/fake/bws"),
+    )
+    monkeypatch.setattr(
+        "agent.secret_sources.bitwarden.fetch_bitwarden_secrets",
+        fake_fetch,
+    )
+    from agent.secret_sources import registry as reg_module
+
+    reg_module._reset_registry_for_tests()
+
+    from hermes_cli.env_loader import load_hermes_dotenv, reset_secret_source_cache
+
+    reset_secret_source_cache()
+
+    load_hermes_dotenv(hermes_home=home)
+    assert os.environ["API_SERVER_KEY"] == "api-from-bsm"
+    assert os.environ["DISCORD_BOT_TOKEN"] == "discord-from-bsm"
+
+    load_hermes_dotenv(hermes_home=home)
+    assert called["n"] == 1
+    assert os.environ["API_SERVER_KEY"] == "api-from-bsm"
+    assert os.environ["DISCORD_BOT_TOKEN"] == "discord-from-bsm"
+
+
 # ---------------------------------------------------------------------------
 # Disk-persisted cache (cross-process — speeds up back-to-back CLI invocations)
 # ---------------------------------------------------------------------------
@@ -703,6 +759,38 @@ def test_disk_cache_written_after_first_fetch(monkeypatch, tmp_path):
     assert payload_disk["secrets"] == {"K1": "v1"}
     # Critically, the raw access token must NOT appear anywhere in the file
     assert "0.t" not in cache_path.read_text()
+
+
+def test_disk_cache_not_written_when_ttl_zero(monkeypatch, tmp_path):
+    """cache_ttl_seconds=0 disables plaintext disk and in-process caching."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([{"key": "K1", "value": "v1"}])
+
+    call_count = {"n": 0}
+
+    def fake_run(*a, **kw):
+        call_count["n"] += 1
+        return mock.Mock(returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+    bw._reset_cache_for_tests(home)
+
+    secrets, _ = bw.fetch_bitwarden_secrets(
+        access_token="0.t", project_id="proj-1", binary=fake_binary,
+        cache_ttl_seconds=0, home_path=home,
+    )
+    assert secrets == {"K1": "v1"}
+    assert call_count["n"] == 1
+    assert not bw._disk_cache_path(home).exists()
+
+    bw.fetch_bitwarden_secrets(
+        access_token="0.t", project_id="proj-1", binary=fake_binary,
+        cache_ttl_seconds=0, home_path=home,
+    )
+    assert call_count["n"] == 2
 
 
 def test_disk_cache_short_circuits_bws_when_fresh(monkeypatch, tmp_path):
@@ -870,16 +958,138 @@ def test_disk_cache_corrupt_file_falls_through(monkeypatch, tmp_path):
     assert json.loads(cache_path.read_text())["secrets"] == {"K1": "v1"}
 
 
+def test_encrypted_cache_writes_without_plaintext(monkeypatch, tmp_path):
+    """Encrypted cache stores last-good secrets without raw values on disk."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([{"key": "K1", "value": "secret-value"}])
+
+    monkeypatch.setattr(
+        bw.subprocess,
+        "run",
+        lambda *a, **kw: mock.Mock(returncode=0, stdout=payload, stderr=""),
+    )
+    bw._reset_cache_for_tests(home)
+
+    secrets, warnings = bw.fetch_bitwarden_secrets(
+        access_token="0.t", project_id="proj-1", binary=fake_binary,
+        cache_ttl_seconds=0, encrypted_cache_enabled=True,
+        encrypted_cache_max_stale_seconds=604800, home_path=home,
+    )
+
+    assert secrets == {"K1": "secret-value"}
+    assert warnings == []
+    assert not bw._disk_cache_path(home).exists()
+    cache_path = bw._encrypted_disk_cache_path(home)
+    assert cache_path.exists()
+    mode = stat.S_IMODE(os.stat(cache_path).st_mode)
+    assert mode == 0o600, f"expected 0o600, got 0o{mode:o}"
+    text = cache_path.read_text()
+    assert "secret-value" not in text
+    assert "0.t" not in text
+    payload_disk = json.loads(text)
+    assert set(payload_disk.keys()) == {
+        "version", "key", "fetched_at", "salt", "nonce", "ciphertext",
+    }
+
+
+def test_encrypted_cache_falls_back_on_network_error(monkeypatch, tmp_path):
+    """A fresh-enough encrypted cache is used when BWS is unreachable."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    calls = {"n": 0}
+
+    def fake_run(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return mock.Mock(
+                returncode=0,
+                stdout=_fake_bws_payload([{"key": "K1", "value": "cached"}]),
+                stderr="",
+            )
+        return mock.Mock(
+            returncode=1,
+            stdout="",
+            stderr="Error: network is unreachable",
+        )
+
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+    bw._reset_cache_for_tests(home)
+
+    first, _ = bw.fetch_bitwarden_secrets(
+        access_token="0.t", project_id="proj-1", binary=fake_binary,
+        cache_ttl_seconds=0, encrypted_cache_enabled=True,
+        encrypted_cache_max_stale_seconds=604800, home_path=home,
+    )
+    assert first == {"K1": "cached"}
+    bw._CACHE.clear()
+
+    second, warnings = bw.fetch_bitwarden_secrets(
+        access_token="0.t", project_id="proj-1", binary=fake_binary,
+        cache_ttl_seconds=0, encrypted_cache_enabled=True,
+        encrypted_cache_max_stale_seconds=604800, home_path=home,
+    )
+    assert second == {"K1": "cached"}
+    assert calls["n"] == 2
+    assert warnings == [
+        "Using stale encrypted Bitwarden cache after network fetching BWS secrets"
+    ]
+
+
+def test_encrypted_cache_does_not_fallback_on_auth_failure(monkeypatch, tmp_path):
+    """Auth failures must not bypass revocation by using stale secrets."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    calls = {"n": 0}
+
+    def fake_run(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return mock.Mock(
+                returncode=0,
+                stdout=_fake_bws_payload([{"key": "K1", "value": "cached"}]),
+                stderr="",
+            )
+        return mock.Mock(returncode=1, stdout="", stderr="Error: invalid access token")
+
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+    bw._reset_cache_for_tests(home)
+
+    bw.fetch_bitwarden_secrets(
+        access_token="0.t", project_id="proj-1", binary=fake_binary,
+        cache_ttl_seconds=0, encrypted_cache_enabled=True,
+        encrypted_cache_max_stale_seconds=604800, home_path=home,
+    )
+    bw._CACHE.clear()
+
+    with pytest.raises(RuntimeError, match="invalid access token"):
+        bw.fetch_bitwarden_secrets(
+            access_token="0.t", project_id="proj-1", binary=fake_binary,
+            cache_ttl_seconds=0, encrypted_cache_enabled=True,
+            encrypted_cache_max_stale_seconds=604800, home_path=home,
+        )
+
+
 def test_reset_cache_for_tests_deletes_disk_file(tmp_path):
     """_reset_cache_for_tests(home_path) must also clean disk."""
     home = tmp_path / ".hermes"
     home.mkdir()
     cache_path = bw._disk_cache_path(home)
+    encrypted_cache_path = bw._encrypted_disk_cache_path(home)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text("{}")
+    encrypted_cache_path.write_text("{}")
     assert cache_path.exists()
+    assert encrypted_cache_path.exists()
 
     bw._reset_cache_for_tests(home)
     assert not cache_path.exists()
+    assert not encrypted_cache_path.exists()
     # Idempotent
     bw._reset_cache_for_tests(home)

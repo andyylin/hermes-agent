@@ -37,11 +37,13 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
 try:
@@ -101,6 +103,8 @@ DEFAULT_PORT = 8644
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
 _RATE_WINDOW_SECONDS = 60.0
+_DEFAULT_REPAIR_QUEUE = "data/automation-failure-repair/webhook-inbox.jsonl"
+
 # Hostnames/IP literals that only serve connections originating on the same
 # machine. Anything else is treated as a public bind for safety-rail purposes.
 _LOOPBACK_HOSTS = frozenset({
@@ -427,6 +431,83 @@ class WebhookAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "webhook"}
 
+    def _resolve_queue_path(self, configured: str | None) -> Path:
+        """Resolve a route queue path under HERMES_HOME unless absolute."""
+        from hermes_constants import get_hermes_home
+
+        base = get_hermes_home()
+        raw = configured or _DEFAULT_REPAIR_QUEUE
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = base / path
+        return path
+
+    def _append_jsonl_0600(self, path: Path, record: dict) -> None:
+        """Append one JSONL record, creating the file with private permissions."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                f.write(line)
+        finally:
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+
+    def _trigger_repair_job(self, job_id: str | None) -> None:
+        """Kick a bounded Hermes cron repair job without granting webhook tools."""
+        if not job_id:
+            return
+        safe_job_id = str(job_id).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", safe_job_id):
+            logger.warning("[webhook] refusing invalid repair job id: %r", job_id)
+            return
+        try:
+            subprocess.Popen(
+                ["hermes", "cron", "run", safe_job_id],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception:
+            logger.exception("[webhook] failed to trigger repair cron job %s", safe_job_id)
+
+    def _enqueue_repair_packet(
+        self,
+        *,
+        route_name: str,
+        event_type: str,
+        delivery_id: str,
+        payload: dict,
+        route_config: dict,
+    ) -> Path:
+        enqueue_cfg = route_config.get("enqueue_repair") or route_config.get("enqueue") or {}
+        if enqueue_cfg is True:
+            enqueue_cfg = {}
+        if not isinstance(enqueue_cfg, dict):
+            enqueue_cfg = {}
+        queue_path = self._resolve_queue_path(enqueue_cfg.get("path"))
+        record = {
+            "type": "webhook_repair_packet",
+            "received_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "route": route_name,
+            "event_type": event_type,
+            "delivery_id": delivery_id,
+            "payload": payload,
+            "repair": {
+                "source": "webhook",
+                "recommended_first_checks": enqueue_cfg.get("recommended_first_checks") or [],
+                "resolved_delivery_target": enqueue_cfg.get("resolved_delivery_target")
+                or route_config.get("deliver")
+                or "alerts",
+            },
+        }
+        self._append_jsonl_0600(queue_path, record)
+        self._trigger_repair_job(enqueue_cfg.get("trigger_cron_job_id"))
+        return queue_path
+
     # ------------------------------------------------------------------
     # HTTP handlers
     # ------------------------------------------------------------------
@@ -746,6 +827,38 @@ class WebhookAdapter(BasePlatformAdapter):
         # cron jobs, other agents) that need to push a plain notification
         # to a user's chat with zero LLM cost.  Reuses the same HMAC auth,
         # rate limiting, idempotency, and template rendering as agent mode.
+        if route_config.get("enqueue_repair") or route_config.get("enqueue"):
+            try:
+                queue_path = self._enqueue_repair_packet(
+                    route_name=route_name,
+                    event_type=event_type,
+                    delivery_id=delivery_id,
+                    payload=payload,
+                    route_config=route_config,
+                )
+            except Exception:
+                logger.exception("[webhook] failed to enqueue repair packet route=%s", route_name)
+                return web.json_response(
+                    {"status": "error", "error": "Repair enqueue failed", "delivery_id": delivery_id},
+                    status=502,
+                )
+            logger.info(
+                "[webhook] queued repair event=%s route=%s delivery=%s queue=%s",
+                event_type,
+                route_name,
+                delivery_id,
+                queue_path,
+            )
+            return web.json_response(
+                {
+                    "status": "queued",
+                    "route": route_name,
+                    "event": event_type,
+                    "delivery_id": delivery_id,
+                },
+                status=202,
+            )
+
         if route_config.get("deliver_only"):
             delivery = {
                 "deliver": route_config.get("deliver", "log"),

@@ -1424,6 +1424,13 @@ def _build_child_agent(
     parent_sid = getattr(parent_agent, "session_id", None)
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
         child._session_init_model_config["_delegate_from"] = parent_sid
+    # Preserve the model that delegation resolved for this child. Credential
+    # pool binding happens later in _run_single_child(); pool entries belong to
+    # a provider credential, not to the caller's per-task model choice. Re-apply
+    # this after binding so dynamic delegate_task(model=...) cannot be silently
+    # clobbered by a shared parent pool.
+    if model:
+        setattr(child, "_delegate_requested_model", effective_model)
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
@@ -1801,6 +1808,9 @@ def _run_single_child(
     """
     child_start = time.monotonic()
 
+    _requested_model = getattr(child, "_delegate_requested_model", None)
+    requested_model = _requested_model if isinstance(_requested_model, str) and _requested_model else None
+
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
 
@@ -1821,6 +1831,8 @@ def _run_single_child(
                 leased_entry = child_pool.current()
                 if leased_entry is not None and hasattr(child, "_swap_credential"):
                     child._swap_credential(leased_entry)
+                if requested_model:
+                    setattr(child, "model", requested_model)
             except Exception as exc:
                 logger.debug("Failed to bind child to leased credential: %s", exc)
 
@@ -2430,19 +2442,24 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context and role)
-      - Batch:  provide tasks array [{goal, context, role}, ...]
+      - Single: provide goal (+ optional context, role, model, provider)
+      - Batch:  provide tasks array [{goal, context, role, model, provider}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    Model/provider precedence is:
+    per-task override > top-level override > delegation config > parent agent.
 
     Returns JSON with results array, one entry per task.
     """
@@ -2532,7 +2549,15 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [
+            {
+                "goal": goal,
+                "context": context,
+                "role": top_role,
+                "model": model,
+                "provider": provider,
+            }
+        ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -2571,6 +2596,22 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            # Explicit per-task values beat top-level defaults. If either is
+            # present, resolve a complete credential bundle for that child; a
+            # model-only override on the same provider must still take effect.
+            task_model = t.get("model") or model
+            task_provider = t.get("provider") or provider
+            if task_model or task_provider:
+                try:
+                    task_creds = _resolve_model_provider_override(
+                        model_input=task_model,
+                        provider_input=task_provider,
+                        parent_agent=parent_agent,
+                    )
+                except ValueError as exc:
+                    return tool_error(str(exc))
+            else:
+                task_creds = creds
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2578,18 +2619,18 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=task_creds.get("model"),
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=task_creds.get("provider"),
+                override_base_url=task_creds.get("base_url"),
+                override_api_key=task_creds.get("api_key"),
+                override_api_mode=task_creds.get("api_mode"),
+                override_request_overrides=task_creds.get("request_overrides"),
+                override_max_tokens=task_creds.get("max_output_tokens"),
+                override_acp_command=task_creds.get("command"),
+                override_acp_args=task_creds.get("args"),
                 role=effective_role,
             )
             # Override with correct parent tool names (before child construction mutated global)
@@ -3226,6 +3267,99 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     }
 
 
+def _resolve_model_provider_override(
+    *,
+    model_input: Optional[str],
+    provider_input: Optional[str],
+    parent_agent,
+) -> dict:
+    """Resolve an explicit delegate_task model/provider override.
+
+    Uses the same model-switching pipeline as the /model command so aliases,
+    provider catalogs, custom providers, and ``--provider`` syntax stay
+    consistent. The result matches _resolve_delegation_credentials() so it can
+    flow directly into _build_child_agent().
+    """
+    raw_model = str(model_input or "").strip()
+    explicit_provider = str(provider_input or "").strip()
+    if not raw_model and not explicit_provider:
+        raise ValueError("model/provider override is empty")
+
+    try:
+        from hermes_cli.model_switch import parse_model_flags, switch_model
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot import model switch resolver for delegation override: {exc}"
+        ) from exc
+
+    _parsed_flags = parse_model_flags(raw_model)
+    parsed_model, parsed_provider = _parsed_flags[0], _parsed_flags[1]
+    if explicit_provider and parsed_provider and explicit_provider != parsed_provider:
+        raise ValueError(
+            f"Conflicting provider overrides: provider={explicit_provider!r} "
+            f"but model contains --provider {parsed_provider!r}."
+        )
+    provider_for_switch = explicit_provider or parsed_provider
+    if not parsed_model and not provider_for_switch:
+        raise ValueError(f"Could not parse model/provider override: {raw_model!r}")
+
+    user_providers = None
+    custom_providers = None
+    try:
+        from hermes_cli.config import load_config
+
+        full_cfg = load_config()
+        user_providers = full_cfg.get("providers")
+        custom_providers = full_cfg.get("custom_providers")
+    except Exception:
+        pass
+
+    result = switch_model(
+        raw_input=parsed_model,
+        current_provider=getattr(parent_agent, "provider", "") or "",
+        current_model=getattr(parent_agent, "model", "") or "",
+        current_base_url=getattr(parent_agent, "base_url", "") or "",
+        current_api_key=getattr(parent_agent, "api_key", "") or "",
+        is_global=False,
+        explicit_provider=provider_for_switch,
+        user_providers=user_providers,
+        custom_providers=custom_providers,
+    )
+    if not result.success:
+        raise ValueError(
+            f"Cannot resolve delegation model/provider override "
+            f"{raw_model or provider_for_switch!r}: "
+            f"{result.error_message or 'unknown error'}"
+        )
+
+    creds = {
+        "model": result.new_model or None,
+        "provider": result.target_provider or None,
+        "base_url": result.base_url or None,
+        "api_key": result.api_key or None,
+        "api_mode": result.api_mode or None,
+        "command": None,
+        "args": [],
+    }
+
+    # Preserve runtime-provider metadata that switch_model does not expose
+    # directly, such as ACP command/args for subprocess-backed providers.
+    if creds["provider"]:
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            runtime = resolve_runtime_provider(
+                requested=creds["provider"],
+                target_model=creds["model"],
+            )
+            creds["command"] = runtime.get("command")
+            creds["args"] = list(runtime.get("args") or [])
+        except Exception:
+            pass
+
+    return creds
+
+
 def _load_config() -> dict:
     """Load delegation config from the active Hermes config.
 
@@ -3496,6 +3630,31 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "provider": {
+                            "type": "string",
+                            "description": (
+                                "Per-task provider override. When set, this child agent "
+                                "connects to the specified provider instead of inheriting "
+                                "from the top-level provider, delegation.provider, or the parent. "
+                                "The provider must be configured in Hermes. Use with 'model' "
+                                "to assign specific provider/model pairs per worker. Prefer "
+                                "this structured field over embedding --provider in model "
+                                "when making JSON tool calls."
+                            ),
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": (
+                                "Per-task model override. When set, this child agent uses "
+                                "the specified model. When unset, inherits from the top-level "
+                                "model, delegation.model, or parent agent. Uses the same syntax "
+                                "as /model: 'sonnet', 'glm-4.7', or "
+                                "'stepfun/step-3.5-flash --provider openrouter'. You may also "
+                                "set the structured 'provider' field. Do NOT use provider:model "
+                                "colon-prefix syntax; colons remain valid only inside model IDs "
+                                "or variant suffixes such as ':free'."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3519,6 +3678,28 @@ DELEGATE_TASK_SCHEMA = {
                     "the work finishes; just continue working in the meantime. "
                     "Setting this has no effect; the parameter remains only for "
                     "backward compatibility."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Provider override for child agents. When set, children connect "
+                    "to the specified provider. The provider must be configured in Hermes. "
+                    "For per-task provider overrides, use the 'provider' field inside "
+                    "each item of the 'tasks' array. Prefer this structured field over "
+                    "embedding --provider in model when making JSON tool calls."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Model override for child agents. When set, the child uses the "
+                    "specified model. When unset, inherits from delegation.model or "
+                    "parent agent. Uses the same syntax as /model: 'sonnet', 'glm-4.7', "
+                    "or 'stepfun/step-3.5-flash --provider openrouter'. You may also "
+                    "set the structured 'provider' field. Do NOT use provider:model "
+                    "colon-prefix syntax. For per-task model overrides, use the 'model' "
+                    "field inside each item of the 'tasks' array."
                 ),
             },
         },
@@ -3581,6 +3762,8 @@ registry.register(
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
+        model=args.get("model"),
+        provider=args.get("provider"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

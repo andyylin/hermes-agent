@@ -309,6 +309,14 @@ class SessionContext:
     connected_platforms: List[Platform]
     home_channels: Dict[Platform, HomeChannel]
     shared_multi_user_session: bool = False
+
+    # Optional conversation-scope → Hermes Project binding. These values come
+    # from trusted local config/projects.db, not platform-controlled room text.
+    workspace_project_id: str = ""
+    workspace_project_slug: str = ""
+    workspace_project_name: str = ""
+    workspace_cwd: str = ""
+    workspace_allowed_folders: tuple[str, ...] = ()
     
     # Session metadata
     session_key: str = ""
@@ -324,6 +332,11 @@ class SessionContext:
                 p.value: hc.to_dict() for p, hc in self.home_channels.items()
             },
             "shared_multi_user_session": self.shared_multi_user_session,
+            "workspace_project_id": self.workspace_project_id,
+            "workspace_project_slug": self.workspace_project_slug,
+            "workspace_project_name": self.workspace_project_name,
+            "workspace_cwd": self.workspace_cwd,
+            "workspace_allowed_folders": list(self.workspace_allowed_folders),
             "session_key": self.session_key,
             "session_id": self.session_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -491,6 +504,24 @@ def build_session_context_prompt(
             "Matrix room/thread only. Do not assume unresolved references are "
             "about other Matrix rooms or projects unless the user explicitly says so."
         )
+        if context.workspace_project_id:
+            lines.append("")
+            lines.append(
+                f"**Bound Hermes Project:** {context.workspace_project_name} "
+                f"(`{context.workspace_project_slug}`)"
+            )
+            lines.append(f"**Project working directory:** `{context.workspace_cwd}`")
+            if context.workspace_allowed_folders:
+                lines.append("**Approved project folders:**")
+                lines.extend(
+                    f"  - `{folder}`" for folder in context.workspace_allowed_folders
+                )
+            lines.append(
+                "**Project context:** This Matrix room shares the bound Project's "
+                "files and project instructions. Each Matrix thread is an independent "
+                "conversation/session; do not import another thread's transcript unless "
+                "the user explicitly asks for a handoff."
+            )
 
     # User identity.
     # In shared multi-user sessions (shared threads OR shared non-thread groups

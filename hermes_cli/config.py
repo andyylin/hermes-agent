@@ -2531,6 +2531,7 @@ DEFAULT_CONFIG = {
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
+        "smart_thread_titles": False,  # Use deterministic smart names and post-reply retitles for Discord threads
         "thread_require_mention": False,  # If True, require @mention in threads too (multi-bot threads)
         "bots_require_inline_mention": False,  # Multi-bot rooms: if True, another bot must type @thisbot in its message to trigger a reply; a Discord reply/quote alone won't. Prevents two bots auto-replying to each other forever. Does not affect humans.
         "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
@@ -2638,6 +2639,7 @@ DEFAULT_CONFIG = {
         "require_mention": True,       # Require @mention to respond in rooms
         "free_response_rooms": "",     # Comma-separated room IDs where bot responds without mention
         "allowed_rooms": "",           # If set, bot ONLY responds in these room IDs (whitelist)
+        "auto_thread_rooms": "",       # Room IDs whose root messages always become Matrix threads
     },
 
     # Approval mode for dangerous commands:
@@ -3337,8 +3339,18 @@ DEFAULT_CONFIG = {
             "access_token_env": "BWS_ACCESS_TOKEN",
             # UUID of the BSM project to sync from.
             "project_id": "",
-            # Seconds to cache fetched secrets in-process.  0 disables.
+            # Seconds to reuse a fresh disk/memory cache entry before contacting
+            # Bitwarden again. 0 disables normal fresh-cache reuse.
             "cache_ttl_seconds": 300,
+            # Optional encrypted last-good fallback for network/timeout outages.
+            # When enabled, successful BWS fetches write AES-GCM encrypted cache
+            # material under ~/.hermes/cache/. If a later startup cannot reach
+            # Bitwarden due to NETWORK/TIMEOUT, Hermes may use this encrypted
+            # cache for up to max_stale_seconds. Auth failures do not fall back.
+            "encrypted_cache": {
+                "enabled": False,
+                "max_stale_seconds": 0,
+            },
             # When True, BSM values overwrite existing env vars.  Default
             # True because the point of using BSM is centralized rotation —
             # if .env had the final say, rotating in Bitwarden wouldn't

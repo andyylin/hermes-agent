@@ -474,6 +474,12 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     text = str(message or "").strip()
     if not text:
         return None
+    platform_value = _gateway_platform_value(platform)
+    # Email is batch delivery, not an interactive status surface.  Do not leak
+    # lifecycle/compaction/retry chatter into the user's inbox; only the final
+    # response belongs there.
+    if platform_value == "email":
+        return None
     if _gateway_surface_passes_raw_text(platform):
         return text
 
@@ -1385,6 +1391,37 @@ def _home_thread_env_var(platform_name: str) -> str:
     return f"{_home_target_env_var(platform_name)}_THREAD_ID"
 
 
+def _platform_has_home_channel(
+    platform: "Platform | str",
+    config: Optional["GatewayConfig"] = None,
+) -> bool:
+    """Return whether a platform has a configured home channel.
+
+    Honor profile-scoped secrets, legacy process env vars, and in-memory/YAML
+    platform config. This keeps the first-session ``/sethome`` nudge correct for
+    secondary multiplex profiles as well as the primary profile.
+    """
+    platform_name = platform.value if isinstance(platform, Platform) else str(platform)
+    env_key = _home_target_env_var(platform_name)
+    try:
+        from agent.secret_scope import get_secret
+
+        if get_secret(env_key):
+            return True
+    except Exception:
+        pass
+    if os.getenv(env_key):
+        return True
+
+    try:
+        platform_enum = platform if isinstance(platform, Platform) else Platform(platform_name)
+        selected_config = config or load_gateway_config()
+        home = selected_config.get_home_channel(platform_enum)
+        return bool(home and home.chat_id)
+    except Exception:
+        return False
+
+
 def _restart_notification_pending() -> bool:
     """Return True when a /restart completion marker is waiting to be delivered."""
     return (_hermes_home / ".restart_notify.json").exists()
@@ -1591,10 +1628,11 @@ def load_gateway_config_for_runner() -> "GatewayConfig":
 
 
 def _platform_has_bot_credential(platform: "Platform", platform_config: "PlatformConfig") -> bool:
-    """Return True when a token-authenticated platform has a usable bot credential.
+    """Return True when a token-authenticated platform has a usable credential.
 
     Platforms that do not use ``PlatformConfig.token`` always return True so we
     never skip them here (Signal session paths, port-binding HTTP adapters, etc.).
+    Matrix also supports password auth when no access token is configured.
     """
     from gateway.config import PLATFORM_TOKEN_ENV_NAMES
 
@@ -1607,6 +1645,11 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
     api_key = getattr(platform_config, "api_key", None) or ""
     if isinstance(api_key, str) and api_key.strip():
         return True
+    if platform.value == "matrix":
+        extra = getattr(platform_config, "extra", None) or {}
+        password = extra.get("password", "") or os.getenv("MATRIX_PASSWORD", "")
+        if isinstance(password, str) and password.strip():
+            return True
     return False
 
 
@@ -2529,8 +2572,12 @@ def _gateway_config_home() -> Path:
     return _hermes_home
 
 
-def _load_gateway_config() -> dict:
-    """Load and parse ~/.hermes/config.yaml, returning {} on any error.
+def _load_gateway_config(*, strict: bool = False) -> dict:
+    """Load and parse ~/.hermes/config.yaml.
+
+    The default remains fail-open for legacy callers. ``strict=True`` is used by
+    workspace binding enforcement so an unreadable or malformed config cannot
+    silently erase configured bindings and restore a broader fallback cwd.
 
     Uses the module-level ``_hermes_home`` (so tests that monkeypatch it
     still see their fixture) and shares the mtime-keyed raw-yaml cache
@@ -2542,6 +2589,42 @@ def _load_gateway_config() -> dict:
     """
     config_home = _gateway_config_home()
     config_path = config_home / 'config.yaml'
+    if strict:
+        from gateway.workspace_bindings import WorkspaceBindingError
+
+        try:
+            if not config_path.exists():
+                return {}
+            import yaml
+
+            with open(config_path, 'r', encoding='utf-8') as f:
+                loaded = yaml.safe_load(f)
+        except Exception as exc:
+            raise WorkspaceBindingError(
+                f"cannot read workspace binding config from {config_path}"
+            ) from exc
+        if loaded is None:
+            raw = {}
+        elif isinstance(loaded, dict):
+            raw = loaded
+        else:
+            raise WorkspaceBindingError(
+                f"workspace binding config {config_path} is not a mapping"
+            )
+        try:
+            from hermes_cli import managed_scope
+
+            overlaid = managed_scope.apply_managed_overlay(raw)
+        except Exception as exc:
+            raise WorkspaceBindingError(
+                f"cannot apply managed workspace binding config from {config_path}"
+            ) from exc
+        if not isinstance(overlaid, dict):
+            raise WorkspaceBindingError(
+                f"managed workspace binding config {config_path} is not a mapping"
+            )
+        return overlaid
+
     raw: dict = {}
     used_canonical = False
     try:
@@ -6954,7 +7037,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
 
-    async def _redeliver_pending_obligations(self) -> int:
+    async def _redeliver_pending_obligations(
+        self,
+        platform: Optional[Platform] = None,
+    ) -> int:
         """Redeliver final responses recorded in the delivery ledger by a
         previous (now dead) gateway process.
 
@@ -6976,12 +7062,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ledger_enabled,
                 mark_delivered,
                 mark_failed,
+                release_unattempted_claim,
                 sweep_recoverable,
             )
 
             if not ledger_enabled():
                 return 0
-            claimed = await asyncio.to_thread(sweep_recoverable)
+            claimed = await asyncio.to_thread(
+                sweep_recoverable,
+                platform=platform.value if platform is not None else None,
+            )
         except Exception:
             logger.debug("delivery ledger sweep failed", exc_info=True)
             return 0
@@ -7000,8 +7090,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             adapter = self.adapters.get(platform)
             if adapter is None:
-                # Platform not connected this boot — leave the row claimed;
-                # attempts cap + stale cutoff bound the retries on later boots.
+                # No transport attempt occurred. Release the live-process claim
+                # so this platform's reconnect hook can retry immediately.
+                release_unattempted_claim(row["obligation_id"])
                 continue
             content = row["content"]
             if row.get("needs_marker"):
@@ -8596,6 +8687,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             await build_channel_directory(self.adapters)
                         except Exception:
                             pass
+
+                        # Deliver already-produced final responses before any
+                        # interrupted turn is resumed on this newly-live platform.
+                        try:
+                            await self._redeliver_pending_obligations(platform=platform)
+                        except Exception:
+                            logger.debug(
+                                "delivery-ledger retry after %s reconnect failed",
+                                platform.value,
+                                exc_info=True,
+                            )
 
                         # A platform that was offline at gateway startup never
                         # got its restart-interrupted sessions auto-resumed —
@@ -12063,6 +12165,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
+
+        # Bind configured conversation scopes (Matrix rooms initially) to a
+        # first-class Hermes Project before prompt/context-file construction or
+        # tool execution. Invalid configured bindings fail closed instead of
+        # inheriting the gateway's broad default working directory.
+        try:
+            await self._apply_workspace_binding(context)
+        except Exception as exc:
+            from gateway.workspace_bindings import WorkspaceBindingError
+
+            if isinstance(exc, WorkspaceBindingError):
+                logger.error(
+                    "Workspace binding refused for %s:%s: %s",
+                    source.platform.value,
+                    source.chat_id,
+                    exc,
+                )
+                adapter = self._adapter_for_source(source)
+                if adapter:
+                    await adapter.send(
+                        source.chat_id,
+                        "⚠️ This project room's workspace binding is invalid, so "
+                        "Hermes refused to run with a broader fallback folder. "
+                        "Fix the room-to-project binding and try again.",
+                        metadata=self._thread_metadata_for_source(source),
+                    )
+                return None
+            raise
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
@@ -12695,40 +12825,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
         if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
             platform_name = source.platform.value
-            env_key = _home_target_env_var(platform_name)
-            # Multiplex: home channel may live only in the profile secret
-            # scope / PlatformConfig, not process os.environ.
-            home_env = ""
-            try:
-                from agent.secret_scope import get_secret
-
-                home_env = (get_secret(env_key) or "").strip() if env_key else ""
-            except Exception:
-                home_env = ""
-            if not home_env:
-                home_env = (os.getenv(env_key) or "").strip() if env_key else ""
-            # Also honor in-memory / yaml home_channel on this platform.
-            try:
-                if not home_env and self.config.get_home_channel(source.platform):
-                    home_env = "set"
-            except Exception:
-                pass
-            # Secondary-profile platforms (e.g. Slack on yolo) may only exist
-            # under that profile's loaded config — check after scope install.
-            if not home_env:
-                try:
-                    from hermes_cli.profiles import get_profile_dir
-                    from gateway.config import load_gateway_config as _lgc
-                    prof = (getattr(source, "profile", None) or "").strip()
-                    if prof and prof != "default":
-                        # Already inside profile scope for secondary handlers;
-                        # re-read live config for home_channel.
-                        _pcfg = _lgc()
-                        if _pcfg.get_home_channel(source.platform):
-                            home_env = "set"
-                except Exception:
-                    pass
-            if not home_env:
+            if not _platform_has_home_channel(source.platform, self.config):
                 # Slack dispatches all Hermes commands through a single
                 # parent slash command `/hermes`; bare `/sethome` is not
                 # registered and would fail with "app did not respond".
@@ -14964,6 +15061,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cleaned = _prefix_within_utf16_limit(cleaned, 77).rstrip() + "..."
         return cleaned
 
+    def _discord_thread_name_from_chat_name(self, source: SessionSource) -> str | None:
+        """Extract the visible Discord thread name captured at intake time.
+
+        Auto-thread retitling uses a compare-and-swap guard so we don't
+        overwrite human titles. For document/attachment first turns, the
+        agent-facing message can be enriched with document text before the
+        title callback runs, while Discord created the visible thread from the
+        raw starter text. The source chat name still carries that visible
+        Discord thread name (``guild / #channel / thread``), so keep it as an
+        allowed guard seed.
+        """
+        if source.platform != Platform.DISCORD or source.chat_type != "thread":
+            return None
+        chat_name = str(getattr(source, "chat_name", "") or "").strip()
+        if not chat_name:
+            return None
+        if " / " in chat_name:
+            chat_name = chat_name.rsplit(" / ", 1)[-1].strip()
+        return chat_name or None
+
+    def _discord_auto_thread_guard_names(self, source: SessionSource) -> list[str]:
+        """Return candidate auto-created names for Discord retitle CAS guard."""
+        candidates: list[str] = []
+        for value in (
+            getattr(source, "auto_thread_initial_name", None),
+            self._discord_thread_name_from_chat_name(source),
+        ):
+            cleaned = re.sub(r"\s+", " ", str(value or "")).strip()
+            if cleaned and cleaned not in candidates:
+                candidates.append(cleaned)
+        return candidates
+
     async def _rename_discord_auto_thread_for_session_title(
         self,
         source: SessionSource,
@@ -14984,7 +15113,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await rename_thread(
                 str(source.thread_id),
                 thread_name,
-                only_if_current_name=getattr(source, "auto_thread_initial_name", None),
+                only_if_current_name=self._discord_auto_thread_guard_names(source),
             )
         except Exception:
             logger.debug("Failed to rename Discord auto-thread for generated session title", exc_info=True)
@@ -15167,6 +15296,104 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 fut.result()
             except Exception:
                 logger.debug("Telegram topic title rename failed", exc_info=True)
+
+        future.add_done_callback(_log_rename_failure)
+
+    def _discord_smart_thread_titles_enabled(self) -> bool:
+        raw = os.getenv("DISCORD_SMART_THREAD_TITLES", "")
+        return raw.strip().lower() in {"true", "1", "yes", "on"}
+
+    def _is_discord_thread_lane(self, source: SessionSource) -> bool:
+        return source.platform == Platform.DISCORD and source.chat_type == "thread" and bool(source.thread_id)
+
+    async def _rename_discord_thread_for_session_title(
+        self,
+        source: SessionSource,
+        session_id: str,
+        title: str,
+        *,
+        only_if_current_name: str | None = None,
+    ) -> None:
+        """Best-effort visible Discord thread rename when Hermes auto-titles a session."""
+        if not self._discord_smart_thread_titles_enabled():
+            logger.debug("Skipping Discord thread auto-retitle for %s: smart titles disabled", session_id)
+            return
+        if not self._is_discord_thread_lane(source):
+            logger.debug(
+                "Skipping Discord thread auto-retitle for %s: not a Discord thread lane (%s)",
+                session_id,
+                source,
+            )
+            return
+        adapter = self.adapters.get(Platform.DISCORD) if getattr(self, "adapters", None) else None
+        if adapter is None:
+            logger.debug("Skipping Discord thread auto-retitle for %s: Discord adapter missing", session_id)
+            return
+        rename_thread = getattr(adapter, "rename_thread", None)
+        if rename_thread is None:
+            logger.debug("Skipping Discord thread auto-retitle for %s: adapter has no rename_thread", session_id)
+            return
+        try:
+            rename_kwargs = {}
+            if only_if_current_name is not None:
+                rename_kwargs["only_if_current_name"] = only_if_current_name
+            logger.info(
+                "Renaming Discord thread %s for session %s to %r (guard=%r)",
+                source.thread_id,
+                session_id,
+                title,
+                only_if_current_name,
+            )
+            renamed = await rename_thread(str(source.thread_id), title, **rename_kwargs)
+            logger.info(
+                "Discord thread auto-retitle result for %s/%s: %s",
+                session_id,
+                source.thread_id,
+                renamed,
+            )
+        except Exception:
+            logger.warning("Failed to rename Discord thread for auto-generated title", exc_info=True)
+
+    def _schedule_discord_thread_title_rename(
+        self,
+        source: SessionSource,
+        session_id: str,
+        title: str,
+        *,
+        only_if_current_name: str | None = None,
+    ) -> None:
+        """Schedule a Discord thread rename from the auto-title background thread."""
+        if not title or not self._discord_smart_thread_titles_enabled() or not self._is_discord_thread_lane(source):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = getattr(self, "_gateway_loop", None)
+        if loop is None or loop.is_closed():
+            return
+        try:
+            copied_source = dataclasses.replace(source)
+        except Exception:
+            copied_source = source
+        future = safe_schedule_threadsafe(
+            self._rename_discord_thread_for_session_title(
+                copied_source,
+                session_id,
+                title,
+                only_if_current_name=only_if_current_name,
+            ),
+            loop,
+            logger=logger,
+            log_message="Discord thread title rename failed to schedule",
+        )
+        if future is None:
+            return
+
+        def _log_rename_failure(fut) -> None:
+            try:
+                fut.result()
+            except Exception:
+                logger.debug("Discord thread title rename failed", exc_info=True)
 
         future.add_done_callback(_log_rename_failure)
 
@@ -16161,6 +16388,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return None
 
+            if not await self._wait_for_lifecycle_delivery_ready(adapter, platform):
+                return None
+
             metadata = self._thread_metadata_for_target(
                 platform,
                 chat_id,
@@ -16199,6 +16429,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         finally:
             notify_path.unlink(missing_ok=True)
 
+    @staticmethod
+    async def _wait_for_lifecycle_delivery_ready(adapter, platform: Platform) -> bool:
+        """Give adapters with explicit health gating time to become send-ready."""
+        # Resolve on the class so permissive mocks do not manufacture a waiter.
+        waiter = getattr(type(adapter), "wait_until_send_ready", None)
+        if not callable(waiter):
+            return True
+        try:
+            ready = await waiter(adapter)
+        except Exception as exc:
+            logger.warning(
+                "Lifecycle delivery readiness check failed for %s: %s",
+                platform.value,
+                exc,
+            )
+            return False
+        if not ready:
+            logger.warning(
+                "Lifecycle delivery path did not become ready for %s before timeout",
+                platform.value,
+            )
+        return bool(ready)
+
     async def _send_home_channel_startup_notifications(
         self,
         *,
@@ -16232,6 +16485,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             try:
+                if not await self._wait_for_lifecycle_delivery_ready(adapter, platform):
+                    continue
                 metadata = self._thread_metadata_for_target(
                     platform,
                     home.chat_id,
@@ -16279,6 +16534,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return delivered
 
+    async def _apply_workspace_binding(self, context: SessionContext):
+        """Resolve and apply a conversation-scope Project workspace.
+
+        Configured-but-invalid bindings raise ``WorkspaceBindingError`` so the
+        caller can refuse the turn instead of falling back to the gateway's
+        broad default cwd. Project membership remains upstream-owned and is
+        inferred from the persisted session cwd; no parallel assignment store
+        is written here.
+        """
+        from gateway.workspace_bindings import resolve_workspace_binding
+
+        def _resolve_binding():
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                profile_home = self._resolve_profile_home_for_source(context.source)
+                with _profile_runtime_scope(profile_home):
+                    config = _load_gateway_config(strict=True)
+                    return resolve_workspace_binding(config, context.source)
+            config = _load_gateway_config(strict=True)
+            return resolve_workspace_binding(config, context.source)
+
+        binding = await asyncio.to_thread(_resolve_binding)
+        if binding is None:
+            return None
+
+        if self._session_db is not None:
+            await self._session_db.replace_session_cwd(
+                context.session_id,
+                binding.cwd,
+            )
+
+        context.workspace_project_id = binding.project_id
+        context.workspace_project_slug = binding.project_slug
+        context.workspace_project_name = binding.project_name
+        context.workspace_cwd = binding.cwd
+        context.workspace_allowed_folders = binding.allowed_folders
+        return binding
+
     def _set_session_env(self, context: SessionContext) -> list:
         """Set session context variables for the current async task.
 
@@ -16309,6 +16601,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            cwd=context.workspace_cwd,
             async_delivery=_async_delivery,
         )
 
@@ -18467,7 +18760,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if _streaming_enabled:
             try:
-                from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+                from gateway.stream_consumer import (
+                    GatewayStreamConsumer,
+                    StreamConsumerConfig,
+                    StreamDeliveryContext,
+                )
                 _adapter = self._adapter_for_source(source)
                 if _adapter:
                     _pause_typing_before_finalize = None
@@ -18509,6 +18806,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=event_message_id,
                         run_still_current=_run_still_current,
+                        delivery_context=(
+                            StreamDeliveryContext(
+                                session_key=session_key,
+                                message_ref=event_message_id,
+                                platform=source.platform.value,
+                                thread_id=getattr(source, "thread_id", None),
+                            )
+                            if session_key and event_message_id
+                            else None
+                        ),
                     )
             except Exception as _sc_err:
                 logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
@@ -18614,7 +18921,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         finally:
             # Finalize stream consumer
             if _stream_consumer:
-                _stream_consumer.finish()
+                _stream_consumer.finish(full_response)
             if stream_task:
                 try:
                     await asyncio.wait_for(stream_task, timeout=5.0)
@@ -18955,10 +19262,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _phrase_err:
                 logger.debug("generic status phrase selection failed: %s", _phrase_err)
                 return "still on it" if kind in {"heartbeat", "waiting", "long_running", "status"} else "one sec"
-        # Disable tool progress for webhooks - they don't support message editing,
-        # so each progress line would be sent as a separate message.
+        # Disable tool/status chatter on batch/non-interactive sinks. Webhooks
+        # and email can't edit progress in place; emitting progress/status there
+        # creates permanent noisy deliveries instead of useful live feedback.
         from gateway.config import Platform
-        tool_progress_enabled = progress_mode not in {"off", "log"} and source.platform != Platform.WEBHOOK
+        _quiet_delivery_platform = source.platform in (Platform.WEBHOOK, Platform.EMAIL)
+        tool_progress_enabled = progress_mode not in {"off", "log"} and not _quiet_delivery_platform
         # Live working-state status for text-rendering typing indicators
         # (Slack's assistant status line). Independent of tool_progress —
         # Slack defaults tool_progress off (permanent lines spam channels)
@@ -18976,18 +19285,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _live_status_adapter = None
         # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
         # instead of the chat (#3459 / #3458). Gateway-only by design.
-        log_mode_enabled = progress_mode == "log" and source.platform != Platform.WEBHOOK
+        log_mode_enabled = progress_mode == "log" and not _quiet_delivery_platform
         log_queue: "queue.Queue | None" = queue.Queue() if log_mode_enabled else None
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
-        # in chat platforms while opting into concise mid-turn updates.
+        # in chat platforms while opting into concise mid-turn updates. Batch
+        # sinks stay final-answer-only even if global display config is chatty.
         interim_assistant_messages_mode = _display_surface_mode(
             "interim_assistant_messages",
             default=True,
             require_platform_override_for={Platform.MATTERMOST},
         )
         interim_assistant_messages_enabled = (
-            source.platform != Platform.WEBHOOK
+            not _quiet_delivery_platform
             and interim_assistant_messages_mode != "off"
         )
         # thinking_progress is independent — if enabled, we need the progress
@@ -19921,7 +20231,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
                 try:
-                    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+                    from gateway.stream_consumer import (
+                        GatewayStreamConsumer,
+                        StreamConsumerConfig,
+                        StreamDeliveryContext,
+                    )
                     _adapter = self._adapter_for_source(source)
                     if _adapter:
                         _pause_typing_before_finalize = None
@@ -19978,6 +20292,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             on_before_finalize=_pause_typing_before_finalize,
                             initial_reply_to_id=event_message_id,
                             run_still_current=_run_still_current,
+                            delivery_context=(
+                                StreamDeliveryContext(
+                                    session_key=session_key,
+                                    message_ref=event_message_id,
+                                    platform=source.platform.value,
+                                    thread_id=getattr(source, "thread_id", None),
+                                )
+                                if session_key and event_message_id
+                                else None
+                            ),
                         )
                         if _want_stream_deltas:
                             def _stream_delta_cb(text: str) -> None:
@@ -20848,12 +21172,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reset_current_session_key(_approval_session_token)
             result_holder[0] = result
 
-            # Signal the stream consumer that the agent is done
-            if _stream_consumer is not None:
-                _stream_consumer.finish()
-            
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
+
+            # Signal the stream consumer that the agent is done
+            if _stream_consumer is not None:
+                _stream_consumer.finish(
+                    "" if result.get("response_transformed") else final_response
+                )
 
             # Extract actual token counts from the agent instance used for this run
             _last_prompt_toks = 0
@@ -21070,18 +21396,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             and getattr(agent, "provider", None) == _title_provider
                         )) if agent else None,
                     }
+                    title_callbacks = []
                     if self._is_telegram_topic_lane(source):
-                        maybe_auto_title_kwargs["title_callback"] = lambda title: self._schedule_telegram_topic_title_rename(
-                            source,
-                            effective_session_id,
-                            title,
+                        title_callbacks.append(
+                            lambda title: self._schedule_telegram_topic_title_rename(
+                                source,
+                                effective_session_id,
+                                title,
+                            )
                         )
-                    elif self._is_discord_auto_thread_lane(source):
-                        maybe_auto_title_kwargs["title_callback"] = lambda title: self._schedule_discord_semantic_thread_rename(
-                            source,
-                            effective_session_id,
-                            title,
+                    if self._is_discord_auto_thread_lane(source):
+                        title_callbacks.append(
+                            lambda title: self._schedule_discord_semantic_thread_rename(
+                                source,
+                                effective_session_id,
+                                title,
+                            )
                         )
+                    if title_callbacks:
+
+                        def _run_title_callbacks(title: str) -> None:
+                            for callback in title_callbacks:
+                                callback(title)
+
+                        maybe_auto_title_kwargs["title_callback"] = _run_title_callbacks
                     maybe_auto_title(
                         getattr(self._session_db, "_db", self._session_db),
                         effective_session_id,
@@ -21257,7 +21595,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             default=True,
             allow_generic=True,
         )
-        if _long_running_mode == "off":
+        if _quiet_delivery_platform or _long_running_mode == "off":
             _NOTIFY_INTERVAL = None
         _notify_start = time.time()
 
@@ -21977,7 +22315,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _final,
                 previewed=_previewed,
             )
-            if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered):
+            if (
+                event_message_id
+                and not _is_empty_sentinel
+                and not _transformed
+                and (_streamed or _content_delivered)
+            ):
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",
@@ -21986,24 +22329,89 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _content_delivered,
                 )
                 response["already_sent"] = True
-            elif not _is_empty_sentinel and _transformed and _sc is not None:
+            elif (
+                event_message_id
+                and not _is_empty_sentinel
+                and _transformed
+                and _sc is not None
+            ):
                 # Plugin hooks transformed the response after streaming — edit the
                 # existing streamed message instead of sending a duplicate.
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
+                    _transformed_obligation_id = None
                     try:
-                        await _sc.adapter.edit_message(
+                        from gateway.delivery_ledger import (
+                            compute_obligation_id,
+                            ledger_enabled,
+                            mark_attempting,
+                            record_obligation,
+                        )
+
+                        if ledger_enabled() and session_key and event_message_id:
+                            _transformed_content = str(response["final_response"])
+                            _transformed_obligation_id = compute_obligation_id(
+                                session_key,
+                                event_message_id,
+                                _transformed_content,
+                            )
+                            record_obligation(
+                                obligation_id=_transformed_obligation_id,
+                                session_key=session_key,
+                                platform=source.platform.value,
+                                chat_id=source.chat_id,
+                                thread_id=getattr(source, "thread_id", None),
+                                content=_transformed_content,
+                            )
+                            mark_attempting(_transformed_obligation_id)
+                    except Exception:
+                        logger.debug(
+                            "Could not record transformed stream delivery obligation",
+                            exc_info=True,
+                        )
+                    try:
+                        _edit_result = await _sc.adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if getattr(_edit_result, "success", False):
+                            response["already_sent"] = True
+                            if _transformed_obligation_id:
+                                from gateway.delivery_ledger import mark_delivered
+
+                                mark_delivered(_transformed_obligation_id)
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
+                        else:
+                            if _transformed_obligation_id:
+                                from gateway.delivery_ledger import mark_failed
+
+                                mark_failed(
+                                    _transformed_obligation_id,
+                                    getattr(_edit_result, "error", None)
+                                    or "transformed stream edit failed",
+                                )
+                            logger.warning(
+                                "Failed to edit streamed message %s for session %s: %s",
+                                _sc_msg_id,
+                                session_key or "?",
+                                getattr(_edit_result, "error", None) or "unknown error",
+                            )
                     except Exception as _edit_err:
+                        if _transformed_obligation_id:
+                            try:
+                                from gateway.delivery_ledger import mark_failed
+
+                                mark_failed(_transformed_obligation_id, str(_edit_err))
+                            except Exception:
+                                logger.debug(
+                                    "Could not update transformed stream delivery obligation",
+                                    exc_info=True,
+                                )
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",
                             session_key or "?", _edit_err,

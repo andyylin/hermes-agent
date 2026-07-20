@@ -6,6 +6,7 @@ but nothing reaches the recipient.  ``_send_path_degraded`` short-circuits
 ``send()`` so cron's live-adapter branch falls through to standalone HTTP.
 """
 import sys
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -62,6 +63,30 @@ async def test_send_short_circuits_when_path_degraded():
     assert result.error == "send_path_degraded"
     assert result.retryable is True
     adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_wait_until_send_ready_unblocks_on_polling_progress():
+    """Startup lifecycle sends can wait for the first healthy long poll."""
+    adapter = _make_adapter()
+    generation, _ = adapter._begin_polling_generation()
+
+    waiter = asyncio.create_task(adapter.wait_until_send_ready(timeout=1))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    adapter._record_polling_progress(generation)
+
+    assert await waiter is True
+    assert adapter._send_path_degraded is False
+
+
+@pytest.mark.asyncio
+async def test_wait_until_send_ready_times_out_while_degraded():
+    adapter = _make_adapter()
+    adapter._begin_polling_generation()
+
+    assert await adapter.wait_until_send_ready(timeout=0) is False
 
 
 @pytest.mark.asyncio

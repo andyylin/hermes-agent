@@ -13,6 +13,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import inspect
+import io
 import json
 import logging
 import math
@@ -47,6 +48,7 @@ class _Snowflake:
         self.id = id
 
 VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
+DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES = 10080
 _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
@@ -94,6 +96,8 @@ _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS = (
     ),
     re.compile(r"^\s*♻️?\s+Gateway\s+(?:restarted successfully|online\b)[\s\S]*$", re.IGNORECASE),
 )
+
+
 
 try:
     import discord
@@ -298,6 +302,104 @@ def _clean_discord_id(entry: str) -> str:
     if entry.lower().startswith("user:"):
         entry = entry[5:]
     return entry.strip()
+
+
+def _discord_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _discord_thread_auto_archive_minutes() -> int:
+    """Return the configured Discord thread auto-archive duration."""
+    raw = os.getenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", "").strip()
+    try:
+        value = int(raw) if raw else DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES
+    except ValueError:
+        value = DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES
+    if value not in VALID_THREAD_AUTO_ARCHIVE_MINUTES:
+        logger.warning(
+            "Invalid DISCORD_THREAD_AUTO_ARCHIVE_MINUTES=%r; using %s",
+            raw,
+            DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
+        )
+        return DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES
+    return value
+
+
+def _truncate_thread_name(name: str, limit: int = 80) -> str:
+    if len(name) <= limit:
+        return name
+    return name[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _strip_discord_noise(content: str) -> str:
+    """Remove Discord syntax that makes terrible human-facing thread names."""
+    text = content or ""
+    text = re.sub(r"<@[!&]?\d+>", "", text)
+    text = re.sub(r"<#\d+>", "", text)
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"[`*_~>#]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" -–—:\t\n\r")
+    return text
+
+
+def _strip_gateway_speaker_prefix(content: str) -> str:
+    """Strip gateway-added speaker prefixes from messages used as title guards.
+
+    Discord auto-thread creation sees the raw Discord message, while the agent
+    conversation text may be prefixed as ``[display name] message`` before title
+    generation.  Guard comparisons must compare against the visible raw-thread
+    name, not treat that prefix as a human rename.
+    """
+    text = (content or "").strip()
+    match = re.match(r"^\[[^\]\n]{1,80}\]\s+(.+)$", text, flags=re.DOTALL)
+    return match.group(1).strip() if match else text
+
+
+def _legacy_auto_thread_name(content: str) -> str:
+    text = _strip_discord_noise(_strip_gateway_speaker_prefix(content))
+    return _truncate_thread_name(text) if text else "Hermes"
+
+
+def _build_auto_thread_name(content: str) -> str:
+    """Build a deterministic smart title for Discord auto-created threads."""
+    # The gateway can prefix agent-facing messages as ``[sender] message``.
+    # Discord's visible auto-thread name is created from the raw message, so
+    # helpers used for initial names and retitle guards must normalize the same
+    # way. Otherwise long starter messages get stuck as ugly prefixed slices and
+    # compare-and-swap retitles can misclassify untouched threads as human-edited.
+    text = _strip_discord_noise(_strip_gateway_speaker_prefix(content))
+    if not text:
+        return "Hermes"
+
+    # Prefer the first meaningful clause/sentence instead of the whole ramble.
+    clauses = [
+        p.strip(" -–—:")
+        for p in re.split(r"[\n.!?;]+|\s+[–—-]\s+", text)
+        if p.strip(" -–—:")
+    ]
+    if clauses:
+        text = clauses[0]
+
+    # Strip common request boilerplate, but never strip down to empty.
+    openers = [
+        r"^(?:hey|hi|hello)\s+(?:hermes|joi|bot)?[,\s:;-]*",
+        r"^(?:can|could|would)\s+you\s+",
+        r"^please\s+",
+        r"^(?:help\s+me|help)\s+(?:to\s+)?",
+        r"^what(?:'s| is)\s+the\s+next\s+step\s+for\s+",
+        r"^how\s+do\s+i\s+",
+        r"^i\s+need\s+(?:you\s+to\s+)?",
+    ]
+    candidate = text
+    for pattern in openers:
+        stripped = re.sub(pattern, "", candidate, flags=re.IGNORECASE).strip(" -–—:")
+        if stripped:
+            candidate = stripped
+
+    return _truncate_thread_name(candidate) if candidate else "Hermes"
 
 
 def check_discord_requirements() -> bool:
@@ -818,6 +920,37 @@ def _read_discord_prompt_timeout() -> int:
     return seconds
 
 
+def _discord_app_command_scope_kwargs() -> Dict[str, Any]:
+    """Return explicit slash-command install/context defaults for discord.py.
+
+    Discord application defaults can be user-install only. If Hermes lets
+    discord.py inherit those defaults, global slash commands can register with
+    ``integration_types=[1]`` and disappear from guild slash menus even while
+    the bot handles normal server messages. Pin both install scopes and all
+    supported contexts at bot construction so newly synced commands are visible
+    in guilds, DMs, and user/private contexts.
+    """
+    if not DISCORD_AVAILABLE or discord is None:
+        return {}
+    app_commands = getattr(discord, "app_commands", None)
+    installation_type = getattr(app_commands, "AppInstallationType", None)
+    command_context = getattr(app_commands, "AppCommandContext", None)
+    if installation_type is None or command_context is None:
+        return {}
+    try:
+        return {
+            "allowed_installs": installation_type(guild=True, user=True),
+            "allowed_contexts": command_context(
+                guild=True,
+                dm_channel=True,
+                private_channel=True,
+            ),
+        }
+    except Exception:
+        logger.debug("Discord app-command scope defaults are unavailable", exc_info=True)
+        return {}
+
+
 class DiscordAdapter(BasePlatformAdapter):
     """
     Discord bot adapter.
@@ -1148,6 +1281,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 command_prefix="!",  # Not really used, we handle raw messages
                 intents=intents,
                 allowed_mentions=_build_allowed_mentions(),
+                **_discord_app_command_scope_kwargs(),
                 **proxy_kwargs_for_bot(proxy_url),
             )
             adapter_self = self  # capture for closure
@@ -2813,6 +2947,79 @@ class DiscordAdapter(BasePlatformAdapter):
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
 
+    @staticmethod
+    def _strip_copy_fence_markers(content: str) -> str:
+        """Remove valid internal copy hints without touching ordinary comments."""
+        return re.sub(
+            r"(?m)^[ \t]*<!--\s*hermes:copy\s*-->[ \t]*\n(?=```)",
+            "",
+            content,
+        )
+
+    def _standalone_fenced_chunks(self, content: str) -> List[str]:
+        """Split only explicitly copy-marked fences into standalone messages.
+
+        ``<!-- hermes:copy -->`` immediately before a triple-backtick fence is
+        an internal delivery hint: Discord mobile exposes a convenient copy
+        action when that fence is its own message.  The marker is removed before
+        delivery.  Unmarked fences stay with the surrounding prose so examples,
+        status output, and illustrative lists do not shatter a coherent answer.
+        Every resulting segment still passes through the normal length-aware
+        splitter, so Discord never receives an oversized text payload.
+        """
+        formatted = self.format_message(content)
+        fence_re = re.compile(
+            r"^[ \t]*<!--\s*hermes:copy\s*-->[ \t]*\n"
+            r"(?P<fence>^```[^\n]*(?:\n|$).*?^```[ \t]*(?=\n|$))",
+            re.MULTILINE | re.DOTALL,
+        )
+        segments: List[str] = []
+        cursor = 0
+        for match in fence_re.finditer(formatted):
+            prose = formatted[cursor:match.start()].strip()
+            if prose:
+                segments.extend(
+                    self.truncate_message(prose, self.MAX_MESSAGE_LENGTH)
+                )
+            fence = match.group("fence").strip("\n")
+            if fence:
+                segments.extend(
+                    self.truncate_message(fence, self.MAX_MESSAGE_LENGTH)
+                )
+            cursor = match.end()
+
+        tail = formatted[cursor:].strip()
+        if tail:
+            segments.extend(self.truncate_message(tail, self.MAX_MESSAGE_LENGTH))
+
+        if segments:
+            return segments
+        return self.truncate_message(
+            self._strip_copy_fence_markers(formatted),
+            self.MAX_MESSAGE_LENGTH,
+        )
+
+    def _oversized_fence_file(self, content: str) -> Optional[Any]:
+        """Return a TXT attachment when the response is one oversized fence."""
+        formatted = self._strip_copy_fence_markers(
+            self.format_message(content).strip()
+        )
+        match = re.fullmatch(
+            r"```[^\n]*(?:\n|$).*\n```[ \t]*",
+            formatted,
+            re.DOTALL,
+        )
+        if not match or len(formatted) <= self.MAX_MESSAGE_LENGTH:
+            return None
+        # Strip only the Markdown fence; preserve the code payload exactly.
+        first_newline = formatted.find("\n")
+        payload = formatted[first_newline + 1:] if first_newline >= 0 else ""
+        payload = re.sub(r"\n```[ \t]*$", "", payload)
+        return discord.File(
+            io.BytesIO(payload.encode("utf-8")),
+            filename="hermes-code-block.txt",
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -2854,6 +3061,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
 
+            oversized_fence = self._oversized_fence_file(content)
+            if oversized_fence is not None:
+                if self._is_forum_parent(channel):
+                    return await self._forum_post_file(
+                        channel,
+                        content="Code attached as TXT.",
+                        file=oversized_fence,
+                    )
+                msg = await channel.send(
+                    content="Code attached as TXT.",
+                    file=oversized_fence,
+                )
+                return SendResult(success=True, message_id=str(msg.id))
+
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
                 result = await self._send_to_forum(channel, content)
@@ -2866,9 +3087,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 return result
 
-            # Format and split message if needed
-            formatted = self.format_message(content)
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            # Keep only explicitly copy-marked fences in standalone Discord
+            # messages. Ordinary fences remain with their surrounding prose.
+            chunks = self._standalone_fenced_chunks(content)
 
             message_ids = []
             reference = None
@@ -2966,8 +3187,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # _derive_forum_thread_name is defined further down in this same
         # module — no cross-module import needed.
 
-        formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        chunks = self._standalone_fenced_chunks(content)
 
         thread_name = _derive_forum_thread_name(content)
 
@@ -3099,7 +3319,35 @@ class DiscordAdapter(BasePlatformAdapter):
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
             msg = await channel.fetch_message(int(message_id))
-            formatted = self.format_message(content)
+            formatted = self._strip_copy_fence_markers(
+                self.format_message(content)
+            )
+
+            # On the final streaming edit, isolate explicitly copy-marked fences
+            # and send any remaining segments as continuations. Mid-stream
+            # previews stay in one editable message.
+            if finalize:
+                oversized_fence = self._oversized_fence_file(content)
+                if oversized_fence is not None:
+                    await msg.edit(content="Code attached as TXT.")
+                    sent = await channel.send(file=oversized_fence)
+                    sent_id = str(sent.id)
+                    self._last_self_message_id[str(channel.id)] = sent_id
+                    return SendResult(
+                        success=True,
+                        message_id=sent_id,
+                        continuation_message_ids=(sent_id,),
+                    )
+
+                final_chunks = self._standalone_fenced_chunks(content)
+                if len(final_chunks) > 1:
+                    return await self._edit_overflow_split(
+                        channel,
+                        msg,
+                        message_id,
+                        content,
+                        chunks=final_chunks,
+                    )
 
             _preview_key = (str(chat_id), str(message_id))
             _saturated_preview = False
@@ -3191,11 +3439,13 @@ class DiscordAdapter(BasePlatformAdapter):
         msg: Any,
         message_id: str,
         content: str,
+        *,
+        chunks: Optional[List[str]] = None,
     ) -> SendResult:
-        """Deliver an oversized final edit across message + continuations.
+        """Deliver a segmented final edit across message + continuations.
 
-        Edit the original ``message_id`` with chunk 1 (fence-aware, with the
-        usual ``(1/N)`` indicator), then send chunks 2..N as new messages each
+        Edit the original ``message_id`` with chunk 1, then send chunks 2..N
+        as new messages each
         threaded as a reply to the previous chunk so Discord groups them
         visually.  Returns ``SendResult(success=True, message_id=<last-id>,
         continuation_message_ids=(...))`` so the stream consumer keeps editing
@@ -3209,8 +3459,11 @@ class DiscordAdapter(BasePlatformAdapter):
         saw would be the worse outcome.  Only a first-chunk edit failure
         returns ``success=False`` (a real adapter problem, not overflow).
         """
-        formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        formatted = self._strip_copy_fence_markers(
+            self.format_message(content)
+        )
+        if chunks is None:
+            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         if len(chunks) <= 1:
             # Defensive: caller's pre-flight should guarantee >1 chunk, but if
             # not, just edit normally.
@@ -5082,7 +5335,7 @@ class DiscordAdapter(BasePlatformAdapter):
             interaction: discord.Interaction,
             name: str,
             message: str = "",
-            auto_archive_duration: int = 1440,
+            auto_archive_duration: int = DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
         ):
             # defer() is performed inside the handler *after* the auth gate
             # so a rejected invoker can receive an ephemeral rejection.
@@ -5528,7 +5781,7 @@ class DiscordAdapter(BasePlatformAdapter):
         interaction: discord.Interaction,
         name: str,
         message: str = "",
-        auto_archive_duration: int = 1440,
+        auto_archive_duration: int = DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
     ) -> None:
         """Create a Discord thread from a slash command and start a session in it."""
         if not await self._check_slash_authorization(interaction, "/thread"):
@@ -6127,7 +6380,7 @@ class DiscordAdapter(BasePlatformAdapter):
         *,
         name: str,
         message: str = "",
-        auto_archive_duration: int = 1440,
+        auto_archive_duration: int = DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
     ) -> Dict[str, Any]:
         """Create a thread in the current Discord channel.
 
@@ -6202,19 +6455,13 @@ class DiscordAdapter(BasePlatformAdapter):
         Strip Discord mention syntax (users / roles / channels) so thread
         titles don't show raw <@id>, <@&id>, or <#id> markers — the ID
         isn't meaningful to humans glancing at the thread list (#6336).
-        Real semantic naming is done after the first agent turn, when
-        Hermes has an LLM-generated session title and can safely rename
-        only this newly-created thread.
+        When smart thread titles are enabled, use the deterministic first-clause
+        placeholder; semantic LLM retitling still happens after the first agent
+        turn and is guarded against clobbering human renames.
         """
-        content = (content or "").strip()
-        # <@123>, <@!123>, <@&123>, <#123> — collapse to empty; normalize spaces.
-        content = re.sub(r"<@[!&]?\d+>", "", content)
-        content = re.sub(r"<#\d+>", "", content)
-        content = re.sub(r"\s+", " ", content).strip()
-        thread_name = content[:80] if content else "Hermes"
-        if len(content) > 80:
-            thread_name = thread_name[:77] + "..."
-        return thread_name
+        if _discord_bool_env("DISCORD_SMART_THREAD_TITLES", False):
+            return _build_auto_thread_name(content)
+        return _legacy_auto_thread_name(content)
 
     async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
         """Create a thread from a user message for auto-threading.
@@ -6234,7 +6481,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
         for attempt in range(2):
             try:
-                thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
+                thread = await message.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=_discord_thread_auto_archive_minutes(),
+                )
                 try:
                     setattr(thread, "_hermes_auto_thread_initial_name", thread_name)
                 except Exception:
@@ -6248,7 +6498,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     )
                     thread = await seed_msg.create_thread(
                         name=thread_name,
-                        auto_archive_duration=1440,
+                        auto_archive_duration=_discord_thread_auto_archive_minutes(),
                         reason=reason,
                     )
                     try:
@@ -6278,12 +6528,15 @@ class DiscordAdapter(BasePlatformAdapter):
         thread_id: str,
         name: str,
         *,
-        only_if_current_name: Optional[str] = None,
+        only_if_current_name: Optional[str | list[str] | tuple[str, ...] | set[str]] = None,
     ) -> bool:
         """Best-effort Discord thread rename.
 
         ``only_if_current_name`` prevents overwriting human-renamed or
-        pre-existing threads.  This is intentionally a no-op on mismatch.
+        pre-existing threads.  It may be a single expected seed title or a
+        collection of seed titles when the agent-facing message differs from
+        the raw Discord thread starter (for example text-document injection).
+        This is intentionally a no-op on mismatch.
         """
         if not self._client or not DISCORD_AVAILABLE:
             return False
@@ -6311,12 +6564,23 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
 
         current_name = getattr(thread, "name", None)
-        if only_if_current_name is not None and current_name != only_if_current_name:
-            logger.info(
-                "[%s] Discord semantic thread rename skipped for %s: current name %r != expected %r",
-                self.name, thread_id, current_name, only_if_current_name,
-            )
-            return False
+        if only_if_current_name is not None:
+            if isinstance(only_if_current_name, (list, tuple, set)):
+                raw_expected_names = [str(name or "") for name in only_if_current_name]
+            else:
+                raw_expected_names = [str(only_if_current_name or "")]
+            expected_names = set()
+            for raw_expected in raw_expected_names:
+                expected_names.add(raw_expected)
+                expected_names.add(_strip_gateway_speaker_prefix(raw_expected))
+            expected_names = {re.sub(r"\s+", " ", name).strip() for name in expected_names}
+            expected_names.discard("")
+            if current_name not in expected_names:
+                logger.info(
+                    "[%s] Discord semantic thread rename skipped for %s: current name %r != expected %r",
+                    self.name, thread_id, current_name, sorted(expected_names),
+                )
+                return False
         if current_name == cleaned:
             return True
 
@@ -6324,7 +6588,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if edit is None:
             return False
         try:
-            await edit(name=cleaned, reason="Hermes semantic session title")
+            await edit(name=cleaned, reason="Hermes auto-generated conversation title")
             logger.info(
                 "[%s] Renamed Discord thread %s from %r to %r",
                 self.name, thread_id, current_name, cleaned,
@@ -6383,7 +6647,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if create is not None:
                 thread = await create(
                     name=thread_name,
-                    auto_archive_duration=1440,
+                    auto_archive_duration=_discord_thread_auto_archive_minutes(),
                     reason=reason,
                 )
                 return str(thread.id)
@@ -6401,7 +6665,7 @@ class DiscordAdapter(BasePlatformAdapter):
             seed_msg = await send(f"\U0001f9f5 Hermes handoff: **{thread_name}**")
             thread = await seed_msg.create_thread(
                 name=thread_name,
-                auto_archive_duration=1440,
+                auto_archive_duration=_discord_thread_auto_archive_minutes(),
                 reason=reason,
             )
             return str(thread.id)
@@ -7162,7 +7426,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
-            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
+            skip_thread = bool(channel_keys & no_thread_channels)
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
@@ -9341,6 +9605,10 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
     if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
+    if "thread_auto_archive_minutes" in discord_cfg and not os.getenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES"):
+        os.environ["DISCORD_THREAD_AUTO_ARCHIVE_MINUTES"] = str(discord_cfg["thread_auto_archive_minutes"])
+    if "smart_thread_titles" in discord_cfg and not os.getenv("DISCORD_SMART_THREAD_TITLES"):
+        os.environ["DISCORD_SMART_THREAD_TITLES"] = str(discord_cfg["smart_thread_titles"]).lower()
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
         os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
     seeded_extra = {}

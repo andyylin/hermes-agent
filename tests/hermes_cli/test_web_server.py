@@ -609,10 +609,20 @@ class TestWebServerEndpoints:
         import hermes_cli.web_server as web_server
 
         original_dependency_importable = web_server._dependency_importable
+        original_is_configured = web_server._memory_provider_is_configured
         monkeypatch.setattr(
             web_server,
             "_dependency_importable",
             lambda dep: True if dep == "honcho-ai" else original_dependency_importable(dep),
+        )
+        monkeypatch.setattr(
+            web_server,
+            "_memory_provider_is_configured",
+            lambda name, provider: (
+                False
+                if name == "honcho"
+                else original_is_configured(name, provider)
+            ),
         )
 
         resp = self.client.get("/api/memory")
@@ -6180,6 +6190,20 @@ class TestModelContextLength:
         result = _normalize_config_for_web(cfg)
         assert result["model_context_length"] == 0
 
+    def test_normalize_stringifies_json_unsafe_integers(self):
+        """Desktop must not receive Discord snowflakes as JS-rounded numbers."""
+        from hermes_cli.web_server import _normalize_config_for_web
+
+        snowflake = 1495601377412513923
+        result = _normalize_config_for_web({
+            "discord": {
+                "free_response_channels": [snowflake],
+                "allowed_channels": [42],
+            }
+        })
+        assert result["discord"]["free_response_channels"] == [str(snowflake)]
+        assert result["discord"]["allowed_channels"] == [42]
+
     def test_denormalize_writes_context_length_into_model_dict(self):
         """denormalize should write model_context_length back into model dict."""
         from hermes_cli.web_server import _denormalize_config_from_web
@@ -8555,6 +8579,25 @@ class TestPtyWebSocket:
             ):
                 pass
         assert exc.value.code == 4400
+
+    def test_events_sends_heartbeat_to_keep_idle_proxy_alive(self, monkeypatch):
+        """Idle /api/events subscribers get periodic JSON heartbeats.
+
+        Cloudflare/reverse proxies can reap quiet WebSockets before the next
+        tool event. The heartbeat keeps the sidebar event feed alive while
+        remaining harmless to clients that only handle known event types.
+        """
+        monkeypatch.setattr(self.ws_module, "_EVENTS_WS_HEARTBEAT_SECONDS", 0.01)
+
+        with self.client.websocket_connect(
+            f"/api/events?token={self.token}&channel=heartbeat-test"
+        ) as conn:
+            frame = json.loads(conn.receive_text())
+
+        assert frame == {
+            "method": "event",
+            "params": {"type": "heartbeat", "payload": {}},
+        }
 
 
 def test_resolve_chat_argv_injects_gateway_ws_url(monkeypatch):

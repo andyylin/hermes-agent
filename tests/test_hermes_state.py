@@ -75,6 +75,22 @@ def db(tmp_path):
     session_db.close()
 
 
+def test_default_db_path_resolves_hermes_home_at_construction(tmp_path, monkeypatch):
+    """A module imported before HERMES_HOME changes must not retain the old DB."""
+    stale_path = tmp_path / "stale-home" / "state.db"
+    active_home = tmp_path / "active-home"
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", stale_path)
+    monkeypatch.setenv("HERMES_HOME", str(active_home))
+
+    session_db = SessionDB()
+    try:
+        assert session_db.db_path == active_home / "state.db"
+        assert session_db.db_path.exists()
+        assert not stale_path.exists()
+    finally:
+        session_db.close()
+
+
 # =========================================================================
 # Session lifecycle
 # =========================================================================
@@ -168,6 +184,22 @@ class TestSessionLifecycle:
         db.update_session_cwd("s1", "/work/repo", git_repo_root="")
 
         assert db.get_session("s1")["git_repo_root"] == "/work/repo"
+
+    def test_delayed_git_metadata_cannot_revert_a_new_workspace(self, db):
+        db.create_session(session_id="s1", source="cli", cwd="/old")
+        db.replace_session_cwd("s1", "/new")
+
+        db.update_session_git_meta_if_cwd(
+            "s1",
+            "/old",
+            git_branch="stale",
+            git_repo_root="/old",
+        )
+
+        session = db.get_session("s1")
+        assert session["cwd"] == "/new"
+        assert session["git_branch"] is None
+        assert session["git_repo_root"] is None
 
     def test_distinct_session_cwds_aggregates_history(self, db):
         db.create_session("s1", "cli", cwd="/repo")
@@ -4734,10 +4766,11 @@ class TestVacuum:
 
 class TestOptimizeFts:
     def test_optimize_returns_index_count(self, db):
-        """A fresh DB has both FTS indexes; optimize merges both."""
+        """Optimize returns the number of available FTS indexes."""
         db.create_session(session_id="s1", source="cli")
         db.append_message(session_id="s1", role="user", content="hello world")
-        assert db.optimize_fts() == 2
+        expected = 1 + int(db._trigram_available)
+        assert db.optimize_fts() == expected
 
     def test_optimize_preserves_search_and_snippet(self, db):
         """Optimize is layout-only: MATCH results + snippets are unchanged."""
@@ -4750,7 +4783,7 @@ class TestOptimizeFts:
             )
         before = db.search_messages("needle")
         n = db.optimize_fts()
-        assert n == 2
+        assert n == 1 + int(db._trigram_available)
         after = db.search_messages("needle")
         assert len(after) == len(before)
         assert len(after) > 0
@@ -4784,8 +4817,9 @@ class TestOptimizeFts:
         """Running optimize twice is safe (second pass is a no-op merge)."""
         db.create_session(session_id="s1", source="cli")
         db.append_message(session_id="s1", role="user", content="repeat me")
-        assert db.optimize_fts() == 2
-        assert db.optimize_fts() == 2
+        expected = 1 + int(db._trigram_available)
+        assert db.optimize_fts() == expected
+        assert db.optimize_fts() == expected
         # Search still works after repeated optimization.
         assert len(db.search_messages("repeat")) == 1
 
@@ -6307,4 +6341,3 @@ class TestLoneSurrogatePersistence:
         db.create_session("s1", source="cli")
         assert db.set_session_title("s1", "title \ud835 bad") is True
         assert db.get_session("s1")["title"] == "title \ufffd bad"
-

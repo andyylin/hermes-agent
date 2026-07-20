@@ -6163,8 +6163,96 @@ def _format_time_ago(iso_ts: str) -> str:
         return "recently"
 
 
+_DASHBOARD_SYSTEMD_UNIT = "hermes-dashboard.service"
+
+
+def _restart_managed_dashboard_service(
+    reason: str,
+    unit: str = _DASHBOARD_SYSTEMD_UNIT,
+) -> bool:
+    """Restart a systemd-managed dashboard instead of raw-killing its PID.
+
+    Returns True when a dashboard unit was found and handled (successfully or
+    with a printed actionable failure).  Returning True deliberately prevents
+    the caller from falling back to ``os.kill``: systemd treats a direct
+    SIGTERM of the service's main PID as a clean stop, so ``Restart=on-failure``
+    will not bring the dashboard back.
+    """
+    if sys.platform == "win32":
+        return False
+
+    def _systemctl(*args: str, timeout: int = 10) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["systemctl", *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    try:
+        listed = _systemctl("list-unit-files", unit, "--no-legend", "--no-pager")
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+    if listed.returncode != 0 or unit not in (listed.stdout or ""):
+        return False
+
+    try:
+        active = _systemctl("is-active", unit)
+        enabled = _systemctl("is-enabled", unit)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+    active_state = (active.stdout or "").strip()
+    enabled_state = (enabled.stdout or "").strip()
+    if active_state != "active" and enabled_state not in {
+        "enabled",
+        "enabled-runtime",
+        "linked",
+        "linked-runtime",
+        "static",
+        "generated",
+    }:
+        return False
+
+    print()
+    print(f"⟲ Restarting managed dashboard service ({reason})")
+
+    errors: list[str] = []
+    for command in (("systemctl", "restart", unit), ("sudo", "-n", "systemctl", "restart", unit)):
+        try:
+            result = subprocess.run(
+                list(command),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+            errors.append(f"{' '.join(command)}: {e}")
+            continue
+        if result.returncode == 0:
+            print(f"    ✓ restarted {unit}")
+            return True
+        errors.append(
+            f"{' '.join(command)}: {(result.stderr or result.stdout or '').strip()}"
+        )
+
+    print(f"    ✗ failed to restart {unit}")
+    for err in errors:
+        if err.strip():
+            print(f"      {err}")
+    print(
+        "  Dashboard is managed by systemd; not raw-killing its PID because "
+        "systemd would treat that as a clean stop."
+    )
+    print(f"  Restart manually: sudo systemctl restart {unit}")
+    return True
+
+
 def _kill_stale_dashboard_processes(
     reason: str = "the running backend no longer matches the updated frontend",
+    *,
+    restart_managed: bool = False,
 ) -> None:
     """Kill running ``hermes dashboard`` processes.
 
@@ -6180,10 +6268,15 @@ def _kill_stale_dashboard_processes(
     Windows: ``taskkill /PID <pid> /F`` since there's no clean SIGTERM
     equivalent for background console apps.
 
-    The dashboard isn't auto-restarted because we don't know the original
-    launch args (--host, --port, --insecure, --tui, --no-open).  The user
-    restarts it manually; a hint is printed.
+    Manually-started dashboards are not auto-restarted because we don't know
+    the original launch args (--host, --port, --insecure, --tui, --no-open).
+    When ``restart_managed`` is true (the ``hermes update`` path), a detected
+    ``hermes-dashboard.service`` is restarted through systemd instead of
+    raw-killing its main PID.
     """
+    if restart_managed and _restart_managed_dashboard_service(reason):
+        return
+
     # When the Hermes Desktop Electron app spawns this dashboard as a
     # backend child, it sets HERMES_DESKTOP_CHILD_PID so that the update
     # path can skip killing the desktop-managed process.  (#37532)
@@ -6528,14 +6621,15 @@ def _update_via_zip(args):
         _print_curator_recent_run_notice()
     except Exception as e:
         logger.debug("Curator recent-run notice failed: %s", e)
-    # Don't stop a working dashboard when the Node refresh failed — see the
-    # git-update path for rationale (#30271).
+    # Don't stop a working dashboard when the Node refresh failed. When it
+    # succeeded, restart a systemd-managed dashboard rather than raw-killing its
+    # PID; otherwise stop stale manual dashboard processes.
     if node_failures:
         print()
         print("  ℹ Leaving running dashboard process(es) untouched because the")
         print("    Node.js dependency refresh did not complete.")
     else:
-        _kill_stale_dashboard_processes()
+        _kill_stale_dashboard_processes(restart_managed=True)
 
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
@@ -11395,22 +11489,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as e:
             logger.debug("Legacy unit check during update failed: %s", e)
 
-        # Kill stale dashboard processes — the dashboard has no service
-        # manager, so leaving it alive after a code update produces a
-        # silent frontend/backend mismatch.  We can't auto-restart it
-        # (no saved launch args) but we can stop it, and a hint is
-        # printed for the user to re-launch.
-        #
-        # Exception: if the Node dependency refresh failed, the rebuilt
-        # frontend the new backend expects may not exist, so stopping a
-        # working dashboard would leave the user with nothing running
-        # rather than a usable (if mixed) state (#30271). Leave it alone.
+        # Preserve a working dashboard when the Node refresh failed. Otherwise
+        # restart the managed service or stop stale manual dashboard processes.
         if node_failures:
             print()
             print("  ℹ Leaving running dashboard process(es) untouched because the")
             print("    Node.js dependency refresh did not complete.")
         else:
-            _kill_stale_dashboard_processes()
+            _kill_stale_dashboard_processes(restart_managed=True)
 
         print()
         print("Tip: You can now select a provider and model:")
@@ -12706,7 +12792,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
-        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
+        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "memory-tree", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
         "project", "proxy",
@@ -13680,6 +13766,13 @@ def main():
         _register_pets_cli(pets_parser)
     except Exception as _exc:
         logging.getLogger(__name__).debug("pets CLI wiring failed: %s", _exc)
+
+    # =========================================================================
+    # memory-tree command
+    # =========================================================================
+    from hermes_cli.memory_tree import add_memory_tree_parser
+
+    add_memory_tree_parser(subparsers)
 
     # =========================================================================
     # journey command — learned skills + memories over time, in the terminal

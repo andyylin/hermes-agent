@@ -856,6 +856,174 @@ class TestThreadContext(unittest.TestCase):
             self.assertEqual(send_call["Subject"], "Re: Hermes Agent")
             self.assertIn("Date", send_call)
 
+    def test_html_body_sends_multipart_alternative(self):
+        """HTML replies should include a text/html part instead of raw tags as plain text only."""
+        adapter = self._make_adapter()
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email("newuser@test.com", "<h2>Brief</h2><p><strong>Done</strong></p>", None)
+
+            msg = mock_server.send_message.call_args[0][0]
+            parts = list(msg.walk())
+            content_types = [part.get_content_type() for part in parts]
+            self.assertIn("multipart/alternative", content_types)
+            self.assertIn("text/plain", content_types)
+            self.assertIn("text/html", content_types)
+            html_part = next(part for part in parts if part.get_content_type() == "text/html")
+            self.assertIn("<h2>Brief</h2>", html_part.get_payload(decode=True).decode("utf-8"))
+
+    def test_plain_text_body_defaults_to_html_with_plain_fallback(self):
+        """Plain assistant replies should be sent as multipart HTML email with plain fallback."""
+        adapter = self._make_adapter()
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email("newuser@test.com", "Summary\n\n- One\n- Two", None)
+
+            msg = mock_server.send_message.call_args[0][0]
+            parts = list(msg.walk())
+            plain_part = next(part for part in parts if part.get_content_type() == "text/plain")
+            html_part = next(part for part in parts if part.get_content_type() == "text/html")
+            self.assertIn("Summary\n\n- One\n- Two", plain_part.get_payload(decode=True).decode("utf-8"))
+            html = html_part.get_payload(decode=True).decode("utf-8")
+            self.assertIn("<h2>Summary</h2>", html)
+            self.assertIn("<ul><li>One</li><li>Two</li></ul>", html)
+
+    def test_explicit_subject_suppresses_reply_threading(self):
+        """Cron-style email sends can start a fresh subject/thread."""
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com"] = {
+            "subject": "Old thread",
+            "message_id": "<old@test.com>",
+        }
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email(
+                "user@test.com",
+                "Fresh briefing",
+                None,
+                {"subject": "Andy Morning Brief — 2026-06-02", "suppress_threading": True},
+            )
+
+            msg = mock_server.send_message.call_args[0][0]
+            self.assertEqual(msg["Subject"], "Andy Morning Brief — 2026-06-02")
+            self.assertNotIn("In-Reply-To", msg)
+            self.assertNotIn("References", msg)
+            plain_part = next(part for part in msg.walk() if part.get_content_type() == "text/plain")
+            self.assertIn("REF: HERMES-NOTIFY:andy-morning-brief-2026-06-02:", plain_part.get_payload(decode=True).decode("utf-8"))
+
+    def test_explicit_subject_can_use_stable_cron_thread_anchor(self):
+        """Recurring cron emails can thread together without hijacking the last human email."""
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com"] = {
+            "subject": "Old thread",
+            "message_id": "<old@test.com>",
+        }
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email(
+                "user@test.com",
+                "Mattermost briefing",
+                None,
+                {
+                    "subject": "[Hermes][Mattermost Brief] Workday",
+                    "thread_anchor_key": "mattermost-brief-workday",
+                },
+            )
+
+            msg = mock_server.send_message.call_args[0][0]
+            self.assertEqual(msg["Subject"], "[Hermes][Mattermost Brief] Workday")
+            self.assertEqual(msg["In-Reply-To"], "<hermes-thread-mattermost-brief-workday@test.com>")
+            self.assertEqual(msg["References"], "<hermes-thread-mattermost-brief-workday@test.com>")
+            self.assertNotEqual(msg["References"], "<old@test.com>")
+
+
+class TestStandaloneEmailSend(unittest.TestCase):
+    """Test send_message_tool's standalone email path used by cron without a live gateway adapter."""
+
+    @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "hermes@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_SMTP_HOST": "smtp.test.com",
+        "EMAIL_SMTP_PORT": "587",
+    }, clear=False)
+    def test_standalone_email_sends_html_as_multipart_alternative(self):
+        """Cron fallback email delivery must not send HTML tags as text/plain only."""
+        import asyncio
+        from gateway.config import PlatformConfig
+        from plugins.platforms.email.adapter import _standalone_send
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            result = asyncio.run(_standalone_send(
+                PlatformConfig(enabled=True, extra={"address": "hermes@test.com", "smtp_host": "smtp.test.com"}),
+                "user@test.com",
+                "<h2>Bottom line</h2><p><strong>Done</strong></p>",
+                subject="2026-06-20 Morning Briefing",
+            ))
+
+            self.assertEqual(result["success"], True)
+            msg = mock_server.send_message.call_args[0][0]
+            self.assertEqual(msg["Subject"], "2026-06-20 Morning Briefing")
+            content_types = [part.get_content_type() for part in msg.walk()]
+            self.assertIn("multipart/alternative", content_types)
+            self.assertIn("text/plain", content_types)
+            self.assertIn("text/html", content_types)
+            plain_part = next(part for part in msg.walk() if part.get_content_type() == "text/plain")
+            html_part = next(part for part in msg.walk() if part.get_content_type() == "text/html")
+            self.assertIn("Bottom line", plain_part.get_payload(decode=True).decode("utf-8"))
+            self.assertIn("REF: HERMES-NOTIFY:2026-06-20-morning-briefing:", plain_part.get_payload(decode=True).decode("utf-8"))
+            self.assertNotIn("<h2>", plain_part.get_payload(decode=True).decode("utf-8"))
+            self.assertIn("<h2>Bottom line</h2>", html_part.get_payload(decode=True).decode("utf-8"))
+            self.assertIn("<h3>Reference</h3>", html_part.get_payload(decode=True).decode("utf-8"))
+            self.assertIn("Message-ID", msg)
+
+    @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "hermes@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_SMTP_HOST": "smtp.test.com",
+        "EMAIL_SMTP_PORT": "587",
+    }, clear=False)
+    def test_standalone_email_can_use_stable_cron_thread_anchor(self):
+        """Cron fallback email delivery can emit RFC threading headers for Apple Mail."""
+        import asyncio
+        from plugins.platforms.email.adapter import _standalone_send
+        from types import SimpleNamespace
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            result = asyncio.run(_standalone_send(
+                SimpleNamespace(extra={"address": "hermes@test.com", "smtp_host": "smtp.test.com"}),
+                "user@test.com",
+                "Mattermost body",
+                subject={
+                    "subject": "[Hermes][Mattermost Brief] Workday",
+                    "thread_anchor_key": "mattermost-brief-workday",
+                },
+            ))
+
+            self.assertEqual(result["success"], True)
+            msg = mock_server.send_message.call_args[0][0]
+            self.assertEqual(msg["Subject"], "[Hermes][Mattermost Brief] Workday")
+            self.assertEqual(msg["In-Reply-To"], "<hermes-thread-mattermost-brief-workday@test.com>")
+            self.assertEqual(msg["References"], "<hermes-thread-mattermost-brief-workday@test.com>")
+            self.assertIn("Message-ID", msg)
+
 
 class TestSendMethods(unittest.TestCase):
     """Test email send methods."""
@@ -890,6 +1058,31 @@ class TestSendMethods(unittest.TestCase):
             mock_server.login.assert_called_once_with("hermes@test.com", "secret")
             mock_server.send_message.assert_called_once()
             mock_server.quit.assert_called_once()
+
+    def test_metadata_subject_sends_fresh_subject_without_threading_headers(self):
+        """A caller can send a fresh email subject and suppress reply threading."""
+        import asyncio
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com"] = {
+            "subject": "Old chain",
+            "message_id": "<old@test.com>",
+        }
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            result = asyncio.run(adapter.send(
+                "user@test.com",
+                "Fresh body.",
+                metadata={"subject": "Joi Morning Briefing — 2026-06-02", "suppress_threading": True},
+            ))
+
+            self.assertTrue(result.success)
+            msg = mock_server.send_message.call_args[0][0]
+            self.assertEqual(msg["Subject"], "Joi Morning Briefing — 2026-06-02")
+            self.assertNotIn("In-Reply-To", msg)
+            self.assertNotIn("References", msg)
 
     def test_send_failure_returns_error(self):
         """SMTP failure should return SendResult with error."""

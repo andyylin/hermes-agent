@@ -37,6 +37,14 @@ _WARNED_UTF32_PATHS: set[str] = set()
 # the .env case and they don't know Bitwarden is wired up).
 _SECRET_SOURCES: dict[str, str] = {}
 
+# HERMES_HOME -> env-var values that were fetched from an external secret
+# source earlier in this process.  load_hermes_dotenv() may be called more than
+# once during startup: hermes_cli.main loads .env+BWS, then gateway.run imports
+# and reloads .env.  Without reapplying the already-fetched BWS values, blank
+# placeholders in .env clobber the real secrets and the second BWS pass is
+# skipped by _APPLIED_HOMES.
+_SECRET_VALUES_BY_HOME: dict[str, dict[str, str]] = {}
+
 # HERMES_HOME paths we've already pulled external secrets for during this
 # process.  ``load_hermes_dotenv()`` is called at module-import time from
 # several hot modules (cli.py, hermes_cli/main.py, run_agent.py,
@@ -71,6 +79,7 @@ def reset_secret_source_cache() -> None:
     that want to refresh after a config change.
     """
     _APPLIED_HOMES.clear()
+    _SECRET_VALUES_BY_HOME.clear()
 
 
 def format_secret_source_suffix(env_var: str) -> str:
@@ -395,6 +404,8 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     """
     home_key = str(Path(home_path).resolve())
     if home_key in _APPLIED_HOMES:
+        for name, value in _SECRET_VALUES_BY_HOME.get(home_key, {}).items():
+            os.environ[name] = value
         return
     _APPLIED_HOMES.add(home_key)
 
@@ -426,6 +437,11 @@ def _apply_external_secret_sources(home_path: Path) -> None:
         # no hint the value came from a vault rather than .env.
         for name, applied in report.provenance.items():
             _SECRET_SOURCES[name] = applied.source
+        _SECRET_VALUES_BY_HOME[home_key] = {
+            name: os.environ[name]
+            for name in report.provenance
+            if name in os.environ
+        }
 
     for src in report.sources:
         if src.applied:

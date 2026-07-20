@@ -319,33 +319,72 @@ class TestSendMessageTool:
             force_document=False,
         )
 
-    def test_cron_duplicate_target_is_skipped_and_explained(self):
-        home = SimpleNamespace(chat_id="-1001")
-        config, _telegram_cfg = _make_config()
-        config.get_home_channel = lambda _platform: home
+    def test_email_subject_reaches_transport(self):
+        email_platform = Platform("email")
+        email_cfg = SimpleNamespace(enabled=True, token=None, extra={})
+        config = SimpleNamespace(
+            platforms={email_platform: email_cfg},
+            get_home_channel=lambda _platform: None,
+        )
 
-        with patch.dict(
-            os.environ,
-            {
-                "HERMES_CRON_AUTO_DELIVER_PLATFORM": "telegram",
-                "HERMES_CRON_AUTO_DELIVER_CHAT_ID": "-1001",
-            },
-            clear=False,
-        ), \
-             patch("gateway.config.load_gateway_config", return_value=config), \
+        with patch("gateway.config.load_gateway_config", return_value=config), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch("model_tools._run_async", side_effect=_run_async_immediately), \
              patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
-             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+             patch("gateway.mirror.mirror_to_session", return_value=True):
             result = json.loads(
                 send_message_tool(
                     {
                         "action": "send",
-                        "target": "telegram",
-                        "message": "hello",
+                        "target": "email:andy@example.com",
+                        "message": "done",
+                        "subject": "[Hermes][Test] Subject",
                     }
                 )
             )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            email_platform,
+            email_cfg,
+            "andy@example.com",
+            "done",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+            subject="[Hermes][Test] Subject",
+        )
+
+    def test_cron_duplicate_target_is_skipped_and_explained(self):
+        home = SimpleNamespace(chat_id="-1001")
+        config, _telegram_cfg = _make_config()
+        config.get_home_channel = lambda _platform: home
+        from gateway.session_context import _VAR_MAP, reset_session_vars
+
+        reset_session_vars()
+        tokens = [
+            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set("telegram"),
+            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set("-1001"),
+        ]
+        try:
+            with patch("gateway.config.load_gateway_config", return_value=config), \
+                 patch("tools.interrupt.is_interrupted", return_value=False), \
+                 patch("model_tools._run_async", side_effect=_run_async_immediately), \
+                 patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+                 patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+                result = json.loads(
+                    send_message_tool(
+                        {
+                            "action": "send",
+                            "target": "telegram",
+                            "message": "hello",
+                        }
+                    )
+                )
+        finally:
+            for token in reversed(tokens):
+                token.var.reset(token)
+            reset_session_vars()
 
         assert result["success"] is True
         assert result["skipped"] is True
@@ -728,6 +767,31 @@ class TestSendToPlatformChunking:
         assert send.await_count >= 3
         for call in send.await_args_list:
             assert len(call.args[2]) <= 2020  # each chunk fits the limit
+
+    def test_long_forum_message_reuses_created_thread_for_followup_chunks(self):
+        """Standalone fallback must create one forum topic, not one per chunk."""
+        send = AsyncMock(side_effect=[
+            {"success": True, "message_id": "starter", "thread_id": "thread-123"},
+            {"success": True, "message_id": "followup-1"},
+            {"success": True, "message_id": "followup-2"},
+        ])
+        long_msg = "word " * 1000
+
+        with _patch_discord_sender(send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.DISCORD,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "forum-parent",
+                    long_msg,
+                )
+            )
+
+        assert result["success"] is True
+        assert send.await_count == 3
+        assert send.await_args_list[0].kwargs["thread_id"] is None
+        assert send.await_args_list[1].kwargs["thread_id"] == "thread-123"
+        assert send.await_args_list[2].kwargs["thread_id"] == "thread-123"
 
     def test_slack_messages_are_formatted_before_send(self, monkeypatch):
         _ensure_slack_mock(monkeypatch)

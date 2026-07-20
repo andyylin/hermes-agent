@@ -2096,7 +2096,7 @@ def _persist_session_git_meta(session: dict, cwd: str) -> None:
                 return
             with _session_db(db_session) as db:
                 if db is not None:
-                    db.update_session_cwd(session_key, cwd, branch, root)
+                    db.update_session_git_meta_if_cwd(session_key, cwd, branch, root)
         except Exception:
             logger.debug("failed to persist session git metadata", exc_info=True)
 
@@ -4284,6 +4284,8 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
 
 
 def _agent_cbs(sid: str) -> dict:
+    from tools.clarify_gateway import get_clarify_timeout
+
     return {
         "tool_start_callback": lambda tc_id, name, args: _on_tool_start(
             sid, tc_id, name, args
@@ -4327,7 +4329,10 @@ def _agent_cbs(sid: str) -> dict:
             "notification.clear", sid, {"key": key}
         ),
         "clarify_callback": lambda q, c: _block(
-            "clarify.request", sid, {"question": q, "choices": c}
+            "clarify.request",
+            sid,
+            {"question": q, "choices": c},
+            timeout=get_clarify_timeout(),
         ),
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
         # renderer answers terminal.read.respond with the serialized buffer.

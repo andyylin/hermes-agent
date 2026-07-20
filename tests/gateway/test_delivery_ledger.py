@@ -81,8 +81,17 @@ class TestStateMachine:
     def test_rerecord_same_id_is_idempotent(self):
         _record()
         dl.mark_attempting("ob-1")
-        _record()  # INSERT OR REPLACE resets to pending — same turn re-record
-        assert _row("ob-1")["state"] == "pending"
+        _record()
+        assert _row("ob-1")["state"] == "attempting"
+
+    def test_rerecord_delivered_id_preserves_terminal_state(self):
+        _record()
+        dl.mark_attempting("ob-1")
+        dl.mark_delivered("ob-1")
+
+        _record()
+
+        assert _row("ob-1")["state"] == "delivered"
 
 
 class TestObligationId:
@@ -112,6 +121,29 @@ class TestSweep:
         # Claim re-stamps ownership: a second sweep in the same (live)
         # process must not double-claim.
         assert dl.sweep_recoverable() == []
+
+    def test_platform_filter_claims_only_requested_platform(self):
+        _record("ob-slack", platform="slack")
+        _record("ob-matrix", platform="matrix")
+        _orphan("ob-slack")
+        _orphan("ob-matrix")
+
+        claimed = dl.sweep_recoverable(platform="matrix")
+
+        assert [row["obligation_id"] for row in claimed] == ["ob-matrix"]
+        assert _row("ob-slack")["attempts"] == 0
+
+    def test_release_unattempted_claim_restores_retry_budget(self):
+        _record()
+        _orphan("ob-1")
+        assert len(dl.sweep_recoverable()) == 1
+
+        dl.release_unattempted_claim("ob-1")
+
+        row = _row("ob-1")
+        assert row["attempts"] == 0
+        assert row["owner_pid"] is None
+        assert len(dl.sweep_recoverable()) == 1
 
     def test_dead_owner_attempting_needs_marker(self):
         _record()
@@ -265,9 +297,11 @@ class TestGatewayRedeliverySweep:
         n = await runner._redeliver_pending_obligations()
 
         assert n == 0
-        # Row still claimed by us but NOT delivered/abandoned — a later boot
-        # (attempts cap permitting) can retry once the platform connects.
+        # No send occurred: the claim is released so a reconnect in this same
+        # process can retry without consuming the attempt budget.
         assert _row("ob-1")["state"] == "pending"
+        assert _row("ob-1")["attempts"] == 0
+        assert _row("ob-1")["owner_pid"] is None
 
     @pytest.mark.asyncio
     async def test_disabled_gate_short_circuits(self):

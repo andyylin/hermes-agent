@@ -98,6 +98,20 @@ Known failure modes and how to handle them.
 How the agent confirms it worked.
 ```
 
+### Description Discipline
+
+The injected system prompt includes a compact skills index so the agent can
+decide when to call `skill_view(name)`. That index uses `description`,
+normalizes whitespace, and caps the prompt-facing copy as a safety net.
+
+Write `description` as one short, action-oriented phrase: what the skill lets
+the agent do, not a trigger essay. Put trigger details, caveats, and examples in
+`## When to Use`, `## Pitfalls`, and references instead of frontmatter.
+
+```yaml
+description: "Read, OCR, split, merge, edit, secure, and export PDFs."
+```
+
 ### Platform-Specific Skills
 
 Skills can restrict themselves to specific operating systems using the `platforms` field:

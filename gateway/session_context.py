@@ -238,6 +238,9 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _CRON_AUTO_DELIVER_PLATFORM,
+        _CRON_AUTO_DELIVER_CHAT_ID,
+        _CRON_AUTO_DELIVER_THREAD_ID,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a

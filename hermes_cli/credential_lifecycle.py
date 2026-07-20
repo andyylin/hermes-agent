@@ -64,6 +64,33 @@ def _providers_for_env_var(env_var: str) -> List[str]:
     return hits
 
 
+def _env_pool_values(env_var: str) -> List[str]:
+    """Return credential values held by pool entries sourced from ``env_var``.
+
+    Values are used only for exact config-mirror reconciliation during delete;
+    callers must never return or log them.
+    """
+    from hermes_cli.auth import _auth_store_lock, _load_auth_store
+
+    source = f"env:{env_var}"
+    values: List[str] = []
+    with _auth_store_lock():
+        pool = _load_auth_store().get("credential_pool")
+        if not isinstance(pool, dict):
+            return values
+        for entries in pool.values():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict) or entry.get("source") != source:
+                    continue
+                for field in ("access_token", "agent_key", "api_key"):
+                    value = entry.get(field)
+                    if isinstance(value, str) and value and value not in values:
+                        values.append(value)
+    return values
+
+
 def _prune_env_pool_entries(env_var: str) -> List[str]:
     """Drop ``credential_pool`` entries seeded from ``env:<env_var>``.
 
@@ -257,9 +284,14 @@ def remove_provider_env_credential(env_var: str) -> Dict[str, Any]:
     from hermes_cli.config import load_env, remove_env_value
 
     old_value = load_env().get(env_var)
+    mirror_values = ([old_value] if old_value else []) + _env_pool_values(env_var)
     removed_from_env = remove_env_value(env_var)
     refs = purge_env_credential_references(env_var)
-    config_scrubbed = _scrub_config_yaml_mirrors(old_value, None) if old_value else []
+    config_scrubbed: List[str] = []
+    for value in dict.fromkeys(mirror_values):
+        for path in _scrub_config_yaml_mirrors(value, None):
+            if path not in config_scrubbed:
+                config_scrubbed.append(path)
 
     return {
         "ok": True,

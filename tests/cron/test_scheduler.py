@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _format_cron_delivery_content, _looks_like_cron_warning_or_error_alert, _bounded_job_closeout, _is_final_bounded_recurring_run
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -63,7 +63,7 @@ class TestPerJobToolsetMcpMerge:
         result = _resolve_cron_enabled_toolsets(job, self.CFG)
         assert set(result) == {"web", "terminal"} | self._enabled_names()
 
-    def test_resolver_empty_per_job_falls_through_to_platform(self):
+    def test_resolver_none_per_job_falls_through_to_platform(self):
         # No per-job list -> must delegate to _get_platform_tools (the platform
         # fallback), NOT the per-job merge. Stub the platform resolver and assert
         # it is the path taken and its result is returned.
@@ -76,6 +76,41 @@ class TestPerJobToolsetMcpMerge:
         # _get_platform_tools args: (cfg, "cron")
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
+
+    def test_resolver_explicit_empty_per_job_means_no_tools(self):
+        job = {"enabled_toolsets": []}
+        with patch("hermes_cli.tools_config._get_platform_tools") as m_platform:
+            result = _resolve_cron_enabled_toolsets(job, self.CFG)
+        m_platform.assert_not_called()
+        assert result == []
+
+
+class TestCronRepairGateAlertClassifier:
+    def test_bilingual_mattermost_fetch_failure_is_alert_shaped(self):
+        content = """Mattermost 讀取失敗：3 個可見頻道/DM 的 posts API 都逾時或被重置，這次沒有拿到可編輯候選，未做任何修改。
+
+Mattermost fetch failed: the posts API timed out or was reset on 3 visible channels/DMs, so no editable candidates were returned and no edits were made.
+"""
+
+        assert _looks_like_cron_warning_or_error_alert(content)
+
+    def test_memory_tree_attention_report_is_alert_shaped(self):
+        content = """Attention needed: Memory Tree attention: 1 item(s)
+
+1. [failure] Backup monitor
+   kind: failed_automation
+"""
+
+        assert _looks_like_cron_warning_or_error_alert(content)
+
+    def test_routine_report_with_risk_section_is_not_alert_shaped(self):
+        content = """# Weekly Report
+
+## Risks / caveats
+- One item may need review later.
+"""
+
+        assert not _looks_like_cron_warning_or_error_alert(content)
 
 
 class TestResolveOrigin:
@@ -514,7 +549,7 @@ class TestRoutingIntents:
                     "SIGNAL_HOME_CHANNEL", "MATRIX_HOME_ROOM", "MATTERMOST_HOME_CHANNEL",
                     "SMS_HOME_CHANNEL", "EMAIL_HOME_ADDRESS", "DINGTALK_HOME_CHANNEL",
                     "FEISHU_HOME_CHANNEL", "WECOM_HOME_CHANNEL", "WEIXIN_HOME_CHANNEL",
-                    "BLUEBUBBLES_HOME_CHANNEL", "QQBOT_HOME_CHANNEL", "QQ_HOME_CHANNEL"):
+                    "BLUEBUBBLES_HOME_CHANNEL", "QQBOT_HOME_CHANNEL", "QQ_HOME_CHANNEL", "LINE_HOME_CHANNEL"):
             monkeypatch.delenv(var, raising=False)
 
         assert _resolve_delivery_targets({"deliver": "all", "origin": None}) == []
@@ -544,6 +579,7 @@ class TestRoutingIntents:
         """'ALL' / 'All' / 'all' are all recognized."""
         from cron.scheduler import _resolve_delivery_targets
 
+        monkeypatch.delenv("LINE_HOME_CHANNEL", raising=False)
         monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "-222")
 
@@ -594,6 +630,68 @@ class TestDeliverResultWrapping:
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
 
+    def test_one_off_reminder_delivery_says_it_will_not_repeat(self):
+        """One-shot reminders should not advertise stop/manage instructions."""
+        job = {
+            "id": "reminder-job",
+            "name": "Remind Andy to get Supernote beta access",
+            "prompt": "Remind Andy: get Supernote beta access.",
+            "repeat": {"times": 1, "completed": 0},
+        }
+
+        sent_content = _format_cron_delivery_content(job, "Get Supernote beta access.", for_discord=True)
+
+        assert "## One-off" in sent_content
+        assert "This was a one-off reminder; it will not repeat." in sent_content
+        assert "To stop or manage this job" not in sent_content
+        assert "stop reminder" not in sent_content
+
+    def test_one_off_non_reminder_delivery_says_one_off_job(self):
+        """One-shot non-reminder jobs also should not get recurring-job management copy."""
+        job = {
+            "id": "once-job",
+            "name": "Verify import propagation",
+            "repeat": {"times": 1, "completed": 0},
+        }
+
+        sent_content = _format_cron_delivery_content(job, "Done.", for_discord=False)
+
+        assert "This was a one-off job; it will not repeat." in sent_content
+        assert "To stop or manage this job" not in sent_content
+
+    def test_final_bounded_recurring_run_detection_and_closeout(self):
+        job = {
+            "id": "bounded-123",
+            "name": "Check import propagation",
+            "prompt": "Check whether the imported artifact propagated to the remote vault.",
+            "schedule": {"kind": "interval"},
+            "repeat": {"times": 3, "completed": 2},
+        }
+
+        assert _is_final_bounded_recurring_run(job) is True
+        closeout = _bounded_job_closeout(job, success=True)
+        assert "## Automation closeout" in closeout
+        assert "completed its final run" in closeout
+        assert "**Bound:** 3 runs" in closeout
+        assert "`bounded-123`" in closeout
+        assert "delete it" in closeout
+        assert "keep it completed" in closeout
+        assert "resume/edit it" in closeout
+        assert "If you do nothing, it stays safely disabled." in closeout
+
+    def test_nonfinal_and_one_shot_runs_do_not_trigger_closeout(self):
+        recurring = {
+            "schedule": {"kind": "interval"},
+            "repeat": {"times": 3, "completed": 1},
+        }
+        one_shot = {
+            "schedule": {"kind": "once"},
+            "repeat": {"times": 1, "completed": 0},
+        }
+
+        assert _is_final_bounded_recurring_run(recurring) is False
+        assert _is_final_bounded_recurring_run(one_shot) is False
+
     def test_delivery_uses_job_id_when_no_name(self):
         """When a job has no name, the wrapper should fall back to job id."""
         from gateway.config import Platform
@@ -614,6 +712,114 @@ class TestDeliverResultWrapping:
 
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
         assert "Cronjob Response: abc-123" in sent_content
+
+    def test_email_delivery_passes_subject_template(self):
+        """Email cron delivery can pass a date-specific subject to avoid mail threading."""
+        from gateway.config import Platform
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.EMAIL: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler._hermes_now", return_value=datetime(2026, 6, 2, 7, 15, tzinfo=ZoneInfo("Asia/Taipei"))), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "brief-job",
+                "name": "joi-morning-briefing-hermes-owner",
+                "deliver": "email:andy@example.com",
+                "email_subject_template": "Joi Morning Briefing — {date}",
+            }
+            _deliver_result(job, "Brief body.")
+
+        send_mock.assert_called_once()
+        assert send_mock.call_args.kwargs["subject"] == "Joi Morning Briefing — 2026-06-02"
+        sent_content = send_mock.call_args[0][3]
+        assert "Brief body." in sent_content
+        assert "REF: `HERMES-NOTIFY:cron:joi-morning-briefing-hermes-owner:brief-job:" in sent_content
+
+    def test_email_delivery_passes_stable_thread_key_when_configured(self):
+        """Recurring email cron jobs can opt into explicit reply headers for Apple Mail threading."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.EMAIL: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "217e74bd5079",
+                "name": "workday-mattermost-brief-email",
+                "deliver": "email:andy@example.com",
+                "email_subject_template": "[Hermes][Mattermost Brief] Workday",
+                "email_thread_key": "mattermost-brief-workday",
+            }
+            _deliver_result(job, "Brief body.")
+
+        send_mock.assert_called_once()
+        assert send_mock.call_args.kwargs["subject"] == {
+            "subject": "[Hermes][Mattermost Brief] Workday",
+            "thread_anchor_key": "mattermost-brief-workday",
+        }
+
+    def test_email_delivery_wraps_html_output_as_html(self):
+        """HTML cron output should keep a rich HTML wrapper instead of plain-text chrome."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.EMAIL: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "privacy-job",
+                "name": "memory-tree-privacy-scan",
+                "deliver": "email:andy@example.com",
+                "email_subject_template": "[Hermes][Memory Tree] Privacy scan",
+            }
+            _deliver_result(job, "<!doctype html><html><body><h2>Privacy</h2><table><tr><td>x</td></tr></table></body></html>")
+
+        sent_content = send_mock.call_args[0][3]
+        assert sent_content.startswith("<!doctype html><html><body")
+        assert "<h2>Cron Alert: memory-tree-privacy-scan</h2>" in sent_content
+        assert "<h2>Privacy</h2>" in sent_content
+        assert "<table" in sent_content
+        assert "<h3>Reference</h3>" in sent_content
+        assert "HERMES-NOTIFY:cron:memory-tree-privacy-scan:privacy-job:" in sent_content
+        assert "Cronjob Response:" not in sent_content
+
+    def test_email_delivery_wraps_plain_output_as_markdown_for_html_rendering(self):
+        """Plain cron output should be sent as Markdown-ish structure for rich email rendering."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.EMAIL: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "29b4bd5a6186",
+                "name": "memory-tree-reconcile-scan",
+                "deliver": "email:andy@example.com",
+                "email_subject_template": "[Hermes][Memory Tree] Reconcile scan",
+            }
+            _deliver_result(job, "Memory Tree reconcile attention\n\nactive_verified: 39\n\n- Item [runtime_attention]\n  source_id: abc\n  next: Inspect it.")
+
+        sent_content = send_mock.call_args[0][3]
+        assert "## Cron Alert: memory-tree-reconcile-scan" in sent_content
+        assert "### Report" in sent_content
+        assert "**Job ID:** `29b4bd5a6186`" in sent_content
+        assert "REF: `HERMES-NOTIFY:cron:memory-tree-reconcile-scan:29b4bd5a6186:" in sent_content
+        assert "Cronjob Response:" not in sent_content
 
     def test_delivery_skips_wrapping_when_config_disabled(self):
         """When cron.wrap_response is false, deliver raw content without header/footer."""
@@ -640,6 +846,33 @@ class TestDeliverResultWrapping:
         assert sent_content == "Clean output only."
         assert "Cronjob Response" not in sent_content
         assert "The agent cannot see" not in sent_content
+
+    def test_email_delivery_passes_templated_subject(self):
+        """Email cron jobs can start a fresh dated thread via subject template."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.EMAIL: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler._hermes_now") as now_mock:
+            now_mock.return_value.strftime.side_effect = lambda fmt: {
+                "%Y-%m-%d": "2026-06-02",
+                "%Y%m%d": "20260602",
+            }[fmt]
+            job = {
+                "id": "brief-job",
+                "name": "joi-morning-briefing-hermes-owner",
+                "deliver": "email:andy@example.com",
+                "email_subject_template": "Andy Morning Brief — {date}",
+            }
+            _deliver_result(job, "Brief body")
+
+        send_mock.assert_called_once()
+        assert send_mock.call_args.kwargs["subject"] == "Andy Morning Brief — 2026-06-02"
 
     def test_delivery_extracts_media_tags_before_send(self, tmp_path, monkeypatch):
         """Cron delivery should pass MEDIA attachments separately to the send helper."""
@@ -925,6 +1158,53 @@ class TestDeliverResultWrapping:
 
         send_mock.assert_called_once()
         assert send_mock.call_args.kwargs["thread_id"] == "17585"
+
+    def test_live_adapter_private_telegram_topic_probe_failure_uses_thread_id(self):
+        """Ambiguous Telegram topic targets fail safe to message_thread_id.
+
+        Without a usable live get_chat_info probe, cron must not guess that a
+        positive chat id plus numeric thread id is a Bot API channel-DM topic;
+        private/forum-style topics are the common case.
+        """
+        import concurrent.futures
+
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="42"))
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        def fake_schedule(coro, _loop):
+            import asyncio as _asyncio
+            future = concurrent.futures.Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
+
+        job = {
+            "id": "dm-topic-job",
+            "name": "dm-topic-job",
+            "deliver": "telegram:545944400:78807",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule):
+            _deliver_result(job, "hello", adapters={Platform.TELEGRAM: adapter}, loop=loop)
+
+        adapter.send.assert_called_once()
+        assert adapter.send.call_args.args[0] == "545944400"
+        assert "hello" in adapter.send.call_args.args[1]
+        assert adapter.send.call_args.kwargs["metadata"] == {
+            "thread_id": "78807",
+            "job_id": "dm-topic-job",
+        }
 
 
 class TestDeliverResultErrorReturns:
@@ -2666,11 +2946,31 @@ class TestSilentDelivery:
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
-             patch("cron.scheduler.mark_job_run"):
+             patch("cron.scheduler._deliver_result", return_value=None) as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
             from cron.scheduler import tick
             tick(verbose=False)
         deliver_mock.assert_called_once()
+        receipt = mark_mock.call_args.kwargs["delivery_receipt"]
+        assert receipt["job_id"] == "monitor-job"
+        assert receipt["target"] == "origin"
+        assert receipt["intended_output_delivered"] is False
+
+    def test_successful_report_records_run_correlated_delivery_receipt(self):
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "Dad report", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        receipt = mark_mock.call_args.kwargs["delivery_receipt"]
+        assert receipt["job_id"] == "monitor-job"
+        assert receipt["target"] == "origin"
+        assert receipt["intended_output_delivered"] is True
+        assert receipt["started_at"] <= receipt["completed_at"]
+        assert receipt["run_id"]
 
     def test_output_saved_even_when_delivery_suppressed(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
@@ -2695,12 +2995,15 @@ class TestSilentDelivery:
             tick(verbose=False)
 
         deliver_mock.assert_not_called()
-        mark_mock.assert_called_once_with(
+        args = mark_mock.call_args.args
+        kwargs = mark_mock.call_args.kwargs
+        assert args == (
             "monitor-job",
             False,
             "Agent completed but produced empty response (model error, timeout, or misconfiguration)",
-            delivery_error=None,
         )
+        assert kwargs["delivery_error"] is None
+        assert kwargs["delivery_receipt"]["intended_output_delivered"] is False
 
 
 class TestOneShotDispatchClaim:

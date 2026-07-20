@@ -69,6 +69,7 @@ HERMES_DIR = get_hermes_home().resolve()
 # with use_cron_store() instead of mutating them process-wide.
 CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
+DEFINITIONS_FILE = CRON_DIR / "jobs.definitions.json"
 # Heartbeat file the in-process ticker touches on every loop iteration. The
 # gateway process and the (separate) ``hermes cron status`` process share it
 # so status can tell whether the ticker THREAD is alive, not just whether the
@@ -78,6 +79,8 @@ TICKER_HEARTBEAT_FILE = CRON_DIR / "ticker_heartbeat"
 # Last tick that completed WITHOUT raising. Distinguishing this from the plain
 # heartbeat lets status detect a ticker that is alive but failing every tick.
 TICKER_SUCCESS_FILE = CRON_DIR / "ticker_last_success"
+_IMPORT_TICKER_HEARTBEAT_FILE = TICKER_HEARTBEAT_FILE
+_IMPORT_TICKER_SUCCESS_FILE = TICKER_SUCCESS_FILE
 # Default ticker loop interval (seconds). The single source of truth shared by
 # the in-process ticker (cron/scheduler_provider.py) and the staleness
 # threshold in `hermes cron status` (hermes_cli/cron.py), so the two never
@@ -173,6 +176,20 @@ def use_cron_store(home: Union[str, Path]):
 def get_cron_output_dir() -> Path:
     """Return the output directory for the active cron store context."""
     return _current_cron_store().output_dir
+
+
+def get_cron_definitions_file() -> Path:
+    """Return the deterministic export path for the active cron store."""
+    from cron.definitions_export import definitions_path_for_jobs_file
+
+    return definitions_path_for_jobs_file(_current_cron_store().jobs_file)
+
+
+def _current_ticker_file(path: Path, import_path: Path, filename: str) -> Path:
+    """Resolve a ticker marker without breaking patched compatibility constants."""
+    if path != import_path:
+        return path
+    return _current_cron_store().cron_dir / filename
 
 
 # Fallback stale-recovery window for a one-shot's running-claim (#59229) when
@@ -686,12 +703,12 @@ def _recoverable_oneshot_run_at(
 def _compute_grace_seconds(schedule: dict) -> int:
     """Compute how late a job can be and still catch up instead of fast-forwarding.
 
-    Uses half the schedule period, clamped between 120 seconds and 2 hours.
-    This ensures daily jobs can catch up if missed by up to 2 hours,
+    Uses half the schedule period, clamped between 120 seconds and 30 minutes.
+    This ensures daily jobs can catch up if missed by up to 30 minutes,
     while frequent jobs (every 5-10 min) still fast-forward quickly.
     """
     MIN_GRACE = 120
-    MAX_GRACE = 7200  # 2 hours
+    MAX_GRACE = 1800  # 30 minutes
 
     kind = schedule.get("kind")
 
@@ -819,12 +836,24 @@ def record_ticker_heartbeat(success: bool = False) -> None:
     Best-effort: a write failure must never disrupt the tick loop.
     """
     try:
-        _atomic_write_epoch(TICKER_HEARTBEAT_FILE)
+        _atomic_write_epoch(
+            _current_ticker_file(
+                TICKER_HEARTBEAT_FILE,
+                _IMPORT_TICKER_HEARTBEAT_FILE,
+                "ticker_heartbeat",
+            )
+        )
     except Exception:
         pass
     if success:
         try:
-            _atomic_write_epoch(TICKER_SUCCESS_FILE)
+            _atomic_write_epoch(
+                _current_ticker_file(
+                    TICKER_SUCCESS_FILE,
+                    _IMPORT_TICKER_SUCCESS_FILE,
+                    "ticker_last_success",
+                )
+            )
         except Exception:
             pass
 
@@ -843,12 +872,24 @@ def get_ticker_heartbeat_age() -> Optional[float]:
     None = heartbeat file missing/unreadable (older build, never ran, or a
     torn read). Callers treat None as "cannot determine", not "dead".
     """
-    return _epoch_file_age(TICKER_HEARTBEAT_FILE)
+    return _epoch_file_age(
+        _current_ticker_file(
+            TICKER_HEARTBEAT_FILE,
+            _IMPORT_TICKER_HEARTBEAT_FILE,
+            "ticker_heartbeat",
+        )
+    )
 
 
 def get_ticker_success_age() -> Optional[float]:
     """Seconds since the ticker last completed a tick WITHOUT raising, or None."""
-    return _epoch_file_age(TICKER_SUCCESS_FILE)
+    return _epoch_file_age(
+        _current_ticker_file(
+            TICKER_SUCCESS_FILE,
+            _IMPORT_TICKER_SUCCESS_FILE,
+            "ticker_last_success",
+        )
+    )
 
 
 # =============================================================================
@@ -907,7 +948,7 @@ def load_jobs() -> List[Dict[str, Any]]:
     )
 
 
-def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
+def _save_jobs_unlocked(jobs: List[Dict[str, Any]], *, export_definitions: bool = False):
     """Save all jobs to storage. Caller must hold _jobs_lock()."""
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
@@ -919,6 +960,11 @@ def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
             os.fsync(f.fileno())
         atomic_replace(tmp_path, jobs_file)
         _secure_file(jobs_file)
+        if export_definitions:
+            try:
+                export_definitions_file(jobs)
+            except Exception as exc:  # pragma: no cover - defensive logging path
+                logger.warning("Failed to export deterministic cron definitions: %s", exc)
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -927,10 +973,24 @@ def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
         raise
 
 
-def save_jobs(jobs: List[Dict[str, Any]]):
+def save_jobs(jobs: List[Dict[str, Any]], *, export_definitions: bool = False):
     """Save all jobs to storage."""
     with _jobs_lock():
-        _save_jobs_unlocked(jobs)
+        _save_jobs_unlocked(jobs, export_definitions=export_definitions)
+
+
+def export_definitions_file(
+    jobs: Optional[List[Dict[str, Any]]] = None,
+    output_path: Optional[Path] = None,
+) -> bool:
+    """Export deterministic cron definitions and return True if file changed."""
+    from cron.definitions_export import definitions_path_for_jobs_file, export_cron_definitions
+
+    ensure_dirs()
+    if jobs is None:
+        jobs = load_jobs()
+    path = output_path or definitions_path_for_jobs_file(_current_cron_store().jobs_file)
+    return export_cron_definitions(jobs, path)
 
 
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
@@ -1262,7 +1322,7 @@ def create_job(
     with _jobs_lock():
         jobs = load_jobs()
         jobs.append(job)
-        save_jobs(jobs)
+        save_jobs(jobs, export_definitions=True)
 
     return job
 
@@ -1426,7 +1486,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updated["next_run_at"] = next_run
 
             jobs[i] = updated
-            save_jobs(jobs)
+            save_jobs(jobs, export_definitions=True)
             return _normalize_job_record(jobs[i])
     return None
 
@@ -1460,16 +1520,23 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
             f"Cannot resume: one-shot time {run_at} is in the past "
             f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire."
         )
-    return update_job(
-        job["id"],
-        {
-            "enabled": True,
-            "state": "scheduled",
-            "paused_at": None,
-            "paused_reason": None,
-            "next_run_at": next_run_at,
-        },
-    )
+    updates = {
+        "enabled": True,
+        "state": "scheduled",
+        "paused_at": None,
+        "paused_reason": None,
+        "next_run_at": next_run_at,
+    }
+    # Resuming a completed bounded job means re-arming the same bounded cycle.
+    # Ordinary paused jobs retain their progress; only terminal completion resets
+    # the exhausted counter and closeout metadata.
+    if job.get("state") == "completed":
+        repeat = job.get("repeat")
+        if isinstance(repeat, dict) and repeat.get("times") is not None:
+            updates["repeat"] = {**repeat, "completed": 0}
+        updates["completed_at"] = None
+        updates["completion_reason"] = None
+    return update_job(job["id"], updates)
 
 
 def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -1504,7 +1571,7 @@ def remove_job(job_id: str) -> bool:
             # left over from before the create-time guard) fails closed without
             # half-applying the removal.
             job_output_dir = _job_output_dir(canonical_id)
-            save_jobs(jobs)
+            save_jobs(jobs, export_definitions=True)
             # Clean up output directory to prevent orphaned dirs accumulating
             if job_output_dir.exists():
                 shutil.rmtree(job_output_dir)
@@ -1513,15 +1580,22 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 delivery_receipt: Optional[Dict[str, Any]] = None):
     """
     Mark a job as having been run.
     
-    Updates last_run_at, last_status, increments completed count,
-    computes next_run_at, and auto-deletes if repeat limit reached.
+    Updates last_run_at, last_status, increments completed count, and computes
+    next_run_at. One-shot jobs still auto-delete after dispatch; bounded
+    recurring jobs are retained in a disabled ``completed`` state so the user
+    can review and explicitly delete, keep, or re-arm them.
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+
+    ``delivery_receipt`` is an execution-scoped proof record. It is replaced
+    on every run (including with ``None``) so a later run cannot accidentally
+    reuse an older run's delivery evidence.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -1533,6 +1607,9 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                # Replace receipt evidence on every run so status and receipt
+                # always describe the same scheduler execution.
+                job["last_delivery_receipt"] = delivery_receipt
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
@@ -1562,10 +1639,21 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         completed += 1
                         repeat["completed"] = completed
 
-                    # Check if we've hit the repeat limit
+                    # Check if we've hit the repeat limit. One-shot reminders
+                    # remain disposable; retaining every one-off would replace
+                    # useful lifecycle review with a graveyard. Recurring
+                    # bounded jobs, however, need a durable object behind the
+                    # closeout receipt so the user can choose delete/keep/resume.
                     if times is not None and times > 0 and completed >= times:
-                        # Remove the job (limit reached)
-                        jobs.pop(i)
+                        if kind == "once":
+                            jobs.pop(i)
+                            save_jobs(jobs)
+                            return
+                        job["enabled"] = False
+                        job["state"] = "completed"
+                        job["next_run_at"] = None
+                        job["completed_at"] = now
+                        job["completion_reason"] = "run_limit_reached"
                         save_jobs(jobs)
                         return
                 
@@ -2048,6 +2136,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     # Job is past its catch-up grace window — skip accumulated
                     # missed runs but still execute once now to avoid deferring
                     # indefinitely (e.g. a long-running job just finished).
+                    # Grace scales with schedule period: daily=30m, hourly=30m, 10min=5m.
                     new_next = compute_next_run(schedule, now.isoformat())
                     if new_next:
                         logger.info(

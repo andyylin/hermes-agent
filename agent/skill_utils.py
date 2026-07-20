@@ -48,6 +48,7 @@ EXCLUDED_SKILL_DIRS = frozenset(
 # be scanned for active SKILL.md/DESCRIPTION.md entries, even if a Curator or
 # archive workflow preserves a complete old skill package under references/.
 SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
+SKILL_DESCRIPTION_PROMPT_MAX_LENGTH = 60
 
 
 def is_excluded_skill_path(path) -> bool:
@@ -780,15 +781,38 @@ def resolve_skill_config_values(
 # ── Description extraction ────────────────────────────────────────────────
 
 
-def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
-    """Extract a truncated description from parsed frontmatter."""
-    raw_desc = frontmatter.get("description", "")
-    if not raw_desc:
+def _hermes_metadata(frontmatter: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the ``metadata.hermes`` mapping from skill frontmatter."""
+    metadata = frontmatter.get("metadata")
+    if not isinstance(metadata, dict):
+        return {}
+    hermes = metadata.get("hermes") or {}
+    if not isinstance(hermes, dict):
+        return {}
+    return hermes
+
+
+def _compact_text(value: Any, max_length: int) -> str:
+    """Normalize whitespace and truncate text to ``max_length`` chars."""
+    if value is None:
         return ""
-    desc = str(raw_desc).strip().strip("'\"")
-    if len(desc) > 60:
-        return desc[:57] + "..."
-    return desc
+    text = " ".join(str(value).strip().strip("'\"").split())
+    if not text:
+        return ""
+    if len(text) > max_length:
+        return text[: max_length - 3].rstrip() + "..."
+    return text
+
+
+def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
+    """Return the compact prompt-index description from skill frontmatter.
+
+    ``description`` is the single source of routing text. Keep it short and
+    action-oriented in the SKILL.md itself; Hermes normalizes whitespace and
+    caps the prompt-facing copy here as a safety net.
+    """
+    raw_desc = frontmatter.get("description", "")
+    return _compact_text(raw_desc, SKILL_DESCRIPTION_PROMPT_MAX_LENGTH)
 
 
 # ── File iteration ────────────────────────────────────────────────────────

@@ -191,6 +191,8 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
         add nothing further (the user named exactly the servers they want)
       * otherwise -> union in every globally-enabled MCP server
     """
+    if not per_job:
+        return []
     result = [t for t in per_job if t != "no_mcp"]
     if "no_mcp" in per_job:
         return result
@@ -226,8 +228,8 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     get cron WITHOUT ``moa`` by default (issue reported by Norbert —
     surprise $4.63 run).
     """
-    per_job = job.get("enabled_toolsets")
-    if per_job:
+    if "enabled_toolsets" in job and job.get("enabled_toolsets") is not None:
+        per_job = job.get("enabled_toolsets") or []
         return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
@@ -277,7 +279,15 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    get_due_jobs,
+    mark_job_run,
+    save_job_output,
+    advance_next_run,
+    claim_dispatch,
+    heartbeat_run_claim,
+    load_jobs,
+)
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -1303,6 +1313,372 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     return targets[0] if targets else None
 
 
+def _job_delivers_to_discord(job: dict) -> bool:
+    """Return True when this job's resolved delivery includes Discord."""
+    try:
+        return any(
+            str(target.get("platform", "")).lower() == "discord"
+            for target in _resolve_delivery_targets(job)
+        )
+    except Exception:
+        return False
+
+
+def _markdown_tables_to_bullets(markdown_text: str) -> str:
+    """Best-effort conversion of simple Markdown tables into bullet lists.
+
+    Discord's Markdown table rendering is inconsistent and hard to read in
+    alert channels. This keeps cron alerts Discord-friendly even when a
+    no-agent script or LLM slips a table into the body.
+    """
+    lines = markdown_text.splitlines()
+    output: list[str] = []
+    i = 0
+
+    def _table_cells(line: str) -> list[str]:
+        stripped = line.strip().strip("|")
+        return [cell.strip() for cell in stripped.split("|")]
+
+    def _is_separator(line: str) -> bool:
+        cells = _table_cells(line)
+        if not cells:
+            return False
+        return all(cell and set(cell.replace(":", "").replace("-", "")) == set() and "-" in cell for cell in cells)
+
+    while i < len(lines):
+        if "|" in lines[i] and i + 1 < len(lines) and _is_separator(lines[i + 1]):
+            headers = _table_cells(lines[i])
+            rows: list[list[str]] = []
+            i += 2
+            while i < len(lines) and "|" in lines[i] and lines[i].strip():
+                rows.append(_table_cells(lines[i]))
+                i += 1
+            if output and output[-1].strip():
+                output.append("")
+            for row in rows:
+                pairs = []
+                for idx, value in enumerate(row):
+                    header = headers[idx] if idx < len(headers) and headers[idx] else f"Column {idx + 1}"
+                    if value:
+                        pairs.append(f"**{header}:** {value}")
+                if pairs:
+                    output.append(f"- {'; '.join(pairs)}")
+            if i < len(lines) and lines[i].strip():
+                output.append("")
+            continue
+        output.append(lines[i])
+        i += 1
+
+    return "\n".join(output)
+
+
+def _format_cron_email_subject(job: dict) -> Optional[str]:
+    """Return an explicit email subject for cron delivery when a job asks for one.
+
+    Supports ``{date}`` / ``{date_compact}`` / ``{job_name}`` / ``{job_id}``
+    templates. Dates are evaluated at delivery time in Hermes' configured
+    timezone, so daily email automations do not thread into one endless chain.
+    """
+    template = job.get("email_subject_template") or job.get("delivery_subject_template")
+    if not template:
+        return None
+    now = _hermes_now()
+    return str(template).format(
+        date=now.strftime("%Y-%m-%d"),
+        date_compact=now.strftime("%Y%m%d"),
+        job_name=job.get("name", job.get("id", "")),
+        job_id=job.get("id", ""),
+    )
+
+
+def _format_cron_email_subject_payload(job: dict):
+    """Return the subject payload for email delivery.
+
+    Most jobs get a plain subject string. Jobs with ``email_thread_key`` opt
+    into explicit RFC 5322 threading headers so mail clients that do not rely
+    on Gmail-style same-subject heuristics (notably Apple Mail) can keep a
+    recurring stream in one conversation.
+    """
+    subject = _format_cron_email_subject(job)
+    if not subject:
+        return None
+    thread_key = str(job.get("email_thread_key") or "").strip()
+    if not thread_key:
+        return subject
+    return {"subject": subject, "thread_anchor_key": thread_key}
+
+
+def _is_one_shot_job(job: dict) -> bool:
+    """Return True when a cron job is configured to run only once."""
+    repeat = job.get("repeat")
+    if isinstance(repeat, dict) and repeat.get("times") == 1:
+        return True
+    if repeat == 1:
+        return True
+
+    schedule = job.get("schedule")
+    if isinstance(schedule, dict) and schedule.get("kind") == "once":
+        return True
+    return False
+
+
+def _one_shot_delivery_footer(job: dict) -> str:
+    """Human-facing footer for one-shot deliveries.
+
+    One-off reminders should not imply there is a recurring job to stop.
+    """
+    label_source = " ".join(
+        str(job.get(field) or "")
+        for field in ("name", "prompt")
+    ).lower()
+    noun = "reminder" if "remind" in label_source or "reminder" in label_source else "job"
+    return f"This was a one-off {noun}; it will not repeat."
+
+
+def _is_final_bounded_recurring_run(job: dict) -> bool:
+    """Return True when this execution consumes a recurring job's last run."""
+    repeat = job.get("repeat")
+    if not isinstance(repeat, dict):
+        return False
+    times = repeat.get("times")
+    completed = repeat.get("completed", 0)
+    kind = (job.get("schedule") or {}).get("kind")
+    return (
+        kind in {"cron", "interval"}
+        and isinstance(times, int)
+        and times > 0
+        and isinstance(completed, int)
+        and completed + 1 >= times
+    )
+
+
+def _bounded_job_closeout(job: dict, *, success: bool) -> str:
+    """Build the one-time review request appended to a bounded job's final run."""
+    job_id = str(job.get("id") or "")
+    name = str(job.get("name") or job_id or "cron job")
+    repeat = job.get("repeat") or {}
+    times = repeat.get("times")
+    prompt = " ".join(str(job.get("prompt") or "").split())
+    if len(prompt) > 240:
+        prompt = prompt[:237].rstrip() + "..."
+    purpose = prompt or name
+    outcome = "completed its final run" if success else "reached its run limit with a failure"
+    return (
+        f"## Automation closeout\n\n"
+        f"`{name}` {outcome}. It is now disabled and will not run again.\n\n"
+        f"- **Purpose:** {purpose}\n"
+        f"- **Bound:** {times} runs\n"
+        f"- **Job ID:** `{job_id}`\n\n"
+        f"Should I **delete it**, **keep it completed**, or **resume/edit it**? "
+        f"Reply with your choice and the job ID. If you do nothing, it stays safely disabled."
+    )
+
+
+def _append_cron_email_reference_footer(job: dict, body: str) -> str:
+    """Add a copy/paste reference code to cron email notifications."""
+    from tools.email_rendering import append_notification_reference_footer, make_notification_ref
+
+    job_id = str(job.get("id") or "")
+    task_name = str(job.get("name") or job_id or "cron-job")
+    script = str(job.get("script") or "")
+    source = f"/home/pi/.hermes/scripts/{script}" if script else "Hermes cron job definition"
+    return append_notification_reference_footer(
+        body,
+        ref=make_notification_ref("cron", task_name, job_id),
+        job_id=job_id,
+        script=script or None,
+        source=source,
+        ask="investigate this REF",
+    )
+
+
+
+
+def _cron_repair_gate_alert_routing_enabled() -> bool:
+    """Whether source cron alerts should be held for the repair gate.
+
+    When enabled, ordinary automations still record failed/warning output and
+    ``last_status`` normally, but the source job does not immediately notify the
+    user. The universal automation repairer scans that state, attempts one
+    bounded repair, and reports only repaired/blocked/escalated outcomes.
+    """
+    env = os.getenv("HERMES_CRON_ROUTE_ALERTS_THROUGH_REPAIR_GATE", "").strip().lower()
+    if env in {"1", "true", "yes", "on"}:
+        return True
+    if env in {"0", "false", "no", "off"}:
+        return False
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron") or {} if isinstance(cfg, dict) else {}
+        return bool(cron_cfg.get("route_alerts_through_repair_gate", False))
+    except Exception as exc:
+        logger.debug("Could not read cron repair-gate alert routing config: %s", exc)
+        return False
+
+
+def _is_repair_gate_job(job: dict) -> bool:
+    return (
+        job.get("script") == "automation_failure_repair_gate.py"
+        or job.get("name") == "automation-failure-first-pass-repairer"
+    )
+
+
+def _cron_repair_gate_available() -> bool:
+    """Return True when the universal repair gate is present and not known-broken.
+
+    Source cron failures should be held for Supervisor first-pass repair, not
+    emailed directly. The only sane fallback is when the bridge itself is
+    missing, disabled, or explicitly failing; then the source job may notify so
+    the failure does not disappear into a dead repair lane.
+    """
+    try:
+        for job in load_jobs():
+            if not isinstance(job, dict) or not _is_repair_gate_job(job):
+                continue
+            if not job.get("enabled", True):
+                continue
+            if job.get("state") not in (None, "scheduled", "running"):
+                continue
+            if str(job.get("last_status") or "").lower() == "error":
+                continue
+            if job.get("last_delivery_error"):
+                continue
+            script = str(job.get("script") or "")
+            if script:
+                script_path = _get_hermes_home() / "scripts" / script
+                if not script_path.exists():
+                    continue
+            return True
+    except Exception as exc:
+        logger.warning("Could not verify automation repair gate availability: %s", exc)
+    return False
+
+
+def _should_hold_cron_output_for_repair_gate(job: dict, *, success: bool, deliver_content: str) -> bool:
+    """Whether this job output should go to Supervisor instead of direct delivery."""
+    if not deliver_content.strip():
+        return False
+    if not _cron_repair_gate_alert_routing_enabled():
+        return False
+    if _is_repair_gate_job(job):
+        return False
+    # Failed jobs are all errors. Successful jobs are held only when their
+    # output is explicitly alert-shaped, so normal reports still deliver.
+    if success and not _looks_like_cron_warning_or_error_alert(deliver_content):
+        return False
+    return _cron_repair_gate_available()
+
+
+def _looks_like_cron_warning_or_error_alert(content: str) -> bool:
+    """Best-effort guard for successful jobs that emitted an alert payload.
+
+    This is intentionally conservative so routine reports that merely contain a
+    risks/caveats section still deliver. It catches deterministic watchdog
+    outputs and short alert-style LLM responses whose leading line/status says
+    warning/error/attention/report.
+    """
+    text = (content or "").strip()
+    if not text:
+        return False
+    head = "\n".join(line.strip() for line in text.splitlines()[:8] if line.strip())
+    if re.search(r'(?is)^\s*\{.*"status"\s*:\s*"(REPORT|WARNING|FAILURE|ERROR)"', text[:2000]):
+        return True
+    # Check each leading line, not just the whole joined head. Bilingual jobs may
+    # put a Chinese failure summary first and an English "... failed" line second;
+    # anchoring to only the first line lets those alerts bypass the repair gate.
+    return bool(re.search(
+        r"(?im)^(?:[#*_\s>`-]*)?(?:⚠|⚠️|warning[:：]|error[:：]|alert[:：]|(?:.+\b)?attention needed\b|action required\b|.+\bfailed\b|.*(?:讀取失敗|失敗|錯誤|異常)[:：]?)",
+        head,
+    ))
+
+def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool, for_email: bool = False) -> str:
+    """Apply the cron wrapper, using native formatting for delivery surfaces."""
+    task_name = job.get("name", job["id"])
+    job_id = job.get("id", "")
+    body = _markdown_tables_to_bullets(content) if for_discord else content
+    if for_email and re.search(r"</?(?:html|body|h[1-6]|p|ul|ol|li|br|strong|em|table|tr|td|div|span|blockquote)\b", body or "", re.IGNORECASE):
+        from html import escape
+
+        body_match = re.search(r"<body[^>]*>(.*?)</body>", body, flags=re.IGNORECASE | re.DOTALL)
+        body_html = body_match.group(1) if body_match else body
+        manage = (
+            f'To stop or manage this job, send me a new message '
+            f'(e.g. &quot;stop reminder {escape(str(task_name))}&quot;).'
+        )
+        if _is_one_shot_job(job):
+            manage = escape(_one_shot_delivery_footer(job))
+        html_body = (
+            '<!doctype html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'
+            "'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.45; color:#24292f; "
+            'font-size:15px; max-width:860px; margin:0 auto; padding:16px;">'
+            '<style>a{color:#0969da} code{background:#f6f8fa; padding:2px 4px; border-radius:4px; '
+            'font-family:SFMono-Regular,Consolas,monospace} table{border-collapse:collapse; width:100%;} '
+            'th,td{border:1px solid #d0d7de; padding:6px; vertical-align:top;} '
+            'th{background:#f6f8fa; text-align:left;} blockquote{border-left:4px solid #d0d7de; '
+            'margin:16px 0; padding:8px 12px; color:#57606a; background:#f6f8fa;}</style>'
+            f"<h2>Cron Alert: {escape(str(task_name))}</h2>"
+            f"<p><strong>Job ID:</strong> <code>{escape(str(job_id))}</code></p>"
+            "<hr>"
+            f"{body_html}"
+            "<hr>"
+            f"<p>{manage}</p>"
+            "</body></html>"
+        )
+        return _append_cron_email_reference_footer(job, html_body)
+    if _is_one_shot_job(job):
+        footer = _one_shot_delivery_footer(job)
+        if for_email:
+            return _append_cron_email_reference_footer(job, (
+                f"## Cron Alert: {task_name}\n\n"
+                f"**Job ID:** `{job_id}`\n\n"
+                f"### Report\n\n"
+                f"{body}\n\n"
+                f"### One-off\n\n"
+                f"{footer}"
+            ))
+        if for_discord:
+            return (
+                f"# Cron Alert: {task_name}\n\n"
+                f"**Job ID:** `{job_id}`\n\n"
+                f"## Report\n\n"
+                f"{body}\n\n"
+                f"## One-off\n\n"
+                f"{footer}"
+            )
+        return (
+            f"Cronjob Response: {task_name}\n"
+            f"(job_id: {job_id})\n"
+            f"-------------\n\n"
+            f"{body}\n\n"
+            f"{footer}"
+        )
+    if for_email:
+        return _append_cron_email_reference_footer(job, (
+            f"## Cron Alert: {task_name}\n\n"
+            f"**Job ID:** `{job_id}`\n\n"
+            f"### Report\n\n"
+            f"{body}\n\n"
+            f"### Manage\n\n"
+            f"To stop or manage this job, send me a new message (e.g. `stop reminder {task_name}`)."
+        ))
+    if for_discord:
+        return (
+            f"# Cron Alert: {task_name}\n\n"
+            f"**Job ID:** `{job_id}`\n\n"
+            f"## Report\n\n"
+            f"{body}\n\n"
+            f"## Manage\n\n"
+            f"To stop or manage this job, send me a new message, e.g. `stop reminder {task_name}`."
+        )
+    return (
+        f"Cronjob Response: {task_name}\n"
+        f"(job_id: {job_id})\n"
+        f"-------------\n\n"
+        f"{body}\n\n"
+        f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+    )
+
+
 # Media extension sets — audio routing is centralized in gateway.platforms.base
 # via should_send_media_as_audio() so Telegram-specific rules stay in one place.
 _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
@@ -1490,17 +1866,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         pass
 
     if wrap_response:
-        task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+        delivery_content = _format_cron_delivery_content(
+            job,
+            content,
+            for_discord=any(str(target.get("platform", "")).lower() == "discord" for target in targets),
+            for_email=any(str(target.get("platform", "")).lower() == "email" for target in targets),
         )
     else:
-        delivery_content = content
+        delivery_content = _markdown_tables_to_bullets(content) if any(
+            str(target.get("platform", "")).lower() == "discord" for target in targets
+        ) else content
+
+    email_subject = _format_cron_email_subject_payload(job)
 
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
@@ -1533,6 +1910,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        email_subject = _format_cron_email_subject_payload(job) if str(platform_name).lower() == "email" else None
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -1575,6 +1953,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
             continue
+
+        target_content = cleaned_delivery_content
+        if platform_name.lower() == "email":
+            target_content = _append_cron_email_reference_footer(job, target_content)
 
         # Prefer the live adapter when the gateway is running — this supports E2EE
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
@@ -1717,6 +2099,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
 
+            if email_subject and platform_name.lower() == "email":
+                route_metadata = dict(route_metadata or {})
+                if isinstance(email_subject, dict):
+                    route_metadata.update(email_subject)
+                else:
+                    route_metadata["subject"] = email_subject
+                    route_metadata["suppress_threading"] = True
+
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
                 # Route through the gateway's DeliveryRouter so the live send
@@ -1725,7 +2115,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # standalone cron path lacked this, so DM-topic cron deliveries
                 # landed in the General topic or were rejected by Bot API 10.0
                 # (#22773).
-                text_to_send = cleaned_delivery_content.strip()
+                text_to_send = target_content.strip()
                 adapter_ok = True
                 timed_out = False
                 if text_to_send:
@@ -1940,7 +2330,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            send_subject = email_subject if platform_name.lower() == "email" else None
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                target_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                subject=send_subject,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -1969,7 +2368,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(
+                            asyncio.run,
+                            _send_to_platform(
+                                platform,
+                                pconfig,
+                                chat_id,
+                                target_content,
+                                thread_id=thread_id,
+                                media_files=media_files,
+                                subject=send_subject,
+                            ),
+                        )
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -2447,6 +2857,12 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "Never combine [SILENT] with content — either report your "
         "findings normally, or say [SILENT] and nothing more.]\n\n"
     )
+    if _job_delivers_to_discord(job):
+        cron_hint += (
+            "[DISCORD FORMAT: This cron output is delivered to Discord. "
+            "Use Markdown headings (`#`/`##`) and short bullets. "
+            "Do not use Markdown tables or pipe-table formatting; convert tabular data into grouped bullets instead.]\n\n"
+        )
     prompt = cron_hint + prompt
     if skills is None:
         legacy = job.get("skill")
@@ -3726,6 +4142,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    run_id = execution_id
+    run_started_at = _hermes_now().isoformat()
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -3820,6 +4238,15 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # If the agent responded with [SILENT], skip delivery (but
             # output is already saved above).  Failed jobs always deliver.
             deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+            final_bounded_run = _is_final_bounded_recurring_run(job)
+            if final_bounded_run:
+                closeout = _bounded_job_closeout(job, success=success)
+                if success and _is_cron_silence_response(deliver_content):
+                    deliver_content = closeout
+                elif deliver_content.strip():
+                    deliver_content = f"{deliver_content.rstrip()}\n\n{closeout}"
+                else:
+                    deliver_content = closeout
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
@@ -3830,8 +4257,18 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # a real report that merely quoted "[SILENT]" mid-sentence (#51438,
             # #46917).  Keeps the intentional bracketed-prefix / trailing-line
             # tolerance the cron contract relies on.
-            if should_deliver and success and _is_cron_silence_response(deliver_content):
+            if should_deliver and success and not final_bounded_run and _is_cron_silence_response(deliver_content):
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+                should_deliver = False
+
+            if (
+                should_deliver
+                and _should_hold_cron_output_for_repair_gate(job, success=success, deliver_content=deliver_content)
+            ):
+                logger.info(
+                    "Job '%s': holding source alert for automation repair gate instead of direct delivery",
+                    job["id"],
+                )
                 should_deliver = False
 
             if should_deliver:
@@ -3855,14 +4292,43 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+            run_completed_at = _hermes_now().isoformat()
+            delivery_receipt = {
+                "run_id": run_id,
+                "job_id": job["id"],
+                "started_at": run_started_at,
+                "completed_at": run_completed_at,
+                "target": job.get("deliver"),
+                # A successfully delivered failure alert is not proof that the
+                # intended job output reached the target.
+                "intended_output_delivered": bool(success and should_deliver and delivery_error is None),
+            }
+            mark_job_run(
+                job["id"],
+                success,
+                error,
+                delivery_error=delivery_error,
+                delivery_receipt=delivery_receipt,
+            )
         finish_execution(execution_id, success=success, error=error)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], False, str(e))
+            mark_job_run(
+                job["id"],
+                False,
+                str(e),
+                delivery_receipt={
+                    "run_id": run_id,
+                    "job_id": job["id"],
+                    "started_at": run_started_at,
+                    "completed_at": _hermes_now().isoformat(),
+                    "target": job.get("deliver"),
+                    "intended_output_delivered": False,
+                },
+            )
         finish_execution(execution_id, success=False, error=str(e))
         return False
 
@@ -3982,14 +4448,21 @@ def tick(
             body."""
             return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
 
-        # Partition due jobs: those with a per-job workdir mutate
-        # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
-        # they queue on the single-thread sequential pool to run one at a time.
-        # That alone only keeps workdir jobs from overlapping EACH OTHER;
-        # run_job's _terminal_cwd_lock is what additionally stops a concurrently
-        # firing workdir-less parallel-pool job from observing the override.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        # Partition due jobs: jobs with a per-job workdir and/or profile touch
+        # process-global runtime state inside run_job. Workdir jobs temporarily
+        # set os.environ["TERMINAL_CWD"]; profile jobs use a context-local
+        # Hermes home override, scheduler _hermes_home hook, and temporary
+        # profile .env load into os.environ with snapshot/restore. They MUST run
+        # sequentially to avoid corrupting each other. Jobs without either field
+        # stay parallel-safe.
+        sequential_jobs = [
+            j for j in due_jobs
+            if (j.get("workdir") or "").strip() or (j.get("profile") or "").strip()
+        ]
+        parallel_jobs = [
+            j for j in due_jobs
+            if not ((j.get("workdir") or "").strip() or (j.get("profile") or "").strip())
+        ]
 
         _results: list = []
         _all_futures: list = []

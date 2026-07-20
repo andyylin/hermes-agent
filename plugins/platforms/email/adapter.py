@@ -31,6 +31,7 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email.utils import formatdate
 from email import encoders
+from html import escape, unescape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -419,8 +420,21 @@ def _extract_attachments(
     return attachments
 
 
+def _stable_thread_message_id(key: str, domain: str) -> Optional[str]:
+    """Build a deterministic Message-ID-like anchor for recurring notifications."""
+    key = str(key or "").strip().lower()
+    domain = str(domain or "").strip().lower()
+    if not key or not domain:
+        return None
+    safe_key = re.sub(r"[^a-z0-9._-]+", "-", key).strip(".-_")[:80]
+    safe_domain = re.sub(r"[^a-z0-9.-]+", "", domain).strip(".")
+    if not safe_key or not safe_domain:
+        return None
+    return f"<hermes-thread-{safe_key}@{safe_domain}>"
+
+
 class EmailAdapter(BasePlatformAdapter):
-    """Email gateway adapter using IMAP (receive) and SMTP (send)."""
+    """Email platform adapter."""
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.EMAIL)
@@ -900,8 +914,23 @@ class EmailAdapter(BasePlatformAdapter):
         """Send an email reply to the given address."""
         try:
             loop = asyncio.get_running_loop()
+            meta = metadata or {}
+            subject = meta.get("subject")
+            suppress_threading = bool(meta.get("suppress_threading"))
+            thread_key = (
+                meta.get("thread_anchor_key")
+                or meta.get("email_thread_key")
+                or meta.get("thread_key")
+            )
             message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, content, reply_to
+                None,
+                self._send_email,
+                chat_id,
+                content,
+                reply_to,
+                subject,
+                suppress_threading,
+                thread_key,
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -923,21 +952,35 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         reply_to_msg_id: Optional[str] = None,
+        subject_override: Optional[str | Dict[str, Any]] = None,
+        suppress_threading: bool = False,
+        thread_anchor_key: Optional[str] = None,
     ) -> str:
+
         """Send an email via SMTP. Runs in executor thread."""
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        # Thread context for reply
+        # Thread context for reply, unless the caller supplies a fresh subject.
+        if isinstance(subject_override, dict):
+            suppress_threading = bool(subject_override.get("suppress_threading"))
+            thread_anchor_key = subject_override.get("thread_anchor_key") or thread_anchor_key
+            subject_override = subject_override.get("subject")
+        notification_like = bool(subject_override) or suppress_threading
         ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
+        if subject_override:
+            subject = str(subject_override)
+        else:
+            subject = ctx.get("subject", "Hermes Agent")
+            if not subject.startswith("Re:"):
+                subject = f"Re: {subject}"
         msg["Subject"] = subject
 
         # Threading headers
-        original_msg_id = reply_to_msg_id or ctx.get("message_id")
+        domain = self._address.split("@", 1)[1] if "@" in self._address else ""
+        thread_anchor_msg_id = _stable_thread_message_id(str(thread_anchor_key or ""), domain)
+        original_msg_id = thread_anchor_msg_id or (None if suppress_threading else (reply_to_msg_id or ctx.get("message_id")))
         if original_msg_id:
             msg["In-Reply-To"] = original_msg_id
             msg["References"] = original_msg_id
@@ -946,7 +989,15 @@ class EmailAdapter(BasePlatformAdapter):
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
         msg["Message-ID"] = msg_id
 
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+        if notification_like:
+            from tools.email_rendering import append_notification_reference_footer
+
+            body = append_notification_reference_footer(
+                body,
+                subject=subject,
+                ask="investigate this REF",
+            )
+        self._attach_body(msg, body)
 
         smtp = self._connect_smtp()
         try:
@@ -960,6 +1011,47 @@ class EmailAdapter(BasePlatformAdapter):
 
         logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, subject)
         return msg_id
+
+    @staticmethod
+    def _looks_like_html(body: str) -> bool:
+        """Return True for complete or fragment HTML bodies worth sending as text/html."""
+        from tools.email_rendering import message_looks_like_html
+
+        return message_looks_like_html(body)
+
+    @staticmethod
+    def _html_to_plain_text(html: str) -> str:
+        """Best-effort plain-text fallback for multipart/alternative HTML email."""
+        from tools.email_rendering import html_to_plain_text
+
+        return html_to_plain_text(html)
+
+    @staticmethod
+    def _render_inline_markdown(text: str) -> str:
+        """Render a small, escaped Markdown subset for outbound email HTML."""
+        from tools.email_rendering import render_inline_markdown
+
+        return render_inline_markdown(text)
+
+    @classmethod
+    def _plain_text_to_html(cls, body: str) -> str:
+        """Render assistant Markdown-ish text as rich, safe HTML email."""
+        from tools.email_rendering import plain_text_to_html
+
+        return plain_text_to_html(body)
+
+    def _attach_body(self, msg: MIMEMultipart, body: str) -> None:
+        """Attach email body as HTML by default, with a plain-text fallback."""
+        alt = MIMEMultipart("alternative")
+        if self._looks_like_html(body):
+            plain_body = self._html_to_plain_text(body)
+            html_body = body
+        else:
+            plain_body = body or ""
+            html_body = self._plain_text_to_html(plain_body)
+        alt.attach(MIMEText(plain_body, "plain", "utf-8"))
+        alt.attach(MIMEText(html_body, "html", "utf-8"))
+        msg.attach(alt)
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Email has no typing indicator — no-op."""
@@ -1060,7 +1152,7 @@ class EmailAdapter(BasePlatformAdapter):
         msg["Message-ID"] = msg_id
 
         if body:
-            msg.attach(MIMEText(body, "plain", "utf-8"))
+            self._attach_body(msg, body)
 
         for file_path in file_paths:
             p = Path(file_path)
@@ -1140,7 +1232,7 @@ class EmailAdapter(BasePlatformAdapter):
         msg["Message-ID"] = msg_id
 
         if body:
-            msg.attach(MIMEText(body, "plain", "utf-8"))
+            self._attach_body(msg, body)
 
         # Attach file
         p = Path(file_path)
@@ -1195,13 +1287,12 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    subject=None,
 ):
     """Out-of-process Email delivery via SMTP (one-shot). Implements the
     standalone_sender_fn contract; replaces the legacy _send_email helper."""
     import smtplib
     import ssl as _ssl
-    from email.mime.text import MIMEText
-    from email.utils import formatdate
 
     extra = getattr(pconfig, "extra", {}) or {}
     address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
@@ -1216,18 +1307,53 @@ async def _standalone_send(
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
     try:
-        msg = MIMEText(message, "plain", "utf-8")
+        msg = MIMEMultipart()
         msg["From"] = address
         msg["To"] = chat_id
-        msg["Subject"] = "Hermes Agent"
+        thread_anchor_key = None
+        suppress_threading = False
+        if isinstance(subject, dict):
+            suppress_threading = bool(subject.get("suppress_threading"))
+            thread_anchor_key = subject.get("thread_anchor_key")
+            subject = subject.get("subject")
+        msg["Subject"] = subject or "Hermes Agent"
+        notification_like = bool(subject) or suppress_threading
         msg["Date"] = formatdate(localtime=True)
+        domain = address.split("@", 1)[1] if "@" in address else ""
+        thread_anchor_msg_id = _stable_thread_message_id(str(thread_anchor_key or ""), domain)
+        if thread_anchor_msg_id:
+            msg["In-Reply-To"] = thread_anchor_msg_id
+            msg["References"] = thread_anchor_msg_id
+        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{domain or 'localhost'}>"
+        msg["Message-ID"] = msg_id
+
+        body = message or ""
+        if notification_like:
+            from tools.email_rendering import append_notification_reference_footer
+
+            body = append_notification_reference_footer(
+                body,
+                subject=str(subject or "Hermes Agent"),
+                ask="investigate this REF",
+            )
+
+        alt = MIMEMultipart("alternative")
+        if EmailAdapter._looks_like_html(body):
+            plain_body = EmailAdapter._html_to_plain_text(body)
+            html_body = body
+        else:
+            plain_body = body
+            html_body = EmailAdapter._plain_text_to_html(plain_body)
+        alt.attach(MIMEText(plain_body, "plain", "utf-8"))
+        alt.attach(MIMEText(html_body, "html", "utf-8"))
+        msg.attach(alt)
 
         server = smtplib.SMTP(smtp_host, smtp_port)
         server.starttls(context=_ssl.create_default_context())
         server.login(address, password)
         server.send_message(msg)
         server.quit()
-        return {"success": True, "platform": "email", "chat_id": chat_id}
+        return {"success": True, "platform": "email", "chat_id": chat_id, "message_id": msg_id}
     except Exception as e:
         try:
             from tools.send_message_tool import _error as _e

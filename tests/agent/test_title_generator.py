@@ -290,6 +290,27 @@ class TestAutoTitleSession:
         db.set_auto_title_if_empty.assert_called_once_with("sess-1", "Readable Session")
         assert seen == ["Readable Session"]
 
+    def test_legacy_on_title_alias_survives_runtime_validator_wrapper(self):
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        db.set_auto_title_if_empty.return_value = True
+        seen = []
+        validator = MagicMock(return_value=True)
+
+        with patch("agent.title_generator.generate_title", return_value="Combined Title") as generate:
+            auto_title_session(
+                db,
+                "sess-1",
+                "hello",
+                "hi there",
+                on_title=seen.append,
+                runtime_validator=validator,
+            )
+
+        assert generate.call_args.kwargs["runtime_validator"] is validator
+        db.set_auto_title_if_empty.assert_called_once_with("sess-1", "Combined Title")
+        assert seen == ["Combined Title"]
+
     def test_skips_if_generation_fails(self):
         db = MagicMock()
         db.get_session_title.return_value = None

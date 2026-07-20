@@ -75,7 +75,13 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from plugins.platforms.discord.adapter import (  # noqa: E402
+    DiscordAdapter,
+    _build_auto_thread_name,
+    _discord_app_command_scope_kwargs,
+    _legacy_auto_thread_name,
+)
+import plugins.platforms.discord.adapter as discord_adapter_module  # noqa: E402
 
 
 class FakeTree:
@@ -97,7 +103,12 @@ class FakeTree:
 
 
 @pytest.fixture
-def adapter():
+def adapter(monkeypatch):
+    monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_NO_THREAD_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_SMART_THREAD_TITLES", raising=False)
     config = PlatformConfig(enabled=True, token="***")
     adapter = DiscordAdapter(config)
     adapter._client = SimpleNamespace(
@@ -112,6 +123,57 @@ def adapter():
     # construct a full auth context (allowlist / channel scope).
     adapter._check_slash_authorization = AsyncMock(return_value=True)
     return adapter
+
+
+def test_discord_bot_scope_kwargs_enable_guild_and_user_installs(monkeypatch):
+    calls = {}
+
+    class FakeInstallationType:
+        def __init__(self, **kwargs):
+            calls["installs"] = kwargs
+
+    class FakeCommandContext:
+        def __init__(self, **kwargs):
+            calls["contexts"] = kwargs
+
+    monkeypatch.setattr(discord_adapter_module, "DISCORD_AVAILABLE", True)
+    monkeypatch.setattr(
+        discord_adapter_module,
+        "discord",
+        SimpleNamespace(
+            app_commands=SimpleNamespace(
+                AppInstallationType=FakeInstallationType,
+                AppCommandContext=FakeCommandContext,
+            )
+        ),
+    )
+
+    kwargs = _discord_app_command_scope_kwargs()
+
+    assert set(kwargs) == {"allowed_installs", "allowed_contexts"}
+    assert calls["installs"] == {"guild": True, "user": True}
+    assert calls["contexts"] == {
+        "guild": True,
+        "dm_channel": True,
+        "private_channel": True,
+    }
+
+
+def test_patchable_payload_excludes_unpatchable_scope_metadata(adapter):
+    payload = {
+        "type": 1,
+        "name": "status",
+        "description": "Show Hermes session status",
+        "options": [],
+        "contexts": [2, 0, 1],
+        "integration_types": [1, 0],
+    }
+
+    assert adapter._patchable_app_command_payload(payload) == {
+        "name": "status",
+        "description": "Show Hermes session status",
+        "options": [],
+    }
 
 
 # ------------------------------------------------------------------
@@ -573,8 +635,55 @@ def test_build_slash_event_uses_group_context_for_channels(adapter):
 # ------------------------------------------------------------------
 
 
+def test_build_auto_thread_name_summarizes_request():
+    assert (
+        _build_auto_thread_name(
+            "Can you make yourself auto-retitle threads intelligently? "
+            "Based on the first message, give the thread a title that is a smart summary."
+        )
+        == "make yourself auto-retitle threads intelligently"
+    )
+
+
+def test_build_auto_thread_name_strips_polite_openers():
+    assert _build_auto_thread_name("<@123> please help me debug Discord auto-thread titles") == "debug Discord auto-thread titles"
+
+
+def test_auto_thread_name_helpers_strip_gateway_speaker_prefix():
+    message = (
+        "[INeedAUsername] I originally organized alerts and reports to go into their "
+        "own dedicated Discord channels, but I think that's worse than having the "
+        "alerts and reports go into their own designated threads."
+    )
+
+    assert _build_auto_thread_name(message) == (
+        "I originally organized alerts and reports to go into their own dedicated Disc..."
+    )
+    assert _legacy_auto_thread_name(message) == (
+        "I originally organized alerts and reports to go into their own dedicated Disc..."
+    )
+
+
 @pytest.mark.asyncio
-async def test_auto_create_thread_uses_message_content_as_name(adapter):
+async def test_auto_create_thread_uses_summarized_name_when_enabled(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_SMART_THREAD_TITLES", "true")
+    thread = SimpleNamespace(id=999, name="summary")
+    message = SimpleNamespace(
+        content="Can you fix our Discord auto-thread titling? It keeps using the whole message.",
+        create_thread=AsyncMock(return_value=thread),
+        channel=SimpleNamespace(send=AsyncMock()),
+        author=SimpleNamespace(display_name="Jezza"),
+    )
+
+    result = await adapter._auto_create_thread(message)
+
+    assert result is thread
+    assert message.create_thread.await_args[1]["name"] == "fix our Discord auto-thread titling"
+
+
+@pytest.mark.asyncio
+async def test_auto_create_thread_uses_message_content_as_name(adapter, monkeypatch):
+    monkeypatch.delenv("DISCORD_SMART_THREAD_TITLES", raising=False)
     thread = SimpleNamespace(id=999, name="Hello world")
     message = SimpleNamespace(
         content="Hello world, how are you?",
@@ -589,8 +698,25 @@ async def test_auto_create_thread_uses_message_content_as_name(adapter):
     message.create_thread.assert_awaited_once()
     call_kwargs = message.create_thread.await_args[1]
     assert call_kwargs["name"] == "Hello world, how are you?"
-    assert call_kwargs["auto_archive_duration"] == 1440
+    assert call_kwargs["auto_archive_duration"] == 10080
     assert thread._hermes_auto_thread_initial_name == "Hello world, how are you?"
+
+
+@pytest.mark.asyncio
+async def test_auto_create_thread_uses_summarized_name_when_enabled(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_SMART_THREAD_TITLES", "true")
+    thread = SimpleNamespace(id=999, name="smart")
+    message = SimpleNamespace(
+        content="<@123> Can you make yourself auto-retitle threads intelligently? Based on the first message",
+        create_thread=AsyncMock(return_value=thread),
+        channel=SimpleNamespace(send=AsyncMock()),
+        author=SimpleNamespace(display_name="Jezza"),
+    )
+
+    await adapter._auto_create_thread(message)
+
+    name = message.create_thread.await_args[1]["name"]
+    assert name == "make yourself auto-retitle threads intelligently"
 
 
 @pytest.mark.asyncio
@@ -670,7 +796,7 @@ async def test_auto_create_thread_falls_back_to_seed_message(adapter):
     message.channel.send.assert_awaited_once_with("🧵 Thread created by Hermes: **Hello**")
     seed_message.create_thread.assert_awaited_once_with(
         name="Hello",
-        auto_archive_duration=1440,
+        auto_archive_duration=10080,
         reason="Auto-threaded from mention by Jezza",
     )
 
@@ -706,7 +832,7 @@ async def test_rename_thread_edits_only_when_current_name_matches(adapter):
     assert result is True
     thread.edit.assert_awaited_once_with(
         name="Semantic Session Title",
-        reason="Hermes semantic session title",
+        reason="Hermes auto-generated conversation title",
     )
 
 
@@ -784,6 +910,124 @@ def _fake_message(channel, *, content="Hello", author_id=42, display_name="Jezza
         created_at=None,
         id=12345,
     )
+
+
+@pytest.mark.asyncio
+async def test_rename_thread_edits_discord_thread(adapter):
+    thread = _FakeThreadChannel(channel_id=777, name="raw first message")
+    thread.edit = AsyncMock()
+    adapter._client.get_channel = lambda _id: thread
+
+    result = await adapter.rename_thread("777", "Helpful Discord thread title")
+
+    assert result is True
+    thread.edit.assert_awaited_once_with(
+        name="Helpful Discord thread title",
+        reason="Hermes auto-generated conversation title",
+    )
+
+
+@pytest.mark.asyncio
+async def test_rename_thread_fetches_when_not_cached(adapter):
+    thread = _FakeThreadChannel(channel_id=777, name="raw first message")
+    thread.edit = AsyncMock()
+    adapter._client.get_channel = lambda _id: None
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
+
+    result = await adapter.rename_thread("777", "Fetched title")
+
+    assert result is True
+    adapter._client.fetch_channel.assert_awaited_once_with(777)
+    thread.edit.assert_awaited_once_with(
+        name="Fetched title",
+        reason="Hermes auto-generated conversation title",
+    )
+
+
+@pytest.mark.asyncio
+async def test_rename_thread_skips_when_human_renamed_thread(adapter):
+    thread = _FakeThreadChannel(channel_id=777, name="Andy's Manual Title")
+    thread.edit = AsyncMock()
+    adapter._client.get_channel = lambda _id: thread
+
+    result = await adapter.rename_thread(
+        "777",
+        "Generated Conversation Title",
+        only_if_current_name="raw first message",
+    )
+
+    assert result is False
+    thread.edit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rename_thread_guard_allows_auto_created_name(adapter):
+    thread = _FakeThreadChannel(channel_id=777, name="raw first message")
+    thread.edit = AsyncMock()
+    adapter._client.get_channel = lambda _id: thread
+
+    result = await adapter.rename_thread(
+        "777",
+        "Generated Conversation Title",
+        only_if_current_name="raw first message",
+    )
+
+    assert result is True
+    thread.edit.assert_awaited_once_with(
+        name="Generated Conversation Title",
+        reason="Hermes auto-generated conversation title",
+    )
+
+
+@pytest.mark.asyncio
+async def test_rename_thread_guard_allows_gateway_prefixed_expected_name(adapter):
+    thread = _FakeThreadChannel(channel_id=777, name="How com eyou are no longer auto-titling Discord threads again")
+    thread.edit = AsyncMock()
+    adapter._client.get_channel = lambda _id: thread
+
+    result = await adapter.rename_thread(
+        "777",
+        "Discord Auto Title Regression",
+        only_if_current_name="[INeedAUsername] How com eyou are no longer auto-titling Discord threads again",
+    )
+
+    assert result is True
+    thread.edit.assert_awaited_once_with(
+        name="Discord Auto Title Regression",
+        reason="Hermes auto-generated conversation title",
+    )
+
+
+@pytest.mark.asyncio
+async def test_rename_thread_guard_accepts_multiple_expected_names(adapter):
+    thread = _FakeThreadChannel(
+        channel_id=777,
+        name="How come n8n still sent me a error message email instead of routing through a...",
+    )
+    thread.edit = AsyncMock()
+    adapter._client.get_channel = lambda _id: thread
+
+    result = await adapter.rename_thread(
+        "777",
+        "Appsheet Sync failure and Auto-Repair",
+        only_if_current_name=[
+            "[The user sent a text document: 'message",
+            "How come n8n still sent me a error message email instead of routing through a...",
+        ],
+    )
+
+    assert result is True
+    thread.edit.assert_awaited_once_with(
+        name="Appsheet Sync failure and Auto-Repair",
+        reason="Hermes auto-generated conversation title",
+    )
+
+
+@pytest.mark.asyncio
+async def test_rename_thread_ignores_non_thread_channel(adapter):
+    adapter._client.get_channel = lambda _id: _FakeTextChannel(channel_id=777)
+
+    assert await adapter.rename_thread("777", "Nope") is False
 
 
 @pytest.mark.asyncio
@@ -894,6 +1138,58 @@ async def test_auto_thread_can_be_disabled(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_auto_thread_still_runs_in_free_response_channels(adapter, monkeypatch):
+    """Free-response means no mention required; it must not imply no-thread."""
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "100")
+
+    fake_thread = _FakeThreadChannel(channel_id=999, name="auto-thread")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+
+    captured_events = []
+
+    async def capture_handle(event):
+        captured_events.append(event)
+
+    adapter.handle_message = capture_handle
+
+    msg = _fake_message(_FakeTextChannel(channel_id=100), content="Did Joi's update work?")
+
+    await adapter._handle_message(msg)
+
+    adapter._auto_create_thread.assert_awaited_once_with(msg)
+    assert len(captured_events) == 1
+    assert captured_events[0].source.chat_id == "999"
+    assert captured_events[0].source.chat_type == "thread"
+
+
+@pytest.mark.asyncio
+async def test_auto_thread_respects_no_thread_channels(adapter, monkeypatch):
+    """no_thread_channels is the explicit opt-out from auto-threading."""
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_NO_THREAD_CHANNELS", "100")
+
+    adapter._auto_create_thread = AsyncMock()
+
+    captured_events = []
+
+    async def capture_handle(event):
+        captured_events.append(event)
+
+    adapter.handle_message = capture_handle
+
+    msg = _fake_message(_FakeTextChannel(channel_id=100), content="Stay in channel")
+
+    await adapter._handle_message(msg)
+
+    adapter._auto_create_thread.assert_not_awaited()
+    assert len(captured_events) == 1
+    assert captured_events[0].source.chat_id == "100"
+
+
+@pytest.mark.asyncio
 async def test_auto_thread_skips_threads_and_dms(adapter, monkeypatch):
     """Auto-thread should not create threads inside existing threads."""
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
@@ -921,7 +1217,7 @@ async def test_auto_thread_skips_threads_and_dms(adapter, monkeypatch):
 
 
 def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
-    """discord.auto_thread in config.yaml should be bridged to DISCORD_AUTO_THREAD env var."""
+    """discord auto-thread keys in config.yaml should be bridged to DISCORD_* env vars."""
     import yaml
     from pathlib import Path
 
@@ -930,10 +1226,16 @@ def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
     hermes_dir.mkdir()
     config_path = hermes_dir / "config.yaml"
     config_path.write_text(yaml.dump({
-        "discord": {"auto_thread": True},
+        "discord": {
+            "auto_thread": True,
+            "smart_thread_titles": True,
+            "thread_auto_archive_minutes": 10080,
+        },
     }))
 
     monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.delenv("DISCORD_SMART_THREAD_TITLES", raising=False)
+    monkeypatch.delenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(hermes_dir))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
@@ -942,6 +1244,31 @@ def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
 
     import os
     assert os.getenv("DISCORD_AUTO_THREAD") == "true"
+    assert os.getenv("DISCORD_SMART_THREAD_TITLES") == "true"
+    assert os.getenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES") == "10080"
+
+
+def test_discord_smart_thread_titles_config_bridge(monkeypatch, tmp_path):
+    """discord.smart_thread_titles in config.yaml should bridge to runtime env."""
+    import yaml
+    from pathlib import Path
+
+    hermes_dir = tmp_path / ".hermes"
+    hermes_dir.mkdir()
+    config_path = hermes_dir / "config.yaml"
+    config_path.write_text(yaml.dump({
+        "discord": {"smart_thread_titles": True},
+    }))
+
+    monkeypatch.delenv("DISCORD_SMART_THREAD_TITLES", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_dir))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    from gateway.config import load_gateway_config
+    load_gateway_config()
+
+    import os
+    assert os.getenv("DISCORD_SMART_THREAD_TITLES") == "true"
 
 
 # ------------------------------------------------------------------

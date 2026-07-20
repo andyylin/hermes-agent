@@ -176,6 +176,11 @@ Trigger conditions for this skill.
 How to confirm it worked.
 ```
 
+`description` is also the routing hint in the injected system-prompt skills
+index. Keep it short and action-oriented; put longer trigger rules, examples,
+and caveats in the body or reference files. Hermes normalizes and caps the
+prompt-facing copy as a safety net.
+
 ### Platform-Specific Skills
 
 Skills can restrict themselves to specific operating systems using the `platforms` field:
