@@ -2,12 +2,18 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
 import { $sidebarAgentsGrouped } from '@/store/layout'
+import { $activeGatewayProfile } from '@/store/profile'
+import type { ProjectInfo } from '@/types/hermes'
 
 import {
   $activeProjectId,
+  $projectDialog,
+  $projects,
   $projectScope,
   $projectsRpcAvailable,
   $projectTree,
+  $projectTreeLoading,
+  $removedSessionIds,
   $worktreeRefreshToken,
   ALL_PROJECTS,
   createProject,
@@ -17,8 +23,13 @@ import {
   pickProjectFolder,
   projectNameForCwd,
   refreshProjects,
-  refreshWorktrees
+  refreshWorktrees,
+  scanAndRecordRepos,
+  tombstoneSessions,
+  updateProject
 } from './projects'
+
+const { scanRepos } = vi.hoisted(() => ({ scanRepos: vi.fn() }))
 
 vi.mock('@/i18n', () => ({
   translateNow: (key: string) => key
@@ -33,6 +44,10 @@ vi.mock('@/lib/desktop-fs', () => ({
   isDesktopFsRemoteMode: vi.fn(),
   selectDesktopPaths: vi.fn(),
   writeDesktopFileText: vi.fn()
+}))
+
+vi.mock('@/lib/desktop-git', () => ({
+  desktopGit: () => ({ scanRepos })
 }))
 
 vi.mock('@/store/gateway', () => ({
@@ -50,9 +65,167 @@ const activeGateway = vi.mocked(gw.activeGateway)
 const notifications = await import('@/store/notifications')
 const notify = vi.mocked(notifications.notify)
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+
+  return { promise, reject, resolve }
+}
+
+const project = (id: string, name: string): ProjectInfo => ({
+  archived: false,
+  board_slug: null,
+  color: null,
+  created_at: 0,
+  description: null,
+  folders: [],
+  icon: null,
+  id,
+  name,
+  primary_path: null,
+  slug: id
+})
+
+describe('profile isolation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    window.localStorage.clear()
+    $activeGatewayProfile.set('default')
+    $projects.set([])
+    $projectScope.set(ALL_PROJECTS)
+  })
+
+  it('drops a stale projects.list response after switching profiles', async () => {
+    const responseA = deferred<{ active_id: null; projects: ProjectInfo[] }>()
+    const gatewayA = { connectionState: 'open', request: vi.fn(() => responseA.promise) }
+    const gatewayB = { connectionState: 'open', request: vi.fn() }
+
+    $activeGatewayProfile.set('alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    const refresh = refreshProjects()
+
+    $activeGatewayProfile.set('beta')
+    activeGateway.mockReturnValue(gatewayB as never)
+    responseA.resolve({ active_id: null, projects: [project('p_alpha', 'Alpha')] })
+    await refresh
+
+    expect($projects.get()).toEqual([])
+  })
+
+  it('drops an old alpha response after a rapid alpha to beta to alpha swap', async () => {
+    const oldAlpha = deferred<{ active_id: null; projects: ProjectInfo[] }>()
+    const gatewayA = { connectionState: 'open', request: vi.fn(() => oldAlpha.promise) }
+    const gatewayB = { connectionState: 'open', request: vi.fn() }
+
+    $activeGatewayProfile.set('rapid-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    const refresh = refreshProjects()
+
+    $activeGatewayProfile.set('rapid-beta')
+    activeGateway.mockReturnValue(gatewayB as never)
+    $activeGatewayProfile.set('rapid-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    $projects.set([project('p_fresh', 'Fresh alpha')])
+
+    oldAlpha.resolve({ active_id: null, projects: [project('p_stale', 'Stale alpha')] })
+    await refresh
+
+    expect($projects.get().map(item => item.id)).toEqual(['p_fresh'])
+  })
+
+  it('never submits alpha repo scan results through beta gateway', async () => {
+    const scanned = deferred<Array<{ path: string }>>()
+    const gatewayA = { connectionState: 'open', request: vi.fn().mockResolvedValue({}) }
+    const gatewayB = { connectionState: 'open', request: vi.fn().mockResolvedValue({}) }
+    scanRepos.mockReturnValue(scanned.promise)
+
+    $activeGatewayProfile.set('scan-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    const scan = scanAndRecordRepos(true)
+
+    $activeGatewayProfile.set('scan-beta')
+    activeGateway.mockReturnValue(gatewayB as never)
+    scanned.resolve([{ path: '/repos/alpha' }])
+    await scan
+
+    expect(gatewayB.request).not.toHaveBeenCalledWith('projects.record_repos', expect.anything())
+  })
+
+  it('scans once for each profile instead of suppressing beta after alpha', async () => {
+    const gatewayA = { connectionState: 'open', request: vi.fn().mockResolvedValue({}) }
+    const gatewayB = { connectionState: 'open', request: vi.fn().mockResolvedValue({}) }
+    scanRepos.mockResolvedValue([{ path: '/repos/shared' }])
+
+    $activeGatewayProfile.set('once-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    await scanAndRecordRepos()
+
+    $activeGatewayProfile.set('once-beta')
+    activeGateway.mockReturnValue(gatewayB as never)
+    await scanAndRecordRepos()
+
+    expect(gatewayA.request).toHaveBeenCalledWith('projects.record_repos', expect.anything())
+    expect(gatewayB.request).toHaveBeenCalledWith('projects.record_repos', expect.anything())
+  })
+
+  it('does not roll an alpha optimistic snapshot into beta after a failed write', async () => {
+    const writeA = deferred<never>()
+    const gatewayA = { connectionState: 'open', request: vi.fn(() => writeA.promise) }
+
+    $activeGatewayProfile.set('write-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    $projects.set([project('p_alpha', 'Alpha')])
+    const update = updateProject('p_alpha', { name: 'Alpha renamed' })
+
+    $activeGatewayProfile.set('write-beta')
+    $projects.set([project('p_beta', 'Beta')])
+    writeA.reject(new Error('alpha write failed'))
+    await expect(update).rejects.toThrow()
+
+    expect($projects.get().map(project => project.id)).toEqual(['p_beta'])
+  })
+
+  it('persists project scope independently per profile', () => {
+    $activeGatewayProfile.set('scope-alpha')
+    enterProject('p_alpha')
+
+    $activeGatewayProfile.set('scope-beta')
+    expect($projectScope.get()).toBe(ALL_PROJECTS)
+    enterProject('p_beta')
+
+    $activeGatewayProfile.set('scope-alpha')
+    expect($projectScope.get()).toBe('p_alpha')
+  })
+
+  it('clears every profile-bound project view atom during a switch', () => {
+    $activeGatewayProfile.set('reset-alpha')
+    $projects.set([project('p_alpha', 'Alpha')])
+    $activeProjectId.set('p_alpha')
+    $projectTreeLoading.set(true)
+    openProjectCreate()
+    $projectsRpcAvailable.set(false)
+    tombstoneSessions(['s_alpha'])
+
+    $activeGatewayProfile.set('reset-beta')
+
+    expect($projects.get()).toEqual([])
+    expect($activeProjectId.get()).toBeNull()
+    expect($projectTreeLoading.get()).toBe(false)
+    expect($projectsRpcAvailable.get()).toBeNull()
+    expect($removedSessionIds.get().size).toBe(0)
+    expect($projectDialog.get()).toBeNull()
+  })
+})
+
 describe('project scope', () => {
   beforeEach(() => {
     window.localStorage.clear()
+    $activeGatewayProfile.set('default')
     $projectScope.set(ALL_PROJECTS)
   })
 
@@ -80,7 +253,7 @@ describe('project scope', () => {
 
   it('persists the scope to localStorage', () => {
     enterProject('p_abc')
-    expect(window.localStorage.getItem('hermes.desktop.projectScope')).toBe('p_abc')
+    expect(window.localStorage.getItem('hermes.desktop.projectScope.default')).toBe('p_abc')
   })
 })
 

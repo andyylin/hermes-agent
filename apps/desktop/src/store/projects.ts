@@ -6,11 +6,10 @@ import { translateNow } from '@/i18n'
 import { desktopDefaultCwd, selectDesktopPaths, writeDesktopFileText } from '@/lib/desktop-fs'
 import { desktopGit } from '@/lib/desktop-git'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
-import { persistentAtom } from '@/lib/persisted'
 import { activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
 import { setSidebarAgentsGrouped } from '@/store/layout'
 import { notify } from '@/store/notifications'
-import { requestFreshSession } from '@/store/profile'
+import { $activeGatewayProfile, normalizeProfileKey, requestFreshSession } from '@/store/profile'
 import { $selectedStoredSessionId, $sessions, sessionMatchesStoredId, workspaceCwdForNewSession } from '@/store/session'
 import type { ProjectInfo, ProjectsPayload } from '@/types/hermes'
 
@@ -106,10 +105,35 @@ export const $reposScanning = atom(false)
 export const ALL_PROJECTS = '__all_projects__'
 
 const PROJECT_SCOPE_KEY = 'hermes.desktop.projectScope'
+const projectScopeStorageKey = (profile: string): string => `${PROJECT_SCOPE_KEY}.${encodeURIComponent(profile)}`
 
-export const $projectScope = persistentAtom<string>(PROJECT_SCOPE_KEY, ALL_PROJECTS, {
-  decode: raw => raw || ALL_PROJECTS,
-  encode: value => value || ALL_PROJECTS
+function readProjectScope(profile: string): string {
+  try {
+    return window.localStorage.getItem(projectScopeStorageKey(profile)) || ALL_PROJECTS
+  } catch {
+    return ALL_PROJECTS
+  }
+}
+
+function writeProjectScope(profile: string, value: string): void {
+  try {
+    window.localStorage.setItem(projectScopeStorageKey(profile), value || ALL_PROJECTS)
+  } catch {
+    // Storage can be unavailable in hardened/private renderer contexts. The
+    // in-memory scope still works for this window.
+  }
+}
+
+let projectProfileKey = normalizeProfileKey($activeGatewayProfile.get())
+let projectProfileGeneration = 0
+let loadingStoredProjectScope = false
+
+export const $projectScope = atom<string>(readProjectScope(projectProfileKey))
+
+$projectScope.subscribe(value => {
+  if (!loadingStoredProjectScope) {
+    writeProjectScope(projectProfileKey, value)
+  }
 })
 
 // Enter a project: scope the sidebar to it and make it the active project
@@ -248,10 +272,36 @@ export async function followActiveSessionCwd(cwd: string): Promise<void> {
   }
 }
 
-// Issue a request on whichever gateway is currently active, reconnecting once
-// if the socket dropped. Projects are per-profile, so they intentionally follow
-// the active gateway just like the session list does.
-async function gatewayRequest<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+// Project RPCs are profile-bound. Capture both the profile generation and the
+// concrete socket before the first await; a live A→B→A swap must not let an old
+// A response publish into the new A view, and a delayed write must never be
+// retargeted through whichever gateway happens to be active later.
+type ProjectGateway = NonNullable<ReturnType<typeof activeGateway>>
+
+interface ProjectRequestContext {
+  gateway: ProjectGateway
+  generation: number
+  profile: string
+}
+
+class StaleProjectProfileError extends Error {
+  constructor() {
+    super('Project operation belongs to a stale profile context')
+    this.name = 'StaleProjectProfileError'
+  }
+}
+
+function projectContextIsCurrent(context: ProjectRequestContext): boolean {
+  return (
+    context.generation === projectProfileGeneration &&
+    context.profile === normalizeProfileKey($activeGatewayProfile.get()) &&
+    context.gateway === activeGateway()
+  )
+}
+
+async function captureProjectRequestContext(): Promise<ProjectRequestContext> {
+  const profile = normalizeProfileKey($activeGatewayProfile.get())
+  const generation = projectProfileGeneration
   let gateway = activeGateway()
 
   if (!gateway || gateway.connectionState !== 'open') {
@@ -262,7 +312,44 @@ async function gatewayRequest<T>(method: string, params: Record<string, unknown>
     throw new Error('Hermes gateway is not connected')
   }
 
-  return gateway.request<T>(method, params)
+  const context = { gateway, generation, profile }
+
+  if (!projectContextIsCurrent(context)) {
+    throw new StaleProjectProfileError()
+  }
+
+  return context
+}
+
+async function gatewayRequest<T>(
+  method: string,
+  params: Record<string, unknown> = {},
+  context?: ProjectRequestContext
+): Promise<T> {
+  const captured = context ?? (await captureProjectRequestContext())
+
+  if (!projectContextIsCurrent(captured)) {
+    throw new StaleProjectProfileError()
+  }
+
+  try {
+    const result = await captured.gateway.request<T>(method, params)
+
+    if (!projectContextIsCurrent(captured)) {
+      throw new StaleProjectProfileError()
+    }
+
+    return result
+  } catch (err) {
+    // A network/backend error that finishes after a profile swap is stale too;
+    // callers must not roll the old profile's optimistic snapshot into the new
+    // view just because the original request rejected.
+    if (!projectContextIsCurrent(captured)) {
+      throw new StaleProjectProfileError()
+    }
+
+    throw err
+  }
 }
 
 function applyPayload(payload: ProjectsPayload): void {
@@ -292,10 +379,12 @@ interface ProjectTreePayload {
 // sessions + the scoped-session-id set). Best-effort: a failure leaves the
 // cached tree intact so the sidebar doesn't flicker.
 export async function refreshProjectTree(): Promise<void> {
-  $projectTreeLoading.set(true)
+  let context: ProjectRequestContext | null = null
 
   try {
-    const res = await gatewayRequest<ProjectTreePayload>('projects.tree', { preview_limit: 3 })
+    context = await captureProjectRequestContext()
+    $projectTreeLoading.set(true)
+    const res = await gatewayRequest<ProjectTreePayload>('projects.tree', { preview_limit: 3 }, context)
     // The flat Sessions list shows everything; scoped ids are only used here to
     // reconcile the optimistic eviction layer against what the server still lists.
     const scoped = new Set(res.scoped_session_ids ?? [])
@@ -321,7 +410,9 @@ export async function refreshProjectTree(): Promise<void> {
     markProjectsRpcFailure(err)
     // Backend may not be ready; keep the last known tree.
   } finally {
-    $projectTreeLoading.set(false)
+    if (context && projectContextIsCurrent(context)) {
+      $projectTreeLoading.set(false)
+    }
   }
 }
 
@@ -340,30 +431,48 @@ export async function fetchProjectSessions(projectId: string): Promise<SidebarPr
   }
 }
 
-// One filesystem scan per app run: the heavy disk walk happens once, the result
-// is cached in the backend, and later opens read the cache. Desktop-only (needs
-// the native crawler); elsewhere discovery falls back to session-derived repos.
-let didScanRepos = false
+// One filesystem scan per profile per app run: the heavy disk walk happens once
+// for each profile backend. A profile switch while the crawler is in flight
+// invalidates its context, so the result is never submitted through another
+// profile's gateway and the original profile remains eligible for a retry.
+const scannedRepoProfiles = new Set<string>()
 
 export async function scanAndRecordRepos(force = false): Promise<void> {
   const scan = desktopGit()?.scanRepos
 
-  if (!scan || (didScanRepos && !force)) {
+  if (!scan) {
     return
   }
 
-  didScanRepos = true
-  $reposScanning.set(true)
+  let context: ProjectRequestContext
+
+  try {
+    context = await captureProjectRequestContext()
+  } catch {
+    return
+  }
+
+  if (scannedRepoProfiles.has(context.profile) && !force) {
+    return
+  }
+
+  scannedRepoProfiles.add(context.profile)
+
+  if (projectContextIsCurrent(context)) {
+    $reposScanning.set(true)
+  }
 
   try {
     const repos = await scan([])
-    await gatewayRequest('projects.record_repos', { repos })
+    await gatewayRequest('projects.record_repos', { repos }, context)
     // The disk scan may surface new zero-session repos; refold them into the tree.
     await refreshProjectTree()
   } catch {
-    didScanRepos = false // let a later open retry a failed scan
+    scannedRepoProfiles.delete(context.profile) // let that profile retry a failed/stale scan
   } finally {
-    $reposScanning.set(false)
+    if (projectContextIsCurrent(context)) {
+      $reposScanning.set(false)
+    }
   }
 }
 
@@ -446,7 +555,10 @@ async function persistOrRollback(snap: ProjectsSnapshot, write: () => Promise<vo
   try {
     await write()
   } catch (err) {
-    restoreProjects(snap)
+    if (!(err instanceof StaleProjectProfileError)) {
+      restoreProjects(snap)
+    }
+
     throw err
   }
 }
@@ -545,6 +657,7 @@ export async function updateProject(
   id: string,
   patch: { name?: string; color?: null | string; icon?: null | string }
 ): Promise<void> {
+  const context = await captureProjectRequestContext()
   const snap = snapshotProjects()
 
   $projectTree.set(
@@ -564,12 +677,16 @@ export async function updateProject(
   // Backend treats null/undefined as "leave unchanged"; "" clears (stores NULL).
   // Map explicit null → "" so "no color"/"no icon" actually clear.
   await persistOrRollback(snap, () =>
-    gatewayRequest('projects.update', {
-      id,
-      ...patch,
-      ...(patch.color === null && { color: '' }),
-      ...(patch.icon === null && { icon: '' })
-    })
+    gatewayRequest(
+      'projects.update',
+      {
+        id,
+        ...patch,
+        ...(patch.color === null && { color: '' }),
+        ...(patch.icon === null && { icon: '' })
+      },
+      context
+    )
   )
 }
 
@@ -610,6 +727,7 @@ export async function addProjectFolder(
   path: string,
   opts: { label?: string; isPrimary?: boolean } = {}
 ): Promise<void> {
+  const context = await captureProjectRequestContext()
   const snap = snapshotProjects()
   const trimmed = path.trim()
 
@@ -640,7 +758,7 @@ export async function addProjectFolder(
   }
 
   await persistOrRollback(snap, () =>
-    gatewayRequest('projects.add_folder', { id, path, label: opts.label, is_primary: opts.isPrimary ?? false })
+    gatewayRequest('projects.add_folder', { id, path, label: opts.label, is_primary: opts.isPrimary ?? false }, context)
   )
   reconcileProjects()
 }
@@ -664,6 +782,7 @@ function openSessionBelongsToProject(projectId: string, projects: ProjectInfo[])
 // clicked (the entered-scope effect exits if you deleted the project you were
 // inside), reconciling from the server payload. A failed delete restores both.
 export async function deleteProject(id: string): Promise<void> {
+  const context = await captureProjectRequestContext()
   const snap = snapshotProjects()
   // Capture membership BEFORE removal — the project's folders (which determine
   // ownership) are gone once it's dropped from the cache.
@@ -683,7 +802,7 @@ export async function deleteProject(id: string): Promise<void> {
   }
 
   await persistOrRollback(snap, async () => {
-    applyPayload(await gatewayRequest<ProjectsPayload>('projects.delete', { id }))
+    applyPayload(await gatewayRequest<ProjectsPayload>('projects.delete', { id }, context))
   })
   void refreshProjectTree()
 }
@@ -729,6 +848,34 @@ export function openProjectAddFolder(project: { id: string; name: string }): voi
 export function closeProjectDialog(): void {
   $projectDialog.set(null)
 }
+
+// A live profile swap is a re-home, not a repaint over the previous backend's
+// cache. Wipe every profile-bound atom synchronously, restore only that profile's
+// persisted view scope, and bump the generation so all in-flight A operations
+// remain stale even if the user rapidly switches A→B→A.
+$activeGatewayProfile.subscribe(value => {
+  const nextProfile = normalizeProfileKey(value)
+
+  if (nextProfile === projectProfileKey) {
+    return
+  }
+
+  projectProfileKey = nextProfile
+  projectProfileGeneration += 1
+
+  $projects.set([])
+  $activeProjectId.set(null)
+  $projectTree.set([])
+  $projectTreeLoading.set(false)
+  $projectsRpcAvailable.set(null)
+  $removedSessionIds.set(new Set())
+  $reposScanning.set(false)
+  $projectDialog.set(null)
+
+  loadingStoredProjectScope = true
+  $projectScope.set(readProjectScope(nextProfile))
+  loadingStoredProjectScope = false
+})
 
 // ── Git-driven worktrees ("Start work") ─────────────────────────────────────
 // Bumped after a `git worktree add`/`remove` so the sidebar's worktree-list
