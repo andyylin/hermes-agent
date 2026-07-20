@@ -42,7 +42,7 @@ import sys
 
 import httpx
 
-from agent.secret_scope import get_secret
+from agent.secret_scope import get_secret, is_multiplex_active
 
 try:
     import websockets
@@ -1665,7 +1665,13 @@ class AutoSetHomeMiddleware(InboundMiddleware):
                     from hermes_cli.config import atomic_config_write
                     import yaml
 
-                    _home = get_hermes_home()
+                    if is_multiplex_active():
+                        _scoped_home = get_secret("HERMES_HOME")
+                        if not _scoped_home:
+                            raise RuntimeError("missing profile-scoped HERMES_HOME")
+                        _home = Path(_scoped_home)
+                    else:
+                        _home = get_hermes_home()
                     config_path = _home / "config.yaml"
                     user_config: dict = {}
                     if config_path.exists():
@@ -1673,6 +1679,8 @@ class AutoSetHomeMiddleware(InboundMiddleware):
                             user_config = yaml.safe_load(f) or {}
                     user_config["YUANBAO_HOME_CHANNEL"] = ctx.chat_id
                     atomic_config_write(config_path, user_config)
+                    if not is_multiplex_active():
+                        os.environ["YUANBAO_HOME_CHANNEL"] = str(ctx.chat_id)
                     adapter._home_channel = str(ctx.chat_id)
                     logger.info(
                         "[%s] Auto-sethome: designated %s (%s) as Yuanbao home channel",

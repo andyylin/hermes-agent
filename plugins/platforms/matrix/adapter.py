@@ -5033,6 +5033,18 @@ def _is_connected(config) -> bool:
     rather than mere SDK presence. #41112.
     """
     extra = getattr(config, "extra", {}) or {}
+    if not is_multiplex_active():
+        import hermes_cli.gateway as gateway_mod
+
+        homeserver = extra.get("homeserver") or gateway_mod.get_env_value("MATRIX_HOMESERVER") or ""
+        token = (
+            getattr(config, "token", None)
+            or gateway_mod.get_env_value("MATRIX_ACCESS_TOKEN")
+            or gateway_mod.get_env_value("MATRIX_PASSWORD")
+            or ""
+        )
+        return bool(str(homeserver).strip() and str(token).strip())
+
     homeserver = extra.get("homeserver") or _matrix_secret("MATRIX_HOMESERVER") or ""
     token = (
         getattr(config, "token", None)

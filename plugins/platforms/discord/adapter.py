@@ -9831,7 +9831,12 @@ def _is_connected(config) -> bool:
     ``DISCORD_BOT_TOKEN`` env vars. Matches what the legacy
     ``_PLATFORMS["discord"]`` dispatch did before this migration.
     """
-    from agent.secret_scope import UnscopedSecretError, get_secret
+    from agent.secret_scope import UnscopedSecretError, get_secret, is_multiplex_active
+
+    if not is_multiplex_active():
+        import hermes_cli.gateway as gateway_mod
+
+        return bool((gateway_mod.get_env_value("DISCORD_BOT_TOKEN") or "").strip())
 
     try:
         return bool((get_secret("DISCORD_BOT_TOKEN", "") or "").strip())

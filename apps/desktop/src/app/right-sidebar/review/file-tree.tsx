@@ -22,7 +22,13 @@ import { $renamingPath, copyFilePath, revealFile, toRelativePath } from '@/store
 import { $sidebarWorkspaceCollapsedIds, revealFileInTree, toggleWorkspaceNodeCollapsed } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
 import { setCurrentSessionPreviewTarget } from '@/store/preview'
-import { activeGatewayProfileContextIsCurrent, captureActiveGatewayProfileContext } from '@/store/profile'
+import {
+  $activeGatewayProfile,
+  $activeGatewayProfileGeneration,
+  activeGatewayProfileContextIsCurrent,
+  captureActiveGatewayProfileContext,
+  normalizeProfileKey
+} from '@/store/profile'
 import {
   $reviewFiles,
   $reviewLoading,
@@ -404,6 +410,9 @@ function ReviewFileContextMenu({
   const c = t.statusStack.coding
   const m = t.fileMenu
   const localFs = !isDesktopFsRemoteMode()
+  const profile = normalizeProfileKey(useStore($activeGatewayProfile))
+  const generation = useStore($activeGatewayProfileGeneration)
+  const owner = useMemo(() => ({ generation, profile }), [generation, profile])
 
   return (
     <ContextMenu>
@@ -427,7 +436,7 @@ function ReviewFileContextMenu({
         <ContextMenuSeparator />
         <ContextMenuItem onSelect={() => revealFileInTree(dragPath)}>{m.revealInSidebar}</ContextMenuItem>
         {localFs && (
-          <ContextMenuItem onSelect={() => void revealFile(dragPath)}>
+          <ContextMenuItem onSelect={() => void revealFile(dragPath, owner)}>
             {pickRevealLabel(m.revealFinder, m.revealExplorer, m.revealFileManager)}
           </ContextMenuItem>
         )}

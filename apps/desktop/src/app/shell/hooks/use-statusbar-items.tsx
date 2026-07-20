@@ -15,7 +15,7 @@ import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusba
 import { cn } from '@/lib/utils'
 import { copyFilePath, revealFile } from '@/store/file-actions'
 import { revealFileInTree } from '@/store/layout'
-import { $activeGatewayProfile } from '@/store/profile'
+import { $activeGatewayProfile, $activeGatewayProfileGeneration, normalizeProfileKey } from '@/store/profile'
 import { $projectTree, projectNameForCwd } from '@/store/projects'
 import {
   $activeSessionId,
@@ -89,6 +89,14 @@ export function useStatusbarItems({
   const fileMenu = t.fileMenu
   const primaryActiveSessionId = useStore($activeSessionId)
   const activeGatewayProfile = useStore($activeGatewayProfile)
+
+  const activeGatewayProfileGeneration = useStore($activeGatewayProfileGeneration)
+
+  const workspaceOwner = useMemo(
+    () => ({ generation: activeGatewayProfileGeneration, profile: normalizeProfileKey(activeGatewayProfile) }),
+    [activeGatewayProfile, activeGatewayProfileGeneration]
+  )
+
   const terminalTakeover = useStore($terminalTakeover)
   const primaryBusy = useStore($busy)
   const currentCwd = useStore($currentCwd)
@@ -97,6 +105,9 @@ export function useStatusbarItems({
   // a second per-session copy of the same fact. Re-derives whenever the cwd or
   // the tree changes; null (no named project) falls back to the cwd leaf below.
   const projectTree = useStore($projectTree)
+  // projectNameForCwd reads the tree store directly; projectTree intentionally
+  // invalidates this memo when that hidden dependency changes.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const projectName = useMemo(() => projectNameForCwd(currentCwd), [currentCwd, projectTree])
   const primaryUsage = useStore($currentUsage)
   const gatewayRestarting = useStore($gatewayRestarting)
@@ -335,7 +346,7 @@ export function useStatusbarItems({
               {
                 id: 'reveal-workspace-finder',
                 label: fileMenu.revealFileManager,
-                onSelect: () => void revealFile(currentCwd),
+                onSelect: () => void revealFile(currentCwd, workspaceOwner),
                 title: currentCwd
               },
               {
@@ -401,7 +412,8 @@ export function useStatusbarItems({
       projectName,
       subagentsFailed,
       subagentsRunning,
-      toggleCommandCenter
+      toggleCommandCenter,
+      workspaceOwner
     ]
   )
 

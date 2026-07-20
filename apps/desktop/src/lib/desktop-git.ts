@@ -147,9 +147,10 @@ function guardedGitBridge(git: GitBridge, profile: string, generation: number): 
       return (...args: unknown[]) => {
         assertOwned()
         const result = Reflect.apply(value, target, args)
+        const promiseLike = result as null | undefined | { then?: unknown }
 
-        if (result && typeof result.then === 'function') {
-          return result.then((resolved: unknown) => {
+        if (promiseLike && typeof promiseLike.then === 'function') {
+          return Promise.resolve(result).then((resolved: unknown) => {
             assertOwned()
 
             return resolved
