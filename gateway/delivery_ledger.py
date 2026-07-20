@@ -217,6 +217,8 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
 def sweep_recoverable(
     now: Optional[float] = None,
     platform: Optional[str] = None,
+    *,
+    deliverable_platforms: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
     """Claim undelivered rows owned by dead processes; return them for
     redelivery.
@@ -226,6 +228,14 @@ def sweep_recoverable(
     double-claim (the UPDATE is guarded on the previous owner stamp).
     Rows over the attempts cap or older than the stale cutoff transition to
     'abandoned' instead of being returned.
+
+    ``platform`` scopes a reconnect sweep to one platform.
+    ``deliverable_platforms`` (platform value strings) restricts claiming to
+    platforms the caller can actually send on this boot.  ``attempts`` is the
+    redelivery budget, so it must only be spent on a real send: a platform
+    that failed to connect would otherwise burn one attempt per boot and hit
+    the cap having never been sent once.  Rows for absent platforms are left
+    untouched for a later boot; the stale cutoff still bounds them.
     """
     now = now if now is not None else time.time()
     pid, started = _owner_stamp()
@@ -253,6 +263,13 @@ def sweep_recoverable(
                        SET state='abandoned', updated_at=? WHERE obligation_id=?""",
                     (now, oid),
                 )
+                continue
+            if (
+                deliverable_platforms is not None
+                and platform not in deliverable_platforms
+            ):
+                # No adapter for this platform this boot — the caller cannot
+                # send, so claiming would spend an attempt on a no-op.
                 continue
             cursor = conn.execute(
                 """UPDATE delivery_obligations
