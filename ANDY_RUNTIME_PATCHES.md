@@ -16,6 +16,10 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
   - Keeps Discord authorization, mention, channel, thread, and reply policy adapter-local under profile multiplexing.
   - Disables legacy YAML-to-environment policy bridges in multiplex mode so one profile cannot inherit another profile's settings.
 
+- `fix(desktop): close profile-generation handoff gaps`
+  - Revalidates project RPC continuations, review reads, filesystem routing, branch/worktree consumers, and session startup against the initiating profile generation.
+  - Defers composer draft cleanup until the profile-owned worktree session is committed, preventing stale or failed handoffs from eating the draft.
+
 - `fix(discord): add smart auto-thread titles`
   - Adds deterministic Discord auto-thread title cleanup/summarization.
   - Runtime switch: `DISCORD_SMART_THREAD_TITLES` / `discord.smart_thread_titles`.

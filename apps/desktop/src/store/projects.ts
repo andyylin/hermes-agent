@@ -383,10 +383,20 @@ function applyPayload(payload: ProjectsPayload): void {
 // Pull the full project list + active pointer. Best-effort: a failure (gateway
 // not up yet) leaves the cached atoms intact so the sidebar doesn't flicker.
 export async function refreshProjects(): Promise<void> {
+  let context: ProjectRequestContext | null = null
+
   try {
-    applyPayload(await gatewayRequest<ProjectsPayload>('projects.list'))
+    context = await captureProjectRequestContext()
+    const payload = await gatewayRequest<ProjectsPayload>('projects.list', {}, context)
+
+    assertProjectContextCurrent(context)
+    applyPayload(payload)
     markProjectsRpcSuccess()
   } catch (err) {
+    if (err instanceof StaleProjectProfileError) {
+      return
+    }
+
     markProjectsRpcFailure(err)
     // Backend may not be ready; keep the last known list.
   }
@@ -409,6 +419,7 @@ export async function refreshProjectTree(): Promise<void> {
     assertProjectContextCurrent(context)
     $projectTreeLoading.set(true)
     const res = await gatewayRequest<ProjectTreePayload>('projects.tree', { preview_limit: 3 }, context)
+    assertProjectContextCurrent(context)
     // The flat Sessions list shows everything; scoped ids are only used here to
     // reconcile the optimistic eviction layer against what the server still lists.
     const scoped = new Set(res.scoped_session_ids ?? [])
@@ -445,9 +456,14 @@ export async function refreshProjectTree(): Promise<void> {
 // membership match exactly.
 export async function fetchProjectSessions(projectId: string): Promise<SidebarProjectTree | null> {
   try {
-    const res = await gatewayRequest<{ project: SidebarProjectTree | null }>('projects.project_sessions', {
-      project_id: projectId
-    })
+    const context = await captureProjectRequestContext()
+    const res = await gatewayRequest<{ project: SidebarProjectTree | null }>(
+      'projects.project_sessions',
+      { project_id: projectId },
+      context
+    )
+
+    assertProjectContextCurrent(context)
 
     return res.project ?? null
   } catch {
@@ -484,6 +500,7 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
   try {
     const repos = await scanDesktopReposForProfile(context.profile)
     await gatewayRequest('projects.record_repos', { repos }, context)
+    assertProjectContextCurrent(context)
     // The disk scan may surface new zero-session repos; refold them into the tree.
     await refreshProjectTree()
   } catch {
@@ -514,13 +531,20 @@ export interface CreateProjectInput {
 // leave the field untouched. The "🎲" affordance in the new-project dialog.
 export async function generateProjectIdea(name: string): Promise<string> {
   try {
-    const res = await gatewayRequest<{ text: string }>('llm.oneshot', {
-      instructions:
-        'You generate a single, concrete project idea as a short IDEA.md body: a one-line summary, ' +
-        'then 3-5 bullet goals. No preamble, no code fences, under 120 words.',
-      input: name.trim() ? `Project name: ${name.trim()}` : 'Surprise me with a fun project.',
-      temperature: 1.0
-    })
+    const context = await captureProjectRequestContext()
+    const res = await gatewayRequest<{ text: string }>(
+      'llm.oneshot',
+      {
+        instructions:
+          'You generate a single, concrete project idea as a short IDEA.md body: a one-line summary, ' +
+          'then 3-5 bullet goals. No preamble, no code fences, under 120 words.',
+        input: name.trim() ? `Project name: ${name.trim()}` : 'Surprise me with a fun project.',
+        temperature: 1.0
+      },
+      context
+    )
+
+    assertProjectContextCurrent(context)
 
     return (res.text || '').trim()
   } catch {
@@ -635,12 +659,20 @@ export async function createProject(input: CreateProjectInput): Promise<ProjectI
       context
     )
   } catch (err) {
+    if (err instanceof StaleProjectProfileError) {
+      return null
+    }
+
     if (isMissingRpcMethod(err)) {
       $projectsRpcAvailable.set(false)
       throw projectsStaleBackendError()
     }
 
     throw err
+  }
+
+  if (!projectContextIsCurrent(context)) {
+    return null
   }
 
   markProjectsRpcSuccess()
@@ -839,13 +871,19 @@ export async function deleteProject(id: string): Promise<void> {
   }
 
   await persistOrRollback(snap, async () => {
-    applyPayload(await gatewayRequest<ProjectsPayload>('projects.delete', { id }, context))
+    const payload = await gatewayRequest<ProjectsPayload>('projects.delete', { id }, context)
+
+    assertProjectContextCurrent(context)
+    applyPayload(payload)
   })
   void refreshProjectTree()
 }
 
 export async function setActiveProject(id: null | string): Promise<void> {
-  const res = await gatewayRequest<{ active_id: null | string }>('projects.set_active', { id })
+  const context = await captureProjectRequestContext()
+  const res = await gatewayRequest<{ active_id: null | string }>('projects.set_active', { id }, context)
+
+  assertProjectContextCurrent(context)
   $activeProjectId.set(res.active_id ?? null)
 }
 
@@ -1084,6 +1122,7 @@ export interface StartWorkSessionRequest {
 }
 
 export const $startWorkSessionRequest = atom<StartWorkSessionRequest | null>(null)
+export const $startWorkSessionCommittedToken = atom(0)
 
 $activeGatewayProfileGeneration.subscribe(() => $startWorkSessionRequest.set(null))
 
@@ -1125,25 +1164,35 @@ export function requestStartWorkSession(
   })
 }
 
+export function markStartWorkSessionCommitted(token: number): void {
+  if ($startWorkSessionRequest.get()?.token === token) {
+    $startWorkSessionCommittedToken.set(token)
+  }
+}
+
 export async function removeWorktreePath(
   repoPath: string,
   worktreePath: string,
   options?: { force?: boolean }
-): Promise<void> {
+): Promise<boolean> {
   try {
     const { context, git } = await captureProjectGitContext()
 
     if (!git) {
-      return
+      return false
     }
 
     await git.worktreeRemove(repoPath, worktreePath, options)
     assertProjectContextCurrent(context)
     bumpWorktrees()
+
+    return true
   } catch (err) {
     if (!(err instanceof StaleProjectProfileError)) {
       throw err
     }
+
+    return false
   }
 }
 

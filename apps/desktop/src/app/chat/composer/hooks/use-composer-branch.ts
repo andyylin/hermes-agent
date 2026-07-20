@@ -1,12 +1,15 @@
-import { type MutableRefObject, useCallback } from 'react'
+import { useStore } from '@nanostores/react'
+import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
 import {
   $startWorkSessionRequest,
+  $startWorkSessionCommittedToken,
   listRepoBranches,
   requestStartWorkSession,
   startWorkInRepo,
   switchBranchInRepo
 } from '@/store/projects'
+import { captureActiveGatewayProfileContext } from '@/store/profile'
 
 import { useComposerScope } from '../scope'
 
@@ -25,12 +28,31 @@ interface UseComposerBranchOptions {
  */
 export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBranchOptions) {
   const scope = useComposerScope()
+  const owner = captureActiveGatewayProfileContext()
+  const committedToken = useStore($startWorkSessionCommittedToken)
+  const pendingClearRef = useRef<null | { text: string; token: number }>(null)
+
+  useEffect(() => {
+    const pending = pendingClearRef.current
+
+    if (!pending || pending.token !== committedToken) {
+      return
+    }
+
+    pendingClearRef.current = null
+
+    if (draftRef.current === pending.text) {
+      clearDraft()
+    }
+
+    scope.attachments.clear()
+  }, [clearDraft, committedToken, draftRef, scope.attachments])
 
   // Hand a worktree off to the controller: open a fresh session anchored there,
   // carrying the composer draft as its first turn. Clearing here means the draft
   // travels to the new session instead of getting stashed under this one.
   const openInWorktree = useCallback(
-    (path: string, profile?: string, generation?: number) => {
+    (path: string, profile = owner.profile, generation = owner.generation) => {
       const text = draftRef.current
       const before = $startWorkSessionRequest.get()
 
@@ -40,10 +62,13 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
         return
       }
 
-      clearDraft()
-      scope.attachments.clear()
+      const accepted = $startWorkSessionRequest.get()
+
+      if (accepted) {
+        pendingClearRef.current = { text, token: accepted.token }
+      }
     },
-    [clearDraft, draftRef, scope.attachments]
+    [draftRef, owner.generation, owner.profile]
   )
 
   // Branch off into a NEW worktree (base = branch name, or current HEAD). A

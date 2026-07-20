@@ -127,6 +127,7 @@ describe('desktop filesystem facade', () => {
   })
 
   it('targets the active profile backend so a remote profile never reads local disk', async () => {
+    $activeGatewayProfile.set('remote-docker')
     $connection.set({ mode: 'remote', profile: 'remote-docker' } as never)
 
     await readDesktopDir('/srv/project')
@@ -134,6 +135,22 @@ describe('desktop filesystem facade', () => {
 
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/list?path=%2Fsrv%2Fproject', profile: 'remote-docker' })
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/default-cwd', profile: 'remote-docker' })
+  })
+
+  it('fails closed while the foreground connection belongs to another profile', async () => {
+    $activeGatewayProfile.set('beta')
+    $connection.set({ mode: 'local', profile: 'alpha' } as never)
+
+    await expect(readDesktopDir('/alpha/private')).rejects.toThrow('active gateway profile')
+    await expect(readDesktopFileText('/alpha/private.txt')).rejects.toThrow('active gateway profile')
+    await expect(desktopGitRoot('/alpha/private')).rejects.toThrow('active gateway profile')
+    await expect(desktopDefaultCwd()).rejects.toThrow('active gateway profile')
+    await expect(desktopFileDiff('/alpha', 'private.txt')).rejects.toThrow('active gateway profile')
+
+    expect(readDir).not.toHaveBeenCalled()
+    expect(readFileText).not.toHaveBeenCalled()
+    expect(gitRoot).not.toHaveBeenCalled()
+    expect(api).not.toHaveBeenCalled()
   })
 
   it('routes profile-bound picker and writes through the requested profile', async () => {

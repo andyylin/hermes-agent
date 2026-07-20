@@ -147,7 +147,12 @@ function RepoFlatSection({
     }
 
     try {
-      await removeWorktreePath(repo.path, group.path, { force })
+      const removed = await removeWorktreePath(repo.path, group.path, { force })
+
+      if (!removed) {
+        return
+      }
+
       dismissWorktree(group.id)
     } catch (err) {
       // git refuses a non-force remove on a dirty/locked worktree — offer force

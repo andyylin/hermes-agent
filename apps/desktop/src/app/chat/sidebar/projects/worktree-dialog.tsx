@@ -17,6 +17,7 @@ import { useI18n } from '@/i18n'
 import { gitRef } from '@/lib/sanitize'
 import { notifyError } from '@/store/notifications'
 import { listRepoBranches, startWorkInRepo, switchBranchInRepo } from '@/store/projects'
+import { captureActiveGatewayProfileContext } from '@/store/profile'
 
 import { BaseBranchPicker } from './base-branch-picker'
 
@@ -60,6 +61,7 @@ export interface WorktreeDialogProps {
 export function WorktreeDialog({ repoPath, onStarted, open, onOpenChange, initialBase }: WorktreeDialogProps) {
   const { t } = useI18n()
   const p = t.sidebar.projects
+  const owner = captureActiveGatewayProfileContext()
   const [name, setName] = useState('')
   const [pending, setPending] = useState(false)
   const [convertMode, setConvertMode] = useState(false)
@@ -130,7 +132,12 @@ export function WorktreeDialog({ repoPath, onStarted, open, onOpenChange, initia
       let result: null | { branch: string; generation?: number; path: string; profile?: string }
 
       if (branch.worktreePath) {
-        result = { branch: branch.name, path: branch.worktreePath }
+        result = {
+          branch: branch.name,
+          generation: owner.generation,
+          path: branch.worktreePath,
+          profile: owner.profile
+        }
       } else if (branch.isDefault) {
         const switched = await switchBranchInRepo(repoPath, branch.name)
         result = switched

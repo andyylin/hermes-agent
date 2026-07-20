@@ -22,6 +22,7 @@ import {
   $projectTree,
   $projectTreeLoading,
   $removedSessionIds,
+  $startWorkSessionCommittedToken,
   $startWorkSessionRequest,
   $worktreeRefreshToken,
   ALL_PROJECTS,
@@ -30,6 +31,7 @@ import {
   exitProjectScope,
   followActiveSessionCwd,
   listRepoBranches,
+  markStartWorkSessionCommitted,
   openProjectCreate,
   pickProjectFolder,
   projectNameForCwd,
@@ -176,6 +178,20 @@ describe('profile isolation', () => {
     requestStartWorkSession('/alpha/stale', 'stale', 'handoff-rapid-alpha', generation)
 
     expect($startWorkSessionRequest.get()).toBeNull()
+  })
+
+  it('acknowledges only the currently accepted work-session handoff token', () => {
+    $activeGatewayProfile.set('handoff-commit')
+    requestStartWorkSession('/repo/worktree', 'draft')
+    const request = $startWorkSessionRequest.get()
+    const before = $startWorkSessionCommittedToken.get()
+
+    expect(request).not.toBeNull()
+    markStartWorkSessionCommitted((request?.token ?? 0) + 1)
+    expect($startWorkSessionCommittedToken.get()).toBe(before)
+
+    markStartWorkSessionCommitted(request?.token ?? 0)
+    expect($startWorkSessionCommittedToken.get()).toBe(request?.token)
   })
 
   it('drops an old alpha response after a rapid alpha to beta to alpha swap', async () => {
@@ -635,6 +651,44 @@ describe('createProject', () => {
     )
     expect($projectsRpcAvailable.get()).toBe(false)
   })
+
+  it('does not publish a resolved create across an A to B to A generation swap', async () => {
+    const created = { ...project('alpha-created', 'Alpha'), primary_path: '/alpha' }
+    const pending = deferred<{ project: ProjectInfo | null }>()
+    const gateway = {
+      connectionState: 'open',
+      request: vi.fn((method: string) =>
+        method === 'projects.create'
+          ? pending.promise
+          : Promise.resolve({ active_id: null, projects: [], scoped_session_ids: [] })
+      )
+    }
+
+    let armGenerationSwap = false
+    let generationSwapQueued = false
+
+    $activeGatewayProfile.set('create-alpha')
+    activeGateway.mockImplementation(() => {
+      if (armGenerationSwap && !generationSwapQueued) {
+        generationSwapQueued = true
+        queueMicrotask(() => {
+          $activeGatewayProfile.set('create-beta')
+          $activeGatewayProfile.set('create-alpha')
+        })
+      }
+
+      return gateway as never
+    })
+    const create = createProject({ folders: ['/alpha'], name: 'Alpha', use: true })
+
+    await vi.waitFor(() => expect(gateway.request).toHaveBeenCalledWith('projects.create', expect.any(Object)))
+    armGenerationSwap = true
+    pending.resolve({ project: created })
+
+    await expect(create).resolves.toBeNull()
+    expect($projects.get()).not.toContainEqual(created)
+    expect($activeProjectId.get()).not.toBe(created.id)
+  })
 })
 
 describe('projects RPC capability', () => {
@@ -662,5 +716,37 @@ describe('projects RPC capability', () => {
     expect(notify).toHaveBeenCalledWith(
       expect.objectContaining({ kind: 'warning', message: 'sidebar.projects.staleBackend' })
     )
+  })
+
+  it('does not publish a resolved list across an A to B to A generation swap', async () => {
+    const pending = deferred<{ active_id: null | string; projects: ProjectInfo[] }>()
+    const gateway = { connectionState: 'open', request: vi.fn(() => pending.promise) }
+    const staleProject = project('alpha-only', 'Alpha only')
+
+    let armGenerationSwap = false
+    let generationSwapQueued = false
+
+    $projects.set([])
+    $activeGatewayProfile.set('list-alpha')
+    activeGateway.mockImplementation(() => {
+      if (armGenerationSwap && !generationSwapQueued) {
+        generationSwapQueued = true
+        queueMicrotask(() => {
+          $activeGatewayProfile.set('list-beta')
+          $activeGatewayProfile.set('list-alpha')
+        })
+      }
+
+      return gateway as never
+    })
+    const refresh = refreshProjects()
+
+    await vi.waitFor(() => expect(gateway.request).toHaveBeenCalledWith('projects.list', {}))
+    armGenerationSwap = true
+    pending.resolve({ active_id: staleProject.id, projects: [staleProject] })
+    await refresh
+
+    expect($projects.get()).toEqual([])
+    expect($activeProjectId.get()).toBeNull()
   })
 })

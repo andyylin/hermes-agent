@@ -83,7 +83,11 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
     // currently sits on (`test0`, etc.), so explicitly switch first.
     if (group.isMain && group.path && group.label) {
       try {
-        await switchBranchInRepo(group.path, group.label)
+        const switched = await switchBranchInRepo(group.path, group.label)
+
+        if (!switched) {
+          return
+        }
       } catch (err) {
         notifyError(err, t.statusStack.coding.switchFailed(group.label))
 

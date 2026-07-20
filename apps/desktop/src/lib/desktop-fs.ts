@@ -17,6 +17,20 @@ export interface DesktopFsRemotePicker {
 
 let remotePicker: DesktopFsRemotePicker | null = null
 
+function foregroundConnection(): HermesConnection | null {
+  const connection = $connection.get()
+  const activeProfile = captureActiveGatewayProfileContext().profile
+  const connectionProfile = normalizeProfileKey(connection?.profile)
+
+  if (connectionProfile !== activeProfile) {
+    throw new Error(
+      `Desktop filesystem connection profile ${connectionProfile} does not match active gateway profile ${activeProfile}`
+    )
+  }
+
+  return connection
+}
+
 export function setDesktopFsRemotePicker(next: DesktopFsRemotePicker | null) {
   remotePicker = next
 }
@@ -34,7 +48,7 @@ export function desktopFsCacheKey() {
 }
 
 export function isDesktopFsRemoteMode() {
-  return $connection.get()?.mode === 'remote'
+  return foregroundConnection()?.mode === 'remote'
 }
 
 // Active profile for FS/git REST calls. Without it the Electron api bridge

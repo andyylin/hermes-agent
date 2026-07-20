@@ -39,7 +39,12 @@ import {
   normalizeProfileKey,
   refreshActiveProfile
 } from '@/store/profile'
-import { $startWorkSessionRequest, followActiveSessionCwd, resolveNewSessionCwd } from '@/store/projects'
+import {
+  $startWorkSessionRequest,
+  followActiveSessionCwd,
+  markStartWorkSessionCommitted,
+  resolveNewSessionCwd
+} from '@/store/projects'
 import {
   $activeSessionId,
   $connection,
@@ -476,14 +481,14 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         return false
       }
 
-      startFreshSessionDraft()
-      setCurrentCwd(target)
-      let info: { branch?: string; cwd?: string }
+      let info: { branch?: string; cwd?: string } = {}
 
       try {
         info = await requestGateway<{ branch?: string; cwd?: string }>('config.get', { key: 'project', cwd: target })
       } catch {
-        return ownsRequest()
+        if (!ownsRequest()) {
+          return false
+        }
       }
 
       if (!ownsRequest()) {
@@ -492,6 +497,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
       const resolved = info.cwd || target
 
+      startFreshSessionDraft()
       setCurrentCwd(resolved)
       setCurrentBranch(info.branch || '')
 
@@ -529,11 +535,15 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
 
     void startSessionInWorkspace(request.path, request.profile, request.generation).then(committed => {
-      if (!committed || $startWorkSessionRequest.get()?.token !== request.token || !request.draft) {
+      if (!committed || $startWorkSessionRequest.get()?.token !== request.token) {
         return
       }
 
-      requestComposerInsert(request.draft, { target: 'main' })
+      markStartWorkSessionCommitted(request.token)
+
+      if (request.draft) {
+        requestComposerInsert(request.draft, { target: 'main' })
+      }
     })
   }, [startSessionInWorkspace, startWorkSessionRequest])
 

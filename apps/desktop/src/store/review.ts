@@ -11,7 +11,7 @@ import { requestOneShot } from '@/lib/oneshot'
 import { Codecs, persistentAtom } from '@/lib/persisted'
 
 import { refreshRepoStatus } from './coding-status'
-import { $activeGatewayProfile, normalizeProfileKey } from './profile'
+import { $activeGatewayProfile, $activeGatewayProfileGeneration, normalizeProfileKey } from './profile'
 import { $busy, $currentCwd } from './session'
 import { $workspaceChangeTick } from './workspace-events'
 
@@ -97,6 +97,7 @@ let shipInfoLastCheckedAt = 0
 // either is missing (no session, remote backend), so callers bail in one line.
 interface ReviewContext {
   cwd: string
+  generation: number
   profile: string
   review: ReviewBridge
 }
@@ -107,11 +108,15 @@ function reviewCtx(): ReviewContext | null {
   const cwd = repoCwd()
   const review = desktopGit()?.review
 
-  return cwd && review ? { cwd, profile: activeReviewProfile(), review } : null
+  return cwd && review
+    ? { cwd, generation: $activeGatewayProfileGeneration.get(), profile: activeReviewProfile(), review }
+    : null
 }
 
 const isReviewContextCurrent = (ctx: ReviewContext) =>
-  repoCwd() === ctx.cwd && activeReviewProfile() === ctx.profile
+  repoCwd() === ctx.cwd &&
+  activeReviewProfile() === ctx.profile &&
+  $activeGatewayProfileGeneration.get() === ctx.generation
 
 // ── Reads ────────────────────────────────────────────────────────────────────
 
@@ -484,16 +489,14 @@ export async function createOrOpenPr(): Promise<void> {
 
 // ── Triggers (module-scope, mirror coding-status.ts) ─────────────────────────
 
-let reviewProfile = activeReviewProfile()
+let reviewProfileGeneration = $activeGatewayProfileGeneration.get()
 
-$activeGatewayProfile.subscribe(value => {
-  const next = normalizeProfileKey(value)
-
-  if (next === reviewProfile) {
+$activeGatewayProfileGeneration.subscribe(value => {
+  if (value === reviewProfileGeneration) {
     return
   }
 
-  reviewProfile = next
+  reviewProfileGeneration = value
   reviewRefreshSeq += 1
   shipInfoSeq += 1
   commitGenSeq += 1

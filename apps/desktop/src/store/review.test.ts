@@ -155,6 +155,45 @@ describe('refreshReview', () => {
     expect($reviewFiles.get()).toEqual([])
   })
 
+  it('drops a delayed same-cwd result after an A to B to A profile generation swap', async () => {
+    let resolveList!: (value: { files: HermesReviewFile[] }) => void
+    const list = vi.fn(() => new Promise<{ files: HermesReviewFile[] }>(resolve => (resolveList = resolve)))
+
+    stubReview({ list })
+    $activeGatewayProfile.set('alpha')
+    $connection.set({ mode: 'local', profile: 'alpha' } as never)
+    $reviewOpen.set(true)
+    const refresh = refreshReview()
+    await vi.waitFor(() => expect(list).toHaveBeenCalled())
+
+    $activeGatewayProfile.set('beta')
+    $activeGatewayProfile.set('alpha')
+    resolveList({ files: [file('old-alpha.ts')] })
+    await refresh
+
+    expect($reviewFiles.get()).toEqual([])
+  })
+
+  it('does not publish an old Alpha diff after Beta and a new Alpha select the same path', async () => {
+    let resolveOldDiff!: (value: string) => void
+    const oldDiff = new Promise<string>(resolve => (resolveOldDiff = resolve))
+    const diff = vi.fn().mockReturnValueOnce(oldDiff).mockResolvedValueOnce('new alpha diff')
+
+    stubReview({ diff })
+    $activeGatewayProfile.set('alpha')
+    $connection.set({ mode: 'local', profile: 'alpha' } as never)
+    const staleSelection = selectReviewFile(file('same.ts'))
+    await vi.waitFor(() => expect(diff).toHaveBeenCalledTimes(1))
+
+    $activeGatewayProfile.set('beta')
+    $activeGatewayProfile.set('alpha')
+    await selectReviewFile(file('same.ts'))
+    resolveOldDiff('old alpha diff')
+    await staleSelection
+
+    expect($reviewDiff.get()).toBe('new alpha diff')
+  })
+
   it('filters excluded paths (node_modules et al.) out of the list', async () => {
     stubReview({ list: vi.fn(async () => ({ files: [file('src/a.ts'), file('node_modules/x/index.js')] })) })
     $reviewOpen.set(true)
