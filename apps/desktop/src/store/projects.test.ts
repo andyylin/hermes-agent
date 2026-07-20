@@ -20,6 +20,7 @@ import {
   enterProject,
   exitProjectScope,
   followActiveSessionCwd,
+  listRepoBranches,
   openProjectCreate,
   pickProjectFolder,
   projectNameForCwd,
@@ -27,11 +28,15 @@ import {
   refreshProjectTree,
   refreshWorktrees,
   scanAndRecordRepos,
+  startWorkInRepo,
   tombstoneSessions,
   updateProject
 } from './projects'
 
-const { scanRepos } = vi.hoisted(() => ({ scanRepos: vi.fn() }))
+const { desktopGitForProfile, scanRepos } = vi.hoisted(() => ({
+  desktopGitForProfile: vi.fn(),
+  scanRepos: vi.fn()
+}))
 
 vi.mock('@/i18n', () => ({
   translateNow: (key: string) => key
@@ -48,7 +53,7 @@ vi.mock('@/lib/desktop-fs', () => ({
 }))
 
 vi.mock('@/lib/desktop-git', () => ({
-  desktopGit: () => ({ scanRepos }),
+  desktopGitForProfile,
   scanDesktopReposForProfile: scanRepos
 }))
 
@@ -96,6 +101,7 @@ const project = (id: string, name: string): ProjectInfo => ({
 describe('profile isolation', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    desktopGitForProfile.mockResolvedValue({ scanRepos })
     window.localStorage.clear()
     $activeGatewayProfile.set('default')
     $projects.set([])
@@ -420,6 +426,48 @@ describe('worktree refresh', () => {
     const before = $worktreeRefreshToken.get()
     refreshWorktrees()
     expect($worktreeRefreshToken.get()).toBe(before + 1)
+  })
+
+  it('drops a completed worktree result after the initiating profile becomes stale', async () => {
+    const added = deferred<{ branch: string; path: string }>()
+    const git = { worktreeAdd: vi.fn(() => added.promise) }
+    const gatewayA = { connectionState: 'open', request: vi.fn() }
+    const gatewayB = { connectionState: 'open', request: vi.fn() }
+
+    desktopGitForProfile.mockResolvedValue(git)
+    $activeGatewayProfile.set('git-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    const before = $worktreeRefreshToken.get()
+    const result = startWorkInRepo('/repo', { branch: 'feature' })
+    await vi.waitFor(() => expect(git.worktreeAdd).toHaveBeenCalled())
+
+    $activeGatewayProfile.set('git-beta')
+    activeGateway.mockReturnValue(gatewayB as never)
+    added.resolve({ branch: 'feature', path: '/repo/.worktrees/feature' })
+
+    await expect(result).resolves.toBeNull()
+    expect(desktopGitForProfile).toHaveBeenCalledWith('git-alpha')
+    expect($worktreeRefreshToken.get()).toBe(before)
+  })
+
+  it('drops a stale branch list instead of rendering alpha branches in beta', async () => {
+    const listed = deferred<Array<{ current: boolean; name: string }>>()
+    const git = { branchList: vi.fn(() => listed.promise) }
+    const gatewayA = { connectionState: 'open', request: vi.fn() }
+    const gatewayB = { connectionState: 'open', request: vi.fn() }
+
+    desktopGitForProfile.mockResolvedValue(git)
+    $activeGatewayProfile.set('branches-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    const result = listRepoBranches('/repo')
+    await vi.waitFor(() => expect(git.branchList).toHaveBeenCalled())
+
+    $activeGatewayProfile.set('branches-beta')
+    activeGateway.mockReturnValue(gatewayB as never)
+    listed.resolve([{ current: true, name: 'alpha-only' }])
+
+    await expect(result).resolves.toEqual([])
+    expect(desktopGitForProfile).toHaveBeenCalledWith('branches-alpha')
   })
 })
 
