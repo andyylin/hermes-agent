@@ -552,7 +552,12 @@ def parse_model_flags(raw_args: str) -> tuple[str, str, bool, bool, bool]:
     )
 
 
-def resolve_persist_behavior(is_global: bool, is_session: bool, is_once: bool = False) -> bool:
+def resolve_persist_behavior(
+    is_global: bool,
+    is_session: bool,
+    is_once: bool = False,
+    explicit_provider: str = "",
+) -> bool:
     """Decide whether a ``/model`` switch should persist to ``config.yaml``.
 
     Resolution order:
@@ -560,13 +565,19 @@ def resolve_persist_behavior(is_global: bool, is_session: bool, is_once: bool = 
     1. ``--once`` explicitly opts out → ``False`` (next turn only).
     2. ``--session`` explicitly opts out → ``False`` (this session only).
     3. ``--global`` explicitly opts in → ``True``.
-    4. Otherwise defer to ``model.persist_switch_by_default`` in
-       ``config.yaml`` (defaults to ``True``, so a plain ``/model <name>``
-       survives across sessions — the behavior users expect).
+    4. ``--provider`` given without an explicit persist flag → ``False``
+       (session only).  Provider switches are typically exploratory — the
+       user is trying a different backend for this conversation, not
+       reconfiguring the default.  ``--global`` can still force persist.
+    5. Otherwise defer to ``model.persist_switch_by_default`` in
+       ``config.yaml`` (defaults to ``False``: a plain ``/model <name>``
+       affects only the current session).  Users who want the old
+       persist-by-default behavior can set the key to ``true``; a one-off
+       ``--global`` always persists.
 
     The config read is defensive: on a fresh install ``model`` may be a
     flat string rather than a dict, in which case the built-in default
-    (``True``) applies.
+    (``False``) applies.
     """
     if is_once:
         return False
@@ -574,15 +585,17 @@ def resolve_persist_behavior(is_global: bool, is_session: bool, is_once: bool = 
         return False
     if is_global:
         return True
+    if explicit_provider:
+        return False
     try:
         from hermes_cli.config import load_config
 
         model_cfg = load_config().get("model")
         if isinstance(model_cfg, dict):
-            return bool(model_cfg.get("persist_switch_by_default", True))
+            return bool(model_cfg.get("persist_switch_by_default", False))
     except Exception:
         pass
-    return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -2440,11 +2453,17 @@ def list_authenticated_providers(
     if custom_providers and isinstance(custom_providers, list):
         from collections import OrderedDict
 
-        # Key by endpoint + credential identity + wire protocol instead of
-        # slug: names frequently differ per model ("Ollama — X") while the
-        # endpoint stays the same.  Keep same-host providers with distinct
-        # env-backed credentials or API protocols separate so picker selection
-        # cannot route through the wrong credential/mode pair.
+        # Key by endpoint + credential identity + wire protocol + display
+        # prefix instead of slug: names frequently differ per model
+        # ("Ollama — X") while the endpoint stays the same.  Keep same-host
+        # providers with distinct env-backed credentials or API protocols
+        # separate so picker selection cannot route through the wrong
+        # credential/mode pair. The display prefix (text before " — " /
+        # " - ") is included so intentionally distinct providers sharing an
+        # endpoint (e.g. a proxy fronting cerebras, groq and perplexity at
+        # a single base_url) each get their own picker row instead of
+        # collapsing into one. Per-model suffix entries that share the same
+        # prefix ("Ollama — A", "Ollama — B") still group together.
         groups: "OrderedDict[tuple, dict]" = OrderedDict()
         for entry in custom_providers:
             if not isinstance(entry, dict):
@@ -2491,19 +2510,19 @@ def list_authenticated_providers(
             entry_extra_headers = _extra_headers_from_config(entry)
             headers_identity = tuple(sorted(entry_extra_headers.items()))
 
-            group_key = (api_url, credential_identity, api_mode, headers_identity)
+            # Display-name prefix (text before " — " / " - "), used both
+            # as a grouping dimension and to derive the row's display name.
+            _display_prefix = raw_name
+            for sep in ("—", " - "):
+                if sep in _display_prefix:
+                    _display_prefix = _display_prefix.split(sep)[0].strip()
+                    break
+
+            group_key = (api_url, credential_identity, api_mode, headers_identity, _display_prefix.lower())
             if group_key not in groups:
-                # Strip per-model suffix so "Ollama — GLM 5.1" becomes
-                # "Ollama" for the grouped row. Em dash is the convention
-                # Hermes's own writer uses; a hyphen variant is accepted
-                # for hand-edited configs.
-                display_name = raw_name
-                for sep in ("—", " - "):
-                    if sep in display_name:
-                        display_name = display_name.split(sep)[0].strip()
-                        break
-                if not display_name:
-                    display_name = raw_name
+                # Reuse the prefix computed above as the row display name;
+                # fall back to the raw name if stripping left it empty.
+                display_name = _display_prefix or raw_name
                 slug = custom_provider_slug(display_name)
                 groups[group_key] = {
                     "slug": slug,
