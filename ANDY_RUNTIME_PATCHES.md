@@ -76,6 +76,12 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
   - Prevents a Mac Desktop connected to the Pi from reading or opening the Pi's plugin directory.
   - Fails closed when the Desktop bridge does not provide a non-empty local Hermes home.
 
+- `fix(desktop): isolate upstream Projects state by live profile`
+  - Captures the concrete profile generation and gateway for every asynchronous Projects RPC so stale A results and writes cannot publish through B.
+  - Resets profile-bound Projects caches, optimistic state, dialogs, tombstones, and loading flags on a live profile swap.
+  - Keys repo-scan completion and persisted Project view scope by profile.
+  - Retire this overlay once upstream Projects provides equivalent A→B→A isolation and regression coverage.
+
 - `fix(desktop): stop idle renderer animation loops` *(temporary pending upstream)*
   - Source: `andyylin/hermes-agent:fix/desktop-idle-rendering` / upstream PR #66160, preserving Ho Lim's original commits from PR #61084.
   - Replaces permanent pet/roam/terminal RAF loops with bounded scheduling while preserving unfocused and occluded transcript streaming.
