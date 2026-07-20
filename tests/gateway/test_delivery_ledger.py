@@ -145,6 +145,21 @@ class TestSweep:
         assert row["owner_pid"] is None
         assert len(dl.sweep_recoverable()) == 1
 
+    def test_release_unattempted_claim_without_process_start_time(self, monkeypatch):
+        monkeypatch.setattr(dl, "_owner_stamp", lambda: (12345, None))
+        _record()
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET attempts=1 WHERE obligation_id=?",
+                ("ob-1",),
+            )
+
+        dl.release_unattempted_claim("ob-1")
+
+        row = _row("ob-1")
+        assert row["attempts"] == 0
+        assert row["owner_pid"] is None
+
     def test_dead_owner_attempting_needs_marker(self):
         _record()
         dl.mark_attempting("ob-1")

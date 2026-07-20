@@ -34,6 +34,9 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 - `fix(email): send HTML bodies as multipart alternative`
   - Sends HTML email content as `text/html` with a plain-text fallback instead of raw tags in plain text.
 
+- `fix(gateway): release delivery claims without process start timestamps`
+  - Uses SQLite's NULL-safe identity comparison so an unavailable process start time cannot strand a delivery obligation or consume its retry budget.
+
 - `fix(cron): format Discord cron deliveries without tables`
   - Uses Discord-friendly headings and bullets for cron reports.
   - Converts simple Markdown tables to grouped bullet rows before Discord delivery.

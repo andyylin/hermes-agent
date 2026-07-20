@@ -199,7 +199,7 @@ def release_unattempted_claim(obligation_id: str) -> None:
             """UPDATE delivery_obligations
                SET owner_pid=NULL, owner_started_at=NULL,
                    attempts=MAX(0, attempts-1), updated_at=?
-               WHERE obligation_id=? AND owner_pid=? AND owner_started_at=?""",
+               WHERE obligation_id=? AND owner_pid=? AND owner_started_at IS ?""",
             (time.time(), obligation_id, pid, started),
         )
 
