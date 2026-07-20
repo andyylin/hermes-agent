@@ -9,6 +9,8 @@ import {
   setNewChatWorkspaceTarget
 } from '@/store/session'
 
+import { bindWorkspaceSessionOwner } from '../chat/sidebar/sessions-section'
+
 import { startWorkspaceSession } from './workspace-session-target'
 
 function deferred<T>() {
@@ -77,5 +79,22 @@ describe('startWorkspaceSession', () => {
     expect($newChatWorkspaceTarget.get()).toBe('/normalized-b')
     expect($currentCwd.get()).toBe('/normalized-b')
     expect($currentBranch.get()).toBe('main')
+  })
+})
+
+describe('bindWorkspaceSessionOwner', () => {
+  it('preserves the producer profile generation across an A to B to A handoff', () => {
+    const start = vi.fn()
+
+    const staleAlphaCallback = bindWorkspaceSessionOwner(start, {
+      generation: 7,
+      profile: 'alpha'
+    })
+
+    // The foreground may leave alpha and later return with a newer generation;
+    // invoking the stale rendered callback must still carry its original owner.
+    staleAlphaCallback('/alpha/project')
+
+    expect(start).toHaveBeenCalledWith('/alpha/project', 'alpha', 7)
   })
 })

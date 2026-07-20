@@ -30,6 +30,7 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
   - Binds composer commitment and draft/attachment cleanup to the owning profile generation, preventing stale or failed handoffs from eating another profile's draft.
   - Uses request ownership for branch-loading teardown, synchronously invalidates stale remote-picker requests, and guards every local-preview continuation and consumer against A→B→A generation swaps.
   - Carries preview ownership through nested helpers to the final pane/browser side effect and rolls gateway activation back when connection-descriptor synchronization fails.
+  - Binds every rendered project/workspace “new session” callback to its producer profile generation so stale sidebar trees cannot reinterpret an old path through a newer foreground profile.
 
 - `fix(discord): add smart auto-thread titles`
   - Adds deterministic Discord auto-thread title cleanup/summarization.

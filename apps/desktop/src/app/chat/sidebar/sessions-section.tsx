@@ -9,6 +9,10 @@ import type { HermesGitWorktree } from '@/global'
 import type { SessionInfo } from '@/hermes'
 import { flattenSessionsWithBranches } from '@/lib/session-branch-tree'
 import { cn } from '@/lib/utils'
+import {
+  type ActiveGatewayProfileContext,
+  captureActiveGatewayProfileContext
+} from '@/store/profile'
 import { sessionPinId } from '@/store/session'
 
 import { SidebarCount } from './chrome'
@@ -26,6 +30,15 @@ import { SidebarSessionRow } from './session-row'
 import { VirtualSessionList } from './virtual-session-list'
 
 export const VIRTUALIZE_THRESHOLD = 25
+
+type OwnedWorkspaceSessionStart = (path: null | string, expectedProfile?: string, expectedGeneration?: number) => void
+
+export function bindWorkspaceSessionOwner(
+  start: OwnedWorkspaceSessionStart,
+  context: ActiveGatewayProfileContext
+): (path: null | string) => void {
+  return path => start(path, context.profile, context.generation)
+}
 
 interface SidebarSectionHeaderProps {
   label: string
@@ -91,7 +104,7 @@ interface SidebarSessionsSectionProps {
   onArchiveSession: (sessionId: string) => void
   onBranchSession?: (sessionId: string, profile?: string) => void
   onTogglePin: (sessionId: string) => void
-  onNewSessionInWorkspace?: (path: null | string) => void
+  onNewSessionInWorkspace?: OwnedWorkspaceSessionStart
   pinned: boolean
   rootClassName?: string
   contentClassName?: string
@@ -181,6 +194,19 @@ export function SidebarSessionsSection({
   dndSensors,
   showProfileTags = false
 }: SidebarSessionsSectionProps) {
+  const { generation: workspaceGeneration, profile: workspaceProfile } = captureActiveGatewayProfileContext()
+
+  const onOwnedNewSessionInWorkspace = useMemo(
+    () =>
+      onNewSessionInWorkspace
+        ? bindWorkspaceSessionOwner(onNewSessionInWorkspace, {
+            generation: workspaceGeneration,
+            profile: workspaceProfile
+          })
+        : undefined,
+    [onNewSessionInWorkspace, workspaceGeneration, workspaceProfile]
+  )
+
   const sectionOpen = collapsible ? open : true
   const hasGroupedSessions = Boolean(groups?.some(group => group.sessions.length > 0))
   // A defined project list is itself content (even an empty project should
@@ -251,7 +277,7 @@ export function SidebarSessionsSection({
         {hasProjectContent ? (
           <EnteredProjectContent
             liveSessions={liveSessions}
-            onNewSession={onNewSessionInWorkspace}
+            onNewSession={onOwnedNewSessionInWorkspace}
             project={projectContent}
             removedSessionIds={removedSessionIds}
             renderRows={renderRows}
@@ -276,7 +302,7 @@ export function SidebarSessionsSection({
         activeProjectId={activeProjectId}
         key={project.id}
         onEnter={onEnterProject}
-        onNewSession={onNewSessionInWorkspace}
+        onNewSession={onOwnedNewSessionInWorkspace}
         previewSessions={project.path ? projectOverviewPreviews?.[project.path] : undefined}
         project={project}
         renderRows={renderRows}
@@ -301,7 +327,7 @@ export function SidebarSessionsSection({
       <SidebarWorkspaceGroup
         group={group}
         key={group.id}
-        onNewSession={onNewSessionInWorkspace}
+        onNewSession={onOwnedNewSessionInWorkspace}
         renderRows={renderRows}
       />
     ))
