@@ -12,6 +12,10 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 
 ## Active runtime patches
 
+- `fix(discord): isolate multiplex profile policy`
+  - Keeps Discord authorization, mention, channel, thread, and reply policy adapter-local under profile multiplexing.
+  - Disables legacy YAML-to-environment policy bridges in multiplex mode so one profile cannot inherit another profile's settings.
+
 - `fix(discord): add smart auto-thread titles`
   - Adds deterministic Discord auto-thread title cleanup/summarization.
   - Runtime switch: `DISCORD_SMART_THREAD_TITLES` / `discord.smart_thread_titles`.

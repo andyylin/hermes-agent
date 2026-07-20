@@ -1567,7 +1567,9 @@ def load_gateway_config() -> GatewayConfig:
 
             # Discord settings → env vars (env vars take precedence)
             discord_cfg = yaml_cfg.get("discord", {})
-            if isinstance(discord_cfg, dict):
+            from agent.secret_scope import is_multiplex_active
+
+            if isinstance(discord_cfg, dict) and not is_multiplex_active():
                 if "require_mention" in discord_cfg and not os.getenv("DISCORD_REQUIRE_MENTION"):
                     os.environ["DISCORD_REQUIRE_MENTION"] = str(discord_cfg["require_mention"]).lower()
                 if "thread_require_mention" in discord_cfg and not os.getenv("DISCORD_THREAD_REQUIRE_MENTION"):
