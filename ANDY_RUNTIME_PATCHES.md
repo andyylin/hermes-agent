@@ -63,6 +63,11 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 - `fix(desktop): preserve unsafe config integers`
   - Serializes large config identifiers without JavaScript precision loss so Discord/channel/account IDs are not silently rounded by Desktop edits.
 
+- `fix(desktop): discover runtime plugins from the local Desktop Hermes home`
+  - Resolves the on-disk plugin directory through Desktop-local profile IPC instead of backend-reported status.
+  - Prevents a Mac Desktop connected to the Pi from reading or opening the Pi's plugin directory.
+  - Fails closed when the Desktop bridge does not provide a non-empty local Hermes home.
+
 - `fix(desktop): stop idle renderer animation loops` *(temporary pending upstream)*
   - Source: `andyylin/hermes-agent:fix/desktop-idle-rendering` / upstream PR #66160, preserving Ho Lim's original commits from PR #61084.
   - Replaces permanent pet/roam/terminal RAF loops with bounded scheduling while preserving unfocused and occluded transcript streaming.
