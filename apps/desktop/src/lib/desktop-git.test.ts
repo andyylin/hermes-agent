@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { $activeGatewayProfile } from '@/store/profile'
 import { $connection } from '@/store/session'
 
 import { desktopGit, desktopGitForProfile, scanDesktopReposForProfile } from './desktop-git'
@@ -29,6 +30,7 @@ const api = vi.fn(async ({ path }: { path: string }) => {
 describe('desktop git facade', () => {
   beforeEach(() => {
     vi.stubGlobal('window', { hermesDesktop: { api, getConnection, git: localGit } })
+    $activeGatewayProfile.set('default')
     $connection.set(null)
   })
 
@@ -66,6 +68,7 @@ describe('desktop git facade', () => {
   })
 
   it('targets the active profile backend so a remote profile never touches the local repo', async () => {
+    $activeGatewayProfile.set('remote-docker')
     $connection.set({ mode: 'remote', profile: 'remote-docker' } as never)
 
     await desktopGit()?.repoStatus('/srv/work')

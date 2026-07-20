@@ -1,7 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
-import { $sidebarAgentsGrouped } from '@/store/layout'
+import {
+  $dismissedAutoProjectIds,
+  $dismissedWorktreeIds,
+  $sidebarAgentsGrouped,
+  $sidebarProjectOrderIds,
+  $sidebarWorkspaceCollapsedIds,
+  $sidebarWorkspaceOrderIds,
+  $sidebarWorkspaceParentOrderIds
+} from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
 import type { ProjectInfo } from '@/types/hermes'
 
@@ -14,6 +22,7 @@ import {
   $projectTree,
   $projectTreeLoading,
   $removedSessionIds,
+  $startWorkSessionRequest,
   $worktreeRefreshToken,
   ALL_PROJECTS,
   createProject,
@@ -27,6 +36,7 @@ import {
   refreshProjects,
   refreshProjectTree,
   refreshWorktrees,
+  requestStartWorkSession,
   scanAndRecordRepos,
   startWorkInRepo,
   tombstoneSessions,
@@ -123,6 +133,37 @@ describe('profile isolation', () => {
     await refresh
 
     expect($projects.get()).toEqual([])
+  })
+
+  it('clears filesystem-bound project layout when switching profiles', () => {
+    $sidebarWorkspaceOrderIds.set(['/alpha/worktree'])
+    $sidebarWorkspaceParentOrderIds.set(['/alpha/repo'])
+    $sidebarProjectOrderIds.set(['alpha-project'])
+    $sidebarWorkspaceCollapsedIds.set(['/alpha/worktree'])
+    $dismissedAutoProjectIds.set(['/alpha/repo'])
+    $dismissedWorktreeIds.set(['/alpha/removed'])
+
+    $activeGatewayProfile.set('layout-beta')
+
+    expect($sidebarWorkspaceOrderIds.get()).toEqual([])
+    expect($sidebarWorkspaceParentOrderIds.get()).toEqual([])
+    expect($sidebarProjectOrderIds.get()).toEqual([])
+    expect($sidebarWorkspaceCollapsedIds.get()).toEqual([])
+    expect($dismissedAutoProjectIds.get()).toEqual([])
+    expect($dismissedWorktreeIds.get()).toEqual([])
+  })
+
+  it('refuses a work-session handoff owned by a stale profile', () => {
+    $activeGatewayProfile.set('handoff-alpha')
+    requestStartWorkSession('/alpha/worktree', 'draft', 'handoff-alpha')
+    const alpha = $startWorkSessionRequest.get()
+
+    expect(alpha).toMatchObject({ path: '/alpha/worktree', profile: 'handoff-alpha' })
+
+    $activeGatewayProfile.set('handoff-beta')
+    requestStartWorkSession('/alpha/late', 'stale', 'handoff-alpha')
+
+    expect($startWorkSessionRequest.get()).toBe(alpha)
   })
 
   it('drops an old alpha response after a rapid alpha to beta to alpha swap', async () => {

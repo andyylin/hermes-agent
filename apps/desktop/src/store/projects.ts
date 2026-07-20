@@ -11,7 +11,7 @@ import {
 import { desktopGitForProfile, scanDesktopReposForProfile } from '@/lib/desktop-git'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
-import { setSidebarAgentsGrouped } from '@/store/layout'
+import { resetProfileBoundWorkspaceLayout, setSidebarAgentsGrouped } from '@/store/layout'
 import { notify } from '@/store/notifications'
 import { $activeGatewayProfile, normalizeProfileKey, requestFreshSession } from '@/store/profile'
 import { $selectedStoredSessionId, $sessions, sessionMatchesStoredId, workspaceCwdForNewSession } from '@/store/session'
@@ -892,7 +892,7 @@ $activeGatewayProfile.subscribe(value => {
 
   projectProfileKey = nextProfile
   projectProfileGeneration += 1
-
+  resetProfileBoundWorkspaceLayout()
   $projects.set([])
   $activeProjectId.set(null)
   $projectTree.set([])
@@ -940,7 +940,7 @@ export function refreshWorktrees(): void {
 export async function startWorkInRepo(
   repoPath: string,
   options?: { name?: string; branch?: string; base?: string; existingBranch?: string }
-): Promise<null | { path: string; branch: string }> {
+): Promise<null | { path: string; branch: string; profile: string }> {
   if (!repoPath) {
     return null
   }
@@ -956,7 +956,7 @@ export async function startWorkInRepo(
     assertProjectContextCurrent(context)
     bumpWorktrees()
 
-    return { branch: result.branch, path: result.path }
+    return { branch: result.branch, path: result.path, profile: context.profile }
   } catch (err) {
     if (err instanceof StaleProjectProfileError) {
       return null
@@ -1052,6 +1052,7 @@ export async function switchBranchInRepo(repoPath: string, branch: string): Prom
 export interface StartWorkSessionRequest {
   draft?: string
   path: string
+  profile: string
   token: number
 }
 
@@ -1070,15 +1071,21 @@ export function requestNewWorktree(): void {
 
 let startWorkToken = 0
 
-export function requestStartWorkSession(path: string, draft?: string): void {
+export function requestStartWorkSession(path: string, draft?: string, profile?: string): void {
   const target = path.trim()
+  const owner = normalizeProfileKey(profile ?? $activeGatewayProfile.get())
 
-  if (!target) {
+  if (!target || owner !== normalizeProfileKey($activeGatewayProfile.get())) {
     return
   }
 
   startWorkToken += 1
-  $startWorkSessionRequest.set({ draft: draft?.trim() || undefined, path: target, token: startWorkToken })
+  $startWorkSessionRequest.set({
+    draft: draft?.trim() || undefined,
+    path: target,
+    profile: owner,
+    token: startWorkToken
+  })
 }
 
 export async function removeWorktreePath(

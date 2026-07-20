@@ -30,7 +30,13 @@ import { latestSessionTodos } from '@/lib/todos'
 import { setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
 import { $filePreviewTarget, $previewTarget } from '@/store/preview'
-import { $activeGatewayProfile, $freshSessionRequest, $profileScope, refreshActiveProfile } from '@/store/profile'
+import {
+  $activeGatewayProfile,
+  $freshSessionRequest,
+  $profileScope,
+  normalizeProfileKey,
+  refreshActiveProfile
+} from '@/store/profile'
 import { $startWorkSessionRequest, followActiveSessionCwd, resolveNewSessionCwd } from '@/store/projects'
 import {
   $activeSessionId,
@@ -445,7 +451,13 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // Seeds cwd + branch from the clicked workspace; an explicit worktree path
   // also drills the sidebar into that project so the new lane is visible.
   const startSessionInWorkspace = useCallback(
-    (path: null | string) => {
+    (path: null | string, expectedProfile = normalizeProfileKey($activeGatewayProfile.get())) => {
+      const ownsRequest = () => normalizeProfileKey($activeGatewayProfile.get()) === expectedProfile
+
+      if (!ownsRequest()) {
+        return
+      }
+
       startFreshSessionDraft()
 
       // A worktree lane carries its own path; the trunk "+" can be path-less
@@ -460,6 +472,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       setCurrentCwd(target)
       void requestGateway<{ branch?: string; cwd?: string }>('config.get', { key: 'project', cwd: target })
         .then(info => {
+          if (!ownsRequest()) {
+            return
+          }
+
           const resolved = info.cwd || target
 
           setCurrentCwd(resolved)
@@ -486,7 +502,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
 
     lastStartWorkTokenRef.current = startWorkSessionRequest.token
-    startSessionInWorkspace(startWorkSessionRequest.path)
+
+    if (normalizeProfileKey($activeGatewayProfile.get()) !== startWorkSessionRequest.profile) {
+      return
+    }
+
+    startSessionInWorkspace(startWorkSessionRequest.path, startWorkSessionRequest.profile)
 
     if (startWorkSessionRequest.draft) {
       requestComposerInsert(startWorkSessionRequest.draft, { target: 'main' })

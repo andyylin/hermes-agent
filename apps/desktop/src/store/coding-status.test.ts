@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { HermesRepoStatus } from '@/global'
 
 import { $repoStatus, $repoStatusLoading, refreshRepoStatus } from './coding-status'
+import { $activeGatewayProfile } from './profile'
 import { $currentCwd } from './session'
 
 const sampleStatus: HermesRepoStatus = {
@@ -22,12 +23,16 @@ const sampleStatus: HermesRepoStatus = {
 }
 
 function stubProbe(impl: (cwd: string) => Promise<HermesRepoStatus | null>) {
-  ;(window as unknown as { hermesDesktop?: unknown }).hermesDesktop = { git: { repoStatus: impl } }
+  ;(window as unknown as { hermesDesktop?: unknown }).hermesDesktop = {
+    getConnection: vi.fn(async () => ({ mode: 'local' })),
+    git: { repoStatus: impl }
+  }
 }
 
 describe('refreshRepoStatus', () => {
   beforeEach(() => {
     vi.useFakeTimers()
+    $activeGatewayProfile.set('default')
     $repoStatus.set(null)
     $currentCwd.set('')
     delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
@@ -95,6 +100,7 @@ describe('refreshRepoStatus', () => {
     )
 
     const first = refreshRepoStatus('/repo-a')
+    await vi.waitFor(() => expect(calls).toEqual(['/repo-a']))
     const second = refreshRepoStatus('/repo-b')
     const third = refreshRepoStatus('/repo-c')
 
@@ -116,5 +122,20 @@ describe('refreshRepoStatus', () => {
     expect(maxActive).toBe(1)
     expect($repoStatus.get()).toEqual(sampleStatus)
     expect($repoStatusLoading.get()).toBe(false)
+  })
+
+  it('drops a delayed status result after a same-cwd profile switch', async () => {
+    let resolveProbe!: (status: HermesRepoStatus | null) => void
+
+    stubProbe(() => new Promise(resolve => (resolveProbe = resolve)))
+    $activeGatewayProfile.set('alpha')
+    const refresh = refreshRepoStatus('/shared/repo')
+    await vi.waitFor(() => expect(resolveProbe).toBeTypeOf('function'))
+
+    $activeGatewayProfile.set('beta')
+    resolveProbe(sampleStatus)
+    await refresh
+
+    expect($repoStatus.get()).toBeNull()
   })
 })

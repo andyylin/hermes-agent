@@ -6,6 +6,7 @@ import type {
   HermesReviewList,
   HermesReviewShipInfo
 } from '@/global'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 
 import { desktopFsProfile, isDesktopFsRemoteMode } from './desktop-fs'
 
@@ -112,6 +113,13 @@ function createRemoteGit(profile: () => string | undefined = desktopFsProfile): 
 const remoteGit = createRemoteGit()
 
 export function desktopGit(): GitBridge | undefined {
+  // Profile activation publishes before the foreground connection atom finishes
+  // synchronizing. Refuse that brief mismatch instead of routing B's operation
+  // through A's local/remote facade.
+  if (normalizeProfileKey(desktopFsProfile()) !== normalizeProfileKey($activeGatewayProfile.get())) {
+    return undefined
+  }
+
   return isDesktopFsRemoteMode() ? remoteGit : window.hermesDesktop?.git
 }
 

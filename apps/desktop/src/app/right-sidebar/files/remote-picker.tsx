@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useStore } from '@nanostores/react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -6,6 +7,7 @@ import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/compone
 import { useI18n } from '@/i18n'
 import { readDesktopDir, readDesktopDirForProfile, setDesktopFsRemotePicker } from '@/lib/desktop-fs'
 import { cn } from '@/lib/utils'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 
 function clean(path: string) {
   return path.replace(/\/+$/, '') || '/'
@@ -37,7 +39,9 @@ interface PendingSelection {
 export function RemoteFolderPicker() {
   const { t } = useI18n()
   const r = t.rightSidebar
+  const activeProfile = normalizeProfileKey(useStore($activeGatewayProfile))
   const [pending, setPending] = useState<PendingSelection | null>(null)
+  const pendingRef = useRef<PendingSelection | null>(null)
   const [currentPath, setCurrentPath] = useState('/')
   const [entries, setEntries] = useState<Array<{ name: string; path: string }>>([])
   const [error, setError] = useState<string | null>(null)
@@ -47,14 +51,42 @@ export function RemoteFolderPicker() {
     setDesktopFsRemotePicker({
       selectPaths: (options, profile) =>
         new Promise(resolve => {
+          if (profile && normalizeProfileKey(profile) !== normalizeProfileKey($activeGatewayProfile.get())) {
+            resolve([])
+
+            return
+          }
+
           const defaultPath = clean(options?.defaultPath || '/')
+          const next = { defaultPath, profile, resolve, title: options?.title || r.remotePickerTitle }
+
+          // There is one global picker surface. Replacing a request must settle
+          // the previous caller instead of leaving its promise pending forever.
+          pendingRef.current?.resolve([])
+          pendingRef.current = next
           setCurrentPath(defaultPath)
-          setPending({ defaultPath, profile, resolve, title: options?.title || r.remotePickerTitle })
+          setPending(next)
         })
     })
 
-    return () => setDesktopFsRemotePicker(null)
+    return () => {
+      pendingRef.current?.resolve([])
+      pendingRef.current = null
+      setDesktopFsRemotePicker(null)
+    }
   }, [r.remotePickerTitle])
+
+  useEffect(() => {
+    const request = pendingRef.current
+
+    if (request?.profile && normalizeProfileKey(request.profile) !== activeProfile) {
+      request.resolve([])
+      pendingRef.current = null
+      setPending(null)
+      setEntries([])
+      setError(null)
+    }
+  }, [activeProfile])
 
   useEffect(() => {
     if (!pending) {
@@ -71,7 +103,7 @@ export function RemoteFolderPicker() {
 
     void readDir
       .then(result => {
-        if (!active) {
+        if (!active || pendingRef.current !== pending) {
           return
         }
 
@@ -87,13 +119,13 @@ export function RemoteFolderPicker() {
         )
       })
       .catch(err => {
-        if (active) {
+        if (active && pendingRef.current === pending) {
           setError(err instanceof Error ? err.message : String(err))
           setEntries([])
         }
       })
       .finally(() => {
-        if (active) {
+        if (active && pendingRef.current === pending) {
           setLoading(false)
         }
       })
@@ -117,7 +149,8 @@ export function RemoteFolderPicker() {
   }, [currentPath])
 
   const close = (paths: string[] = []) => {
-    pending?.resolve(paths)
+    pendingRef.current?.resolve(paths)
+    pendingRef.current = null
     setPending(null)
     setEntries([])
     setError(null)

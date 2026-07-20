@@ -24,13 +24,13 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
   // carrying the composer draft as its first turn. Clearing here means the draft
   // travels to the new session instead of getting stashed under this one.
   const openInWorktree = useCallback(
-    (path: string) => {
+    (path: string, profile?: string) => {
       const text = draftRef.current
       clearDraft()
       scope.attachments.clear()
-      requestStartWorkSession(path, text)
+      requestStartWorkSession(path, text, profile)
     },
-    [clearDraft, draftRef]
+    [clearDraft, draftRef, scope.attachments]
   )
 
   // Branch off into a NEW worktree (base = branch name, or current HEAD). A
@@ -42,7 +42,7 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
       const result = repoPath && (await startWorkInRepo(repoPath, { base, branch, name: branch }))
 
       if (result) {
-        openInWorktree(result.path)
+        openInWorktree(result.path, result.profile)
       }
     },
     [cwd, openInWorktree]
@@ -71,7 +71,7 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
       const result = repoPath && (await startWorkInRepo(repoPath, { existingBranch: branch }))
 
       if (result) {
-        openInWorktree(result.path)
+        openInWorktree(result.path, result.profile)
       }
     },
     [cwd, openInWorktree]
