@@ -299,6 +299,12 @@ function projectContextIsCurrent(context: ProjectRequestContext): boolean {
   )
 }
 
+function assertProjectContextCurrent(context: ProjectRequestContext): void {
+  if (!projectContextIsCurrent(context)) {
+    throw new StaleProjectProfileError()
+  }
+}
+
 async function captureProjectRequestContext(): Promise<ProjectRequestContext> {
   const profile = normalizeProfileKey($activeGatewayProfile.get())
   const generation = projectProfileGeneration
@@ -327,10 +333,7 @@ async function gatewayRequest<T>(
   context?: ProjectRequestContext
 ): Promise<T> {
   const captured = context ?? (await captureProjectRequestContext())
-
-  if (!projectContextIsCurrent(captured)) {
-    throw new StaleProjectProfileError()
-  }
+  assertProjectContextCurrent(captured)
 
   try {
     const result = await captured.gateway.request<T>(method, params)
@@ -383,6 +386,7 @@ export async function refreshProjectTree(): Promise<void> {
 
   try {
     context = await captureProjectRequestContext()
+    assertProjectContextCurrent(context)
     $projectTreeLoading.set(true)
     const res = await gatewayRequest<ProjectTreePayload>('projects.tree', { preview_limit: 3 }, context)
     // The flat Sessions list shows everything; scoped ids are only used here to
@@ -448,6 +452,7 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
 
   try {
     context = await captureProjectRequestContext()
+    assertProjectContextCurrent(context)
   } catch {
     return
   }
@@ -658,6 +663,7 @@ export async function updateProject(
   patch: { name?: string; color?: null | string; icon?: null | string }
 ): Promise<void> {
   const context = await captureProjectRequestContext()
+  assertProjectContextCurrent(context)
   const snap = snapshotProjects()
 
   $projectTree.set(
@@ -728,6 +734,7 @@ export async function addProjectFolder(
   opts: { label?: string; isPrimary?: boolean } = {}
 ): Promise<void> {
   const context = await captureProjectRequestContext()
+  assertProjectContextCurrent(context)
   const snap = snapshotProjects()
   const trimmed = path.trim()
 
@@ -783,6 +790,7 @@ function openSessionBelongsToProject(projectId: string, projects: ProjectInfo[])
 // inside), reconciling from the server payload. A failed delete restores both.
 export async function deleteProject(id: string): Promise<void> {
   const context = await captureProjectRequestContext()
+  assertProjectContextCurrent(context)
   const snap = snapshotProjects()
   // Capture membership BEFORE removal — the project's folders (which determine
   // ownership) are gone once it's dropped from the cache.

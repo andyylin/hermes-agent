@@ -23,6 +23,7 @@ import {
   pickProjectFolder,
   projectNameForCwd,
   refreshProjects,
+  refreshProjectTree,
   refreshWorktrees,
   scanAndRecordRepos,
   tombstoneSessions,
@@ -181,6 +182,7 @@ describe('profile isolation', () => {
     activeGateway.mockReturnValue(gatewayA as never)
     $projects.set([project('p_alpha', 'Alpha')])
     const update = updateProject('p_alpha', { name: 'Alpha renamed' })
+    await Promise.resolve()
 
     $activeGatewayProfile.set('write-beta')
     $projects.set([project('p_beta', 'Beta')])
@@ -188,6 +190,35 @@ describe('profile isolation', () => {
     await expect(update).rejects.toThrow()
 
     expect($projects.get().map(project => project.id)).toEqual(['p_beta'])
+  })
+
+  it('does not mutate beta after switching during the context-capture microtask', async () => {
+    const gatewayA = { connectionState: 'open', request: vi.fn().mockResolvedValue({}) }
+
+    $activeGatewayProfile.set('microtask-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    $projects.set([project('p_shared', 'Alpha')])
+    const update = updateProject('p_shared', { name: 'Alpha renamed' })
+
+    $activeGatewayProfile.set('microtask-beta')
+    $projects.set([project('p_shared', 'Beta')])
+    await expect(update).rejects.toThrow()
+
+    expect($projects.get()[0]?.name).toBe('Beta')
+  })
+
+  it('does not leave beta loading when switching during tree context capture', async () => {
+    const gatewayA = { connectionState: 'open', request: vi.fn().mockResolvedValue({}) }
+
+    $activeGatewayProfile.set('loading-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    const refresh = refreshProjectTree()
+
+    $activeGatewayProfile.set('loading-beta')
+    $projectTreeLoading.set(false)
+    await refresh
+
+    expect($projectTreeLoading.get()).toBe(false)
   })
 
   it('persists project scope independently per profile', () => {
