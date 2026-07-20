@@ -103,3 +103,23 @@ const remoteGit: GitBridge = {
 export function desktopGit(): GitBridge | undefined {
   return isDesktopFsRemoteMode() ? remoteGit : window.hermesDesktop?.git
 }
+
+// Repo discovery must bind to the initiating profile. During a live profile
+// swap `$activeGatewayProfile` is published before the foreground connection
+// atom finishes synchronizing; selecting `desktopGit()` in that gap can crawl
+// the old local machine and submit its paths to the new profile.
+export async function scanDesktopReposForProfile(profile: string): Promise<{ label: string; root: string }[]> {
+  const desktop = window.hermesDesktop
+
+  if (!desktop) {
+    return []
+  }
+
+  const connection = await desktop.getConnection(profile)
+
+  if (connection.mode === 'remote') {
+    return []
+  }
+
+  return desktop.git?.scanRepos([]) ?? []
+}

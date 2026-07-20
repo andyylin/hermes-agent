@@ -42,14 +42,14 @@ vi.mock('@/store/notifications', () => ({
 }))
 
 vi.mock('@/lib/desktop-fs', () => ({
-  desktopDefaultCwd: vi.fn(),
-  isDesktopFsRemoteMode: vi.fn(),
-  selectDesktopPaths: vi.fn(),
-  writeDesktopFileText: vi.fn()
+  desktopDefaultCwdForProfile: vi.fn(),
+  selectDesktopPathsForProfile: vi.fn(),
+  writeDesktopFileTextForProfile: vi.fn()
 }))
 
 vi.mock('@/lib/desktop-git', () => ({
-  desktopGit: () => ({ scanRepos })
+  desktopGit: () => ({ scanRepos }),
+  scanDesktopReposForProfile: scanRepos
 }))
 
 vi.mock('@/store/gateway', () => ({
@@ -58,9 +58,9 @@ vi.mock('@/store/gateway', () => ({
 }))
 
 const fs = await import('@/lib/desktop-fs')
-const desktopDefaultCwd = vi.mocked(fs.desktopDefaultCwd)
-const isDesktopFsRemoteMode = vi.mocked(fs.isDesktopFsRemoteMode)
-const selectDesktopPaths = vi.mocked(fs.selectDesktopPaths)
+const desktopDefaultCwdForProfile = vi.mocked(fs.desktopDefaultCwdForProfile)
+const selectDesktopPathsForProfile = vi.mocked(fs.selectDesktopPathsForProfile)
+const writeDesktopFileTextForProfile = vi.mocked(fs.writeDesktopFileTextForProfile)
 
 const gw = await import('@/store/gateway')
 const activeGateway = vi.mocked(gw.activeGateway)
@@ -175,6 +175,17 @@ describe('profile isolation', () => {
     expect(gatewayB.request).toHaveBeenCalledWith('projects.record_repos', expect.anything())
   })
 
+  it('selects the repo scanner for the captured profile', async () => {
+    const gateway = { connectionState: 'open', request: vi.fn().mockResolvedValue({}) }
+    scanRepos.mockResolvedValue([{ path: '/repos/beta' }])
+
+    $activeGatewayProfile.set('scanner-beta')
+    activeGateway.mockReturnValue(gateway as never)
+    await scanAndRecordRepos(true)
+
+    expect(scanRepos).toHaveBeenCalledWith('scanner-beta')
+  })
+
   it('does not roll an alpha optimistic snapshot into beta after a failed write', async () => {
     const writeA = deferred<never>()
     const gatewayA = { connectionState: 'open', request: vi.fn(() => writeA.promise) }
@@ -256,6 +267,23 @@ describe('profile isolation', () => {
     await follow
 
     expect($projectScope.get()).toBe(ALL_PROJECTS)
+  })
+
+  it('writes IDEA.md through the captured project profile', async () => {
+    const created = { ...project('p_idea', 'Idea'), primary_path: '/idea' }
+
+    const gateway = {
+      connectionState: 'open',
+      request: vi.fn().mockResolvedValue({ project: created })
+    }
+
+    writeDesktopFileTextForProfile.mockResolvedValue({ path: '/idea/IDEA.md' })
+
+    $activeGatewayProfile.set('idea-beta')
+    activeGateway.mockReturnValue(gateway as never)
+    await createProject({ folders: ['/idea'], idea: '# Beta idea', name: 'Idea' })
+
+    expect(writeDesktopFileTextForProfile).toHaveBeenCalledWith('idea-beta', '/idea/IDEA.md', '# Beta idea\n')
   })
 
   it('persists project scope independently per profile', () => {
@@ -398,23 +426,28 @@ describe('worktree refresh', () => {
 describe('pickProjectFolder', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    $activeGatewayProfile.set('default')
+    activeGateway.mockReturnValue({ connectionState: 'open', request: vi.fn() } as never)
   })
 
   it('uses the remote-aware directory picker locally', async () => {
-    isDesktopFsRemoteMode.mockReturnValue(false)
-    selectDesktopPaths.mockResolvedValue(['/local/repo'])
+    desktopDefaultCwdForProfile.mockResolvedValue(null)
+    selectDesktopPathsForProfile.mockResolvedValue(['/local/repo'])
 
     await expect(pickProjectFolder()).resolves.toBe('/local/repo')
-    expect(selectDesktopPaths).toHaveBeenCalledWith({ defaultPath: undefined, directories: true, multiple: false })
+    expect(selectDesktopPathsForProfile).toHaveBeenCalledWith('default', {
+      defaultPath: undefined,
+      directories: true,
+      multiple: false
+    })
   })
 
   it('seeds the picker with the backend cwd on a remote gateway', async () => {
-    isDesktopFsRemoteMode.mockReturnValue(true)
-    desktopDefaultCwd.mockResolvedValue({ branch: 'main', cwd: '/backend/work' })
-    selectDesktopPaths.mockResolvedValue(['/backend/work/repo'])
+    desktopDefaultCwdForProfile.mockResolvedValue({ branch: 'main', cwd: '/backend/work' })
+    selectDesktopPathsForProfile.mockResolvedValue(['/backend/work/repo'])
 
     await expect(pickProjectFolder()).resolves.toBe('/backend/work/repo')
-    expect(selectDesktopPaths).toHaveBeenCalledWith({
+    expect(selectDesktopPathsForProfile).toHaveBeenCalledWith('default', {
       defaultPath: '/backend/work',
       directories: true,
       multiple: false
@@ -422,10 +455,24 @@ describe('pickProjectFolder', () => {
   })
 
   it('returns null when the picker is cancelled (empty selection)', async () => {
-    isDesktopFsRemoteMode.mockReturnValue(false)
-    selectDesktopPaths.mockResolvedValue([])
+    desktopDefaultCwdForProfile.mockResolvedValue(null)
+    selectDesktopPathsForProfile.mockResolvedValue([])
 
     await expect(pickProjectFolder()).resolves.toBeNull()
+  })
+
+  it('drops a picker result after the active profile changes', async () => {
+    const selected = deferred<string[]>()
+
+    $activeGatewayProfile.set('picker-alpha')
+    desktopDefaultCwdForProfile.mockResolvedValue(null)
+    selectDesktopPathsForProfile.mockReturnValue(selected.promise)
+    const picked = pickProjectFolder()
+
+    $activeGatewayProfile.set('picker-beta')
+    selected.resolve(['/alpha/repo'])
+
+    await expect(picked).resolves.toBeNull()
   })
 })
 

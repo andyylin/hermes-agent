@@ -58,6 +58,10 @@ function remoteFsApi<T>(path: string, body?: Record<string, unknown>): Promise<T
   )
 }
 
+function remoteFsApiForProfile<T>(profile: string, path: string, body?: Record<string, unknown>): Promise<T> {
+  return bridge().api<T>(body ? { body, method: 'POST', path, profile } : { path, profile })
+}
+
 export async function readDesktopDir(path: string): Promise<HermesReadDirResult> {
   if (!isDesktopFsRemoteMode()) {
     return bridge().readDir(path)
@@ -94,6 +98,33 @@ export async function writeDesktopFileText(path: string, content: string): Promi
   return { path: result.path || path }
 }
 
+// Profile-bound variant for operations that outlive a live profile swap. It
+// resolves the requested profile's connection directly instead of consulting
+// the mutable foreground `$connection` atom.
+export async function writeDesktopFileTextForProfile(
+  profile: string,
+  path: string,
+  content: string
+): Promise<{ path: string }> {
+  const desktop = bridge()
+  const connection = await desktop.getConnection(profile)
+
+  if (connection.mode !== 'remote') {
+    if (!desktop.writeTextFile) {
+      throw new Error('Saving is not available')
+    }
+
+    return desktop.writeTextFile(path, content)
+  }
+
+  const result = await remoteFsApiForProfile<{ ok?: boolean; path?: string }>(profile, '/api/fs/write-text', {
+    content,
+    path
+  })
+
+  return { path: result.path || path }
+}
+
 export async function readDesktopFileDataUrl(path: string): Promise<string> {
   if (!isDesktopFsRemoteMode()) {
     return bridge().readFileDataUrl(path)
@@ -120,6 +151,16 @@ export async function desktopDefaultCwd(): Promise<{ branch: string; cwd: string
   }
 
   return remoteFsApi<{ branch: string; cwd: string }>('/api/fs/default-cwd')
+}
+
+export async function desktopDefaultCwdForProfile(profile: string): Promise<{ branch: string; cwd: string } | null> {
+  const connection = await bridge().getConnection(profile)
+
+  if (connection.mode !== 'remote') {
+    return null
+  }
+
+  return remoteFsApiForProfile<{ branch: string; cwd: string }>(profile, '/api/fs/default-cwd')
 }
 
 // Reveal a path in the OS file manager (Finder / Explorer / Files). Local only.
@@ -179,6 +220,20 @@ export async function selectDesktopPaths(options?: HermesSelectPathsOptions): Pr
   }
 
   if (!options?.directories) {
+    return desktop.selectPaths(options)
+  }
+
+  return remotePicker ? remotePicker.selectPaths({ ...options, multiple: false }) : []
+}
+
+export async function selectDesktopPathsForProfile(
+  profile: string,
+  options?: HermesSelectPathsOptions
+): Promise<string[]> {
+  const desktop = bridge()
+  const connection = await desktop.getConnection(profile)
+
+  if (connection.mode !== 'remote' || !options?.directories) {
     return desktop.selectPaths(options)
   }
 

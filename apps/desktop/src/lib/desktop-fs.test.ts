@@ -4,13 +4,16 @@ import { $connection } from '@/store/session'
 
 import {
   desktopDefaultCwd,
+  desktopDefaultCwdForProfile,
   desktopFileDiff,
   desktopGitRoot,
   readDesktopDir,
   readDesktopFileDataUrl,
   readDesktopFileText,
   selectDesktopPaths,
-  setDesktopFsRemotePicker
+  selectDesktopPathsForProfile,
+  setDesktopFsRemotePicker,
+  writeDesktopFileTextForProfile
 } from './desktop-fs'
 
 const readDir = vi.fn(async () => ({ entries: [{ name: 'local', path: '/local', isDirectory: true }] }))
@@ -18,6 +21,8 @@ const readFileText = vi.fn(async () => ({ path: '/local/file.txt', text: 'local'
 const readFileDataUrl = vi.fn(async () => 'data:text/plain;base64,bG9jYWw=')
 const gitRoot = vi.fn(async () => '/local')
 const selectPaths = vi.fn(async () => ['/local'])
+const writeTextFile = vi.fn(async (path: string) => ({ path }))
+const getConnection = vi.fn(async () => ({ mode: 'local' }))
 
 const api = vi.fn(async ({ path }: { path: string }) => {
   if (path.startsWith('/api/fs/list?')) {
@@ -40,6 +45,10 @@ const api = vi.fn(async ({ path }: { path: string }) => {
     return { cwd: '/backend/project', branch: 'main' }
   }
 
+  if (path === '/api/fs/write-text') {
+    return { ok: true, path: '/remote/IDEA.md' }
+  }
+
   if (path.startsWith('/api/git/file-diff?')) {
     return { diff: 'remote diff' }
   }
@@ -51,11 +60,13 @@ function stubBridge() {
   vi.stubGlobal('window', {
     hermesDesktop: {
       api,
+      getConnection,
       gitRoot,
       readDir,
       readFileDataUrl,
       readFileText,
-      selectPaths
+      selectPaths,
+      writeTextFile
     }
   })
 }
@@ -120,6 +131,34 @@ describe('desktop filesystem facade', () => {
 
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/list?path=%2Fsrv%2Fproject', profile: 'remote-docker' })
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/default-cwd', profile: 'remote-docker' })
+  })
+
+  it('routes profile-bound picker and writes through the requested profile', async () => {
+    const remoteSelect = vi.fn(async () => ['/remote/project'])
+    getConnection.mockResolvedValue({ mode: 'remote', profile: 'beta' } as never)
+    setDesktopFsRemotePicker({ selectPaths: remoteSelect })
+
+    await expect(desktopDefaultCwdForProfile('beta')).resolves.toEqual({
+      branch: 'main',
+      cwd: '/backend/project'
+    })
+    await expect(selectDesktopPathsForProfile('beta', { directories: true, multiple: false })).resolves.toEqual([
+      '/remote/project'
+    ])
+    await expect(writeDesktopFileTextForProfile('beta', '/remote/IDEA.md', '# Idea\n')).resolves.toEqual({
+      path: '/remote/IDEA.md'
+    })
+
+    expect(getConnection).toHaveBeenCalledWith('beta')
+    expect(remoteSelect).toHaveBeenCalledWith({ directories: true, multiple: false })
+    expect(api).toHaveBeenCalledWith({ path: '/api/fs/default-cwd', profile: 'beta' })
+    expect(api).toHaveBeenCalledWith({
+      body: { content: '# Idea\n', path: '/remote/IDEA.md' },
+      method: 'POST',
+      path: '/api/fs/write-text',
+      profile: 'beta'
+    })
+    expect(writeTextFile).not.toHaveBeenCalled()
   })
 
   it('routes file diffs through backend git in remote mode', async () => {

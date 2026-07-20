@@ -3,8 +3,12 @@ import { atom } from 'nanostores'
 import { liveSessionProjectId, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
 import type { HermesGitBaseBranch, HermesGitBranch } from '@/global'
 import { translateNow } from '@/i18n'
-import { desktopDefaultCwd, selectDesktopPaths, writeDesktopFileText } from '@/lib/desktop-fs'
-import { desktopGit } from '@/lib/desktop-git'
+import {
+  desktopDefaultCwdForProfile,
+  selectDesktopPathsForProfile,
+  writeDesktopFileTextForProfile
+} from '@/lib/desktop-fs'
+import { desktopGit, scanDesktopReposForProfile } from '@/lib/desktop-git'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
 import { setSidebarAgentsGrouped } from '@/store/layout'
@@ -451,12 +455,6 @@ export async function fetchProjectSessions(projectId: string): Promise<SidebarPr
 const scannedRepoProfiles = new Set<string>()
 
 export async function scanAndRecordRepos(force = false): Promise<void> {
-  const scan = desktopGit()?.scanRepos
-
-  if (!scan) {
-    return
-  }
-
   let context: ProjectRequestContext
 
   try {
@@ -477,7 +475,7 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
   }
 
   try {
-    const repos = await scan([])
+    const repos = await scanDesktopReposForProfile(context.profile)
     await gatewayRequest('projects.record_repos', { repos }, context)
     // The disk scan may surface new zero-session repos; refold them into the tree.
     await refreshProjectTree()
@@ -526,7 +524,7 @@ export async function generateProjectIdea(name: string): Promise<string> {
 // Write IDEA.md to a project's primary folder (best-effort). Routes through the
 // remote-aware fs write, so it lands on the backend for a remote gateway and on
 // disk locally — the project is created regardless of whether the file lands.
-async function writeProjectIdea(folder: null | string | undefined, idea: string): Promise<void> {
+async function writeProjectIdea(profile: string, folder: null | string | undefined, idea: string): Promise<void> {
   const dir = (folder || '').trim()
   const body = idea.trim()
 
@@ -535,7 +533,11 @@ async function writeProjectIdea(folder: null | string | undefined, idea: string)
   }
 
   try {
-    await writeDesktopFileText(`${dir.replace(/[/\\]+$/, '')}/IDEA.md`, body.endsWith('\n') ? body : `${body}\n`)
+    await writeDesktopFileTextForProfile(
+      profile,
+      `${dir.replace(/[/\\]+$/, '')}/IDEA.md`,
+      body.endsWith('\n') ? body : `${body}\n`
+    )
   } catch {
     // Best-effort: the project is created regardless of whether IDEA.md lands.
   }
@@ -604,20 +606,27 @@ export async function createProject(input: CreateProjectInput): Promise<ProjectI
     throw projectsStaleBackendError()
   }
 
+  let context: ProjectRequestContext
   let res: { project: ProjectInfo | null }
 
   try {
-    res = await gatewayRequest<{ project: ProjectInfo | null }>('projects.create', {
-      name: input.name,
-      folders: input.folders ?? [],
-      primary_path: input.primaryPath,
-      slug: input.slug,
-      description: input.description,
-      icon: input.icon,
-      color: input.color,
-      board_slug: input.boardSlug,
-      use: input.use ?? false
-    })
+    context = await captureProjectRequestContext()
+    assertProjectContextCurrent(context)
+    res = await gatewayRequest<{ project: ProjectInfo | null }>(
+      'projects.create',
+      {
+        name: input.name,
+        folders: input.folders ?? [],
+        primary_path: input.primaryPath,
+        slug: input.slug,
+        description: input.description,
+        icon: input.icon,
+        color: input.color,
+        board_slug: input.boardSlug,
+        use: input.use ?? false
+      },
+      context
+    )
   } catch (err) {
     if (isMissingRpcMethod(err)) {
       $projectsRpcAvailable.set(false)
@@ -637,7 +646,11 @@ export async function createProject(input: CreateProjectInput): Promise<ProjectI
 
   if (created) {
     if (input.idea) {
-      void writeProjectIdea(created.primary_path ?? created.folders?.[0]?.path ?? input.primaryPath, input.idea)
+      void writeProjectIdea(
+        context.profile,
+        created.primary_path ?? created.folders?.[0]?.path ?? input.primaryPath,
+        input.idea
+      )
     }
 
     if (!$projects.get().some(proj => proj.id === created.id)) {
@@ -1038,11 +1051,26 @@ export async function copyPath(path: null | string): Promise<void> {
 // the backend filesystem (seeded at its default cwd) where sessions run; local
 // mode opens the native dialog. Returns the absolute path, or null if cancelled.
 export async function pickProjectFolder(): Promise<null | string> {
-  const [dir] = await selectDesktopPaths({
-    defaultPath: (await desktopDefaultCwd())?.cwd,
-    directories: true,
-    multiple: false
-  })
+  try {
+    const context = await captureProjectRequestContext()
+    const defaultCwd = await desktopDefaultCwdForProfile(context.profile)
 
-  return dir || null
+    assertProjectContextCurrent(context)
+
+    const [dir] = await selectDesktopPathsForProfile(context.profile, {
+      defaultPath: defaultCwd?.cwd,
+      directories: true,
+      multiple: false
+    })
+
+    assertProjectContextCurrent(context)
+
+    return dir || null
+  } catch (err) {
+    if (err instanceof StaleProjectProfileError) {
+      return null
+    }
+
+    throw err
+  }
 }
