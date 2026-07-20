@@ -1,6 +1,7 @@
 from argparse import Namespace
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -1684,7 +1685,8 @@ def test_launch_tui_worktree_validates_relative_python_against_final_cwd(
     relative_python = Path(".review-venv") / "bin" / Path(sys.executable).name
     python_path = worktree / relative_python
     python_path.parent.mkdir(parents=True)
-    os.link(sys.executable, python_path)
+    # The temp directory may be on another filesystem than the active venv.
+    shutil.copy2(sys.executable, python_path)
     captured = {}
 
     monkeypatch.setenv("HERMES_CWD", str(parent_cwd))
