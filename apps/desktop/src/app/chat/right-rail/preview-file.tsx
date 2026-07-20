@@ -1,3 +1,4 @@
+import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import type {
   ComponentProps,
@@ -33,6 +34,7 @@ import { shikiLanguageForFilename } from '@/lib/markdown-code'
 import { cn } from '@/lib/utils'
 import type { PreviewTarget } from '@/store/preview'
 import { setPreviewDirty } from '@/store/preview-edit'
+import { $activeGatewayProfile, $activeGatewayProfileGeneration } from '@/store/profile'
 import { $currentCwd } from '@/store/session'
 import { notifyWorkspaceChanged } from '@/store/workspace-events'
 
@@ -565,6 +567,8 @@ type PreviewViewMode = 'diff' | 'rendered' | 'source'
 
 export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; target: PreviewTarget }) {
   const { t } = useI18n()
+  const activeProfile = useStore($activeGatewayProfile)
+  const activeProfileGeneration = useStore($activeGatewayProfileGeneration)
   const [state, setState] = useState<LocalPreviewState>({ loading: true })
   const [forcePreview, setForcePreview] = useState(false)
   // User-picked view; null = auto (diff when changed, else rendered markdown,
@@ -685,7 +689,19 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
     return () => {
       active = false
     }
-  }, [blockedByTarget, filePath, forcePreview, isImage, isText, reloadKey, selfReload, target.dataUrl, target.language])
+  }, [
+    activeProfile,
+    activeProfileGeneration,
+    blockedByTarget,
+    filePath,
+    forcePreview,
+    isImage,
+    isText,
+    reloadKey,
+    selfReload,
+    target.dataUrl,
+    target.language
+  ])
 
   // Editing is only offered for whole, readable text — never images, binaries,
   // or files we only loaded the first 512 KB of (saving would drop the tail).

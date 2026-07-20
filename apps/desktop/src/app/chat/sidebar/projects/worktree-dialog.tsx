@@ -1,3 +1,4 @@
+import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
@@ -16,7 +17,11 @@ import type { HermesGitBranch } from '@/global'
 import { useI18n } from '@/i18n'
 import { gitRef } from '@/lib/sanitize'
 import { notifyError } from '@/store/notifications'
-import { activeGatewayProfileContextIsCurrent, captureActiveGatewayProfileContext } from '@/store/profile'
+import {
+  $activeGatewayProfileGeneration,
+  activeGatewayProfileContextIsCurrent,
+  captureActiveGatewayProfileContext
+} from '@/store/profile'
 import { listRepoBranches, startWorkInRepo, switchBranchInRepo } from '@/store/projects'
 
 import { BaseBranchPicker } from './base-branch-picker'
@@ -69,6 +74,9 @@ export function WorktreeDialog({ repoPath, onStarted, open, onOpenChange, initia
   const [branchesLoading, setBranchesLoading] = useState(false)
   const branchRequestRef = useRef(0)
   const [selectedBase, setSelectedBase] = useState('')
+  const profileGeneration = useStore($activeGatewayProfileGeneration)
+  const branchOwnerKey = `${profileGeneration}:${repoPath}`
+  const previousBranchOwnerKeyRef = useRef(branchOwnerKey)
 
   // Reset to a fresh state each time the dialog opens, applying any pre-selected
   // base branch from the caller (e.g. "branch off from main" in the coding row's
@@ -102,11 +110,26 @@ export function WorktreeDialog({ repoPath, onStarted, open, onOpenChange, initia
         setBranches([])
       }
     } finally {
-      if (branchRequestRef.current === request) {
+      if (branchRequestRef.current === request && activeGatewayProfileContextIsCurrent(context)) {
         setBranchesLoading(false)
       }
     }
   }, [repoPath])
+
+  useEffect(() => {
+    if (previousBranchOwnerKeyRef.current === branchOwnerKey) {
+      return
+    }
+
+    previousBranchOwnerKeyRef.current = branchOwnerKey
+    branchRequestRef.current += 1
+    setBranches([])
+    setBranchesLoading(false)
+
+    if (open && convertMode) {
+      void loadBranches()
+    }
+  }, [branchOwnerKey, convertMode, loadBranches, open])
 
   const submit = async () => {
     const branch = name.trim()

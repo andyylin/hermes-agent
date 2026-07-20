@@ -89,8 +89,22 @@ export async function readDesktopDir(path: string): Promise<HermesReadDirResult>
   return remoteFsApi<HermesReadDirResult>(fsPath('list', path))
 }
 
-export async function readDesktopDirForProfile(profile: string, path: string): Promise<HermesReadDirResult> {
+export async function readDesktopDirForProfile(
+  profile: string,
+  generation: number,
+  path: string
+): Promise<HermesReadDirResult> {
+  const context = { generation, profile: normalizeProfileKey(profile) }
+
+  if (!activeGatewayProfileContextIsCurrent(context)) {
+    throw new Error('Desktop filesystem profile ownership changed before directory read')
+  }
+
   const connection = await bridge().getConnection(profile)
+
+  if (!activeGatewayProfileContextIsCurrent(context)) {
+    throw new Error('Desktop filesystem profile ownership changed while resolving directory connection')
+  }
 
   if (connection.mode !== 'remote') {
     return bridge().readDir(path)

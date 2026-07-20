@@ -8,7 +8,11 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import type { HermesGitBaseBranch } from '@/global'
 import { useI18n } from '@/i18n'
 import { $repoStatus } from '@/store/coding-status'
-import { activeGatewayProfileContextIsCurrent, captureActiveGatewayProfileContext } from '@/store/profile'
+import {
+  $activeGatewayProfileGeneration,
+  activeGatewayProfileContextIsCurrent,
+  captureActiveGatewayProfileContext
+} from '@/store/profile'
 import { listBaseBranches } from '@/store/projects'
 
 // Filterable combobox for picking the base branch of a new worktree. Lists
@@ -34,6 +38,13 @@ export function BaseBranchPicker({
   const [loading, setLoading] = useState(false)
   const [open, setOpen] = useState(false)
   const branchRequestRef = useRef(0)
+  const profileGeneration = useStore($activeGatewayProfileGeneration)
+
+  useEffect(() => {
+    branchRequestRef.current += 1
+    setBranches([])
+    setLoading(false)
+  }, [profileGeneration, repoPath])
 
   const currentBranch = repoStatus?.detached ? null : (repoStatus?.branch ?? null)
 
@@ -70,7 +81,7 @@ export function BaseBranchPicker({
         setBranches([])
       }
     } finally {
-      if (branchRequestRef.current === request) {
+      if (branchRequestRef.current === request && activeGatewayProfileContextIsCurrent(context)) {
         setLoading(false)
       }
     }

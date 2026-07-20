@@ -163,7 +163,9 @@ describe('desktop filesystem facade', () => {
       branch: 'main',
       cwd: '/backend/project'
     })
-    await expect(readDesktopDirForProfile('beta', '/backend/project')).resolves.toMatchObject({
+    await expect(
+      readDesktopDirForProfile('beta', $activeGatewayProfileGeneration.get(), '/backend/project')
+    ).resolves.toMatchObject({
       entries: [{ name: 'remote' }]
     })
     await expect(selectDesktopPathsForProfile('beta', { directories: true, multiple: false })).resolves.toEqual([
@@ -188,6 +190,28 @@ describe('desktop filesystem facade', () => {
       profile: 'beta'
     })
     expect(writeTextFile).not.toHaveBeenCalled()
+  })
+
+  it('refuses a profile-bound directory read when ownership changes while resolving the connection', async () => {
+    let resolveConnection!: (value: { mode: 'local'; profile: string }) => void
+
+    const connection = new Promise<{ mode: 'local'; profile: string }>(resolve => {
+      resolveConnection = resolve
+    })
+
+    $activeGatewayProfile.set('alpha')
+    const generation = $activeGatewayProfileGeneration.get()
+
+    getConnection.mockReturnValueOnce(connection as never)
+
+    const read = readDesktopDirForProfile('alpha', generation, '/alpha/private')
+
+    $activeGatewayProfile.set('beta')
+    resolveConnection({ mode: 'local', profile: 'alpha' })
+
+    await expect(read).rejects.toThrow('profile ownership changed')
+    expect(readDir).not.toHaveBeenCalled()
+    expect(api).not.toHaveBeenCalled()
   })
 
   it('routes file diffs through backend git in remote mode', async () => {

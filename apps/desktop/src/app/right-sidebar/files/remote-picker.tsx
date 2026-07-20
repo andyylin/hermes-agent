@@ -139,7 +139,7 @@ export function RemoteFolderPicker() {
     setError(null)
 
     const readDir = pending.profile
-      ? readDesktopDirForProfile(pending.profile, currentPath)
+      ? readDesktopDirForProfile(pending.profile, pending.generation, currentPath)
       : readDesktopDir(currentPath)
 
     void readDir

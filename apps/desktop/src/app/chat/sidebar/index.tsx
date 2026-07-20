@@ -62,7 +62,14 @@ import {
   toggleSidebarMessagingOpen,
   unpinSession
 } from '@/store/layout'
-import { $newChatProfile, $profiles, $profileScope, ALL_PROFILES, normalizeProfileKey } from '@/store/profile'
+import {
+  $newChatProfile,
+  $profiles,
+  $profileScope,
+  ALL_PROFILES,
+  captureActiveGatewayProfileContext,
+  normalizeProfileKey
+} from '@/store/profile'
 import {
   $activeProjectId,
   $projects,
@@ -130,7 +137,7 @@ import {
   useRepoWorktreeMap
 } from './projects'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
-import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
+import { bindWorkspaceSessionOwner, SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 
 // Non-session groups (messaging platforms) stay compact: show a few rows up
@@ -255,6 +262,17 @@ export function ChatSidebar({
 }: ChatSidebarProps) {
   const { t } = useI18n()
   const s = t.sidebar
+  const { generation: newSessionGeneration, profile: newSessionProfile } = captureActiveGatewayProfileContext()
+
+  const onOwnedNewSessionInWorkspace = useMemo(
+    () =>
+      bindWorkspaceSessionOwner(onNewSessionInWorkspace, {
+        generation: newSessionGeneration,
+        profile: newSessionProfile
+      }),
+    [newSessionGeneration, newSessionProfile, onNewSessionInWorkspace]
+  )
+
   const { pathname } = useLocation()
   // Contributed nav rows (plugins pairing a page with a sidebar entry) render
   // below the built-ins with the same chrome; active = at their route.
@@ -1341,7 +1359,7 @@ export function ChatSidebar({
                             if (agentsGrouped) {
                               openProjectCreate()
                             } else {
-                              onNewSessionInWorkspace(null)
+                              onOwnedNewSessionInWorkspace(null)
                             }
                           }}
                           size="icon-xs"

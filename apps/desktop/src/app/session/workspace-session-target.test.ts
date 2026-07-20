@@ -94,7 +94,9 @@ describe('bindWorkspaceSessionOwner', () => {
     // The foreground may leave alpha and later return with a newer generation;
     // invoking the stale rendered callback must still carry its original owner.
     staleAlphaCallback('/alpha/project')
+    staleAlphaCallback(null)
 
     expect(start).toHaveBeenCalledWith('/alpha/project', 'alpha', 7)
+    expect(start).toHaveBeenCalledWith(null, 'alpha', 7)
   })
 })
