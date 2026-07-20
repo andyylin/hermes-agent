@@ -10,15 +10,21 @@ field, DeepSeek rejects the next request with HTTP 400::
 Fix covers three paths:
 
 1. ``_build_assistant_message`` — new tool-call messages without raw
-   reasoning_content get ``""`` pinned at creation time so nothing gets
+   reasoning_content get ``" "`` pinned at creation time so nothing gets
    persisted poisoned.
 2. ``_copy_reasoning_content_for_api`` — already-poisoned history replays
-   with ``reasoning_content=""`` injected defensively.
+   with ``reasoning_content=" "`` injected defensively.
 3. Detection covers three signals: ``provider == "deepseek"``,
    ``"deepseek" in model``, and ``api.deepseek.com`` host match. The third
    catches custom-provider setups pointing at DeepSeek.
 
-Refs #15250 / #15353.
+The placeholder is a single space (not empty string) because DeepSeek V4 Pro
+tightened validation and rejects empty-string reasoning_content with a
+400 ("The reasoning content in the thinking mode must be passed back to
+the API"). A space satisfies non-empty checks everywhere without leaking
+fabricated reasoning.
+
+Refs #15250 / #15353 / #17341.
 """
 
 from __future__ import annotations
@@ -105,8 +111,8 @@ class TestNeedsDeepSeekToolReasoning:
 class TestCopyReasoningContentForApi:
     """_copy_reasoning_content_for_api pads reasoning_content for DeepSeek tool-calls."""
 
-    def test_deepseek_tool_call_poisoned_history_gets_empty_string(self) -> None:
-        """Already-poisoned history (no reasoning_content, no reasoning) gets ''."""
+    def test_deepseek_tool_call_poisoned_history_gets_space_placeholder(self) -> None:
+        """Already-poisoned history (no reasoning_content, no reasoning) gets ' '."""
         agent = _make_agent(provider="deepseek", model="deepseek-v4-flash")
         source = {
             "role": "assistant",
@@ -115,7 +121,7 @@ class TestCopyReasoningContentForApi:
         }
         api_msg: dict = {}
         agent._copy_reasoning_content_for_api(source, api_msg)
-        assert api_msg.get("reasoning_content") == ""
+        assert api_msg.get("reasoning_content") == " "
 
     def test_deepseek_assistant_no_tool_call_gets_padded(self) -> None:
         """DeepSeek thinking mode pads ALL assistant turns, even without tool_calls."""
@@ -123,7 +129,7 @@ class TestCopyReasoningContentForApi:
         source = {"role": "assistant", "content": "hello"}
         api_msg: dict = {}
         agent._copy_reasoning_content_for_api(source, api_msg)
-        assert api_msg.get("reasoning_content") == ""
+        assert api_msg.get("reasoning_content") == " "
 
     def test_deepseek_explicit_reasoning_content_preserved(self) -> None:
         """When reasoning_content is already set, it's copied verbatim."""
@@ -136,6 +142,43 @@ class TestCopyReasoningContentForApi:
         api_msg: dict = {}
         agent._copy_reasoning_content_for_api(source, api_msg)
         assert api_msg["reasoning_content"] == "<think>real chain of thought</think>"
+
+    def test_deepseek_stale_empty_placeholder_upgraded_to_space(self) -> None:
+        """Sessions persisted before #17341 have ``reasoning_content=""`` pinned
+        at creation time. DeepSeek V4 Pro rejects "" with HTTP 400. When the
+        active provider enforces the thinking-mode echo, the replay path
+        upgrades "" → " " so stale history doesn't break the next turn.
+        """
+        agent = _make_agent(provider="deepseek", model="deepseek-v4-pro")
+        source = {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "",
+            "tool_calls": [{"id": "c1", "function": {"name": "terminal"}}],
+        }
+        api_msg: dict = {}
+        agent._copy_reasoning_content_for_api(source, api_msg)
+        assert api_msg["reasoning_content"] == " "
+
+    def test_non_thinking_provider_strips_empty_reasoning_content(self) -> None:
+        """Strict OpenAI-compatible providers (Mistral, Cerebras, …) reject ANY
+        reasoning_content key in input messages — even an empty string — with
+        HTTP 400/422. On a non-thinking provider the field must be stripped,
+        not round-tripped. Refs #45655.
+        """
+        agent = _make_agent(
+            provider="openrouter",
+            model="anthropic/claude-sonnet-4.6",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        source = {
+            "role": "assistant",
+            "content": "hi",
+            "reasoning_content": "",
+        }
+        api_msg: dict = {}
+        agent._copy_reasoning_content_for_api(source, api_msg)
+        assert "reasoning_content" not in api_msg
 
     def test_deepseek_reasoning_field_promoted(self) -> None:
         """When only 'reasoning' is set, it gets promoted to reasoning_content."""
@@ -155,7 +198,7 @@ class TestCopyReasoningContentForApi:
 
         If the source turn has tool_calls AND a 'reasoning' field but NO
         'reasoning_content' key, it's from a prior provider (the DeepSeek
-        build path pins reasoning_content at creation). Inject "" instead
+        build path pins reasoning_content at creation). Inject " " instead
         of forwarding the prior provider's chain of thought.
         """
         agent = _make_agent(provider="deepseek", model="deepseek-v4-flash")
@@ -167,7 +210,7 @@ class TestCopyReasoningContentForApi:
         }
         api_msg: dict = {}
         agent._copy_reasoning_content_for_api(source, api_msg)
-        assert api_msg["reasoning_content"] == ""
+        assert api_msg["reasoning_content"] == " "
 
     def test_kimi_poisoned_cross_provider_history_padded(self) -> None:
         """Kimi path of #15748 — same rule as DeepSeek."""
@@ -180,7 +223,7 @@ class TestCopyReasoningContentForApi:
         }
         api_msg: dict = {}
         agent._copy_reasoning_content_for_api(source, api_msg)
-        assert api_msg["reasoning_content"] == ""
+        assert api_msg["reasoning_content"] == " "
 
     def test_kimi_path_still_works(self) -> None:
         """Existing Kimi detection still pads reasoning_content."""
@@ -192,7 +235,7 @@ class TestCopyReasoningContentForApi:
         }
         api_msg: dict = {}
         agent._copy_reasoning_content_for_api(source, api_msg)
-        assert api_msg.get("reasoning_content") == ""
+        assert api_msg.get("reasoning_content") == " "
 
     def test_kimi_moonshot_base_url(self) -> None:
         agent = _make_agent(
@@ -205,7 +248,7 @@ class TestCopyReasoningContentForApi:
         }
         api_msg: dict = {}
         agent._copy_reasoning_content_for_api(source, api_msg)
-        assert api_msg.get("reasoning_content") == ""
+        assert api_msg.get("reasoning_content") == " "
 
     def test_non_thinking_provider_not_padded(self) -> None:
         """Providers that don't require the echo are untouched."""
@@ -237,7 +280,7 @@ class TestCopyReasoningContentForApi:
         }
         api_msg: dict = {}
         agent._copy_reasoning_content_for_api(source, api_msg)
-        assert api_msg.get("reasoning_content") == ""
+        assert api_msg.get("reasoning_content") == " "
 
     def test_non_assistant_role_ignored(self) -> None:
         """User/tool messages are left alone."""
@@ -302,7 +345,7 @@ class TestBuildAssistantMessageDeepSeekReasoningContent:
 
         assert msg["reasoning_content"] == "DeepSeek model_extra reasoning"
 
-    def test_deepseek_tool_call_without_raw_reasoning_content_gets_empty_string(self) -> None:
+    def test_deepseek_tool_call_without_raw_reasoning_content_gets_space_placeholder(self) -> None:
         agent = _make_agent(provider="deepseek", model="deepseek-v4-flash")
         assistant_message = SimpleNamespace(
             content=None,
@@ -324,7 +367,7 @@ class TestBuildAssistantMessageDeepSeekReasoningContent:
 
         msg = agent._build_assistant_message(assistant_message, "tool_calls")
 
-        assert msg["reasoning_content"] == ""
+        assert msg["reasoning_content"] == " "
         assert msg["tool_calls"][0]["id"] == "call_1"
 
 
@@ -345,22 +388,22 @@ class TestBuildAssistantMessagePadsStrictProviders:
         [
             pytest.param(
                 "deepseek", "deepseek-v4-pro", "",
-                None, "",
+                None, " ",
                 id="deepseek-attr-none",
             ),
             pytest.param(
                 "deepseek", "deepseek-v4-pro", "",
-                _ATTR_ABSENT, "",
+                _ATTR_ABSENT, " ",
                 id="deepseek-attr-absent",
             ),
             pytest.param(
                 "kimi-coding", "kimi-k2.6", "",
-                None, "",
+                None, " ",
                 id="kimi-attr-none",
             ),
             pytest.param(
                 "custom", "kimi-k2", "https://api.moonshot.ai/v1",
-                _ATTR_ABSENT, "",
+                _ATTR_ABSENT, " ",
                 id="moonshot-base-url",
             ),
             pytest.param(
@@ -439,3 +482,168 @@ class TestNeedsKimiToolReasoning:
         )
         # model name contains 'moonshot' but host is openrouter — should be False
         assert agent._needs_kimi_tool_reasoning() is False
+
+
+class TestReapplyReasoningEchoForProviderSwitch:
+    """Mid-conversation fallover to a require-side provider must re-pad.
+
+    ``api_messages`` is built once, before the retry loop, while the *primary*
+    provider is active. When a fallback then switches to DeepSeek/Kimi/MiMo,
+    assistant turns that were built under a non-require primary (e.g. Codex,
+    which uses encrypted reasoning, not ``reasoning_content``) go out bare and
+    the new provider 400s with "reasoning_content must be passed back".
+
+    ``reapply_reasoning_echo_for_provider`` re-applies the pad against the
+    *current* provider right before the request is built. It is idempotent and
+    a no-op unless the active provider enforces echo-back.
+    """
+
+    @staticmethod
+    def _codex_built_history() -> list[dict]:
+        """Assistant turns as built under a Codex primary: some carry a
+        reasoning summary (stored as reasoning_content), some are bare."""
+        return [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "do the thing"},
+            {  # turn that emitted a reasoning summary
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "summary from codex",
+                "tool_calls": [{"id": "c1", "function": {"name": "terminal"}}],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {  # bare tool-call turn (Codex emitted no summary)
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "c2", "function": {"name": "terminal"}}],
+            },
+            {"role": "tool", "tool_call_id": "c2", "content": "ok"},
+        ]
+
+    def test_switch_to_deepseek_pads_bare_turns(self) -> None:
+        from agent.agent_runtime_helpers import reapply_reasoning_echo_for_provider
+
+        agent = _make_agent(provider="deepseek", model="deepseek-v4-pro")
+        msgs = self._codex_built_history()
+        padded = reapply_reasoning_echo_for_provider(agent, msgs)
+        assert padded == 1
+        bare = [m for m in msgs if m.get("role") == "assistant" and not m.get("reasoning_content")]
+        assert bare == []
+        # existing summary preserved verbatim, not clobbered with the pad
+        assert msgs[2]["reasoning_content"] == "summary from codex"
+        assert msgs[4]["reasoning_content"] == " "
+
+    def test_strips_stale_pad_under_strict_provider(self) -> None:
+        """Switching TO a strict provider (Codex/Mistral/Cerebras) must STRIP
+        stale reasoning_content baked in under a reasoning primary, otherwise
+        the fallback request 400/422s ("Extra inputs are not permitted").
+        Refs #45655 — DeepSeek primary → Mistral fallback 422 on the " " pad.
+        """
+        from agent.agent_runtime_helpers import reapply_reasoning_echo_for_provider
+
+        agent = _make_agent(
+            provider="openai-codex",
+            model="gpt-5.5",
+            base_url="https://chatgpt.com/backend-api/codex",
+        )
+        msgs = self._codex_built_history()
+        changed = reapply_reasoning_echo_for_provider(agent, msgs)
+        # msgs[2] carried "summary from codex" — must be stripped for the
+        # strict provider; the bare turn (msgs[4]) stays bare.
+        assert changed == 1
+        assert "reasoning_content" not in msgs[2]
+        assert "reasoning_content" not in msgs[4]
+
+    def test_idempotent(self) -> None:
+        from agent.agent_runtime_helpers import reapply_reasoning_echo_for_provider
+
+        agent = _make_agent(provider="deepseek", model="deepseek-v4-pro")
+        msgs = self._codex_built_history()
+        assert reapply_reasoning_echo_for_provider(agent, msgs) == 1
+        assert reapply_reasoning_echo_for_provider(agent, msgs) == 0
+
+    def test_non_assistant_messages_untouched(self) -> None:
+        from agent.agent_runtime_helpers import reapply_reasoning_echo_for_provider
+
+        agent = _make_agent(provider="deepseek", model="deepseek-v4-pro")
+        msgs = self._codex_built_history()
+        reapply_reasoning_echo_for_provider(agent, msgs)
+        assert "reasoning_content" not in msgs[0]  # system
+        assert "reasoning_content" not in msgs[1]  # user
+        assert "reasoning_content" not in msgs[3]  # tool
+
+
+class TestReasoningPrimaryToStrictFallback:
+    """Regression: reasoning primary → strict fallback must not 422.
+
+    User report (HTTP 422): a DeepSeek V4 Pro primary pads tool-call turns
+    with ``reasoning_content=" "``; a mid-session fallback to Mistral
+    (mistral-small) replays those pads and Mistral rejects them with::
+
+        body.messages.2.assistant.reasoning_content: Extra inputs are not
+        permitted  (input: ' ')
+
+    api_messages is built once under the primary, so the stale pad survives
+    into the fallback request. reapply_reasoning_echo_for_provider() must
+    strip it when the active provider doesn't enforce echo-back. Refs #45655.
+    """
+
+    @staticmethod
+    def _deepseek_built_history() -> list[dict]:
+        """Multi-turn history as built under a DeepSeek primary — tool-call
+        turns padded with " " at indices 2 and 6 (matching the report)."""
+        return [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "reasoning_content": " ",
+             "tool_calls": [{"id": "a", "function": {"name": "terminal"}}]},
+            {"role": "tool", "tool_call_id": "a", "content": "ok"},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "reasoning_content": " ",
+             "tool_calls": [{"id": "b", "function": {"name": "terminal"}}]},
+            {"role": "tool", "tool_call_id": "b", "content": "ok"},
+        ]
+
+    def test_mistral_fallback_strips_space_pad(self) -> None:
+        from agent.agent_runtime_helpers import reapply_reasoning_echo_for_provider
+
+        mistral = _make_agent(
+            provider="mistral",
+            model="mistral-small-latest",
+            base_url="https://api.mistral.ai/v1",
+        )
+        msgs = self._deepseek_built_history()
+        changed = reapply_reasoning_echo_for_provider(mistral, msgs)
+        assert changed == 2  # both padded tool-call turns
+        leaks = [i for i, m in enumerate(msgs) if "reasoning_content" in m]
+        assert leaks == []
+
+    def test_roundtrip_back_to_deepseek_repads(self) -> None:
+        """Strict fallback strips, then switching back to DeepSeek re-pads —
+        no regression on the #15748 echo-back requirement."""
+        from agent.agent_runtime_helpers import reapply_reasoning_echo_for_provider
+
+        msgs = self._deepseek_built_history()
+        mistral = _make_agent(
+            provider="mistral", model="mistral-small-latest",
+            base_url="https://api.mistral.ai/v1",
+        )
+        reapply_reasoning_echo_for_provider(mistral, msgs)
+        deepseek = _make_agent(provider="deepseek", model="deepseek-v4-pro")
+        reapply_reasoning_echo_for_provider(deepseek, msgs)
+        assert msgs[2]["reasoning_content"] == " "
+        assert msgs[6]["reasoning_content"] == " "
+
+    def test_copy_strips_space_pad_for_mistral(self) -> None:
+        """copy_reasoning_content_for_api strips the " " pad on the rebuild
+        path too (covers fresh api_messages built under the strict provider)."""
+        mistral = _make_agent(
+            provider="mistral", model="mistral-small-latest",
+            base_url="https://api.mistral.ai/v1",
+        )
+        source = {"role": "assistant", "reasoning_content": " ",
+                  "tool_calls": [{"id": "a"}]}
+        api_msg: dict = {"role": "assistant", "tool_calls": [{"id": "a"}]}
+        mistral._copy_reasoning_content_for_api(source, api_msg)
+        assert "reasoning_content" not in api_msg
