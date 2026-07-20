@@ -81,6 +81,25 @@ function remoteFsApiForProfile<T>(profile: string, path: string, body?: Record<s
   return bridge().api<T>(body ? { body, method: 'POST', path, profile } : { path, profile })
 }
 
+function fsContext(profile: string, generation: number) {
+  return { generation, profile: normalizeProfileKey(profile) }
+}
+
+function assertFsContext(profile: string, generation: number, operation: string) {
+  if (!activeGatewayProfileContextIsCurrent(fsContext(profile, generation))) {
+    throw new Error(`Desktop filesystem profile ownership changed ${operation}`)
+  }
+}
+
+async function connectionForFsContext(profile: string, generation: number) {
+  assertFsContext(profile, generation, 'before resolving connection')
+  const connection = await bridge().getConnection(profile)
+
+  assertFsContext(profile, generation, 'while resolving connection')
+
+  return connection
+}
+
 export async function readDesktopDir(path: string): Promise<HermesReadDirResult> {
   if (!isDesktopFsRemoteMode()) {
     return bridge().readDir(path)
@@ -121,6 +140,20 @@ export async function readDesktopFileText(path: string): Promise<HermesReadFileT
   return remoteFsApi<HermesReadFileTextResult>(fsPath('read-text', path))
 }
 
+export async function readDesktopFileTextForProfile(
+  profile: string,
+  generation: number,
+  path: string
+): Promise<HermesReadFileTextResult> {
+  const connection = await connectionForFsContext(profile, generation)
+
+  if (connection.mode !== 'remote') {
+    return bridge().readFileText(path)
+  }
+
+  return remoteFsApiForProfile<HermesReadFileTextResult>(profile, fsPath('read-text', path))
+}
+
 // Save UTF-8 text back to a file. Local writes go through the hardened Electron
 // IPC; remote writes hit the dashboard's POST /api/fs/write-text (same path
 // hardening, parent-must-exist, size cap) so the editor behaves identically in
@@ -147,10 +180,13 @@ export async function writeDesktopFileText(path: string, content: string): Promi
 export async function writeDesktopFileTextForProfile(
   profile: string,
   path: string,
-  content: string
+  content: string,
+  generation?: number
 ): Promise<{ path: string }> {
   const desktop = bridge()
-  const connection = await desktop.getConnection(profile)
+
+  const connection =
+    generation === undefined ? await desktop.getConnection(profile) : await connectionForFsContext(profile, generation)
 
   if (connection.mode !== 'remote') {
     if (!desktop.writeTextFile) {
@@ -178,6 +214,22 @@ export async function readDesktopFileDataUrl(path: string): Promise<string> {
   return typeof result === 'string' ? result : result.dataUrl || ''
 }
 
+export async function readDesktopFileDataUrlForProfile(
+  profile: string,
+  generation: number,
+  path: string
+): Promise<string> {
+  const connection = await connectionForFsContext(profile, generation)
+
+  if (connection.mode !== 'remote') {
+    return bridge().readFileDataUrl(path)
+  }
+
+  const result = await remoteFsApiForProfile<string | { dataUrl?: string }>(profile, fsPath('read-data-url', path))
+
+  return typeof result === 'string' ? result : result.dataUrl || ''
+}
+
 export async function desktopGitRoot(path: string): Promise<string | null> {
   const desktop = bridge()
 
@@ -186,6 +238,21 @@ export async function desktopGitRoot(path: string): Promise<string | null> {
   }
 
   return (await remoteFsApi<{ root: string | null }>(fsPath('git-root', path))).root
+}
+
+export async function desktopGitRootForProfile(
+  profile: string,
+  generation: number,
+  path: string
+): Promise<string | null> {
+  const connection = await connectionForFsContext(profile, generation)
+  const desktop = bridge()
+
+  if (connection.mode !== 'remote') {
+    return desktop.gitRoot ? desktop.gitRoot(path) : null
+  }
+
+  return (await remoteFsApiForProfile<{ root: string | null }>(profile, fsPath('git-root', path))).root
 }
 
 export async function desktopDefaultCwd(): Promise<{ branch: string; cwd: string } | null> {
@@ -244,6 +311,28 @@ export async function copyTextToClipboard(text: string): Promise<void> {
 export async function desktopFileDiff(repoRoot: string, filePath: string): Promise<string> {
   if (isDesktopFsRemoteMode()) {
     const result = await remoteFsApi<{ diff: string }>(
+      `/api/git/file-diff?path=${encodeURIComponent(repoRoot)}&file=${encodeURIComponent(filePath)}`
+    )
+
+    return result.diff || ''
+  }
+
+  const git = bridge().git
+
+  return git?.fileDiff ? git.fileDiff(repoRoot, filePath) : ''
+}
+
+export async function desktopFileDiffForProfile(
+  profile: string,
+  generation: number,
+  repoRoot: string,
+  filePath: string
+): Promise<string> {
+  const connection = await connectionForFsContext(profile, generation)
+
+  if (connection.mode === 'remote') {
+    const result = await remoteFsApiForProfile<{ diff: string }>(
+      profile,
       `/api/git/file-diff?path=${encodeURIComponent(repoRoot)}&file=${encodeURIComponent(filePath)}`
     )
 

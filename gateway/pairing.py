@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from agent.secret_scope import current_secret_scope, get_secret, is_multiplex_active
 from gateway.whatsapp_identity import (
     expand_whatsapp_aliases,
     normalize_whatsapp_identifier,
@@ -37,6 +38,12 @@ from hermes_constants import get_hermes_dir, get_hermes_home
 from utils import atomic_replace
 
 logger = logging.getLogger(__name__)
+
+
+def _pairing_env(name: str) -> str:
+    if is_multiplex_active() and current_secret_scope() is None:
+        return ""
+    return get_secret(name, "") or ""
 
 
 # Unambiguous alphabet -- excludes 0/O, 1/I to prevent confusion
@@ -121,7 +128,7 @@ def _sync_allowlist_add(platform: str, user_id: str) -> None:
     env_var = _allowlist_env_for_platform(platform)
     if not env_var:
         return
-    current = os.getenv(env_var, "").strip()
+    current = _pairing_env(env_var).strip()
     if not current:
         return  # No allowlist configured — leave the gateway open (option i).
     ids = _split_allowlist(current)
@@ -143,7 +150,7 @@ def _sync_allowlist_remove(platform: str, user_id: str) -> None:
     env_var = _allowlist_env_for_platform(platform)
     if not env_var:
         return
-    current = os.getenv(env_var, "").strip()
+    current = _pairing_env(env_var).strip()
     if not current:
         return
     ids = _split_allowlist(current)

@@ -214,6 +214,29 @@ describe('desktop filesystem facade', () => {
     expect(api).not.toHaveBeenCalled()
   })
 
+  it('refuses a stale profile-bound write before issuing the filesystem mutation', async () => {
+    let resolveConnection!: (value: { mode: 'local'; profile: string }) => void
+
+    const connection = new Promise<{ mode: 'local'; profile: string }>(resolve => {
+      resolveConnection = resolve
+    })
+
+    $activeGatewayProfile.set('alpha')
+    const generation = $activeGatewayProfileGeneration.get()
+
+    getConnection.mockReturnValueOnce(connection as never)
+
+    const write = writeDesktopFileTextForProfile('alpha', '/alpha/private.txt', 'secret', generation)
+
+    $activeGatewayProfile.set('beta')
+    $activeGatewayProfile.set('alpha')
+    resolveConnection({ mode: 'local', profile: 'alpha' })
+
+    await expect(write).rejects.toThrow('profile ownership changed')
+    expect(writeTextFile).not.toHaveBeenCalled()
+    expect(api).not.toHaveBeenCalled()
+  })
+
   it('routes file diffs through backend git in remote mode', async () => {
     $connection.set({ mode: 'remote' } as never)
 

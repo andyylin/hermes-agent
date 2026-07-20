@@ -1,7 +1,6 @@
 import { act, cleanup, render, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import * as desktopFs from '@/lib/desktop-fs'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $connection } from '@/store/session'
 
@@ -9,7 +8,10 @@ import { LocalFilePreview } from './preview-file'
 import { PreviewPane } from './preview-pane'
 
 describe('PreviewPane console state', () => {
+  let originalDesktop: typeof window.hermesDesktop
+
   beforeEach(() => {
+    originalDesktop = window.hermesDesktop
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) =>
       window.setTimeout(() => callback(Date.now()), 0)
     )
@@ -20,6 +22,7 @@ describe('PreviewPane console state', () => {
     cleanup()
     $activeGatewayProfile.set('default')
     $connection.set(null)
+    Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: originalDesktop })
     vi.restoreAllMocks()
     vi.unstubAllGlobals()
   })
@@ -31,11 +34,20 @@ describe('PreviewPane console state', () => {
       resolveAlpha = resolve
     })
 
-    vi.spyOn(desktopFs, 'readDesktopFileText')
+    const readFileText = vi
+      .fn()
       .mockReturnValueOnce(oldAlphaRead)
       .mockResolvedValueOnce({ byteSize: 4, path: '/same.txt', text: 'beta' })
       .mockResolvedValueOnce({ byteSize: 11, path: '/same.txt', text: 'fresh alpha' })
-    vi.spyOn(desktopFs, 'desktopGitRoot').mockResolvedValue(null)
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        getConnection: vi.fn(async (profile: string) => ({ mode: 'local', profile })),
+        gitRoot: vi.fn(async () => null),
+        readFileText
+      }
+    })
 
     $activeGatewayProfile.set('alpha')
     $connection.set({ mode: 'local', profile: 'alpha' } as never)
@@ -54,10 +66,16 @@ describe('PreviewPane console state', () => {
       />
     )
 
+    await waitFor(() => expect(readFileText).toHaveBeenCalledTimes(1))
+
     await act(async () => {
       $activeGatewayProfile.set('beta')
       $connection.set({ mode: 'local', profile: 'beta' } as never)
-      await Promise.resolve()
+    })
+
+    await waitFor(() => expect(readFileText).toHaveBeenCalledTimes(2))
+
+    await act(async () => {
       $activeGatewayProfile.set('alpha')
       $connection.set({ mode: 'local', profile: 'alpha' } as never)
     })

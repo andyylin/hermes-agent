@@ -68,6 +68,14 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
+from agent.secret_scope import current_secret_scope, get_secret, is_multiplex_active
+
+
+def _matrix_secret(name: str, default: str = "") -> str:
+    if is_multiplex_active() and current_secret_scope() is None:
+        return default
+    return get_secret(name, default) or default
+
 try:
     from mautrix.types import (
         ContentURI,
@@ -773,9 +781,9 @@ def check_matrix_requirements() -> bool:
     forever and broke E2EE connect with ``No module named 'asyncpg'``
     (#31116).  Rebinds module-level type globals on success.
     """
-    token = os.getenv("MATRIX_ACCESS_TOKEN", "")
-    password = os.getenv("MATRIX_PASSWORD", "")
-    homeserver = os.getenv("MATRIX_HOMESERVER", "")
+    token = _matrix_secret("MATRIX_ACCESS_TOKEN")
+    password = _matrix_secret("MATRIX_PASSWORD")
+    homeserver = _matrix_secret("MATRIX_HOMESERVER")
 
     if not token and not password:
         logger.debug("Matrix: neither MATRIX_ACCESS_TOKEN nor MATRIX_PASSWORD set")
@@ -892,20 +900,14 @@ class MatrixAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.MATRIX)
 
         self._homeserver: str = (
-            config.extra.get("homeserver", "") or os.getenv("MATRIX_HOMESERVER", "")
+            config.extra.get("homeserver", "") or _matrix_secret("MATRIX_HOMESERVER")
         ).rstrip("/")
-        self._access_token: str = config.token or os.getenv("MATRIX_ACCESS_TOKEN", "")
-        self._user_id: str = config.extra.get("user_id", "") or os.getenv(
-            "MATRIX_USER_ID", ""
-        )
-        self._password: str = config.extra.get("password", "") or os.getenv(
-            "MATRIX_PASSWORD", ""
-        )
+        self._access_token: str = config.token or _matrix_secret("MATRIX_ACCESS_TOKEN")
+        self._user_id: str = config.extra.get("user_id", "") or _matrix_secret("MATRIX_USER_ID")
+        self._password: str = config.extra.get("password", "") or _matrix_secret("MATRIX_PASSWORD")
         self._e2ee_mode: str = _resolve_e2ee_mode(config.extra)
         self._encryption: bool = self._e2ee_mode != "off"
-        self._device_id: str = config.extra.get("device_id", "") or os.getenv(
-            "MATRIX_DEVICE_ID", ""
-        )
+        self._device_id: str = config.extra.get("device_id", "") or _matrix_secret("MATRIX_DEVICE_ID")
         self._device_id_unverified: bool = False
 
         self._client: Any = None  # mautrix.client.Client
