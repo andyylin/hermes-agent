@@ -1,4 +1,4 @@
-import { isDesktopFsRemoteMode, readDesktopFileText } from '@/lib/desktop-fs'
+import { isDesktopFsRemoteMode, readDesktopFileTextForProfile } from '@/lib/desktop-fs'
 import type { PreviewTarget } from '@/store/preview'
 import { activeGatewayProfileContextIsCurrent, captureActiveGatewayProfileContext } from '@/store/profile'
 
@@ -122,7 +122,15 @@ async function enrichPreviewTarget(
   }
 
   try {
-    const result = await readDesktopFileText(target.path || target.source)
+    const result = await readDesktopFileTextForProfile(
+      context.profile,
+      context.generation,
+      target.path || target.source
+    )
+
+    if (!activeGatewayProfileContextIsCurrent(context)) {
+      return null
+    }
 
     return {
       ...target,

@@ -108,7 +108,7 @@ export function useRepoWorktreeMap(
     const context = { generation, profile }
 
     setLoading(true)
-    void desktopGitForProfile(profile)
+    void desktopGitForProfile(profile, generation)
       .then(async git => {
         if (!git?.worktreeList || cancelled || !activeGatewayProfileContextIsCurrent(context)) {
           return []

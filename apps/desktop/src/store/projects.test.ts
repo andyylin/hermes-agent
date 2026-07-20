@@ -261,7 +261,7 @@ describe('profile isolation', () => {
     activeGateway.mockReturnValue(gateway as never)
     await scanAndRecordRepos(true)
 
-    expect(scanRepos).toHaveBeenCalledWith('scanner-beta')
+    expect(scanRepos).toHaveBeenCalledWith('scanner-beta', expect.any(Number))
   })
 
   it('does not roll an alpha optimistic snapshot into beta after a failed write', async () => {
@@ -358,10 +358,17 @@ describe('profile isolation', () => {
     writeDesktopFileTextForProfile.mockResolvedValue({ path: '/idea/IDEA.md' })
 
     $activeGatewayProfile.set('idea-beta')
+    const generation = $activeGatewayProfileGeneration.get()
+
     activeGateway.mockReturnValue(gateway as never)
     await createProject({ folders: ['/idea'], idea: '# Beta idea', name: 'Idea' })
 
-    expect(writeDesktopFileTextForProfile).toHaveBeenCalledWith('idea-beta', '/idea/IDEA.md', '# Beta idea\n')
+    expect(writeDesktopFileTextForProfile).toHaveBeenCalledWith(
+      'idea-beta',
+      '/idea/IDEA.md',
+      '# Beta idea\n',
+      generation
+    )
   })
 
   it('persists project scope independently per profile', () => {
@@ -518,7 +525,7 @@ describe('worktree refresh', () => {
     added.resolve({ branch: 'feature', path: '/repo/.worktrees/feature' })
 
     await expect(result).resolves.toBeNull()
-    expect(desktopGitForProfile).toHaveBeenCalledWith('git-alpha')
+    expect(desktopGitForProfile).toHaveBeenCalledWith('git-alpha', expect.any(Number))
     expect($worktreeRefreshToken.get()).toBe(before)
   })
 
@@ -577,7 +584,7 @@ describe('worktree refresh', () => {
     listed.resolve([{ current: true, name: 'alpha-only' }])
 
     await expect(result).rejects.toThrow('stale profile context')
-    expect(desktopGitForProfile).toHaveBeenCalledWith('branches-alpha')
+    expect(desktopGitForProfile).toHaveBeenLastCalledWith('branches-alpha', expect.any(Number))
   })
 })
 
@@ -593,11 +600,15 @@ describe('pickProjectFolder', () => {
     selectDesktopPathsForProfile.mockResolvedValue(['/local/repo'])
 
     await expect(pickProjectFolder()).resolves.toBe('/local/repo')
-    expect(selectDesktopPathsForProfile).toHaveBeenCalledWith('default', {
-      defaultPath: undefined,
-      directories: true,
-      multiple: false
-    })
+    expect(selectDesktopPathsForProfile).toHaveBeenCalledWith(
+      'default',
+      {
+        defaultPath: undefined,
+        directories: true,
+        multiple: false
+      },
+      expect.any(Number)
+    )
   })
 
   it('seeds the picker with the backend cwd on a remote gateway', async () => {
@@ -605,11 +616,15 @@ describe('pickProjectFolder', () => {
     selectDesktopPathsForProfile.mockResolvedValue(['/backend/work/repo'])
 
     await expect(pickProjectFolder()).resolves.toBe('/backend/work/repo')
-    expect(selectDesktopPathsForProfile).toHaveBeenCalledWith('default', {
-      defaultPath: '/backend/work',
-      directories: true,
-      multiple: false
-    })
+    expect(selectDesktopPathsForProfile).toHaveBeenCalledWith(
+      'default',
+      {
+        defaultPath: '/backend/work',
+        directories: true,
+        multiple: false
+      },
+      expect.any(Number)
+    )
   })
 
   it('returns null when the picker is cancelled (empty selection)', async () => {

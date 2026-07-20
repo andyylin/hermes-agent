@@ -59,4 +59,40 @@ describe('profile-bound local preview normalization', () => {
     await expect(result).resolves.toBeNull()
     expect(api).not.toHaveBeenCalled()
   })
+
+  it('drops stale enrichment after a generation swap instead of publishing alpha metadata', async () => {
+    const enriched = deferred<{ byteSize: number; path: string; text: string }>()
+
+    const api = vi.fn(() => enriched.promise)
+
+    const normalized = {
+      kind: 'file' as const,
+      label: 'notes.txt',
+      path: '/alpha/notes.txt',
+      previewKind: 'text' as const,
+      source: '/alpha/notes.txt',
+      url: 'file:///alpha/notes.txt'
+    }
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        api,
+        getConnection: vi.fn(async () => ({ mode: 'remote', profile: 'alpha' })),
+        normalizePreviewTarget: vi.fn(async () => normalized)
+      }
+    })
+    $connection.set({ mode: 'remote', profile: 'alpha' } as never)
+
+    const result = normalizeOrLocalPreviewTarget('/alpha/notes.txt')
+    await vi.waitFor(() => expect(api).toHaveBeenCalled())
+
+    $activeGatewayProfile.set('beta')
+    $activeGatewayProfileGeneration.set(2)
+    $activeGatewayProfile.set('alpha')
+    $activeGatewayProfileGeneration.set(3)
+    enriched.resolve({ byteSize: 5, path: '/alpha/notes.txt', text: 'stale' })
+
+    await expect(result).resolves.toBeNull()
+  })
 })

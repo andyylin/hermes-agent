@@ -12,9 +12,11 @@ import {
   readDesktopDirForProfile,
   readDesktopFileDataUrl,
   readDesktopFileText,
+  renameDesktopPathForProfile,
   selectDesktopPaths,
   selectDesktopPathsForProfile,
   setDesktopFsRemotePicker,
+  trashDesktopPathForProfile,
   writeDesktopFileTextForProfile
 } from './desktop-fs'
 
@@ -24,6 +26,8 @@ const readFileDataUrl = vi.fn(async () => 'data:text/plain;base64,bG9jYWw=')
 const gitRoot = vi.fn(async () => '/local')
 const selectPaths = vi.fn(async () => ['/local'])
 const writeTextFile = vi.fn(async (path: string) => ({ path }))
+const renamePath = vi.fn(async (path: string, newName: string) => ({ path: `${path}/${newName}` }))
+const trashPath = vi.fn(async () => undefined)
 const getConnection = vi.fn(async () => ({ mode: 'local' }))
 
 const api = vi.fn(async ({ path }: { path: string }) => {
@@ -67,7 +71,9 @@ function stubBridge() {
       readDir,
       readFileDataUrl,
       readFileText,
+      renamePath,
       selectPaths,
+      trashPath,
       writeTextFile
     }
   })
@@ -158,8 +164,9 @@ describe('desktop filesystem facade', () => {
     $activeGatewayProfile.set('beta')
     getConnection.mockResolvedValue({ mode: 'remote', profile: 'beta' } as never)
     setDesktopFsRemotePicker({ selectPaths: remoteSelect })
+    const generation = $activeGatewayProfileGeneration.get()
 
-    await expect(desktopDefaultCwdForProfile('beta')).resolves.toEqual({
+    await expect(desktopDefaultCwdForProfile('beta', generation)).resolves.toEqual({
       branch: 'main',
       cwd: '/backend/project'
     })
@@ -168,10 +175,17 @@ describe('desktop filesystem facade', () => {
     ).resolves.toMatchObject({
       entries: [{ name: 'remote' }]
     })
-    await expect(selectDesktopPathsForProfile('beta', { directories: true, multiple: false })).resolves.toEqual([
-      '/remote/project'
-    ])
-    await expect(writeDesktopFileTextForProfile('beta', '/remote/IDEA.md', '# Idea\n')).resolves.toEqual({
+    await expect(
+      selectDesktopPathsForProfile('beta', { directories: true, multiple: false }, generation)
+    ).resolves.toEqual(['/remote/project'])
+    await expect(
+      writeDesktopFileTextForProfile(
+        'beta',
+        '/remote/IDEA.md',
+        '# Idea\n',
+        $activeGatewayProfileGeneration.get()
+      )
+    ).resolves.toEqual({
       path: '/remote/IDEA.md'
     })
 
@@ -235,6 +249,22 @@ describe('desktop filesystem facade', () => {
     await expect(write).rejects.toThrow('profile ownership changed')
     expect(writeTextFile).not.toHaveBeenCalled()
     expect(api).not.toHaveBeenCalled()
+  })
+
+  it('refuses stale rename and trash callbacks before local filesystem mutation', async () => {
+    $activeGatewayProfile.set('alpha')
+    const generation = $activeGatewayProfileGeneration.get()
+
+    $activeGatewayProfile.set('beta')
+
+    await expect(renameDesktopPathForProfile('alpha', generation, '/alpha/file.txt', 'next.txt')).rejects.toThrow(
+      'profile ownership changed'
+    )
+    await expect(trashDesktopPathForProfile('alpha', generation, '/alpha/file.txt')).rejects.toThrow(
+      'profile ownership changed'
+    )
+    expect(renamePath).not.toHaveBeenCalled()
+    expect(trashPath).not.toHaveBeenCalled()
   })
 
   it('routes file diffs through backend git in remote mode', async () => {

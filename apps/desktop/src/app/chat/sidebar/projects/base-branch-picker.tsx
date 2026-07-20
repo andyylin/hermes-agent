@@ -9,9 +9,9 @@ import type { HermesGitBaseBranch } from '@/global'
 import { useI18n } from '@/i18n'
 import { $repoStatus } from '@/store/coding-status'
 import {
+  $activeGatewayProfile,
   $activeGatewayProfileGeneration,
-  activeGatewayProfileContextIsCurrent,
-  captureActiveGatewayProfileContext
+  activeGatewayProfileContextIsCurrent
 } from '@/store/profile'
 import { listBaseBranches } from '@/store/projects'
 
@@ -38,7 +38,13 @@ export function BaseBranchPicker({
   const [loading, setLoading] = useState(false)
   const [open, setOpen] = useState(false)
   const branchRequestRef = useRef(0)
+  const activeProfile = useStore($activeGatewayProfile)
   const profileGeneration = useStore($activeGatewayProfileGeneration)
+
+  const owner = useMemo(
+    () => ({ generation: profileGeneration, profile: activeProfile }),
+    [activeProfile, profileGeneration]
+  )
 
   useEffect(() => {
     branchRequestRef.current += 1
@@ -53,14 +59,13 @@ export function BaseBranchPicker({
       return
     }
 
-    const context = captureActiveGatewayProfileContext()
     const request = ++branchRequestRef.current
     setLoading(true)
 
     try {
-      const list = await listBaseBranches(repoPath, context)
+      const list = await listBaseBranches(repoPath, owner)
 
-      if (branchRequestRef.current !== request || !activeGatewayProfileContextIsCurrent(context)) {
+      if (branchRequestRef.current !== request || !activeGatewayProfileContextIsCurrent(owner)) {
         return
       }
 
@@ -77,15 +82,15 @@ export function BaseBranchPicker({
         onValueChange(list[0]?.name ?? '')
       }
     } catch {
-      if (branchRequestRef.current === request && activeGatewayProfileContextIsCurrent(context)) {
+      if (branchRequestRef.current === request && activeGatewayProfileContextIsCurrent(owner)) {
         setBranches([])
       }
     } finally {
-      if (branchRequestRef.current === request && activeGatewayProfileContextIsCurrent(context)) {
+      if (branchRequestRef.current === request && activeGatewayProfileContextIsCurrent(owner)) {
         setLoading(false)
       }
     }
-  }, [repoPath, onValueChange])
+  }, [repoPath, onValueChange, owner])
 
   // Load on mount so the default branch fills in before the user opens the
   // popover — otherwise the button reads "branch off " with nothing after it.

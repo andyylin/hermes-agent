@@ -6,7 +6,11 @@ import type {
   HermesReviewList,
   HermesReviewShipInfo
 } from '@/global'
-import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import {
+  $activeGatewayProfile,
+  activeGatewayProfileContextIsCurrent,
+  normalizeProfileKey
+} from '@/store/profile'
 
 import { desktopFsProfile, isDesktopFsRemoteMode } from './desktop-fs'
 
@@ -123,34 +127,84 @@ export function desktopGit(): GitBridge | undefined {
   return isDesktopFsRemoteMode() ? remoteGit : window.hermesDesktop?.git
 }
 
-export async function desktopGitForProfile(profile: string): Promise<GitBridge | undefined> {
-  const desktop = window.hermesDesktop
+function guardedGitBridge(git: GitBridge, profile: string, generation: number): GitBridge {
+  const context = { generation, profile: normalizeProfileKey(profile) }
 
-  if (!desktop) {
+  const assertOwned = () => {
+    if (!activeGatewayProfileContextIsCurrent(context)) {
+      throw new Error('Desktop Git profile ownership changed')
+    }
+  }
+
+  return new Proxy(git, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver)
+
+      if (typeof value !== 'function') {
+        return value
+      }
+
+      return (...args: unknown[]) => {
+        assertOwned()
+        const result = Reflect.apply(value, target, args)
+
+        if (result && typeof result.then === 'function') {
+          return result.then((resolved: unknown) => {
+            assertOwned()
+
+            return resolved
+          })
+        }
+
+        assertOwned()
+
+        return result
+      }
+    }
+  }) as GitBridge
+}
+
+export async function desktopGitForProfile(profile: string, generation: number): Promise<GitBridge | undefined> {
+  const desktop = window.hermesDesktop
+  const context = { generation, profile: normalizeProfileKey(profile) }
+
+  if (!desktop || !activeGatewayProfileContextIsCurrent(context)) {
     return undefined
   }
 
   const connection = await desktop.getConnection(profile)
 
-  return connection.mode === 'remote' ? createRemoteGit(() => profile) : desktop.git
+  if (!activeGatewayProfileContextIsCurrent(context)) {
+    return undefined
+  }
+
+  const git = connection.mode === 'remote' ? createRemoteGit(() => profile) : desktop.git
+
+  return git ? guardedGitBridge(git, profile, generation) : undefined
 }
 
 // Repo discovery must bind to the initiating profile. During a live profile
 // swap `$activeGatewayProfile` is published before the foreground connection
 // atom finishes synchronizing; selecting `desktopGit()` in that gap can crawl
 // the old local machine and submit its paths to the new profile.
-export async function scanDesktopReposForProfile(profile: string): Promise<{ label: string; root: string }[]> {
+export async function scanDesktopReposForProfile(
+  profile: string,
+  generation: number
+): Promise<{ label: string; root: string }[]> {
   const desktop = window.hermesDesktop
+  const context = { generation, profile: normalizeProfileKey(profile) }
 
-  if (!desktop) {
+  if (!desktop || !activeGatewayProfileContextIsCurrent(context)) {
     return []
   }
 
   const connection = await desktop.getConnection(profile)
 
-  if (connection.mode === 'remote') {
+  if (!activeGatewayProfileContextIsCurrent(context) || connection.mode === 'remote') {
     return []
   }
 
-  return desktop.git?.scanRepos([]) ?? []
+  const repos = await desktop.git?.scanRepos([])
+
+  return activeGatewayProfileContextIsCurrent(context) ? (repos ?? []) : []
 }

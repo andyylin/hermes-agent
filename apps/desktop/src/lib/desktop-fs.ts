@@ -185,12 +185,10 @@ export async function writeDesktopFileTextForProfile(
   profile: string,
   path: string,
   content: string,
-  generation?: number
+  generation: number
 ): Promise<{ path: string }> {
   const desktop = bridge()
-
-  const connection =
-    generation === undefined ? await desktop.getConnection(profile) : await connectionForFsContext(profile, generation)
+  const connection = await connectionForFsContext(profile, generation)
 
   if (connection.mode !== 'remote') {
     if (!desktop.writeTextFile) {
@@ -267,19 +265,39 @@ export async function desktopDefaultCwd(): Promise<{ branch: string; cwd: string
   return remoteFsApi<{ branch: string; cwd: string }>('/api/fs/default-cwd')
 }
 
-export async function desktopDefaultCwdForProfile(profile: string): Promise<{ branch: string; cwd: string } | null> {
-  const connection = await bridge().getConnection(profile)
+export async function desktopDefaultCwdForProfile(
+  profile: string,
+  generation: number
+): Promise<{ branch: string; cwd: string } | null> {
+  const context = fsContext(profile, generation)
+  const connection = await connectionForFsContext(profile, generation)
 
   if (connection.mode !== 'remote') {
     return null
   }
 
-  return remoteFsApiForProfile<{ branch: string; cwd: string }>(profile, '/api/fs/default-cwd')
+  const result = await remoteFsApiForProfile<{ branch: string; cwd: string }>(profile, '/api/fs/default-cwd')
+
+  return activeGatewayProfileContextIsCurrent(context) ? result : null
 }
 
 // Reveal a path in the OS file manager (Finder / Explorer / Files). Local only.
 export async function revealDesktopPath(path: string): Promise<void> {
   await bridge().revealPath?.(path)
+}
+
+export async function revealDesktopPathForProfile(
+  profile: string,
+  generation: number,
+  path: string
+): Promise<void> {
+  const desktop = bridge()
+
+  assertFsContext(profile, generation, 'before revealing desktop path')
+  await desktop.getConnection(profile)
+  assertFsContext(profile, generation, 'while resolving reveal connection')
+  await desktop.revealPath?.(path)
+  assertFsContext(profile, generation, 'publishing desktop path reveal')
 }
 
 // Rename a file/folder in place; returns the new absolute path. Local only.
@@ -295,6 +313,26 @@ export async function renameDesktopPath(path: string, newName: string): Promise<
   return result.path
 }
 
+export async function renameDesktopPathForProfile(
+  profile: string,
+  generation: number,
+  path: string,
+  newName: string
+): Promise<string> {
+  const connection = await connectionForFsContext(profile, generation)
+  const desktop = bridge()
+
+  if (connection.mode === 'remote' || !desktop.renamePath) {
+    throw new Error('Rename is not available')
+  }
+
+  assertFsContext(profile, generation, 'renaming desktop path')
+  const result = await desktop.renamePath(path, newName)
+  assertFsContext(profile, generation, 'publishing desktop path rename')
+
+  return result.path
+}
+
 // Move a file/folder to the OS trash (recoverable). Local only.
 export async function trashDesktopPath(path: string): Promise<void> {
   const desktop = bridge()
@@ -304,6 +342,23 @@ export async function trashDesktopPath(path: string): Promise<void> {
   }
 
   await desktop.trashPath(path)
+}
+
+export async function trashDesktopPathForProfile(
+  profile: string,
+  generation: number,
+  path: string
+): Promise<void> {
+  const connection = await connectionForFsContext(profile, generation)
+  const desktop = bridge()
+
+  if (connection.mode === 'remote' || !desktop.trashPath) {
+    throw new Error('Move to Trash is not available')
+  }
+
+  assertFsContext(profile, generation, 'trashing desktop path')
+  await desktop.trashPath(path)
+  assertFsContext(profile, generation, 'publishing desktop path trash')
 }
 
 export async function copyTextToClipboard(text: string): Promise<void> {
@@ -370,12 +425,13 @@ export async function selectDesktopPaths(options?: HermesSelectPathsOptions): Pr
 
 export async function selectDesktopPathsForProfile(
   profile: string,
-  options?: HermesSelectPathsOptions
+  options: HermesSelectPathsOptions | undefined,
+  generation: number
 ): Promise<string[]> {
   const desktop = bridge()
-  const context = captureActiveGatewayProfileContext()
+  const context = fsContext(profile, generation)
 
-  if (normalizeProfileKey(profile) !== context.profile) {
+  if (!activeGatewayProfileContextIsCurrent(context)) {
     return []
   }
 

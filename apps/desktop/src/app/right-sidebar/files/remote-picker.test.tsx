@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider } from '@/i18n'
 import { selectDesktopPaths, selectDesktopPathsForProfile } from '@/lib/desktop-fs'
-import { $activeGatewayProfile } from '@/store/profile'
+import { $activeGatewayProfile, $activeGatewayProfileGeneration } from '@/store/profile'
 
 import { RemoteFolderPicker } from './remote-picker'
 
@@ -43,9 +43,10 @@ describe('RemoteFolderPicker profile lifecycle', () => {
 
   it('settles the previous caller when a new request replaces it', async () => {
     renderPicker()
+    const generation = $activeGatewayProfileGeneration.get()
 
-    const first = selectDesktopPathsForProfile('alpha', { directories: true })
-    const second = selectDesktopPathsForProfile('alpha', { directories: true })
+    const first = selectDesktopPathsForProfile('alpha', { directories: true }, generation)
+    const second = selectDesktopPathsForProfile('alpha', { directories: true }, generation)
 
     await expect(first).resolves.toEqual([])
 
@@ -55,13 +56,24 @@ describe('RemoteFolderPicker profile lifecycle', () => {
 
   it('cancels the pending request on profile switch and unmount', async () => {
     const view = renderPicker()
-    const switched = selectDesktopPathsForProfile('alpha', { directories: true })
+
+    const switched = selectDesktopPathsForProfile(
+      'alpha',
+      { directories: true },
+      $activeGatewayProfileGeneration.get()
+    )
 
     act(() => $activeGatewayProfile.set('beta'))
     await expect(switched).resolves.toEqual([])
 
     act(() => $activeGatewayProfile.set('alpha'))
-    const unmounted = selectDesktopPathsForProfile('alpha', { directories: true })
+
+    const unmounted = selectDesktopPathsForProfile(
+      'alpha',
+      { directories: true },
+      $activeGatewayProfileGeneration.get()
+    )
+
     view.unmount()
 
     await expect(unmounted).resolves.toEqual([])
@@ -91,7 +103,7 @@ describe('RemoteFolderPicker profile lifecycle', () => {
     ;(window as unknown as { hermesDesktop: { api: typeof apiMock } }).hermesDesktop.api = apiMock
 
     renderPicker()
-    void selectDesktopPathsForProfile('alpha', { directories: true })
+    void selectDesktopPathsForProfile('alpha', { directories: true }, $activeGatewayProfileGeneration.get())
 
     await vi.waitFor(() => expect(apiMock).toHaveBeenCalled())
     $activeGatewayProfile.set('beta')

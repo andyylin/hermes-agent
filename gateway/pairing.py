@@ -125,6 +125,10 @@ def _sync_allowlist_add(platform: str, user_id: str) -> None:
     the authz union honors it, so we never silently convert an open gateway into
     a locked one on first pairing.
     """
+    from agent.secret_scope import is_multiplex_active
+
+    if is_multiplex_active():
+        return
     env_var = _allowlist_env_for_platform(platform)
     if not env_var:
         return
@@ -147,6 +151,10 @@ def _sync_allowlist_add(platform: str, user_id: str) -> None:
 
 def _sync_allowlist_remove(platform: str, user_id: str) -> None:
     """Remove ``user_id`` from the platform allowlist env var if present."""
+    from agent.secret_scope import is_multiplex_active
+
+    if is_multiplex_active():
+        return
     env_var = _allowlist_env_for_platform(platform)
     if not env_var:
         return

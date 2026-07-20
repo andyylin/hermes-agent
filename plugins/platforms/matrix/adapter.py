@@ -611,12 +611,12 @@ def _normalize_e2ee_mode(value: Any) -> str:
 def _resolve_e2ee_mode(extra: Optional[Dict[str, Any]] = None) -> str:
     """Resolve E2EE mode with MATRIX_ENCRYPTION backwards compatibility."""
     extra = extra or {}
-    explicit = extra.get("e2ee_mode") or os.getenv("MATRIX_E2EE_MODE", "")
+    explicit = extra.get("e2ee_mode") or _matrix_secret("MATRIX_E2EE_MODE")
     if explicit:
         return _normalize_e2ee_mode(explicit)
     legacy_enabled = extra.get(
         "encryption",
-        os.getenv("MATRIX_ENCRYPTION", "").lower() in ("true", "1", "yes"),
+        _matrix_secret("MATRIX_ENCRYPTION").lower() in ("true", "1", "yes"),
     )
     return "required" if legacy_enabled else "off"
 
@@ -654,7 +654,7 @@ def _write_matrix_recovery_key_output_file(recovery_key: str) -> Optional[Path]:
     The file is created with mode 0600 and never overwritten. Returns the path
     when written, otherwise None.
     """
-    output_file = os.getenv("MATRIX_RECOVERY_KEY_OUTPUT_FILE", "").strip()
+    output_file = _matrix_secret("MATRIX_RECOVERY_KEY_OUTPUT_FILE").strip()
     if not output_file:
         return None
     path = Path(output_file).expanduser()
@@ -676,7 +676,7 @@ def _write_matrix_recovery_key_output_file(recovery_key: str) -> Optional[Path]:
 
 def _get_matrix_recovery_key_output_target() -> tuple[Optional[Path], str]:
     """Return a usable one-time recovery-key output path, or a redacted reason."""
-    output_file = os.getenv("MATRIX_RECOVERY_KEY_OUTPUT_FILE", "").strip()
+    output_file = _matrix_secret("MATRIX_RECOVERY_KEY_OUTPUT_FILE").strip()
     if not output_file:
         return None, "not_configured"
     path = Path(output_file).expanduser()
@@ -937,7 +937,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self._room_identity_cached_at: Dict[str, float] = {}
         try:
             self._room_identity_ttl_seconds = float(
-                os.getenv("MATRIX_ROOM_IDENTITY_TTL_SECONDS", "60")
+                _matrix_secret("MATRIX_ROOM_IDENTITY_TTL_SECONDS", "60")
             )
         except ValueError:
             self._room_identity_ttl_seconds = 60.0
@@ -1052,7 +1052,7 @@ class MatrixAdapter(BasePlatformAdapter):
         if self._proxy_url:
             logger.info("Matrix: proxy configured — %s", self._proxy_url)
         try:
-            self._max_media_bytes = int(os.getenv("MATRIX_MAX_MEDIA_BYTES", str(100 * 1024 * 1024)))
+            self._max_media_bytes = int(_matrix_secret("MATRIX_MAX_MEDIA_BYTES", str(100 * 1024 * 1024)))
         except ValueError:
             self._max_media_bytes = 100 * 1024 * 1024
 
@@ -1087,7 +1087,7 @@ class MatrixAdapter(BasePlatformAdapter):
         )
         try:
             self._approval_timeout_seconds = int(
-                os.getenv("MATRIX_APPROVAL_TIMEOUT_SECONDS", "300")
+                _matrix_secret("MATRIX_APPROVAL_TIMEOUT_SECONDS", "300")
             )
         except ValueError:
             self._approval_timeout_seconds = 300
@@ -1586,7 +1586,7 @@ class MatrixAdapter(BasePlatformAdapter):
                             return False
                         logger.warning("Matrix: share_keys() warning during startup: %s", exc)
 
-                    recovery_key = os.getenv("MATRIX_RECOVERY_KEY", "").strip()
+                    recovery_key = _matrix_secret("MATRIX_RECOVERY_KEY").strip()
                     if recovery_key:
                         try:
                             await olm.verify_with_recovery_key(recovery_key)
@@ -1901,7 +1901,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 "crypto_store_path": str(
                     self._crypto_db_path or _get_matrix_crypto_db_path()
                 ),
-                "recovery_key_configured": bool(os.getenv("MATRIX_RECOVERY_KEY", "").strip()),
+                "recovery_key_configured": bool(_matrix_secret("MATRIX_RECOVERY_KEY").strip()),
             },
             "policy": {
                 "allowed_user_count": len(self._allowed_user_ids),
@@ -4807,8 +4807,8 @@ async def _standalone_send(
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
-        homeserver = (extra.get("homeserver") or os.getenv("MATRIX_HOMESERVER", "")).rstrip("/")
-        token = token or os.getenv("MATRIX_ACCESS_TOKEN", "")
+        homeserver = (extra.get("homeserver") or _matrix_secret("MATRIX_HOMESERVER")).rstrip("/")
+        token = token or _matrix_secret("MATRIX_ACCESS_TOKEN")
         if not homeserver or not token:
             return {"error": "Matrix not configured (MATRIX_HOMESERVER, MATRIX_ACCESS_TOKEN required)"}
         txn_id = f"hermes_{int(time.time() * 1000)}_{os.urandom(4).hex()}"
@@ -5033,12 +5033,11 @@ def _is_connected(config) -> bool:
     rather than mere SDK presence. #41112.
     """
     extra = getattr(config, "extra", {}) or {}
-    import hermes_cli.gateway as gateway_mod
-    homeserver = extra.get("homeserver") or gateway_mod.get_env_value("MATRIX_HOMESERVER") or ""
+    homeserver = extra.get("homeserver") or _matrix_secret("MATRIX_HOMESERVER") or ""
     token = (
         getattr(config, "token", None)
-        or gateway_mod.get_env_value("MATRIX_ACCESS_TOKEN")
-        or gateway_mod.get_env_value("MATRIX_PASSWORD")
+        or _matrix_secret("MATRIX_ACCESS_TOKEN")
+        or _matrix_secret("MATRIX_PASSWORD")
         or ""
     )
     return bool(str(homeserver).strip() and str(token).strip())

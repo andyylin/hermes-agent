@@ -7,7 +7,7 @@ import type {
   MouseEvent as ReactMouseEvent,
   ReactNode
 } from 'react'
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import ShikiHighlighter from 'react-shiki'
 import { Streamdown } from 'streamdown'
 
@@ -599,7 +599,8 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
   const filePath = filePathForTarget(target)
   const isImage = target.previewKind === 'image'
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    setState({ loading: true })
     setUserMode(null)
     setEditing(false)
     setDirty(false)
@@ -623,6 +624,10 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
     const owned = () => active && activeGatewayProfileContextIsCurrent(context)
 
     async function load() {
+      if (!owned()) {
+        return
+      }
+
       if (blockedByTarget) {
         setState({ loading: false })
 

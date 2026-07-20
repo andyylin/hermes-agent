@@ -266,16 +266,18 @@ class GatewayAuthorizationMixin:
     def _pairing_store_for(self, source: "SessionSource"):
         """Pick the per-profile PairingStore for a source, falling back to global.
 
-        In a multiplexing gateway, each profile owns its own pairing whitelist
-        so isolation is preserved. When the source has no profile (single-
-        profile gateway, or a path that hasn't stamped profile yet) or the
-        profile isn't registered, fall back to ``self.pairing_store`` (the
-        global default) so existing behavior is preserved.
+        In a multiplexing gateway, each profile owns its own pairing whitelist.
+        A missing or unknown profile must fail closed rather than borrow the
+        process-global store. Single-profile gateways retain the legacy store.
         """
         per_profile = getattr(self, "pairing_stores", None) or {}
         profile = getattr(source, "profile", None)
         if profile and profile in per_profile:
             return per_profile[profile]
+        from agent.secret_scope import is_multiplex_active
+
+        if is_multiplex_active():
+            return None
         return getattr(self, "pairing_store", None)
 
     def _is_user_authorized(self, source: SessionSource) -> bool:

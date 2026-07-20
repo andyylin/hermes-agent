@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { type KeyboardEvent as ReactKeyboardEvent, useCallback, useEffect, useRef, useState } from 'react'
+import { type KeyboardEvent as ReactKeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { type NodeApi, type NodeRendererProps, type RowRendererProps, Tree, type TreeApi } from 'react-arborist'
 
 import { TreeSkeleton } from '@/components/chat/skeletons'
@@ -9,6 +9,7 @@ import { cn } from '@/lib/utils'
 import { $repoChangeByPath, type RepoChangeKind } from '@/store/coding-status'
 import { $renamingPath, beginInlineRename } from '@/store/file-actions'
 import { $revealInTreeRequest } from '@/store/layout'
+import { $activeGatewayProfile, $activeGatewayProfileGeneration, normalizeProfileKey } from '@/store/profile'
 
 import { FileEntryContextMenu, InlineRenameInput, isRenameShortcut } from '../file-actions'
 
@@ -55,6 +56,9 @@ export function ProjectTree({
   onPreviewFile,
   openState
 }: ProjectTreeProps) {
+  const profile = normalizeProfileKey(useStore($activeGatewayProfile))
+  const generation = useStore($activeGatewayProfileGeneration)
+  const owner = useMemo(() => ({ generation, profile }), [generation, profile])
   const containerRef = useRef<HTMLDivElement | null>(null)
   const treeRef = useRef<TreeApi<TreeNode> | null>(null)
   const [size, setSize] = useState({ height: 0, width: 0 })
@@ -171,8 +175,8 @@ export function ProjectTree({
 
     event.preventDefault()
     event.stopPropagation()
-    beginInlineRename(node.data.id)
-  }, [])
+    beginInlineRename(node.data.id, owner)
+  }, [owner])
 
   return (
     <div className="min-h-0 flex-1 overflow-hidden" onKeyDownCapture={handleRenameShortcut} ref={containerRef}>

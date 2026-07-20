@@ -15,6 +15,7 @@ import { IS_MAC } from '@/lib/keybinds/combo'
 import { cn } from '@/lib/utils'
 import {
   $fileActionDialog,
+  $renamingOwner,
   beginInlineRename,
   cancelInlineRename,
   closeFileActionDialog,
@@ -27,6 +28,7 @@ import {
   toRelativePath
 } from '@/store/file-actions'
 import { notifyError } from '@/store/notifications'
+import { captureActiveGatewayProfileContext } from '@/store/profile'
 
 const IS_WIN = typeof navigator !== 'undefined' && /win/i.test(navigator.platform || navigator.userAgent || '')
 
@@ -59,6 +61,7 @@ export function FileEntryContextMenu({ children, isDirectory, name, path, relati
   // Reveal / rename / delete need the local filesystem; hide them on a remote
   // backend (copy-path still works everywhere).
   const localFs = !isDesktopFsRemoteMode()
+  const owner = captureActiveGatewayProfileContext()
   const target: FileActionTarget = { isDirectory, name, path }
   const revealLabel = pickRevealLabel(m.revealFinder, m.revealExplorer, m.revealFileManager)
 
@@ -70,7 +73,7 @@ export function FileEntryContextMenu({ children, isDirectory, name, path, relati
       <ContextMenuContent onCloseAutoFocus={event => event.preventDefault()}>
         {localFs && (
           <>
-            <ContextMenuItem onSelect={() => void revealFile(path)}>{revealLabel}</ContextMenuItem>
+            <ContextMenuItem onSelect={() => void revealFile(path, owner)}>{revealLabel}</ContextMenuItem>
             <ContextMenuSeparator />
           </>
         )}
@@ -83,8 +86,8 @@ export function FileEntryContextMenu({ children, isDirectory, name, path, relati
         {localFs && (
           <>
             <ContextMenuSeparator />
-            <ContextMenuItem onSelect={() => beginInlineRename(path)}>{m.rename}</ContextMenuItem>
-            <ContextMenuItem onSelect={() => requestFileDelete(target)} variant="destructive">
+            <ContextMenuItem onSelect={() => beginInlineRename(path, owner)}>{m.rename}</ContextMenuItem>
+            <ContextMenuItem onSelect={() => requestFileDelete(target, owner)} variant="destructive">
               {m.delete}
             </ContextMenuItem>
           </>
@@ -109,7 +112,7 @@ export function FileActionDialogs() {
       onClose={closeFileActionDialog}
       onConfirm={() => {
         if (deleting) {
-          return executeFileDelete(dialog.path)
+          return executeFileDelete(dialog.path, dialog.owner)
         }
       }}
       open={deleting}
@@ -131,6 +134,7 @@ interface InlineRenameInputProps {
  *  row's label when `$renamingPath === path`. */
 export function InlineRenameInput({ className, name, path }: InlineRenameInputProps) {
   const [value, setValue] = useState(name)
+  const owner = useStore($renamingOwner)
   // Enter then the resulting blur must not both commit; latch on first finish.
   const done = useRef(false)
   // Focus churn right after mount (context-menu close, arborist refocus, the
@@ -146,9 +150,9 @@ export function InlineRenameInput({ className, name, path }: InlineRenameInputPr
     done.current = true
     const next = value.trim()
 
-    if (commit && next && next !== name) {
+    if (commit && next && next !== name && owner) {
       try {
-        await executeFileRename(path, next)
+        await executeFileRename(path, next, owner)
       } catch (error) {
         notifyError(error, translateNow('errors.genericFailure'))
       }

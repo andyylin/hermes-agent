@@ -311,8 +311,12 @@ def _discord_bool_env(name: str, default: bool = False, getenv=os.getenv) -> boo
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _discord_thread_auto_archive_minutes(getenv=os.getenv) -> int:
+def _discord_thread_auto_archive_minutes(getenv=None) -> int:
     """Return the configured Discord thread auto-archive duration."""
+    if getenv is None:
+        from agent.secret_scope import get_secret
+
+        getenv = get_secret
     raw = getenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", "").strip()
     try:
         value = int(raw) if raw else DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES
@@ -4382,6 +4386,10 @@ class DiscordAdapter(BasePlatformAdapter):
         user_id = str(user_id or "").strip()
         if not user_id:
             return False
+        from agent.secret_scope import is_multiplex_active
+
+        if is_multiplex_active():
+            return False
         try:
             from gateway.pairing import PairingStore
 
@@ -6688,7 +6696,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if create is not None:
                 thread = await create(
                     name=thread_name,
-                    auto_archive_duration=_discord_thread_auto_archive_minutes(),
+                    auto_archive_duration=_discord_thread_auto_archive_minutes(self._discord_env),
                     reason=reason,
                 )
                 return str(thread.id)
@@ -6706,7 +6714,7 @@ class DiscordAdapter(BasePlatformAdapter):
             seed_msg = await send(f"\U0001f9f5 Hermes handoff: **{thread_name}**")
             thread = await seed_msg.create_thread(
                 name=thread_name,
-                auto_archive_duration=_discord_thread_auto_archive_minutes(),
+                auto_archive_duration=_discord_thread_auto_archive_minutes(self._discord_env),
                 reason=reason,
             )
             return str(thread.id)
@@ -8028,7 +8036,9 @@ def _component_check_auth(
     # Check pairing store — mirrors ``authz_mixin._check_authorization``
     # so users approved via ``hermes pairing approve`` can interact with
     # component buttons even without DISCORD_ALLOWED_USERS set.
-    if uid:
+    from agent.secret_scope import is_multiplex_active
+
+    if uid and not is_multiplex_active():
         try:
             from gateway.pairing import PairingStore
             store = PairingStore()
@@ -9821,8 +9831,12 @@ def _is_connected(config) -> bool:
     ``DISCORD_BOT_TOKEN`` env vars. Matches what the legacy
     ``_PLATFORMS["discord"]`` dispatch did before this migration.
     """
-    import hermes_cli.gateway as gateway_mod
-    return bool((gateway_mod.get_env_value("DISCORD_BOT_TOKEN") or "").strip())
+    from agent.secret_scope import UnscopedSecretError, get_secret
+
+    try:
+        return bool((get_secret("DISCORD_BOT_TOKEN", "") or "").strip())
+    except UnscopedSecretError:
+        return False
 
 
 def _build_adapter(config):

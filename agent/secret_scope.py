@@ -160,6 +160,36 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     return val if val is not None else default
 
 
+def profile_env_bool(name: str, default: bool = False) -> bool:
+    """Resolve a profile-scoped boolean without bypassing multiplex isolation."""
+    raw = get_secret(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def profile_env_int(name: str, default: int) -> int:
+    """Resolve a profile-scoped integer without bypassing multiplex isolation."""
+    raw = get_secret(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def profile_env_float(name: str, default: float) -> float:
+    """Resolve a profile-scoped float without bypassing multiplex isolation."""
+    raw = get_secret(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 def load_env_file(env_path: Path) -> Dict[str, str]:
     """Parse a ``.env`` file into a plain dict WITHOUT touching ``os.environ``.
 

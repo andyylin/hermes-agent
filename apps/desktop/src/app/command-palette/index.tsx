@@ -56,6 +56,7 @@ import {
 } from '@/store/command-palette'
 import { $bindings } from '@/store/keybinds'
 import { openPetGenerate } from '@/store/pet-generate'
+import { $activeGatewayProfile, $activeGatewayProfileGeneration } from '@/store/profile'
 import { requestStartWorkSession } from '@/store/projects'
 import { runGatewayRestart } from '@/store/system-actions'
 import { applyBackendUpdate } from '@/store/updates'
@@ -297,6 +298,14 @@ export function CommandPalette() {
   const pendingPage = useStore($commandPalettePage)
   const bindings = useStore($bindings)
   const worktrees = useStore($repoWorktrees)
+  const activeProfile = useStore($activeGatewayProfile)
+  const profileGeneration = useStore($activeGatewayProfileGeneration)
+
+  const worktreeOwner = useMemo(
+    () => ({ generation: profileGeneration, profile: activeProfile }),
+    [activeProfile, profileGeneration]
+  )
+
   const navigate = useNavigate()
   const { availableThemes, resolvedMode, setMode, setTheme, themeName } = useTheme()
   const [search, setSearch] = useState('')
@@ -394,7 +403,7 @@ export function CommandPalette() {
                   id: `worktree-${wt.path}`,
                   keywords: ['branch', 'worktree', 'switch', name, wt.path],
                   label: cc.startInBranch(name),
-                  run: () => requestStartWorkSession(wt.path)
+                  run: () => requestStartWorkSession(wt.path, '', worktreeOwner.profile, worktreeOwner.generation)
                 }
               })
             }
@@ -583,7 +592,7 @@ export function CommandPalette() {
           ]
         : [])
     ]
-  }, [contributedItems, go, settingsSectionLabel, t, worktrees])
+  }, [contributedItems, go, settingsSectionLabel, t, worktreeOwner, worktrees])
 
   // The long, granular lists (settings fields, API keys, MCP servers, archived
   // chats) only surface once the user types — otherwise they'd bury the

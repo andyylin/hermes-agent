@@ -499,7 +499,7 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
   }
 
   try {
-    const repos = await scanDesktopReposForProfile(context.profile)
+    const repos = await scanDesktopReposForProfile(context.profile, context.generation)
     await gatewayRequest('projects.record_repos', { repos }, context)
     assertProjectContextCurrent(context)
     // The disk scan may surface new zero-session repos; refold them into the tree.
@@ -557,7 +557,11 @@ export async function generateProjectIdea(name: string): Promise<string> {
 // Write IDEA.md to a project's primary folder (best-effort). Routes through the
 // remote-aware fs write, so it lands on the backend for a remote gateway and on
 // disk locally — the project is created regardless of whether the file lands.
-async function writeProjectIdea(profile: string, folder: null | string | undefined, idea: string): Promise<void> {
+async function writeProjectIdea(
+  context: ProjectRequestContext,
+  folder: null | string | undefined,
+  idea: string
+): Promise<void> {
   const dir = (folder || '').trim()
   const body = idea.trim()
 
@@ -567,9 +571,10 @@ async function writeProjectIdea(profile: string, folder: null | string | undefin
 
   try {
     await writeDesktopFileTextForProfile(
-      profile,
+      context.profile,
       `${dir.replace(/[/\\]+$/, '')}/IDEA.md`,
-      body.endsWith('\n') ? body : `${body}\n`
+      body.endsWith('\n') ? body : `${body}\n`,
+      context.generation
     )
   } catch {
     // Best-effort: the project is created regardless of whether IDEA.md lands.
@@ -688,7 +693,7 @@ export async function createProject(input: CreateProjectInput): Promise<ProjectI
   if (created) {
     if (input.idea) {
       void writeProjectIdea(
-        context.profile,
+        context,
         created.primary_path ?? created.folders?.[0]?.path ?? input.primaryPath,
         input.idea
       )
@@ -964,7 +969,7 @@ const bumpWorktrees = () => $worktreeRefreshToken.set($worktreeRefreshToken.get(
 async function captureProjectGitContext() {
   const context = await captureProjectRequestContext()
   assertProjectContextCurrent(context)
-  const git = await desktopGitForProfile(context.profile)
+  const git = await desktopGitForProfile(context.profile, context.generation)
   assertProjectContextCurrent(context)
 
   return { context, git }
@@ -1258,15 +1263,19 @@ export async function copyPath(path: null | string): Promise<void> {
 export async function pickProjectFolder(): Promise<null | string> {
   try {
     const context = await captureProjectRequestContext()
-    const defaultCwd = await desktopDefaultCwdForProfile(context.profile)
+    const defaultCwd = await desktopDefaultCwdForProfile(context.profile, context.generation)
 
     assertProjectContextCurrent(context)
 
-    const [dir] = await selectDesktopPathsForProfile(context.profile, {
-      defaultPath: defaultCwd?.cwd,
-      directories: true,
-      multiple: false
-    })
+    const [dir] = await selectDesktopPathsForProfile(
+      context.profile,
+      {
+        defaultPath: defaultCwd?.cwd,
+        directories: true,
+        multiple: false
+      },
+      context.generation
+    )
 
     assertProjectContextCurrent(context)
 

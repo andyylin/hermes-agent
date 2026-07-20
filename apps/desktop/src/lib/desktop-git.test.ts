@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $activeGatewayProfile } from '@/store/profile'
+import { $activeGatewayProfile, $activeGatewayProfileGeneration } from '@/store/profile'
 import { $connection } from '@/store/session'
 
 import { desktopGit, desktopGitForProfile, scanDesktopReposForProfile } from './desktop-git'
@@ -97,22 +97,33 @@ describe('desktop git facade', () => {
   })
 
   it('binds repo discovery to the requested profile connection', async () => {
+    $activeGatewayProfile.set('alpha')
+    const alphaGeneration = $activeGatewayProfileGeneration.get()
+
     getConnection.mockResolvedValueOnce({ mode: 'local', profile: 'alpha' } as never)
 
-    await expect(scanDesktopReposForProfile('alpha')).resolves.toEqual([{ label: 'Repo', root: '/repo' }])
+    await expect(scanDesktopReposForProfile('alpha', alphaGeneration)).resolves.toEqual([
+      { label: 'Repo', root: '/repo' }
+    ])
     expect(getConnection).toHaveBeenCalledWith('alpha')
     expect(scanRepos).toHaveBeenCalledWith([])
 
+    $activeGatewayProfile.set('beta')
+    const betaGeneration = $activeGatewayProfileGeneration.get()
+
     getConnection.mockResolvedValueOnce({ mode: 'remote', profile: 'beta' } as never)
-    await expect(scanDesktopReposForProfile('beta')).resolves.toEqual([])
+    await expect(scanDesktopReposForProfile('beta', betaGeneration)).resolves.toEqual([])
     expect(scanRepos).toHaveBeenCalledTimes(1)
   })
 
   it('binds remote git operations to the requested profile instead of the foreground connection', async () => {
+    $activeGatewayProfile.set('remote-beta')
+    const generation = $activeGatewayProfileGeneration.get()
+
     $connection.set({ mode: 'local', profile: 'foreground-alpha' } as never)
     getConnection.mockResolvedValueOnce({ mode: 'remote', profile: 'remote-beta' } as never)
 
-    const git = await desktopGitForProfile('remote-beta')
+    const git = await desktopGitForProfile('remote-beta', generation)
     await git?.repoStatus('/srv/work')
 
     expect(getConnection).toHaveBeenCalledWith('remote-beta')

@@ -4920,7 +4920,9 @@ async def _standalone_send(
     throwaway ``SlackAdapter`` instance's ``format_message`` — so cron-delivered
     Slack messages render identically to gateway-delivered ones.
     """
-    token = getattr(pconfig, "token", None) or os.getenv("SLACK_BOT_TOKEN", "")
+    from agent.secret_scope import get_secret
+
+    token = getattr(pconfig, "token", None) or get_secret("SLACK_BOT_TOKEN", "")
     if not token:
         return {"error": "Slack send failed: SLACK_BOT_TOKEN not configured"}
 
@@ -5138,9 +5140,12 @@ def _is_connected(config) -> bool:
     can suppress ambient ``SLACK_BOT_TOKEN`` env vars. Matches what the legacy
     ``Platform.SLACK`` connected-check did before this migration.
     """
-    import hermes_cli.gateway as gateway_mod
+    from agent.secret_scope import UnscopedSecretError, get_secret
 
-    return bool((gateway_mod.get_env_value("SLACK_BOT_TOKEN") or "").strip())
+    try:
+        return bool((get_secret("SLACK_BOT_TOKEN", "") or "").strip())
+    except UnscopedSecretError:
+        return False
 
 
 def _build_adapter(config):

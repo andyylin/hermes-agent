@@ -190,7 +190,11 @@ async function fallbackRootFor(cwd: string, owner: ProjectTreeOwner): Promise<st
 }
 
 async function loadRoot(cwd: string, owner: ProjectTreeOwner, { force = false }: { force?: boolean } = {}) {
-  if (!cwd || !activeGatewayProfileContextIsCurrent(owner)) {
+  if (!activeGatewayProfileContextIsCurrent(owner)) {
+    return
+  }
+
+  if (!cwd) {
     clearProjectTree()
 
     return

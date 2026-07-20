@@ -1,8 +1,14 @@
 import { atom } from 'nanostores'
 
 import { translateNow } from '@/i18n'
-import { copyTextToClipboard, renameDesktopPath, revealDesktopPath, trashDesktopPath } from '@/lib/desktop-fs'
+import {
+  copyTextToClipboard,
+  renameDesktopPathForProfile,
+  revealDesktopPathForProfile,
+  trashDesktopPathForProfile
+} from '@/lib/desktop-fs'
 import { notify, notifyError } from '@/store/notifications'
+import type { ActiveGatewayProfileContext } from '@/store/profile'
 import { notifyWorkspaceChanged } from '@/store/workspace-events'
 
 // Shared file-row actions for BOTH trees (the file browser + the review/git
@@ -21,12 +27,12 @@ export interface FileActionTarget {
 
 // Delete routes through a single confirm dialog (rendered once). Rename is
 // INLINE (VS Code style — an input in the row), driven by `$renamingPath`.
-export type FileActionDialog = { kind: 'delete' } & FileActionTarget
+export type FileActionDialog = { kind: 'delete'; owner: ActiveGatewayProfileContext } & FileActionTarget
 
 export const $fileActionDialog = atom<FileActionDialog | null>(null)
 
-export function requestFileDelete(target: FileActionTarget): void {
-  $fileActionDialog.set({ kind: 'delete', ...target })
+export function requestFileDelete(target: FileActionTarget, owner: ActiveGatewayProfileContext): void {
+  $fileActionDialog.set({ kind: 'delete', owner, ...target })
 }
 
 export function closeFileActionDialog(): void {
@@ -37,20 +43,23 @@ export function closeFileActionDialog(): void {
 // path matches renders an edit input in place of its label; F2 / Enter (on a
 // focused row) and the context-menu "Rename" all set this.
 export const $renamingPath = atom<null | string>(null)
+export const $renamingOwner = atom<ActiveGatewayProfileContext | null>(null)
 
-export function beginInlineRename(path: string): void {
+export function beginInlineRename(path: string, owner: ActiveGatewayProfileContext): void {
   $renamingPath.set(path)
+  $renamingOwner.set(owner)
 }
 
 export function cancelInlineRename(): void {
   $renamingPath.set(null)
+  $renamingOwner.set(null)
 }
 
 // ── Direct (no-dialog) actions ───────────────────────────────────────────────
 
-export async function revealFile(path: string): Promise<void> {
+export async function revealFile(path: string, owner: ActiveGatewayProfileContext): Promise<void> {
   try {
-    await revealDesktopPath(path)
+    await revealDesktopPathForProfile(owner.profile, owner.generation, path)
   } catch (error) {
     notifyError(error, translateNow('errors.genericFailure'))
   }
@@ -78,12 +87,16 @@ export function toRelativePath(path: string, relativeTo: string): string {
 
 // ── Dialog-confirmed mutations (called by FileActionDialogs) ──────────────────
 
-export async function executeFileRename(path: string, newName: string): Promise<void> {
-  await renameDesktopPath(path, newName)
+export async function executeFileRename(
+  path: string,
+  newName: string,
+  owner: ActiveGatewayProfileContext
+): Promise<void> {
+  await renameDesktopPathForProfile(owner.profile, owner.generation, path, newName)
   notifyWorkspaceChanged()
 }
 
-export async function executeFileDelete(path: string): Promise<void> {
-  await trashDesktopPath(path)
+export async function executeFileDelete(path: string, owner: ActiveGatewayProfileContext): Promise<void> {
+  await trashDesktopPathForProfile(owner.profile, owner.generation, path)
   notifyWorkspaceChanged()
 }

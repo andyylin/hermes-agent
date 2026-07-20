@@ -1167,46 +1167,46 @@ class WeixinAdapter(BasePlatformAdapter):
             extra.get("cdn_base_url") or get_secret("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)
         ).strip().rstrip("/")
         self._send_chunk_delay_seconds = float(
-            extra.get("send_chunk_delay_seconds") or os.getenv("WEIXIN_SEND_CHUNK_DELAY_SECONDS", "1.5")
+            extra.get("send_chunk_delay_seconds") or get_secret("WEIXIN_SEND_CHUNK_DELAY_SECONDS", "1.5")
         )
         self._send_chunk_retries = int(
-            extra.get("send_chunk_retries") or os.getenv("WEIXIN_SEND_CHUNK_RETRIES", "4")
+            extra.get("send_chunk_retries") or get_secret("WEIXIN_SEND_CHUNK_RETRIES", "4")
         )
         self._send_chunk_retry_delay_seconds = float(
             extra.get("send_chunk_retry_delay_seconds")
-            or os.getenv("WEIXIN_SEND_CHUNK_RETRY_DELAY_SECONDS", "1.0")
+            or get_secret("WEIXIN_SEND_CHUNK_RETRY_DELAY_SECONDS", "1.0")
         )
         self._send_text_gate = asyncio.Lock()
         self._rate_limit_circuit_threshold = max(
             1,
             int(
                 extra.get("rate_limit_circuit_threshold")
-                or os.getenv("WEIXIN_RATE_LIMIT_CIRCUIT_THRESHOLD", "1")
+                or get_secret("WEIXIN_RATE_LIMIT_CIRCUIT_THRESHOLD", "1")
             ),
         )
         self._rate_limit_circuit_window_seconds = float(
             extra.get("rate_limit_circuit_window_seconds")
-            or os.getenv("WEIXIN_RATE_LIMIT_CIRCUIT_WINDOW_SECONDS", "30.0")
+            or get_secret("WEIXIN_RATE_LIMIT_CIRCUIT_WINDOW_SECONDS", "30.0")
         )
         self._rate_limit_circuit_open_seconds = float(
             extra.get("rate_limit_circuit_open_seconds")
-            or os.getenv("WEIXIN_RATE_LIMIT_CIRCUIT_OPEN_SECONDS", "30.0")
+            or get_secret("WEIXIN_RATE_LIMIT_CIRCUIT_OPEN_SECONDS", "30.0")
         )
         self._rate_limit_circuit_until = 0.0
         self._rate_limit_events: List[float] = []
-        self._dm_policy = str(extra.get("dm_policy") or os.getenv("WEIXIN_DM_POLICY", "pairing")).strip().lower()
-        self._group_policy = str(extra.get("group_policy") or os.getenv("WEIXIN_GROUP_POLICY", "disabled")).strip().lower()
+        self._dm_policy = str(extra.get("dm_policy") or get_secret("WEIXIN_DM_POLICY", "pairing")).strip().lower()
+        self._group_policy = str(extra.get("group_policy") or get_secret("WEIXIN_GROUP_POLICY", "disabled")).strip().lower()
         allow_from = extra.get("allow_from")
         if allow_from is None:
-            allow_from = os.getenv("WEIXIN_ALLOWED_USERS", "")
+            allow_from = get_secret("WEIXIN_ALLOWED_USERS", "")
         group_allow_from = extra.get("group_allow_from")
         if group_allow_from is None:
-            group_allow_from = os.getenv("WEIXIN_GROUP_ALLOWED_USERS", "")
+            group_allow_from = get_secret("WEIXIN_GROUP_ALLOWED_USERS", "")
         self._allow_from = self._coerce_list(allow_from)
         self._group_allow_from = self._coerce_list(group_allow_from)
         self._split_multiline_messages = _coerce_bool(
             extra.get("split_multiline_messages")
-            or os.getenv("WEIXIN_SPLIT_MULTILINE_MESSAGES"),
+            or get_secret("WEIXIN_SPLIT_MULTILINE_MESSAGES"),
             default=False,
         )
 
@@ -1474,9 +1474,9 @@ class WeixinAdapter(BasePlatformAdapter):
             await self.handle_message(event)
 
     def _open_dm_opted_in(self) -> bool:
-        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+        if str(get_secret("GATEWAY_ALLOW_ALL_USERS", "")).lower() in {"true", "1", "yes"}:
             return True
-        return os.getenv("WEIXIN_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+        return str(get_secret("WEIXIN_ALLOW_ALL_USERS", "")).lower() in {"true", "1", "yes"}
 
     def _is_dm_allowed(self, sender_id: str) -> bool:
         if self._dm_policy == "disabled":

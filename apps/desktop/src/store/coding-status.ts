@@ -3,7 +3,7 @@ import { atom, computed } from 'nanostores'
 import type { HermesGitWorktree, HermesRepoStatus } from '@/global'
 import { desktopGitForProfile } from '@/lib/desktop-git'
 
-import { $activeGatewayProfile, normalizeProfileKey } from './profile'
+import { $activeGatewayProfile, $activeGatewayProfileGeneration, normalizeProfileKey } from './profile'
 import { $worktreeRefreshToken } from './projects'
 import { $busy, $currentCwd } from './session'
 import { $workspaceChangeTick } from './workspace-events'
@@ -66,6 +66,7 @@ async function loadWorktrees(request: RepoStatusRefreshRequest): Promise<void> {
 }
 
 interface RepoStatusRefreshRequest {
+  generation: number
   profile: string
   probe: (cwd: string) => Promise<HermesRepoStatus | null>
   seq: number
@@ -87,7 +88,10 @@ const normalizeCwd = (cwd?: null | string): null | string => cwd?.trim() || null
 const activeProfileKey = () => normalizeProfileKey($activeGatewayProfile.get())
 
 const isRepoStatusRequestCurrent = (request: RepoStatusRefreshRequest) =>
-  request.seq === repoStatusRefreshSeq && inflightCwd === request.target && request.profile === activeProfileKey()
+  request.seq === repoStatusRefreshSeq &&
+  inflightCwd === request.target &&
+  request.profile === activeProfileKey() &&
+  request.generation === $activeGatewayProfileGeneration.get()
 
 /**
  * Re-probe the working tree for `cwd` (defaults to the active session's cwd).
@@ -95,6 +99,7 @@ const isRepoStatusRequestCurrent = (request: RepoStatusRefreshRequest) =>
  * status so the rail hides rather than showing stale data.
  */
 async function runRepoStatusRefresh({
+  generation,
   probe,
   profile,
   seq,
@@ -103,21 +108,24 @@ async function runRepoStatusRefresh({
 }: RepoStatusRefreshRequest): Promise<void> {
   try {
     const status = await probe(target)
+    const request = { generation, probe, seq, target, profile, worktreeList }
 
     // Drop the result if the cwd moved on while we were probing (a fast session
     // switch) — the newer probe owns the atom.
-    if (isRepoStatusRequestCurrent({ probe, seq, target, profile, worktreeList })) {
+    if (isRepoStatusRequestCurrent(request)) {
       $repoStatus.set(status)
 
       // Worktrees only matter inside a repo; clear them otherwise.
       if (status) {
-        void loadWorktrees({ probe, seq, target, profile, worktreeList })
+        void loadWorktrees(request)
       } else {
         $repoWorktrees.set([])
       }
     }
   } catch {
-    if (isRepoStatusRequestCurrent({ probe, seq, target, profile, worktreeList })) {
+    const request = { generation, probe, seq, target, profile, worktreeList }
+
+    if (isRepoStatusRequestCurrent(request)) {
       $repoStatus.set(null)
       $repoWorktrees.set([])
     }
@@ -142,11 +150,16 @@ async function drainRepoStatusRefreshes(): Promise<void> {
 export async function refreshRepoStatus(cwd?: null | string): Promise<void> {
   const target = normalizeCwd(cwd ?? $currentCwd.get())
   const profile = activeProfileKey()
+  const generation = $activeGatewayProfileGeneration.get()
   const seq = (repoStatusRefreshSeq += 1)
-  const git = target ? await desktopGitForProfile(profile) : undefined
+  const git = target ? await desktopGitForProfile(profile, generation) : undefined
   const probe = git?.repoStatus
 
-  if (seq !== repoStatusRefreshSeq || profile !== activeProfileKey()) {
+  if (
+    seq !== repoStatusRefreshSeq ||
+    profile !== activeProfileKey() ||
+    generation !== $activeGatewayProfileGeneration.get()
+  ) {
     return repoStatusRefreshInFlight ?? Promise.resolve()
   }
 
@@ -161,7 +174,7 @@ export async function refreshRepoStatus(cwd?: null | string): Promise<void> {
   }
 
   inflightCwd = target
-  pendingRepoStatusRefresh = { probe, profile, seq, target, worktreeList: git?.worktreeList }
+  pendingRepoStatusRefresh = { generation, probe, profile, seq, target, worktreeList: git?.worktreeList }
   $repoStatusLoading.set(true)
 
   if (!repoStatusRefreshInFlight) {

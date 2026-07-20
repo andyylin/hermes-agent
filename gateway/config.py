@@ -243,6 +243,10 @@ def _getenv(name: str, default: Optional[str] = None) -> Optional[str]:
     if current_secret_scope() is not None:
         scope_val = _get_secret(name, None)
         return scope_val if scope_val is not None else default
+    from agent.secret_scope import is_multiplex_active
+
+    if is_multiplex_active():
+        return default
     env_val = os.environ.get(name)
     if env_val is not None:
         return env_val

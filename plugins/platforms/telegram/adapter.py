@@ -22,6 +22,8 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
+from agent.secret_scope import get_secret, is_multiplex_active, profile_env_int
+
 logger = logging.getLogger(__name__)
 
 
@@ -911,13 +913,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
 
-        allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
+        allowed_csv = str(get_secret("TELEGRAM_ALLOWED_USERS", "")).strip()
         if not allowed_csv:
             # Fail-closed: no allowlist means deny by default.
             # The runner auth path in _is_user_authorized() handles
             # GATEWAY_ALLOW_ALL_USERS; this fallback must not silently
             # allow everyone (fixes #24457).
-            return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+            return str(get_secret("GATEWAY_ALLOW_ALL_USERS", "")).lower() in {"true", "1", "yes"}
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or normalized_user_id in allowed_ids
 
@@ -991,7 +993,7 @@ class TelegramAdapter(BasePlatformAdapter):
             "GATEWAY_ALLOWED_USERS",
             "GATEWAY_ALLOW_ALL_USERS",
         )
-        return any(os.getenv(key, "").strip() for key in keys)
+        return any(str(get_secret(key, "")).strip() for key in keys)
 
     def _is_user_authorized_from_message(self, message: Message) -> bool:
         """Check if the sender of a Telegram message is authorized.
@@ -1055,7 +1057,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
 
-        allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
+        allowed_csv = str(get_secret("TELEGRAM_ALLOWED_USERS", "")).strip()
         if not allowed_csv:
             return True
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
@@ -3690,7 +3692,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._app.start()
 
             # Decide between webhook and polling mode
-            webhook_url = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
+            webhook_url = str(get_secret("TELEGRAM_WEBHOOK_URL", "")).strip()
 
             if webhook_url:
                 # ── Webhook mode ─────────────────────────────────────
@@ -3704,8 +3706,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 # inject forged updates as if from Telegram. Refuse to
                 # start rather than silently run in fail-open mode.
                 # See GHSA-3vpc-7q5r-276h.
-                webhook_port = env_int("TELEGRAM_WEBHOOK_PORT", 8443)
-                webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+                webhook_port = profile_env_int("TELEGRAM_WEBHOOK_PORT", 8443)
+                webhook_secret = str(get_secret("TELEGRAM_WEBHOOK_SECRET", "")).strip()
                 if not webhook_secret:
                     raise RuntimeError(
                         "TELEGRAM_WEBHOOK_SECRET is required when "
@@ -7305,7 +7307,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
+        return str(get_secret("TELEGRAM_REQUIRE_MENTION", "false")).lower() in {"true", "1", "yes", "on"}
 
     def _telegram_observe_unmentioned_group_messages(self) -> bool:
         """Return whether skipped unmentioned group messages are stored as context.
@@ -7322,7 +7324,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false").lower() in {"true", "1", "yes", "on"}
+        return str(get_secret("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false")).lower() in {"true", "1", "yes", "on"}
 
     def _telegram_guest_mode(self) -> bool:
         """Return whether non-allowlisted groups may trigger via direct @mention."""
@@ -7331,7 +7333,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_GUEST_MODE", "false").lower() in {"true", "1", "yes", "on"}
+        return str(get_secret("TELEGRAM_GUEST_MODE", "false")).lower() in {"true", "1", "yes", "on"}
 
     def _telegram_exclusive_bot_mentions(self) -> bool:
         """Return whether explicit @...bot mentions exclusively route group messages."""
@@ -7340,12 +7342,12 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_EXCLUSIVE_BOT_MENTIONS", "true").lower() in {"true", "1", "yes", "on"}
+        return str(get_secret("TELEGRAM_EXCLUSIVE_BOT_MENTIONS", "true")).lower() in {"true", "1", "yes", "on"}
 
     def _telegram_free_response_chats(self) -> set[str]:
         raw = self.config.extra.get("free_response_chats")
         if raw is None:
-            raw = os.getenv("TELEGRAM_FREE_RESPONSE_CHATS", "")
+            raw = get_secret("TELEGRAM_FREE_RESPONSE_CHATS", "")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -7359,7 +7361,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         raw = self.config.extra.get("free_response_topics")
         if raw is None:
-            raw = os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS", "")
+            raw = get_secret("TELEGRAM_FREE_RESPONSE_TOPICS", "")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -7386,7 +7388,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         raw = self.config.extra.get("allowed_chats")
         if raw is None:
-            raw = os.getenv("TELEGRAM_ALLOWED_CHATS", "")
+            raw = get_secret("TELEGRAM_ALLOWED_CHATS", "")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -7395,7 +7397,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Return Telegram chats authorized at group scope."""
         raw = self.config.extra.get("group_allowed_chats")
         if raw is None:
-            raw = os.getenv("TELEGRAM_GROUP_ALLOWED_CHATS", "")
+            raw = get_secret("TELEGRAM_GROUP_ALLOWED_CHATS", "")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -7425,7 +7427,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         raw = self.config.extra.get("allowed_topics")
         if raw is None:
-            raw = os.getenv("TELEGRAM_ALLOWED_TOPICS", "")
+            raw = get_secret("TELEGRAM_ALLOWED_TOPICS", "")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -7433,7 +7435,7 @@ class TelegramAdapter(BasePlatformAdapter):
     def _telegram_ignored_threads(self) -> set[int]:
         raw = self.config.extra.get("ignored_threads")
         if raw is None:
-            raw = os.getenv("TELEGRAM_IGNORED_THREADS", "")
+            raw = get_secret("TELEGRAM_IGNORED_THREADS", "")
 
         if isinstance(raw, list):
             values = raw
@@ -7455,7 +7457,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Compile optional regex wake-word patterns for group triggers."""
         patterns = self.config.extra.get("mention_patterns")
         if patterns is None:
-            raw = os.getenv("TELEGRAM_MENTION_PATTERNS", "").strip()
+            raw = str(get_secret("TELEGRAM_MENTION_PATTERNS", "")).strip()
             if raw:
                 try:
                     loaded = json.loads(raw)
@@ -9139,7 +9141,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
-        return os.getenv("TELEGRAM_REACTIONS", "false").lower() not in {"false", "0", "no"}
+        return str(get_secret("TELEGRAM_REACTIONS", "false")).lower() not in {"false", "0", "no"}
 
     async def _set_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Set a single emoji reaction on a Telegram message."""
@@ -9299,7 +9301,7 @@ async def _standalone_send(
     parse-mode fallback). Implements the standalone_sender_fn contract so
     deliver=telegram cron jobs succeed when cron runs separately from the
     gateway."""
-    token = getattr(pconfig, "token", None) or os.getenv("TELEGRAM_BOT_TOKEN", "")
+    token = getattr(pconfig, "token", None) or get_secret("TELEGRAM_BOT_TOKEN", "")
     disable_link_previews = bool(
         getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews")
     )
@@ -9343,6 +9345,14 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         extras.setdefault("disable_topic_auto_rename", telegram_cfg["disable_topic_auto_rename"])
 
     _effective_rm = telegram_cfg.get("require_mention", yaml_cfg.get("require_mention"))
+    if is_multiplex_active():
+        nested_extra = telegram_cfg.get("extra") if isinstance(telegram_cfg.get("extra"), dict) else {}
+        extras.update({key: value for key, value in telegram_cfg.items() if key != "extra"})
+        extras.update(nested_extra)
+        if _effective_rm is not None:
+            extras.setdefault("require_mention", _effective_rm)
+        return extras
+
     if _effective_rm is not None and not os.getenv("TELEGRAM_REQUIRE_MENTION"):
         os.environ["TELEGRAM_REQUIRE_MENTION"] = str(_effective_rm).lower()
     if "mention_patterns" in telegram_cfg and not os.getenv("TELEGRAM_MENTION_PATTERNS"):

@@ -23,10 +23,14 @@ const sampleStatus: HermesRepoStatus = {
 }
 
 function stubProbe(impl: (cwd: string) => Promise<HermesRepoStatus | null>) {
+  const getConnection = vi.fn(async () => ({ mode: 'local' }))
+
   ;(window as unknown as { hermesDesktop?: unknown }).hermesDesktop = {
-    getConnection: vi.fn(async () => ({ mode: 'local' })),
+    getConnection,
     git: { repoStatus: impl }
   }
+
+  return getConnection
 }
 
 describe('refreshRepoStatus', () => {
@@ -86,7 +90,7 @@ describe('refreshRepoStatus', () => {
     let active = 0
     let maxActive = 0
 
-    stubProbe(
+    const getConnection = stubProbe(
       cwd =>
         new Promise(resolve => {
           calls.push(cwd)
@@ -103,16 +107,15 @@ describe('refreshRepoStatus', () => {
     await vi.waitFor(() => expect(calls).toEqual(['/repo-a']))
     const second = refreshRepoStatus('/repo-b')
     const third = refreshRepoStatus('/repo-c')
+    await vi.waitFor(() => expect(getConnection).toHaveBeenCalledTimes(3))
+    await Promise.resolve()
 
     expect(calls).toEqual(['/repo-a'])
     expect(maxActive).toBe(1)
     expect($repoStatusLoading.get()).toBe(true)
 
     resolvers.shift()?.(sampleStatus)
-    await Promise.resolve()
-    await Promise.resolve()
-
-    expect(calls).toEqual(['/repo-a', '/repo-c'])
+    await vi.waitFor(() => expect(calls).toEqual(['/repo-a', '/repo-c']))
     expect(maxActive).toBe(1)
     expect($repoStatus.get()).toBeNull()
 

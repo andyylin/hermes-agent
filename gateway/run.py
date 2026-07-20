@@ -1648,7 +1648,7 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
     never skip them here (Signal session paths, port-binding HTTP adapters, etc.).
     Matrix also supports password auth when no access token is configured.
     """
-    from gateway.config import PLATFORM_TOKEN_ENV_NAMES
+    from gateway.config import PLATFORM_TOKEN_ENV_NAMES, _getenv
 
     if platform not in PLATFORM_TOKEN_ENV_NAMES:
         return True
@@ -1661,7 +1661,7 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
         return True
     if platform.value == "matrix":
         extra = getattr(platform_config, "extra", None) or {}
-        password = extra.get("password", "") or os.getenv("MATRIX_PASSWORD", "")
+        password = extra.get("password", "") or _getenv("MATRIX_PASSWORD", "")
         if isinstance(password, str) and password.strip():
             return True
     return False
@@ -2027,6 +2027,8 @@ _OWN_POLICY_OPEN_ENV = {
 
 def _own_policy_open_startup_violation(config) -> Optional[str]:
     """Return a startup-abort reason when open policy lacks allow-all opt-in."""
+    from gateway.config import _getenv
+
     for platform, platform_config in getattr(config, "platforms", {}).items():
         if not getattr(platform_config, "enabled", False):
             continue
@@ -2037,20 +2039,20 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
         extra = getattr(platform_config, "extra", None) or {}
         dm_policy = str(
             extra.get("dm_policy")
-            or (os.getenv(dm_env, "pairing") if dm_env else "pairing")
+            or (_getenv(dm_env, "pairing") if dm_env else "pairing")
         ).strip().lower()
         group_policy = str(
             extra.get("group_policy")
-            or (os.getenv(group_env, "pairing") if group_env else "pairing")
+            or (_getenv(group_env, "pairing") if group_env else "pairing")
         ).strip().lower()
         if dm_policy != "open" and group_policy != "open":
             continue
-        gateway_allow_all = os.getenv(
+        gateway_allow_all = (_getenv(
             "GATEWAY_ALLOW_ALL_USERS", ""
-        ).lower() in {"true", "1", "yes"}
+        ) or "").lower() in {"true", "1", "yes"}
         platform_opted_in = gateway_allow_all or (
             allow_all_env
-            and os.getenv(allow_all_env, "").lower() in {"true", "1", "yes"}
+            and (_getenv(allow_all_env, "") or "").lower() in {"true", "1", "yes"}
         )
         if platform_opted_in:
             continue
@@ -7548,14 +7550,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             pass
-        _any_allowlist = any(
-            os.getenv(v) for v in _builtin_allowed_vars + _plugin_allowed_vars
-        )
+        from agent.secret_scope import is_multiplex_active
+
+        _any_allowlist = any(os.getenv(v) for v in _builtin_allowed_vars + _plugin_allowed_vars)
         _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"} or any(
-            os.getenv(v, "").lower() in {"true", "1", "yes"}
-            for v in _builtin_allow_all_vars + _plugin_allow_all_vars
+            os.getenv(v, "").lower() in {"true", "1", "yes"} for v in _builtin_allow_all_vars + _plugin_allow_all_vars
         )
-        if not _any_allowlist and not _allow_all:
+        if not is_multiplex_active() and not _any_allowlist and not _allow_all:
             logger.warning(
                 "No env user allowlists configured. Messaging platforms default to "
                 "pairing/allowlist policies and will deny unknown senders unless you "
@@ -10177,12 +10178,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 == "pair"
             ):
                 platform_name = source.platform.value if source.platform else "unknown"
+                pairing_store = self._pairing_store_for(source)
+                if pairing_store is None:
+                    return None
                 # Rate-limit ALL pairing responses (code or rejection) to
                 # prevent spamming the user with repeated messages when
                 # multiple DMs arrive in quick succession.
-                if self.pairing_store._is_rate_limited(platform_name, source.user_id):
+                if pairing_store._is_rate_limited(platform_name, source.user_id):
                     return None
-                code = self.pairing_store.generate_code(
+                code = pairing_store.generate_code(
                     platform_name, source.user_id, source.user_name or ""
                 )
                 if code:
@@ -10204,7 +10208,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Please try again later!"
                         )
                     # Record rate limit so subsequent messages are silently ignored
-                    self.pairing_store._record_rate_limit(platform_name, source.user_id)
+                    pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
         # Intercept messages that are responses to a pending /update prompt.
