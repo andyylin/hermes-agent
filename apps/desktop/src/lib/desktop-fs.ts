@@ -7,7 +7,7 @@ import type {
 import { $connection } from '@/store/session'
 
 export interface DesktopFsRemotePicker {
-  selectPaths: (options?: HermesSelectPathsOptions) => Promise<string[]>
+  selectPaths: (options?: HermesSelectPathsOptions, profile?: string) => Promise<string[]>
 }
 
 let remotePicker: DesktopFsRemotePicker | null = null
@@ -68,6 +68,16 @@ export async function readDesktopDir(path: string): Promise<HermesReadDirResult>
   }
 
   return remoteFsApi<HermesReadDirResult>(fsPath('list', path))
+}
+
+export async function readDesktopDirForProfile(profile: string, path: string): Promise<HermesReadDirResult> {
+  const connection = await bridge().getConnection(profile)
+
+  if (connection.mode !== 'remote') {
+    return bridge().readDir(path)
+  }
+
+  return remoteFsApiForProfile<HermesReadDirResult>(profile, fsPath('list', path))
 }
 
 export async function readDesktopFileText(path: string): Promise<HermesReadFileTextResult> {
@@ -237,5 +247,5 @@ export async function selectDesktopPathsForProfile(
     return desktop.selectPaths(options)
   }
 
-  return remotePicker ? remotePicker.selectPaths({ ...options, multiple: false }) : []
+  return remotePicker ? remotePicker.selectPaths({ ...options, multiple: false }, profile) : []
 }

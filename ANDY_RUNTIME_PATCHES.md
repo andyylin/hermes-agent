@@ -6,7 +6,7 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 
 ## Integrated upstream baseline
 
-- `65b73eb1e90e05c0931e3eac68f179662bc7ca63` (2026-07-20)
+- `98cadadd84fb1354fa5e999ed0e2f0eb294dbeae` (2026-07-20)
 - Upstream Projects is canonical. The former explicit session-assignment and Desktop move-to-Project overlay was retired against this cutoff.
 - Temporary overlays below were re-audited against this cutoff; idle-rendering PR #66160 remains external to upstream.
 
@@ -78,6 +78,7 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 
 - `fix(desktop): isolate upstream Projects state by live profile`
   - Captures the concrete profile generation and gateway for every asynchronous Projects RPC so stale A results and writes cannot publish through B.
+  - Binds repo discovery, folder-picker browsing, and post-create `IDEA.md` writes to the initiating profile's filesystem transport.
   - Resets profile-bound Projects caches, optimistic state, dialogs, tombstones, and loading flags on a live profile swap.
   - Keys repo-scan completion and persisted Project view scope by profile.
   - Retire this overlay once upstream Projects provides equivalent A→B→A isolation and regression coverage.

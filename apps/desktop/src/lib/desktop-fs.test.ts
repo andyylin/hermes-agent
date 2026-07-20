@@ -8,6 +8,7 @@ import {
   desktopFileDiff,
   desktopGitRoot,
   readDesktopDir,
+  readDesktopDirForProfile,
   readDesktopFileDataUrl,
   readDesktopFileText,
   selectDesktopPaths,
@@ -142,6 +143,9 @@ describe('desktop filesystem facade', () => {
       branch: 'main',
       cwd: '/backend/project'
     })
+    await expect(readDesktopDirForProfile('beta', '/backend/project')).resolves.toMatchObject({
+      entries: [{ name: 'remote' }]
+    })
     await expect(selectDesktopPathsForProfile('beta', { directories: true, multiple: false })).resolves.toEqual([
       '/remote/project'
     ])
@@ -150,7 +154,8 @@ describe('desktop filesystem facade', () => {
     })
 
     expect(getConnection).toHaveBeenCalledWith('beta')
-    expect(remoteSelect).toHaveBeenCalledWith({ directories: true, multiple: false })
+    expect(remoteSelect).toHaveBeenCalledWith({ directories: true, multiple: false }, 'beta')
+    expect(api).toHaveBeenCalledWith({ path: '/api/fs/list?path=%2Fbackend%2Fproject', profile: 'beta' })
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/default-cwd', profile: 'beta' })
     expect(api).toHaveBeenCalledWith({
       body: { content: '# Idea\n', path: '/remote/IDEA.md' },
