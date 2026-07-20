@@ -984,6 +984,17 @@ class TestMatrixRenderingPayloads:
         assert "<strong>Bold</strong>" in content["formatted_body"]
 
     @pytest.mark.asyncio
+    async def test_silent_notification_metadata_sends_notice(self):
+        result = await self.adapter.send(
+            "!room:example.org",
+            "🔧 Running a tool",
+            metadata={"silent_notification": True},
+        )
+
+        assert result.success is True
+        assert self._sent_contents()[0]["msgtype"] == "m.notice"
+
+    @pytest.mark.asyncio
     async def test_thread_payload_uses_m_thread_with_reply_fallback(self):
         result = await self.adapter.send(
             "!room:example.org",
@@ -1030,6 +1041,35 @@ class TestMatrixRenderingPayloads:
         }
         assert content["m.new_content"]["body"] == "edited **body**"
         assert content["body"] == "* edited **body**"
+
+    @pytest.mark.asyncio
+    async def test_silent_notification_edit_stays_notice(self):
+        result = await self.adapter.edit_message(
+            "!room:example.org",
+            "$original",
+            "🔧 Tool finished",
+            metadata={"silent_notification": True},
+        )
+
+        assert result.success is True
+        content = self._sent_contents()[0]
+        assert content["msgtype"] == "m.notice"
+        assert content["m.new_content"]["msgtype"] == "m.notice"
+
+
+    def test_matrix_silent_progress_metadata_preserves_thread_context(self):
+        from gateway.config import Platform
+        from gateway.run import _silent_progress_metadata
+
+        metadata = _silent_progress_metadata(
+            {"thread_id": "$root"},
+            platform=Platform.MATRIX,
+        )
+
+        assert metadata == {
+            "thread_id": "$root",
+            "silent_notification": True,
+        }
 
     @pytest.mark.asyncio
     async def test_long_response_split_preserves_thread_context(self):
