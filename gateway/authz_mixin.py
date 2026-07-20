@@ -17,7 +17,6 @@ import time -> no import cycle. The lazy import preserves the exact logger name
 
 from __future__ import annotations
 
-import os
 from typing import Optional
 
 from gateway.config import Platform
@@ -39,8 +38,11 @@ def _auth_env(name: str, default: str = "") -> str:
         if val is not None and str(val).strip():
             return str(val).strip()
     except Exception:
-        pass
-    return (os.getenv(name) or default).strip()
+        # ``get_secret`` deliberately raises on an unscoped multiplex read.
+        # Auth policy must fail closed here rather than reopening a process-
+        # global fallback that may belong to another profile.
+        return default.strip()
+    return default.strip()
 
 
 class GatewayAuthorizationMixin:
@@ -349,7 +351,7 @@ class GatewayAuthorizationMixin:
             if not chat_allowlist_env and source.platform and source.platform.value == "line":
                 chat_allowlist_env = "LINE_ALLOWED_GROUPS"
             if chat_allowlist_env:
-                raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
+                raw_chat_allowlist = _auth_env(chat_allowlist_env)
                 if raw_chat_allowlist:
                     allowed_group_ids = {
                         cid.strip()
@@ -373,7 +375,7 @@ class GatewayAuthorizationMixin:
         }
         if getattr(source, "is_bot", False):
             allow_bots_var = platform_allow_bots_map.get(source.platform)
-            if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
+            if allow_bots_var and _auth_env(allow_bots_var, "none").lower() in {"mentions", "all"}:
                 return True
 
         if not user_id:
@@ -719,13 +721,13 @@ class GatewayAuthorizationMixin:
             }
             if platform and platform.value == "line":
                 platform_group_env_map[platform] = ("LINE_ALLOWED_GROUPS",)
-            if os.getenv(platform_env_map.get(platform, ""), "").strip():
+            if _auth_env(platform_env_map.get(platform, "")):
                 return "ignore"
             for env_key in platform_group_env_map.get(platform, ()):
-                if os.getenv(env_key, "").strip():
+                if _auth_env(env_key):
                     return "ignore"
 
-        if os.getenv("GATEWAY_ALLOWED_USERS", "").strip():
+        if _auth_env("GATEWAY_ALLOWED_USERS"):
             return "ignore"
 
         return "pair"

@@ -135,12 +135,14 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
     expect($connection.get()?.mode).toBe('local')
   })
 
-  it('leaves the prior connection intact when the descriptor fetch fails', async () => {
+  it('rolls back gateway activation and leaves the prior profile active when descriptor fetch fails', async () => {
     getConnection.mockRejectedValue(new Error('backend unreachable'))
 
-    await ensureGatewayProfile('vps-remote')
+    await expect(ensureGatewayProfile('vps-remote')).rejects.toThrow('backend unreachable')
 
-    // Best-effort: boot/reconnect resyncs later; we must not null it out here.
+    expect(ensureGatewayForProfile).toHaveBeenNthCalledWith(1, 'vps-remote')
+    expect(ensureGatewayForProfile).toHaveBeenNthCalledWith(2, 'default')
+    expect($activeGatewayProfile.get()).toBe('default')
     expect($connection.get()?.mode).toBe('local')
   })
 

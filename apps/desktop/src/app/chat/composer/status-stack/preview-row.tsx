@@ -40,7 +40,7 @@ export const PreviewStatusRow = memo(function PreviewStatusRow({ item, onDismiss
       throw new Error(`Could not open preview target: ${item.target}`)
     }
 
-    return target
+    return { context, target }
   }
 
   const togglePreview = async () => {
@@ -57,10 +57,10 @@ export const PreviewStatusRow = memo(function PreviewStatusRow({ item, onDismiss
     setOpening(true)
 
     try {
-      const target = await resolveTarget()
+      const resolved = await resolveTarget()
 
-      if (target) {
-        setCurrentSessionPreviewTarget(target, 'tool-result', item.target)
+      if (resolved && activeGatewayProfileContextIsCurrent(resolved.context)) {
+        setCurrentSessionPreviewTarget(resolved.target, 'tool-result', item.target)
       }
     } catch (error) {
       notifyError(error, t.preview.unavailable)
@@ -77,10 +77,10 @@ export const PreviewStatusRow = memo(function PreviewStatusRow({ item, onDismiss
         throw new Error('Desktop preview browser bridge is unavailable')
       }
 
-      const target = await resolveTarget()
+      const resolved = await resolveTarget()
 
-      if (target) {
-        await bridge(target.url)
+      if (resolved && activeGatewayProfileContextIsCurrent(resolved.context)) {
+        await bridge(resolved.target.url)
       }
     } catch (error) {
       notifyError(error, t.preview.unavailable)

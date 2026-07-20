@@ -22,12 +22,14 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
   - Keeps Matrix room/user authorization, mentions, reactions, threading, notices, and public-room policy adapter-local.
   - Disables Matrix's legacy YAML-to-environment bridge while multiplexing so secondary profiles cannot contaminate process-global policy.
   - Resolves absent-profile authorization, room, mention, reaction, threading, and approval policy from fail-closed/default values rather than poisoned process globals; legacy single-profile environment fallback remains intact.
+  - Makes shared gateway authorization fail closed on unscoped multiplex reads and routes chat, bot, allowlist, and unauthorized-DM policy through the scoped resolver.
 
 - `fix(desktop): close profile-generation handoff gaps`
   - Revalidates project RPC continuations, review reads, filesystem routing/previews, picker listings, branch/worktree consumers, and session startup against the initiating profile generation.
   - Publishes profile activation only after connection synchronization and delays fresh-session reset until activation settles.
   - Binds composer commitment and draft/attachment cleanup to the owning profile generation, preventing stale or failed handoffs from eating another profile's draft.
   - Uses request ownership for branch-loading teardown, synchronously invalidates stale remote-picker requests, and guards every local-preview continuation and consumer against A→B→A generation swaps.
+  - Carries preview ownership through nested helpers to the final pane/browser side effect and rolls gateway activation back when connection-descriptor synchronization fails.
 
 - `fix(discord): add smart auto-thread titles`
   - Adds deterministic Discord auto-thread title cleanup/summarization.
