@@ -991,7 +991,7 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             app_token = get_secret("SLACK_APP_TOKEN")
         except UnscopedSecretError:
-            app_token = os.getenv("SLACK_APP_TOKEN")
+            app_token = None
 
         if not raw_token:
             logger.error("[Slack] SLACK_BOT_TOKEN not set")
@@ -2233,7 +2233,9 @@ class SlackAdapter(BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
-        return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
+        configured = self.config.extra.get("reactions")
+        value = configured if configured is not None else _scoped_env("SLACK_REACTIONS", "true")
+        return str(value).lower() not in {"false", "0", "no"}
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
@@ -4769,7 +4771,7 @@ class SlackAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
-        return os.getenv("SLACK_REQUIRE_MENTION", "true").lower() not in {
+        return _scoped_env("SLACK_REQUIRE_MENTION", "true").lower() not in {
             "false",
             "0",
             "no",
@@ -4786,7 +4788,7 @@ class SlackAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("SLACK_STRICT_MENTION", "false").lower() in {
+        return _scoped_env("SLACK_STRICT_MENTION", "false").lower() in {
             "true",
             "1",
             "yes",
@@ -4797,7 +4799,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Return channel IDs where no @mention is required."""
         raw = self.config.extra.get("free_response_channels")
         if raw is None:
-            raw = os.getenv("SLACK_FREE_RESPONSE_CHANNELS", "")
+            raw = _scoped_env("SLACK_FREE_RESPONSE_CHANNELS")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         # Coerce non-list scalars (str/int/float) to str before splitting.
@@ -4820,7 +4822,7 @@ class SlackAdapter(BasePlatformAdapter):
         """
         raw = self.config.extra.get("allowed_channels")
         if raw is None:
-            raw = os.getenv("SLACK_ALLOWED_CHANNELS", "")
+            raw = _scoped_env("SLACK_ALLOWED_CHANNELS")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         if isinstance(raw, str) and raw.strip():
@@ -4844,7 +4846,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         patterns = self.config.extra.get("mention_patterns") if self.config.extra else None
         if patterns is None:
-            raw = os.getenv("SLACK_MENTION_PATTERNS", "").strip()
+            raw = _scoped_env("SLACK_MENTION_PATTERNS").strip()
             if raw:
                 try:
                     import json as _json
@@ -5102,6 +5104,11 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
     survive a config.yaml update. Returns ``None`` because no extras are
     seeded into ``PlatformConfig.extra`` directly (everything flows through env).
     """
+    from agent.secret_scope import is_multiplex_active
+
+    if is_multiplex_active():
+        return dict(slack_cfg)
+
     if "require_mention" in slack_cfg and not os.getenv("SLACK_REQUIRE_MENTION"):
         os.environ["SLACK_REQUIRE_MENTION"] = str(slack_cfg["require_mention"]).lower()
     if "strict_mention" in slack_cfg and not os.getenv("SLACK_STRICT_MENTION"):

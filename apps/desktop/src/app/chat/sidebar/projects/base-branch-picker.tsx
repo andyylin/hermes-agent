@@ -58,7 +58,7 @@ export function BaseBranchPicker({
     setLoading(true)
 
     try {
-      const list = await listBaseBranches(repoPath)
+      const list = await listBaseBranches(repoPath, context)
 
       if (branchRequestRef.current !== request || !activeGatewayProfileContextIsCurrent(context)) {
         return

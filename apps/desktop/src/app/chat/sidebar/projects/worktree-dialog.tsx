@@ -100,7 +100,10 @@ export function WorktreeDialog({ repoPath, onStarted, open, onOpenChange, initia
     setBranchesLoading(true)
 
     try {
-      const next = await listRepoBranches(repoPath)
+      const next = await listRepoBranches(repoPath, {
+        generation: owner.generation,
+        profile: owner.profile
+      })
 
       if (branchRequestRef.current === request && activeGatewayProfileContextIsCurrent(context)) {
         setBranches(next)
@@ -114,7 +117,7 @@ export function WorktreeDialog({ repoPath, onStarted, open, onOpenChange, initia
         setBranchesLoading(false)
       }
     }
-  }, [repoPath])
+  }, [owner.generation, owner.profile, repoPath])
 
   useEffect(() => {
     if (previousBranchOwnerKeyRef.current === branchOwnerKey) {

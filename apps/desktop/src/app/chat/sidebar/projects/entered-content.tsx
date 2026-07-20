@@ -17,6 +17,7 @@ import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { $dismissedWorktreeIds, dismissWorktree } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
+import { captureActiveGatewayProfileContext } from '@/store/profile'
 import { removeWorktreePath } from '@/store/projects'
 
 import { SidebarRowStack } from '../chrome'
@@ -140,6 +141,7 @@ function RepoFlatSection({
   // instead of erroring (those changes are usually throwaway).
   const [removeTarget, setRemoveTarget] = useState<null | SidebarSessionGroup>(null)
   const [forceTarget, setForceTarget] = useState<null | SidebarSessionGroup>(null)
+  const owner = captureActiveGatewayProfileContext()
 
   const removeViaGit = async (group: SidebarSessionGroup, force = false) => {
     if (!repo.path || !group.path) {
@@ -147,7 +149,11 @@ function RepoFlatSection({
     }
 
     try {
-      const removed = await removeWorktreePath(repo.path, group.path, { force })
+      const removed = await removeWorktreePath(repo.path, group.path, {
+        force,
+        generation: owner.generation,
+        profile: owner.profile
+      })
 
       if (!removed) {
         return

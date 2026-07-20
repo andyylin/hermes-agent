@@ -91,13 +91,22 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
   const handleBranchOff = useCallback(
     async (branch: string, base?: string) => {
       const repoPath = cwd?.trim()
-      const result = repoPath && (await startWorkInRepo(repoPath, { base, branch, name: branch }))
+
+      const result =
+        repoPath &&
+        (await startWorkInRepo(repoPath, {
+          base,
+          branch,
+          generation: owner.generation,
+          name: branch,
+          profile: owner.profile
+        }))
 
       if (result) {
         openInWorktree(result.path, result.profile, result.generation)
       }
     },
-    [cwd, openInWorktree]
+    [cwd, openInWorktree, owner.generation, owner.profile]
   )
 
   // Convert an EXISTING branch into a fresh worktree + session (no new branch).
@@ -114,7 +123,7 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
       const repoPath = cwd?.trim()
 
       if (repoPath && isDefault) {
-        const switched = await switchBranchInRepo(repoPath, branch)
+        const switched = await switchBranchInRepo(repoPath, branch, owner)
 
         if (switched) {
           openInWorktree(repoPath, switched.profile, switched.generation)
@@ -123,30 +132,36 @@ export function useComposerBranch({ clearDraft, cwd, draftRef }: UseComposerBran
         return
       }
 
-      const result = repoPath && (await startWorkInRepo(repoPath, { existingBranch: branch }))
+      const result =
+        repoPath &&
+        (await startWorkInRepo(repoPath, {
+          existingBranch: branch,
+          generation: owner.generation,
+          profile: owner.profile
+        }))
 
       if (result) {
         openInWorktree(result.path, result.profile, result.generation)
       }
     },
-    [cwd, openInWorktree]
+    [cwd, openInWorktree, owner]
   )
 
   const handleListBranches = useCallback(async () => {
     const repoPath = cwd?.trim()
 
-    return repoPath ? listRepoBranches(repoPath) : []
-  }, [cwd])
+    return repoPath ? listRepoBranches(repoPath, owner) : []
+  }, [cwd, owner])
 
   const handleSwitchBranch = useCallback(
     async (branch: string) => {
       const repoPath = cwd?.trim()
 
       if (repoPath) {
-        await switchBranchInRepo(repoPath, branch)
+        await switchBranchInRepo(repoPath, branch, owner)
       }
     },
-    [cwd]
+    [cwd, owner]
   )
 
   return { handleBranchOff, handleConvertBranch, handleListBranches, handleSwitchBranch, openInWorktree }

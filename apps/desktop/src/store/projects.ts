@@ -1047,14 +1047,17 @@ export async function startWorkInRepo(
 
 // Local branches for the composer's "convert a branch into a worktree" picker.
 // Empty on a remote backend / non-repo (the Electron probe can't run).
-export async function listRepoBranches(repoPath: string): Promise<HermesGitBranch[]> {
+export async function listRepoBranches(
+  repoPath: string,
+  owner?: { generation: number; profile: string }
+): Promise<HermesGitBranch[]> {
   if (!repoPath) {
     return []
   }
 
   const { context, git } = await captureProjectGitContext()
 
-  if (!git?.branchList) {
+  if (!git?.branchList || (owner && !activeGatewayProfileContextIsCurrent(owner))) {
     return []
   }
 
@@ -1067,14 +1070,17 @@ export async function listRepoBranches(repoPath: string): Promise<HermesGitBranc
 // Local + remote-tracking branches for the base-branch picker in the
 // new-worktree dialog. The remote default (origin/HEAD) is flagged so the
 // UI can preselect it. Empty on a remote backend / non-repo.
-export async function listBaseBranches(repoPath: string): Promise<HermesGitBaseBranch[]> {
+export async function listBaseBranches(
+  repoPath: string,
+  owner?: { generation: number; profile: string }
+): Promise<HermesGitBaseBranch[]> {
   if (!repoPath) {
     return []
   }
 
   const { context, git } = await captureProjectGitContext()
 
-  if (!git?.baseBranchList) {
+  if (!git?.baseBranchList || (owner && !activeGatewayProfileContextIsCurrent(owner))) {
     return []
   }
 
@@ -1193,17 +1199,33 @@ export function markStartWorkSessionCommitted(token: number): void {
 export async function removeWorktreePath(
   repoPath: string,
   worktreePath: string,
-  options?: { force?: boolean }
+  options?: { force?: boolean; generation?: number; profile?: string }
 ): Promise<boolean> {
   try {
-    const { context, git } = await captureProjectGitContext()
+    const current = captureActiveGatewayProfileContext()
 
-    if (!git) {
+    const owner = {
+      generation: options?.generation ?? current.generation,
+      profile: options?.profile ?? current.profile
+    }
+
+    if (!activeGatewayProfileContextIsCurrent(owner)) {
       return false
     }
 
-    await git.worktreeRemove(repoPath, worktreePath, options)
+    const { context, git } = await captureProjectGitContext()
+
+    if (!git || !activeGatewayProfileContextIsCurrent(owner)) {
+      return false
+    }
+
+    await git.worktreeRemove(repoPath, worktreePath, { force: options?.force })
     assertProjectContextCurrent(context)
+
+    if (!activeGatewayProfileContextIsCurrent(owner)) {
+      return false
+    }
+
     bumpWorktrees()
 
     return true

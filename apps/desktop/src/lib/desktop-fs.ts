@@ -116,7 +116,11 @@ export async function readDesktopDirForProfile(
   const context = { generation, profile: normalizeProfileKey(profile) }
 
   if (!activeGatewayProfileContextIsCurrent(context)) {
-    throw new Error('Desktop filesystem profile ownership changed before directory read')
+    const current = captureActiveGatewayProfileContext()
+
+    throw new Error(
+      `Desktop filesystem profile ownership changed before directory read (expected ${context.profile}@${context.generation}, current ${current.profile}@${current.generation})`
+    )
   }
 
   const connection = await bridge().getConnection(profile)
