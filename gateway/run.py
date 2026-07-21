@@ -9527,7 +9527,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # profiles/<name>/pairing/. See gateway.pairing.PairingStore.
             for name in served:
                 if name and name not in self.pairing_stores:
-                    self.pairing_stores[name] = PairingStore(profile=name)
+                    if name == active:
+                        self.pairing_stores[name] = self.pairing_store
+                    else:
+                        self.pairing_stores[name] = PairingStore(profile=name)
             write_runtime_status(served_profiles=served)
         except Exception:
             logger.debug("could not record served_profiles", exc_info=True)
