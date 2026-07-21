@@ -1685,7 +1685,8 @@ def test_launch_tui_worktree_validates_relative_python_against_final_cwd(
     relative_python = Path(".review-venv") / "bin" / Path(sys.executable).name
     python_path = worktree / relative_python
     python_path.parent.mkdir(parents=True)
-    # The temp directory may be on another filesystem than the active venv.
+    # copy2, not os.link: tmp_path may sit on a different filesystem than
+    # the venv (tmpfs /tmp vs disk home) where hard links raise EXDEV.
     shutil.copy2(sys.executable, python_path)
     captured = {}
 
