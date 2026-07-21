@@ -143,12 +143,18 @@ class TestConcurrentSessionDbSafety:
         finally:
             db.close()
 
-    def test_concurrent_writers_and_searcher_no_fts_clean_pragmas(
+    def test_concurrent_reopen_write_search_no_fts_clean_pragmas(
         self, corpus_db
     ):
-        """Multi-connection stress: no FTS objects; quick/integrity stay ok."""
+        """Multi-connection open/write/search: no FTS objects; PRAGMAs clean.
+
+        Mirrors the production gate shape: sequential opens scrub any legacy
+        FTS first, then concurrent SessionDB connections create/append/search
+        without racing healthy-open FTS DDL.
+        """
         path, baseline_msgs = corpus_db
 
+        # Five sequential opens (legacy FTS already absent) — must stay clean.
         for _ in range(5):
             db = SessionDB(db_path=path)
             assert db._fts_enabled is False
@@ -159,6 +165,7 @@ class TestConcurrentSessionDbSafety:
         errors: list[str] = []
         probe_ids: list[str] = []
         lock = threading.Lock()
+        # Barrier after each connection is open so open-time work overlaps.
         barrier = threading.Barrier(3)
 
         def writer(wid: int) -> None:

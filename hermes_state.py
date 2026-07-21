@@ -1062,11 +1062,33 @@ class SessionDB:
     def _retire_all_live_fts(self, cursor: sqlite3.Cursor) -> None:
         """Scrub legacy FTS objects so message writes never touch a derived index.
 
-        Fresh DBs never create FTS. Existing DBs drop triggers and virtual
-        tables best-effort on open. ``writable_schema`` surgery runs only when
-        residual ``messages_fts%`` objects remain after DROP (e.g. corrupt
-        shadows that reject DROP TABLE).
+        Fresh DBs never create FTS. Healthy opens that already have zero
+        ``messages_fts%`` schema objects take a SELECT-only fast path — no
+        ``DROP TRIGGER``/``DROP TABLE``/``writable_schema`` — so concurrent
+        SessionDB opens do not race unnecessary schema DDL on large WAL DBs.
+
+        When objects exist: drop triggers and virtual tables best-effort.
+        ``writable_schema`` surgery runs only when residual ``messages_fts%``
+        rows remain after DROP (e.g. corrupt shadows that reject DROP TABLE).
         """
+        try:
+            present = cursor.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'messages_fts%'"
+            ).fetchone()[0]
+        except sqlite3.DatabaseError:
+            # Schema unreadable (malformed master) — leave offline repair to
+            # repair_state_db_schema; still mark live FTS disabled.
+            present = 0
+            self._fts_enabled = False
+            self._trigram_available = False
+            return
+
+        if not present:
+            # Healthy no-FTS DB: zero schema mutation on open.
+            self._fts_enabled = False
+            self._trigram_available = False
+            return
+
         self._drop_legacy_fts_triggers(cursor)
         for table_name in ("messages_fts", "messages_fts_trigram"):
             try:

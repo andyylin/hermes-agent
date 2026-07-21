@@ -795,6 +795,66 @@ class TestSessionLifecycle:
             finally:
                 restored.close()
 
+    def test_healthy_open_executes_no_fts_schema_ddl(self, tmp_path, monkeypatch):
+        """Healthy opens must not race DROP/CREATE/writable_schema FTS DDL.
+
+        After FTS retirement, concurrent SessionDB() on a large WAL DB was
+        still issuing six DROP TRIGGER IF EXISTS + two DROP TABLE IF EXISTS
+        on every open even when zero FTS objects remained. The healthy fast
+        path is SELECT-only against sqlite_master.
+        """
+        db_path = tmp_path / "state.db"
+        seeded = SessionDB(db_path=db_path)
+        try:
+            seeded.create_session(session_id="s1", source="cli")
+            seeded.append_message("s1", role="user", content="trace target needle")
+        finally:
+            seeded.close()
+
+        forbidden = []
+        real_connect = sqlite3.connect
+
+        def _is_forbidden_ddl(sql: str) -> bool:
+            text = " ".join(str(sql).upper().split())
+            if "WRITABLE_SCHEMA" in text:
+                return True
+            if "DROP TRIGGER" in text and "MESSAGES_FTS" in text:
+                return True
+            if "DROP TABLE" in text and "MESSAGES_FTS" in text:
+                return True
+            if "CREATE VIRTUAL TABLE" in text and "FTS5" in text:
+                return True
+            if "CREATE TRIGGER" in text and "MESSAGES_FTS" in text:
+                return True
+            if "DELETE FROM SQLITE_MASTER" in text and "MESSAGES_FTS" in text:
+                return True
+            return False
+
+        def connect_traced(*args, **kwargs):
+            conn = real_connect(*args, **kwargs)
+
+            # set_trace_callback sees every statement (including executescript
+            # bodies). Prefer this over patching execute — Connection.execute
+            # is read-only on some Python builds.
+            def _trace(sql):
+                if _is_forbidden_ddl(sql):
+                    forbidden.append(str(sql))
+
+            conn.set_trace_callback(_trace)
+            return conn
+
+        monkeypatch.setattr("hermes_state.sqlite3.connect", connect_traced)
+
+        for _ in range(3):
+            db = SessionDB(db_path=db_path)
+            try:
+                assert db._fts_enabled is False
+                assert len(db.search_messages("needle")) == 1
+            finally:
+                db.close()
+
+        assert forbidden == [], f"healthy open issued FTS schema DDL: {forbidden!r}"
+
     def test_optimize_and_rebuild_are_noop_and_scrub_leftovers(self, tmp_path):
         """optimize_fts/rebuild_fts return 0 and scrub leftover FTS objects."""
         db_path = tmp_path / "state.db"
