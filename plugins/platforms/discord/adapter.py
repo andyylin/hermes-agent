@@ -7888,7 +7888,7 @@ def _component_check_auth(
                     store = PairingStore()
             if store is not None and store.is_approved("discord", uid):
                 return True
-        except (AttributeError, TypeError):
+        except (AttributeError, TypeError, ImportError):
             pass
 
     return False
