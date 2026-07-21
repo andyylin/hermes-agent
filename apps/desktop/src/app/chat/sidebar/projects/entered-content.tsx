@@ -17,6 +17,7 @@ import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { $dismissedWorktreeIds, dismissWorktree } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
+import { captureActiveGatewayProfileContext } from '@/store/profile'
 import { removeWorktreePath } from '@/store/projects'
 
 import { SidebarRowStack } from '../chrome'
@@ -42,7 +43,6 @@ export function EnteredProjectContent({
   onNewSession,
   repoWorktrees,
   liveSessions,
-  sessionProjectAssignments,
   removedSessionIds
 }: {
   project: SidebarProjectTree
@@ -50,7 +50,6 @@ export function EnteredProjectContent({
   onNewSession?: (path: null | string) => void
   repoWorktrees?: Record<string, HermesGitWorktree[]>
   liveSessions?: SessionInfo[]
-  sessionProjectAssignments?: Readonly<Record<string, null | string>>
   removedSessionIds?: ReadonlySet<string>
 }) {
   if (!project.repos.length) {
@@ -67,11 +66,9 @@ export function EnteredProjectContent({
           key={repo.id}
           liveSessions={liveSessions}
           onNewSession={onNewSession}
-          projectId={project.id}
           removedSessionIds={removedSessionIds}
           renderRows={renderRows}
           repo={repo}
-          sessionProjectAssignments={sessionProjectAssignments}
           showHeader={!single}
         />
       ))}
@@ -81,23 +78,19 @@ export function EnteredProjectContent({
 
 function RepoFlatSection({
   repo,
-  projectId,
   showHeader,
   renderRows,
   onNewSession,
   discoveredWorktrees,
   liveSessions,
-  sessionProjectAssignments,
   removedSessionIds
 }: {
   repo: SidebarWorkspaceTree
-  projectId: string
   showHeader: boolean
   renderRows: (sessions: SessionInfo[]) => React.ReactNode
   onNewSession?: (path: null | string) => void
   discoveredWorktrees?: HermesGitWorktree[]
   liveSessions?: SessionInfo[]
-  sessionProjectAssignments?: Readonly<Record<string, null | string>>
   removedSessionIds?: ReadonlySet<string>
 }) {
   const { t } = useI18n()
@@ -118,16 +111,10 @@ function RepoFlatSection({
       return mergedGroups
     }
 
-    const { groups } = overlayRepoLanes(
-      { ...repo, groups: mergedGroups },
-      liveSessions ?? [],
-      removedSessionIds,
-      projectId,
-      sessionProjectAssignments
-    )
+    const { groups } = overlayRepoLanes({ ...repo, groups: mergedGroups }, liveSessions ?? [], removedSessionIds)
 
     return mergeRepoWorktreeGroups({ id: repo.id, path: repo.path, groups }, discoveredWorktrees)
-  }, [repo, projectId, mergedGroups, discoveredWorktrees, liveSessions, removedSessionIds, sessionProjectAssignments])
+  }, [repo, mergedGroups, discoveredWorktrees, liveSessions, removedSessionIds])
 
   const discoveredWorktreePaths = useMemo(
     () =>
@@ -154,6 +141,7 @@ function RepoFlatSection({
   // instead of erroring (those changes are usually throwaway).
   const [removeTarget, setRemoveTarget] = useState<null | SidebarSessionGroup>(null)
   const [forceTarget, setForceTarget] = useState<null | SidebarSessionGroup>(null)
+  const owner = captureActiveGatewayProfileContext()
 
   const removeViaGit = async (group: SidebarSessionGroup, force = false) => {
     if (!repo.path || !group.path) {
@@ -161,7 +149,16 @@ function RepoFlatSection({
     }
 
     try {
-      await removeWorktreePath(repo.path, group.path, { force })
+      const removed = await removeWorktreePath(repo.path, group.path, {
+        force,
+        generation: owner.generation,
+        profile: owner.profile
+      })
+
+      if (!removed) {
+        return
+      }
+
       dismissWorktree(group.id)
     } catch (err) {
       // git refuses a non-force remove on a dirty/locked worktree — offer force

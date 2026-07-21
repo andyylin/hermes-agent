@@ -14,6 +14,7 @@ this suite locks the complementary primary-path fixes:
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -77,6 +78,35 @@ class TestLoadGatewayConfigForRunner:
         assert tg is not None
         assert tg.token == "default-profile-token-123"
         assert tg.enabled is True
+
+    def test_multiplex_flag_is_active_before_platform_yaml_bridges(self, tmp_path, monkeypatch):
+        from agent.secret_scope import is_multiplex_active
+        from gateway import run as run_mod
+        import hermes_constants as hc
+
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "gateway:\n"
+            "  multiplex_profiles: true\n"
+            "discord:\n"
+            "  allowed_channels: [private-channel]\n"
+            "  require_mention: false\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
+        monkeypatch.delenv("DISCORD_REQUIRE_MENTION", raising=False)
+        monkeypatch.setattr(hc, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(run_mod, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(run_mod, "_hermes_home", home)
+
+        cfg = run_mod.load_gateway_config_for_runner()
+
+        assert cfg.multiplex_profiles is True
+        assert is_multiplex_active() is True
+        assert "DISCORD_ALLOWED_CHANNELS" not in os.environ
+        assert "DISCORD_REQUIRE_MENTION" not in os.environ
 
 
 class TestPlatformHasBotCredential:

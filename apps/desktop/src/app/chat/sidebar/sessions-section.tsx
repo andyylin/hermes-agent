@@ -9,6 +9,10 @@ import type { HermesGitWorktree } from '@/global'
 import type { SessionInfo } from '@/hermes'
 import { flattenSessionsWithBranches } from '@/lib/session-branch-tree'
 import { cn } from '@/lib/utils'
+import {
+  type ActiveGatewayProfileContext,
+  captureActiveGatewayProfileContext
+} from '@/store/profile'
 import { sessionPinId } from '@/store/session'
 
 import { SidebarCount } from './chrome'
@@ -26,6 +30,15 @@ import { SidebarSessionRow } from './session-row'
 import { VirtualSessionList } from './virtual-session-list'
 
 export const VIRTUALIZE_THRESHOLD = 25
+
+type OwnedWorkspaceSessionStart = (path: null | string, expectedProfile?: string, expectedGeneration?: number) => void
+
+export function bindWorkspaceSessionOwner(
+  start: OwnedWorkspaceSessionStart,
+  context: ActiveGatewayProfileContext
+): (path: null | string) => void {
+  return path => start(path, context.profile, context.generation)
+}
 
 interface SidebarSectionHeaderProps {
   label: string
@@ -91,7 +104,7 @@ interface SidebarSessionsSectionProps {
   onArchiveSession: (sessionId: string) => void
   onBranchSession?: (sessionId: string, profile?: string) => void
   onTogglePin: (sessionId: string) => void
-  onNewSessionInWorkspace?: (path: null | string) => void
+  onNewSessionInWorkspace?: OwnedWorkspaceSessionStart
   pinned: boolean
   rootClassName?: string
   contentClassName?: string
@@ -111,7 +124,6 @@ interface SidebarSessionsSectionProps {
   // True while the backend project tree is loading (overview skeleton).
   projectsLoading?: boolean
   onEnterProject?: (id: string) => void
-  onAssignSessionToProject?: (sessionId: string, projectId: string, profile?: string) => void
   // The entered project's flattened content: main-checkout sessions render
   // directly (no redundant repo/branch header); only linked worktrees nest.
   projectContent?: SidebarProjectTree
@@ -120,8 +132,6 @@ interface SidebarSessionsSectionProps {
   projectRepoWorktrees?: Record<string, HermesGitWorktree[]>
   // Live session cache used for optimistic placement inside entered-project lanes.
   liveSessions?: SessionInfo[]
-  // Explicit session -> project memberships from the backend tree. These beat cwd inference.
-  sessionProjectAssignments?: Readonly<Record<string, null | string>>
   // Client-side optimistic eviction layer (deleted/archived ids).
   removedSessionIds?: ReadonlySet<string>
   activeProjectId?: null | string
@@ -169,11 +179,9 @@ export function SidebarSessionsSection({
   projectOverviewPreviews,
   projectsLoading = false,
   onEnterProject,
-  onAssignSessionToProject,
   projectContent,
   projectRepoWorktrees,
   liveSessions,
-  sessionProjectAssignments,
   removedSessionIds,
   activeProjectId,
   labelMeta,
@@ -186,6 +194,19 @@ export function SidebarSessionsSection({
   dndSensors,
   showProfileTags = false
 }: SidebarSessionsSectionProps) {
+  const { generation: workspaceGeneration, profile: workspaceProfile } = captureActiveGatewayProfileContext()
+
+  const onOwnedNewSessionInWorkspace = useMemo(
+    () =>
+      onNewSessionInWorkspace
+        ? bindWorkspaceSessionOwner(onNewSessionInWorkspace, {
+            generation: workspaceGeneration,
+            profile: workspaceProfile
+          })
+        : undefined,
+    [onNewSessionInWorkspace, workspaceGeneration, workspaceProfile]
+  )
+
   const sectionOpen = collapsible ? open : true
   const hasGroupedSessions = Boolean(groups?.some(group => group.sessions.length > 0))
   // A defined project list is itself content (even an empty project should
@@ -256,12 +277,11 @@ export function SidebarSessionsSection({
         {hasProjectContent ? (
           <EnteredProjectContent
             liveSessions={liveSessions}
-            onNewSession={onNewSessionInWorkspace}
+            onNewSession={onOwnedNewSessionInWorkspace}
             project={projectContent}
             removedSessionIds={removedSessionIds}
             renderRows={renderRows}
             repoWorktrees={projectRepoWorktrees}
-            sessionProjectAssignments={sessionProjectAssignments}
           />
         ) : (
           emptyState
@@ -281,9 +301,8 @@ export function SidebarSessionsSection({
       <Row
         activeProjectId={activeProjectId}
         key={project.id}
-        onAssignSession={onAssignSessionToProject}
         onEnter={onEnterProject}
-        onNewSession={onNewSessionInWorkspace}
+        onNewSession={onOwnedNewSessionInWorkspace}
         previewSessions={project.path ? projectOverviewPreviews?.[project.path] : undefined}
         project={project}
         renderRows={renderRows}
@@ -308,7 +327,7 @@ export function SidebarSessionsSection({
       <SidebarWorkspaceGroup
         group={group}
         key={group.id}
-        onNewSession={onNewSessionInWorkspace}
+        onNewSession={onOwnedNewSessionInWorkspace}
         renderRows={renderRows}
       />
     ))

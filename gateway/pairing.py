@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from agent.secret_scope import current_secret_scope, get_secret, is_multiplex_active
 from gateway.whatsapp_identity import (
     expand_whatsapp_aliases,
     normalize_whatsapp_identifier,
@@ -37,6 +38,12 @@ from hermes_constants import get_hermes_dir, get_hermes_home
 from utils import atomic_replace
 
 logger = logging.getLogger(__name__)
+
+
+def _pairing_env(name: str) -> str:
+    if is_multiplex_active() and current_secret_scope() is None:
+        return ""
+    return get_secret(name, "") or ""
 
 
 # Unambiguous alphabet -- excludes 0/O, 1/I to prevent confusion
@@ -118,10 +125,14 @@ def _sync_allowlist_add(platform: str, user_id: str) -> None:
     the authz union honors it, so we never silently convert an open gateway into
     a locked one on first pairing.
     """
+    from agent.secret_scope import is_multiplex_active
+
+    if is_multiplex_active():
+        return
     env_var = _allowlist_env_for_platform(platform)
     if not env_var:
         return
-    current = os.getenv(env_var, "").strip()
+    current = _pairing_env(env_var).strip()
     if not current:
         return  # No allowlist configured — leave the gateway open (option i).
     ids = _split_allowlist(current)
@@ -140,10 +151,14 @@ def _sync_allowlist_add(platform: str, user_id: str) -> None:
 
 def _sync_allowlist_remove(platform: str, user_id: str) -> None:
     """Remove ``user_id`` from the platform allowlist env var if present."""
+    from agent.secret_scope import is_multiplex_active
+
+    if is_multiplex_active():
+        return
     env_var = _allowlist_env_for_platform(platform)
     if not env_var:
         return
-    current = os.getenv(env_var, "").strip()
+    current = _pairing_env(env_var).strip()
     if not current:
         return
     ids = _split_allowlist(current)
@@ -248,10 +263,16 @@ class PairingStore:
     directory (backward-compat for the ``hermes pairing`` CLI).
     """
 
-    def __init__(self, profile: Optional[str] = None):
+    def __init__(
+        self,
+        profile: Optional[str] = None,
+        home: Optional[Path] = None,
+    ):
         # Resolve storage directory lazily — tests use a temp HERMES_HOME
         # and PairingStore may be constructed before the env is set.
-        if profile:
+        if home is not None:
+            self._dir = Path(home) / "pairing"
+        elif profile:
             from hermes_constants import get_hermes_home
             self._dir = get_hermes_home() / "profiles" / profile / "pairing"
         else:

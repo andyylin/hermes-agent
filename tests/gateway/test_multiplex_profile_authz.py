@@ -7,6 +7,8 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.session import SessionSource
+from gateway.authz_mixin import _auth_env
+from agent.secret_scope import set_multiplex_active
 
 
 def _clear_auth_env(monkeypatch) -> None:
@@ -66,6 +68,24 @@ def test_secondary_open_policy_not_authorized_by_default_allowlist(monkeypatch):
     assert runner._adapter_dm_policy(Platform.WECOM, profile="coder") == "open"
     assert runner._adapter_dm_policy(Platform.WECOM) == "allowlist"
     assert runner._is_user_authorized(source) is False
+
+
+def test_multiplex_unscoped_auth_env_fails_closed_on_poisoned_process_env(monkeypatch):
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+    monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "poisoned-user")
+    set_multiplex_active(True)
+    try:
+        assert _auth_env("GATEWAY_ALLOW_ALL_USERS") == ""
+        assert _auth_env("GATEWAY_ALLOWED_USERS") == ""
+    finally:
+        set_multiplex_active(False)
+
+
+def test_single_profile_auth_env_preserves_process_environment(monkeypatch):
+    monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "legacy-user")
+    set_multiplex_active(False)
+
+    assert _auth_env("GATEWAY_ALLOWED_USERS") == "legacy-user"
 
 
 def test_default_profile_still_trusts_own_allowlist(monkeypatch):

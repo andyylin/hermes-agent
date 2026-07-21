@@ -26,10 +26,22 @@ import time
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
+from agent.message_sanitization import _sanitize_surrogates
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
+
+
+def _scrub_surrogates(value: Any) -> Any:
+    """Replace lone surrogates when *value* is text; pass anything else through.
+
+    sqlite3 encodes bound ``str`` parameters as UTF-8 and raises
+    ``UnicodeEncodeError`` on lone surrogates (U+D800..U+DFFF), so a single
+    such code point anywhere in a message aborts the whole write. No-op for
+    well-formed text.
+    """
+    return _sanitize_surrogates(value) if isinstance(value, str) else value
 
 
 def workspace_key(row: Dict[str, Any]) -> Optional[str]:
@@ -184,14 +196,17 @@ _last_init_error_lock = threading.Lock()
 _wal_fallback_warned_paths: set[str] = set()
 _wal_fallback_warned_lock = threading.Lock()
 
-_FTS_TRIGGERS = (
+_BASE_FTS_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
     "messages_fts_update",
+)
+_TRIGRAM_FTS_TRIGGERS = (
     "messages_fts_trigram_insert",
     "messages_fts_trigram_delete",
     "messages_fts_trigram_update",
 )
+_FTS_TRIGGERS = _BASE_FTS_TRIGGERS + _TRIGRAM_FTS_TRIGGERS
 
 
 def _set_last_init_error(msg: Optional[str]) -> None:
@@ -817,7 +832,8 @@ CREATE TABLE IF NOT EXISTS messages (
     platform_message_id TEXT,
     observed INTEGER DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
-    compacted INTEGER NOT NULL DEFAULT 0
+    compacted INTEGER NOT NULL DEFAULT 0,
+    api_content TEXT
 );
 
 CREATE TABLE IF NOT EXISTS session_model_usage (
@@ -1195,6 +1211,26 @@ class SessionDB:
                 cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             except sqlite3.OperationalError:
                 pass
+
+    def _retire_trigram_fts(self, cursor: sqlite3.Cursor) -> None:
+        """Detach disabled trigram FTS so it cannot poison message writes.
+
+        Dropping the write triggers is mandatory.  Dropping the virtual table is
+        best-effort because an already-corrupt FTS shadow tree can make SQLite
+        reject ``DROP TABLE``; with the triggers gone, canonical message writes
+        remain safe and CJK/substring search uses the existing LIKE fallback.
+        """
+        for trigger in _TRIGRAM_FTS_TRIGGERS:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        try:
+            cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+        except sqlite3.DatabaseError as exc:
+            logger.warning(
+                "Detached legacy trigram FTS triggers for %s but could not drop "
+                "the table; LIKE fallback remains active: %s",
+                self.db_path,
+                exc,
+            )
 
     @staticmethod
     def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
@@ -1658,61 +1694,36 @@ class SessionDB:
                 else:
                     fts_migrations_complete = False
             if current_version < 11:
-                # v11: re-index FTS5 tables to cover tool_name + tool_calls and
-                # switch from external-content to inline mode. Existing DBs have
-                # old-schema FTS tables and triggers that IF NOT EXISTS won't
-                # overwrite, so we drop them explicitly and let the post-migration
-                # existence checks (below) recreate them from FTS_SQL /
-                # FTS_TRIGRAM_SQL, then backfill every message row. Fixes #16751.
+                # v11: re-index base FTS to cover tool_name + tool_calls and
+                # switch to the current external-content schema. Existing DBs
+                # may still have obsolete base/trigram tables and triggers, so
+                # retire trigram, recreate base FTS, and backfill canonical rows.
                 if fts5_available:
                     self._drop_fts_triggers(cursor)
-                    for _tbl in ("messages_fts", "messages_fts_trigram"):
-                        try:
-                            cursor.execute(f"DROP TABLE IF EXISTS {_tbl}")
-                        except sqlite3.OperationalError as exc:
-                            if not self._is_fts5_unavailable_error(exc):
-                                raise
-                            if self._is_trigram_unavailable_error(exc):
-                                self._warn_trigram_unavailable(exc)
-                            else:
-                                self._warn_fts5_unavailable(exc)
-                                fts5_available = False
-                                fts_migrations_complete = False
-                            break
+                    self._retire_trigram_fts(cursor)
+                    try:
+                        cursor.execute("DROP TABLE IF EXISTS messages_fts")
+                    except sqlite3.OperationalError as exc:
+                        if not self._is_fts5_unavailable_error(exc):
+                            raise
+                        self._warn_fts5_unavailable(exc)
+                        fts5_available = False
+                        fts_migrations_complete = False
 
                     if fts5_available:
-                        # Recreate virtual tables + triggers with the new inline-mode
-                        # schema that indexes content || tool_name || tool_calls.
-                        # Handle base and trigram independently — a missing
-                        # trigram tokenizer should not prevent base FTS backfill.
+                        # Recreate and backfill only the supported base index.
+                        # Trigram is retired on this runtime; CJK/substring
+                        # search deliberately uses the LIKE fallback.
                         base_fts_ok = self._ensure_fts_schema(
                             cursor, "messages_fts", FTS_SQL
                         )
                         if base_fts_ok:
-                            cursor.execute(
-                                "INSERT INTO messages_fts(rowid, content) "
-                                "SELECT id, "
-                                "COALESCE(content, '') || ' ' || "
-                                "COALESCE(tool_name, '') || ' ' || "
-                                "COALESCE(tool_calls, '') "
-                                "FROM messages"
+                            self._rebuild_fts_indexes(
+                                cursor, include_trigram=False
                             )
-                        trigram_ok = self._ensure_fts_schema(
-                            cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                        )
-                        if trigram_ok:
-                            cursor.execute(
-                                "INSERT INTO messages_fts_trigram(rowid, content) "
-                                "SELECT id, "
-                                "COALESCE(content, '') || ' ' || "
-                                "COALESCE(tool_name, '') || ' ' || "
-                                "COALESCE(tool_calls, '') "
-                                "FROM messages"
-                            )
-                        if not base_fts_ok:
+                        else:
                             fts_migrations_complete = False
-                        # Track trigram availability for CJK LIKE fallback.
-                        self._trigram_available = trigram_ok
+                        self._trigram_available = False
                     else:
                         fts_migrations_complete = False
                 else:
@@ -1926,11 +1937,12 @@ class SessionDB:
             triggers_need_repair = int(row[0] if not isinstance(row, sqlite3.Row) else row[0]) < len(base_fts_triggers)
             self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
 
-            # Trigram FTS5 is deliberately disabled on this SQLite/runtime path.
+            # Trigram FTS5 is deliberately retired on this SQLite/runtime path.
             # The real corpus repeatedly produced globally malformed trigram
-            # indexes even when FTS5's own integrity-check passed. Base FTS stays
-            # enabled for normal/tool-field search; CJK/substring search falls
-            # back to LIKE instead of poisoning PRAGMA integrity_check.
+            # indexes. Remove its write triggers and table so a disabled index
+            # cannot continue poisoning message writes; CJK/substring search
+            # falls back to LIKE.
+            self._retire_trigram_fts(cursor)
             self._trigram_available = False
             if self._fts_enabled and triggers_need_repair:
                 self._rebuild_fts_indexes(cursor, include_trigram=False)
@@ -2495,26 +2507,6 @@ class SessionDB:
                 "UPDATE sessions SET cwd = ?, git_branch = ?, git_repo_root = ? "
                 "WHERE id = ?",
                 (cwd, git_branch or None, git_repo_root or None, session_id),
-            )
-
-        self._execute_write(_do)
-
-    def restore_session_workspace(
-        self,
-        session_id: str,
-        cwd: Optional[str],
-        git_branch: Optional[str] = None,
-        git_repo_root: Optional[str] = None,
-    ) -> None:
-        """Restore an exact workspace snapshot, including a NULL cwd."""
-        if not session_id:
-            return
-
-        def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET cwd = ?, git_branch = ?, git_repo_root = ? "
-                "WHERE id = ?",
-                (cwd or None, git_branch or None, git_repo_root or None, session_id),
             )
 
         self._execute_write(_do)
@@ -3384,6 +3376,10 @@ class SessionDB:
         if not title:
             return None
 
+        # Lone surrogates cannot be bound by sqlite3 (UnicodeEncodeError at
+        # UTF-8 encode time) — scrub them like every other write path here.
+        title = _sanitize_surrogates(title)
+
         # Remove ASCII control characters (0x00-0x1F, 0x7F) but keep
         # whitespace chars (\t=0x09, \n=0x0A, \r=0x0D) so they can be
         # normalized to spaces by the whitespace collapsing step below
@@ -4190,13 +4186,26 @@ class SessionDB:
         sentinel-prefixed JSON string for lists/dicts. Paired with
         :meth:`_decode_content` on read.
         """
-        if content is None or isinstance(content, (str, bytes, int, float)):
+        if isinstance(content, str):
+            # Lone UTF-16 surrogates reach here inside tool results scraped
+            # from the web/social platforms (the same input that crashed the
+            # guardrail hasher). The proactive sanitizer upstream only cleans
+            # the *api_messages* copy, and the recovery sanitizer only runs
+            # after the API call itself raises — which it no longer does — so
+            # the canonical history keeps them and this write is where they
+            # land. Left raw, sqlite3 raises UnicodeEncodeError, the flush is
+            # abandoned, and the session silently stops persisting for the
+            # rest of its life. Scrub so persistence never fails.
+            return _sanitize_surrogates(content)
+        if content is None or isinstance(content, (bytes, int, float)):
             return content
         try:
+            # json.dumps defaults to ensure_ascii=True, which escapes any
+            # surrogate as \udXXX — already safe to bind.
             return cls._CONTENT_JSON_PREFIX + json.dumps(content)
         except (TypeError, ValueError):
             # Last-resort fallback: stringify so persistence never fails.
-            return str(content)
+            return _sanitize_surrogates(str(content))
 
     @classmethod
     def _decode_content(cls, content: Any) -> Any:
@@ -4231,6 +4240,7 @@ class SessionDB:
         observed: bool = False,
         effect_disposition: Optional[str] = None,
         timestamp: Any = None,
+        api_content: Optional[str] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -4243,6 +4253,14 @@ class SessionDB:
         independent of the SQLite autoincrement primary key and is used by
         platform-specific flows like yuanbao's recall guard to redact a
         message by its platform-side identifier.
+
+        ``api_content`` is the exact content string sent to the API for this
+        message when it differs from ``content`` (ephemeral memory/plugin
+        injections, persist overrides).  It is a byte-fidelity sidecar for
+        prompt-cache-stable replay — stored as sent, except lone surrogates
+        (which sqlite3 cannot bind and which the conversation loop scrubs
+        from every outgoing payload anyway, so the scrubbed form IS the
+        wire bytes).
         """
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
@@ -4282,27 +4300,28 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, api_content)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
                     stored_content,
                     tool_call_id,
                     tool_calls_json,
-                    tool_name,
+                    _scrub_surrogates(tool_name),
                     effect_disposition,
                     message_timestamp,
                     token_count,
                     finish_reason,
-                    reasoning,
-                    reasoning_content,
+                    _scrub_surrogates(reasoning),
+                    _scrub_surrogates(reasoning_content),
                     reasoning_details_json,
                     codex_items_json,
                     codex_message_items_json,
                     platform_message_id,
                     1 if observed else 0,
                     1,
+                    _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -4371,31 +4390,34 @@ class SessionDB:
                 msg.get("platform_message_id") or msg.get("message_id")
             )
 
+            api_content = msg.get("api_content")
+
             conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, api_content)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
                     self._encode_content(msg.get("content")),
                     msg.get("tool_call_id"),
                     tool_calls_json,
-                    msg.get("tool_name"),
+                    _scrub_surrogates(msg.get("tool_name")),
                     msg.get("effect_disposition"),
                     message_timestamp,
                     msg.get("token_count"),
                     msg.get("finish_reason"),
-                    msg.get("reasoning") if role == "assistant" else None,
-                    msg.get("reasoning_content") if role == "assistant" else None,
+                    _scrub_surrogates(msg.get("reasoning")) if role == "assistant" else None,
+                    _scrub_surrogates(msg.get("reasoning_content")) if role == "assistant" else None,
                     reasoning_details_json,
                     codex_items_json,
                     codex_message_items_json,
                     platform_msg_id,
                     1 if msg.get("observed") else 0,
                     1,
+                    _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                 ),
             )
             inserted += 1
@@ -4520,6 +4542,37 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    def set_latest_user_api_content(
+        self, session_id: str, content: Any, api_content: str
+    ) -> int:
+        """Backfill the ``api_content`` sidecar onto the newest ACTIVE user row.
+
+        In-place preflight compaction (:meth:`archive_and_compact`) inserts the
+        current turn's user row BEFORE the turn prologue composes the
+        prefetch/plugin sidecar, and the subsequent crash persist identity-skips
+        every compacted dict — without this backfill the stamped sidecar would
+        never land in the DB and any reload would replay clean content,
+        re-introducing the prompt-cache divergence the sidecar exists to close.
+
+        The ``content`` match is a defensive guard: if the newest active user
+        row is not the message the caller stamped (racing rewrite, unexpected
+        tail shape), nothing is written. Returns the number of rows updated
+        (0 or 1).
+        """
+        encoded = self._encode_content(content)
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE messages SET api_content = ? WHERE id = ("
+                "SELECT id FROM messages "
+                "WHERE session_id = ? AND role = 'user' AND active = 1 "
+                "ORDER BY id DESC LIMIT 1"
+                ") AND content IS ?",
+                (_scrub_surrogates(api_content), session_id, encoded),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do)
 
     def get_messages(
         self,
@@ -4893,7 +4946,8 @@ class SessionDB:
             rows = self._conn.execute(
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
-                "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp "
+                "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
+                "api_content "
                 f"FROM messages WHERE session_id IN ({placeholders})"
                 # Order by AUTOINCREMENT id (true insertion order), NOT timestamp:
                 # append_message stamps rows with time.time(), which is not
@@ -4907,12 +4961,52 @@ class SessionDB:
                 tuple(session_ids),
             ).fetchall()
 
+        return self._rows_to_conversation(
+            rows,
+            session_id=session_id,
+            include_ancestors=include_ancestors,
+            repair_alternation=repair_alternation,
+        )
+
+    # Columns every conversation projection decodes. Shared by
+    # get_messages_as_conversation and get_resume_conversations so a single
+    # SELECT can feed both the model-fed and display views.
+    _CONVERSATION_ROW_COLUMNS = (
+        "role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
+        "finish_reason, reasoning, reasoning_content, reasoning_details, "
+        "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
+        "api_content"
+    )
+
+    def _rows_to_conversation(
+        self,
+        rows,
+        *,
+        session_id: str,
+        include_ancestors: bool,
+        repair_alternation: bool,
+    ) -> List[Dict[str, Any]]:
+        """Decode fetched message rows into the OpenAI conversation format.
+
+        Extracted from get_messages_as_conversation so get_resume_conversations
+        can build the model-fed and display views from one SELECT. ``rows`` must
+        already be ordered by ``id`` (insertion order) and filtered to the
+        desired session set / active state by the caller.
+        """
         messages = []
         for row in rows:
             content = self._decode_content(row["content"])
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
+            # api_content is the byte-fidelity sidecar: the exact string sent
+            # to the API when it differed from the clean content. Returned
+            # VERBATIM — no sanitize_context, no strip — because the replay
+            # path substitutes it for content to keep the provider prompt
+            # cache prefix byte-stable across turns. Cleaning it here would
+            # re-introduce the divergence it exists to remove.
+            if row["api_content"]:
+                msg["api_content"] = row["api_content"]
             if row["timestamp"]:
                 msg["timestamp"] = row["timestamp"]
             if row["tool_call_id"]:
@@ -4994,6 +5088,96 @@ class SessionDB:
                     session_id,
                 )
         return messages
+
+    def get_resume_conversations(
+        self, session_id: str
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Return ``(model_history, display_history)`` for a session resume in ONE SELECT.
+
+        ``session.resume`` needs two projections of the same lineage:
+
+        - ``model_history`` — the tip session's active rows, alternation-repaired
+          (the live-replay working conversation). Equivalent to
+          ``get_messages_as_conversation(session_id, repair_alternation=True)``.
+        - ``display_history`` — the full lineage (ancestors → tip), verbatim, with
+          replayed-user dedup. Equivalent to
+          ``get_messages_as_conversation(session_id, include_ancestors=True)``.
+
+        The display fetch already reads a superset of the model fetch (the tip
+        rows are part of the lineage), so serving both from one lineage SELECT
+        halves the resume's DB work versus two separate calls, with byte-identical
+        output (see test_get_resume_conversations_matches_separate_reads).
+        """
+        session_ids = self._session_lineage_root_to_tip(session_id)
+        with self._lock:
+            placeholders = ",".join("?" for _ in session_ids)
+            rows = self._conn.execute(
+                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
+                f"FROM messages WHERE session_id IN ({placeholders}) AND active = 1 "
+                # ORDER BY id (insertion order) — see get_messages_as_conversation
+                # for why timestamp ordering is unsafe.
+                "ORDER BY id",
+                tuple(session_ids),
+            ).fetchall()
+
+        # Tip rows are exactly the model-fed set (get_messages_as_conversation
+        # with session_ids=[session_id]); filtering the lineage fetch preserves
+        # their relative id order.
+        tip_rows = [r for r in rows if r["session_id"] == session_id]
+        model_history = self._rows_to_conversation(
+            tip_rows,
+            session_id=session_id,
+            include_ancestors=False,
+            repair_alternation=True,
+        )
+        display_history = self._rows_to_conversation(
+            rows,
+            session_id=session_id,
+            include_ancestors=True,
+            repair_alternation=False,
+        )
+        return model_history, display_history
+
+    def get_ancestor_display_prefix(self, session_id: str) -> List[Dict[str, Any]]:
+        """Return the ancestor-only display messages for a session lineage.
+
+        These are messages from parent/grandparent sessions (compression
+        ancestors) that appear in the display transcript but NOT in the
+        tip session's model-fed history. Used by ``session.resume`` to
+        build the ``display_history_prefix`` that ``_live_session_payload``
+        prepends to the live model history.
+
+        Previously the prefix was calculated as
+        ``display_history[:len(display) - len(raw)]``, but that overcounts
+        when ``repair_message_sequence`` removes messages from the MIDDLE
+        of the tip history (e.g. verification candidates collapsed by the
+        consecutive-assistant merge) — the length difference includes both
+        ancestor messages AND repair-removed tip messages, but the slice
+        only captures the first N display messages (which are tip messages
+        when there are no ancestors), causing duplication. This method
+        returns ONLY the genuine ancestor messages, identified by
+        ``session_id != tip_session_id``. (#65919)
+        """
+        session_ids = self._session_lineage_root_to_tip(session_id)
+        if len(session_ids) <= 1:
+            return []
+        with self._lock:
+            placeholders = ",".join("?" for _ in session_ids)
+            rows = self._conn.execute(
+                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
+                f"FROM messages WHERE session_id IN ({placeholders}) AND active = 1 "
+                "ORDER BY id",
+                tuple(session_ids),
+            ).fetchall()
+        ancestor_rows = [r for r in rows if r["session_id"] != session_id]
+        if not ancestor_rows:
+            return []
+        return self._rows_to_conversation(
+            ancestor_rows,
+            session_id=session_id,
+            include_ancestors=True,
+            repair_alternation=False,
+        )
 
     def get_conversation_root(self, session_id: str) -> str:
         """Return the ROOT id of *session_id*'s lineage chain.

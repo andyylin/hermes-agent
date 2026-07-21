@@ -13,6 +13,7 @@ import { useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
 import {
   Activity,
+  AppWindow,
   Archive,
   BarChart3,
   ChevronLeft,
@@ -56,9 +57,11 @@ import {
 } from '@/store/command-palette'
 import { $bindings } from '@/store/keybinds'
 import { openPetGenerate } from '@/store/pet-generate'
+import { $activeGatewayProfile, $activeGatewayProfileGeneration } from '@/store/profile'
 import { requestStartWorkSession } from '@/store/projects'
 import { runGatewayRestart } from '@/store/system-actions'
 import { applyBackendUpdate } from '@/store/updates'
+import { canOpenNewWindow, openNewWindow } from '@/store/windows'
 import { luminance } from '@/themes/color'
 import { type ThemeMode, useTheme } from '@/themes/context'
 import { isUserTheme, resolveTheme } from '@/themes/user-themes'
@@ -297,6 +300,14 @@ export function CommandPalette() {
   const pendingPage = useStore($commandPalettePage)
   const bindings = useStore($bindings)
   const worktrees = useStore($repoWorktrees)
+  const activeProfile = useStore($activeGatewayProfile)
+  const profileGeneration = useStore($activeGatewayProfileGeneration)
+
+  const worktreeOwner = useMemo(
+    () => ({ generation: profileGeneration, profile: activeProfile }),
+    [activeProfile, profileGeneration]
+  )
+
   const navigate = useNavigate()
   const { availableThemes, resolvedMode, setMode, setTheme, themeName } = useTheme()
   const [search, setSearch] = useState('')
@@ -394,7 +405,7 @@ export function CommandPalette() {
                   id: `worktree-${wt.path}`,
                   keywords: ['branch', 'worktree', 'switch', name, wt.path],
                   label: cc.startInBranch(name),
-                  run: () => requestStartWorkSession(wt.path)
+                  run: () => requestStartWorkSession(wt.path, '', worktreeOwner.profile, worktreeOwner.generation)
                 }
               })
             }
@@ -413,6 +424,18 @@ export function CommandPalette() {
             label: cc.nav.newChat.title,
             run: go(NEW_CHAT_ROUTE)
           },
+          ...(canOpenNewWindow()
+            ? [
+                {
+                  action: 'session.newWindow',
+                  icon: AppWindow,
+                  id: 'nav-new-window',
+                  keywords: ['window', 'instance', 'open', 'new'],
+                  label: t.keybinds.actions['session.newWindow'],
+                  run: () => void openNewWindow()
+                }
+              ]
+            : []),
           {
             action: 'view.showTerminal',
             icon: Terminal,
@@ -583,7 +606,7 @@ export function CommandPalette() {
           ]
         : [])
     ]
-  }, [contributedItems, go, settingsSectionLabel, t, worktrees])
+  }, [contributedItems, go, settingsSectionLabel, t, worktreeOwner, worktrees])
 
   // The long, granular lists (settings fields, API keys, MCP servers, archived
   // chats) only surface once the user types — otherwise they'd bury the

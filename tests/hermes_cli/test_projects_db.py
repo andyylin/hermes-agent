@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import sqlite3
 
 import pytest
 
@@ -133,95 +132,6 @@ def test_project_for_path_skips_archived(conn):
 
     pdb.restore_project(conn, pid)
     assert pdb.project_for_path(conn, "/www/app/src").id == pid
-
-
-def test_assign_session_to_project_upserts_and_lists(conn):
-    first = pdb.create_project(conn, name="First", folders=["/first"])
-    second = pdb.create_project(conn, name="Second", folders=["/second"])
-
-    pdb.assign_session(conn, first, "s_123", previous_cwd="/before")
-    pdb.assign_session(conn, second, "s_123", previous_cwd="/ignored")
-
-    assert pdb.list_session_assignments(conn) == {"s_123": second}
-    assert pdb.previous_session_cwd(conn, "s_123") == "/before"
-
-
-def test_reassign_after_detach_captures_a_new_previous_cwd(conn):
-    pid = pdb.create_project(conn, name="Assigned", folders=["/assigned"])
-    pdb.assign_session(conn, pid, "s_123", previous_cwd="/before-1")
-    pdb.exclude_session(conn, "s_123")
-
-    pdb.assign_session(conn, pid, "s_123", previous_cwd="/before-2")
-
-    assert pdb.previous_session_cwd(conn, "s_123") == "/before-2"
-
-
-def test_exclude_session_preserves_explicit_no_project(conn):
-    pid = pdb.create_project(conn, name="Assigned", folders=["/assigned"])
-    pdb.assign_session(conn, pid, "s_123", previous_cwd="/before")
-
-    assert pdb.exclude_session(conn, "s_123") == "/before"
-    assert pdb.list_session_assignments(conn) == {"s_123": None}
-
-
-def test_project_delete_detaches_session_assignments(conn):
-    pid = pdb.create_project(conn, name="Assigned", folders=["/assigned"])
-    pdb.assign_session(conn, pid, "s_123")
-
-    pdb.delete_project(conn, pid)
-
-    assert pdb.list_session_assignments(conn) == {"s_123": None}
-
-
-def test_archived_project_assignment_returns_to_inference(conn):
-    pid = pdb.create_project(conn, name="Assigned", folders=["/assigned"])
-    next_pid = pdb.create_project(conn, name="Next", folders=["/next"])
-    pdb.assign_session(conn, pid, "s_123", previous_cwd="/before-1")
-
-    pdb.archive_project(conn, pid)
-
-    assert pdb.list_session_assignments(conn) == {}
-    pdb.assign_session(conn, next_pid, "s_123", previous_cwd="/before-2")
-    assert pdb.list_session_assignments(conn) == {"s_123": next_pid}
-    assert pdb.previous_session_cwd(conn, "s_123") == "/before-2"
-
-
-def test_assignment_schema_migrates_from_original_pr(tmp_path):
-    path = tmp_path / "projects.db"
-    current = pdb.connect(db_path=path)
-    pid = pdb.create_project(current, name="Legacy", folders=["/legacy"])
-    current.close()
-
-    raw = sqlite3.connect(path)
-    raw.execute("DROP TABLE project_session_assignments")
-    raw.execute(
-        "CREATE TABLE project_session_assignments ("
-        "session_id TEXT PRIMARY KEY, "
-        "project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, "
-        "assigned_at INTEGER NOT NULL)"
-    )
-    raw.execute(
-        "INSERT INTO project_session_assignments VALUES (?, ?, ?)",
-        ("s_legacy", pid, 1),
-    )
-    raw.commit()
-    raw.close()
-
-    pdb._INITIALIZED_PATHS.discard(str(path.resolve()))
-    upgraded = pdb.connect(db_path=path)
-    try:
-        columns = {
-            row["name"]: row
-            for row in upgraded.execute("PRAGMA table_info(project_session_assignments)")
-        }
-        assert columns["project_id"]["notnull"] == 0
-        assert "previous_cwd" in columns
-        assert pdb.list_session_assignments(upgraded) == {"s_legacy": pid}
-
-        pdb.delete_project(upgraded, pid)
-        assert pdb.list_session_assignments(upgraded) == {"s_legacy": None}
-    finally:
-        upgraded.close()
 
 
 def test_active_pointer(conn):

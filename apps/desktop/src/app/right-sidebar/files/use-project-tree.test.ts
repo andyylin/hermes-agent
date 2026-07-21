@@ -2,6 +2,7 @@ import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { HermesReadDirResult } from '@/global'
+import { $activeGatewayProfile, $activeGatewayProfileGeneration } from '@/store/profile'
 import { $connection } from '@/store/session'
 
 import { clearProjectDirCache, readProjectDir } from './ipc'
@@ -10,10 +11,19 @@ import { resetProjectTreeState, useProjectTree } from './use-project-tree'
 const readDir = vi.fn<(path: string) => Promise<HermesReadDirResult>>()
 
 beforeEach(() => {
+  $activeGatewayProfile.set('default')
+  $activeGatewayProfileGeneration.set(0)
   $connection.set(null)
   resetProjectTreeState()
   readDir.mockReset()
-  ;(window as unknown as { hermesDesktop: { readDir: typeof readDir } }).hermesDesktop = { readDir }
+  ;(
+    window as unknown as {
+      hermesDesktop: { getConnection: () => Promise<{ mode: 'local'; profile: string }>; readDir: typeof readDir }
+    }
+  ).hermesDesktop = {
+    getConnection: async () => ({ mode: 'local', profile: 'default' }),
+    readDir
+  }
 })
 
 afterEach(() => {
@@ -238,7 +248,7 @@ describe('useProjectTree', () => {
 
       throw new Error(`unexpected path ${path}`)
     })
-    ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = { readDir, sanitizeWorkspaceCwd }
+    window.hermesDesktop = { ...window.hermesDesktop, readDir, sanitizeWorkspaceCwd }
 
     const { result } = renderHook(() => useProjectTree('/deleted/worktree'))
 
@@ -253,12 +263,41 @@ describe('useProjectTree', () => {
   it('keeps the root error when sanitize offers no usable fallback', async () => {
     const sanitizeWorkspaceCwd = vi.fn(async () => ({ cwd: '/deleted/worktree', sanitized: false }))
     readDir.mockResolvedValue({ entries: [], error: 'ENOENT' })
-    ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = { readDir, sanitizeWorkspaceCwd }
+    window.hermesDesktop = { ...window.hermesDesktop, readDir, sanitizeWorkspaceCwd }
 
     const { result } = renderHook(() => useProjectTree('/deleted/worktree'))
 
     await waitFor(() => expect(result.current.rootError).toBe('ENOENT'))
     expect(result.current.effectiveCwd).toBe('/deleted/worktree')
+  })
+
+  it('does not publish an old root after an alpha to beta to alpha generation swap', async () => {
+    let resolveOld: ((value: HermesReadDirResult) => void) | undefined
+
+    const oldRead = new Promise<HermesReadDirResult>(resolve => {
+      resolveOld = resolve
+    })
+
+    $activeGatewayProfile.set('alpha')
+    readDir
+      .mockImplementationOnce(() => oldRead)
+      .mockResolvedValueOnce(ok([{ name: 'beta', path: '/p/beta', isDirectory: false }]))
+      .mockResolvedValueOnce(ok([{ name: 'fresh-alpha', path: '/p/fresh', isDirectory: false }]))
+
+    const { result } = renderHook(() => useProjectTree('/p'))
+
+    await waitFor(() => expect(readDir).toHaveBeenCalledTimes(1))
+
+    act(() => $activeGatewayProfile.set('beta'))
+    await waitFor(() => expect(readDir).toHaveBeenCalledTimes(2))
+
+    act(() => $activeGatewayProfile.set('alpha'))
+    await waitFor(() => expect(readDir).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(result.current.data[0]?.name).toBe('fresh-alpha'))
+
+    await act(async () => resolveOld?.(ok([{ name: 'stale-alpha', path: '/p/stale', isDirectory: false }])))
+
+    expect(result.current.data[0]?.name).toBe('fresh-alpha')
   })
 
   it('returns no-bridge gracefully when window.hermesDesktop is missing', async () => {

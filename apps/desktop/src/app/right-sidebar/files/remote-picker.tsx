@@ -1,11 +1,12 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog'
 import { useI18n } from '@/i18n'
-import { readDesktopDir, setDesktopFsRemotePicker } from '@/lib/desktop-fs'
+import { readDesktopDir, readDesktopDirForProfile, setDesktopFsRemotePicker } from '@/lib/desktop-fs'
 import { cn } from '@/lib/utils'
+import { $activeGatewayProfile, $activeGatewayProfileGeneration, normalizeProfileKey } from '@/store/profile'
 
 function clean(path: string) {
   return path.replace(/\/+$/, '') || '/'
@@ -29,6 +30,8 @@ function pathName(path: string) {
 
 interface PendingSelection {
   defaultPath: string
+  generation: number
+  profile?: string
   resolve: (paths: string[]) => void
   title: string
 }
@@ -36,27 +39,98 @@ interface PendingSelection {
 export function RemoteFolderPicker() {
   const { t } = useI18n()
   const r = t.rightSidebar
+
   const [pending, setPending] = useState<PendingSelection | null>(null)
+  const pendingRef = useRef<PendingSelection | null>(null)
   const [currentPath, setCurrentPath] = useState('/')
   const [entries, setEntries] = useState<Array<{ name: string; path: string }>>([])
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
 
+  const ownsPending = useCallback(
+    (request: PendingSelection) =>
+      pendingRef.current === request &&
+      normalizeProfileKey(request.profile) === normalizeProfileKey($activeGatewayProfile.get()) &&
+      request.generation === $activeGatewayProfileGeneration.get(),
+    []
+  )
+
   useEffect(() => {
+    const invalidateStalePending = () => {
+      const request = pendingRef.current
+
+      if (request && !ownsPending(request)) {
+        request.resolve([])
+        pendingRef.current = null
+        setPending(null)
+        setEntries([])
+        setError(null)
+        setLoading(false)
+      }
+    }
+
+    const unsubscribeProfile = $activeGatewayProfile.subscribe(invalidateStalePending)
+
+    const unsubscribeGeneration = $activeGatewayProfileGeneration.subscribe(invalidateStalePending)
+
     setDesktopFsRemotePicker({
-      selectPaths: options =>
+      selectPaths: (options, profile, generation) =>
         new Promise(resolve => {
+          const requestProfile = normalizeProfileKey(profile || $activeGatewayProfile.get())
+          const requestGeneration = generation ?? $activeGatewayProfileGeneration.get()
+
+          if (
+            requestProfile !== normalizeProfileKey($activeGatewayProfile.get()) ||
+            requestGeneration !== $activeGatewayProfileGeneration.get()
+          ) {
+            resolve([])
+
+            return
+          }
+
           const defaultPath = clean(options?.defaultPath || '/')
+
+          const next = {
+            defaultPath,
+            generation: requestGeneration,
+            profile: requestProfile,
+            resolve,
+            title: options?.title || r.remotePickerTitle
+          }
+
+          if (
+            requestProfile !== normalizeProfileKey($activeGatewayProfile.get()) ||
+            requestGeneration !== $activeGatewayProfileGeneration.get()
+          ) {
+            resolve([])
+
+            return
+          }
+
+          // There is one global picker surface. Replacing a request must settle
+          // the previous caller instead of leaving its promise pending forever.
+          pendingRef.current?.resolve([])
+          pendingRef.current = next
           setCurrentPath(defaultPath)
-          setPending({ defaultPath, resolve, title: options?.title || r.remotePickerTitle })
+          setPending(next)
         })
     })
 
-    return () => setDesktopFsRemotePicker(null)
-  }, [r.remotePickerTitle])
+    return () => {
+      unsubscribeGeneration()
+      unsubscribeProfile()
+      pendingRef.current?.resolve([])
+      pendingRef.current = null
+      setDesktopFsRemotePicker(null)
+    }
+  }, [ownsPending, r.remotePickerTitle])
 
   useEffect(() => {
     if (!pending) {
+      return
+    }
+
+    if (!ownsPending(pending)) {
       return
     }
 
@@ -64,9 +138,13 @@ export function RemoteFolderPicker() {
     setLoading(true)
     setError(null)
 
-    void readDesktopDir(currentPath)
+    const readDir = pending.profile
+      ? readDesktopDirForProfile(pending.profile, pending.generation, currentPath)
+      : readDesktopDir(currentPath)
+
+    void readDir
       .then(result => {
-        if (!active) {
+        if (!active || !ownsPending(pending)) {
           return
         }
 
@@ -82,13 +160,13 @@ export function RemoteFolderPicker() {
         )
       })
       .catch(err => {
-        if (active) {
+        if (active && ownsPending(pending)) {
           setError(err instanceof Error ? err.message : String(err))
           setEntries([])
         }
       })
       .finally(() => {
-        if (active) {
+        if (active && ownsPending(pending)) {
           setLoading(false)
         }
       })
@@ -96,7 +174,7 @@ export function RemoteFolderPicker() {
     return () => {
       active = false
     }
-  }, [currentPath, pending])
+  }, [currentPath, ownsPending, pending])
 
   const crumbs = useMemo(() => {
     const parts = clean(currentPath).split('/').filter(Boolean)
@@ -112,10 +190,25 @@ export function RemoteFolderPicker() {
   }, [currentPath])
 
   const close = (paths: string[] = []) => {
-    pending?.resolve(paths)
+    const request = pendingRef.current
+
+    if (!request || !ownsPending(request)) {
+      return
+    }
+
+    request.resolve(paths)
+    pendingRef.current = null
     setPending(null)
     setEntries([])
     setError(null)
+  }
+
+  const setCurrentOwnedPath = (path: string) => {
+    const request = pendingRef.current
+
+    if (request && ownsPending(request)) {
+      setCurrentPath(path)
+    }
   }
 
   return (
@@ -135,7 +228,7 @@ export function RemoteFolderPicker() {
                   index === crumbs.length - 1 && 'text-foreground'
                 )}
                 key={crumb.path}
-                onClick={() => setCurrentPath(crumb.path)}
+                onClick={() => setCurrentOwnedPath(crumb.path)}
                 type="button"
               >
                 {crumb.label}
@@ -147,7 +240,7 @@ export function RemoteFolderPicker() {
             <FolderRow
               disabled={currentPath === '/'}
               name=".."
-              onClick={() => setCurrentPath(parentDir(currentPath))}
+              onClick={() => setCurrentOwnedPath(parentDir(currentPath))}
             />
             {loading ? (
               <div className="flex items-center gap-2 px-2 py-3 text-xs text-muted-foreground">
@@ -160,7 +253,7 @@ export function RemoteFolderPicker() {
               <div className="px-2 py-3 text-xs text-muted-foreground">{r.emptyBody}</div>
             ) : (
               entries.map(entry => (
-                <FolderRow key={entry.path} name={pathName(entry.path)} onClick={() => setCurrentPath(entry.path)} />
+                <FolderRow key={entry.path} name={pathName(entry.path)} onClick={() => setCurrentOwnedPath(entry.path)} />
               ))
             )}
           </div>

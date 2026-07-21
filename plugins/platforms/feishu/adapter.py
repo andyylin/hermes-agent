@@ -128,6 +128,7 @@ except ImportError:
 FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
 
+from agent.secret_scope import get_secret, is_multiplex_active, profile_env_int
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -152,11 +153,24 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _MARKDOWN_HINT_RE = re.compile(
-    r"(^#{1,6}\s)|(^\s*[-*]\s)|(^\s*\d+\.\s)|(^\s*---+\s*$)|(```)|(`[^`\n]+`)|(\*\*[^*\n].+?\*\*)|(~~[^~\n].+?~~)|(<u>.+?</u>)|(\*[^*\n]+\*)|(\[[^\]]+\]\([^)]+\))|(^>\s)",
+    # Pipe table: any header line + separator line both starting with '|'.
+    r"(^\|.*\|\s*\n\|[-:|\s]+\|)"
+    # Headings, lists, code, bold/italic/strike/underline, links, blockquotes.
+    r"|(^#{1,6}\s)"
+    r"|(^\s*[-*]\s)"
+    r"|(^\s*\d+\.\s)"
+    r"|(^\s*---+\s*$)"
+    r"|(```)"
+    r"|(`[^`\n]+`)"
+    r"|(\*\*[^*\n].+?\*\*)"
+    r"|(~~[^~\n].+?~~)"
+    r"|(<u>.+?</u>)"
+    r"|(\*[^*\n]+\*)"
+    r"|(\[[^\]]+\]\([^)]+\))"
+    r"|(^>\s)",
     re.MULTILINE,
 )
-# Detect markdown tables: a line starting with | followed by a separator line.
-# Feishu post-type 'md' elements do not render tables, so we force text mode.
+# Backwards-compatible alias retained because external callers reference it.
 _MARKDOWN_TABLE_RE = re.compile(r"^\|.*\|\n\|[-|: ]+\|", re.MULTILINE)
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
@@ -1528,9 +1542,10 @@ class FeishuAdapter(BasePlatformAdapter):
         # Default group policy (for groups not in group_rules)
         default_group_policy = str(extra.get("default_group_policy", "")).strip().lower()
 
-        # Env-only so adapter and gateway auth bypass share one source; yaml
-        # feishu.allow_bots is bridged to this env var at config load.
-        allow_bots = os.getenv("FEISHU_ALLOW_BOTS", "none").strip().lower()
+        allow_bots = str(
+            extra.get("allow_bots") if is_multiplex_active()
+            else get_secret("FEISHU_ALLOW_BOTS", "none")
+        ).strip().lower()
         if allow_bots not in {"none", "mentions", "all"}:
             logger.warning(
                 "[Feishu] Unknown allow_bots=%r, falling back to 'none'. Valid: none, mentions, all.",
@@ -1539,25 +1554,25 @@ class FeishuAdapter(BasePlatformAdapter):
             allow_bots = "none"
 
         return FeishuAdapterSettings(
-            app_id=str(extra.get("app_id") or os.getenv("FEISHU_APP_ID", "")).strip(),
-            app_secret=str(extra.get("app_secret") or os.getenv("FEISHU_APP_SECRET", "")).strip(),
-            domain_name=str(extra.get("domain") or os.getenv("FEISHU_DOMAIN", "feishu")).strip().lower(),
+            app_id=str(extra.get("app_id") or get_secret("FEISHU_APP_ID", "")).strip(),
+            app_secret=str(extra.get("app_secret") or get_secret("FEISHU_APP_SECRET", "")).strip(),
+            domain_name=str(extra.get("domain") or get_secret("FEISHU_DOMAIN", "feishu")).strip().lower(),
             connection_mode=str(
-                extra.get("connection_mode") or os.getenv("FEISHU_CONNECTION_MODE", "websocket")
+                extra.get("connection_mode") or get_secret("FEISHU_CONNECTION_MODE", "websocket")
             ).strip().lower(),
-            encrypt_key=str(extra.get("encrypt_key") or os.getenv("FEISHU_ENCRYPT_KEY", "")).strip(),
+            encrypt_key=str(extra.get("encrypt_key") or get_secret("FEISHU_ENCRYPT_KEY", "")).strip(),
             verification_token=str(
-                extra.get("verification_token") or os.getenv("FEISHU_VERIFICATION_TOKEN", "")
+                extra.get("verification_token") or get_secret("FEISHU_VERIFICATION_TOKEN", "")
             ).strip(),
-            group_policy=os.getenv("FEISHU_GROUP_POLICY", "allowlist").strip().lower(),
+            group_policy=str(extra.get("group_policy") or get_secret("FEISHU_GROUP_POLICY", "allowlist")).strip().lower(),
             allowed_group_users=frozenset(
                 item.strip()
-                for item in os.getenv("FEISHU_ALLOWED_USERS", "").split(",")
+                for item in str(extra.get("allowed_users") or get_secret("FEISHU_ALLOWED_USERS", "")).split(",")
                 if item.strip()
             ),
-            bot_open_id=os.getenv("FEISHU_BOT_OPEN_ID", "").strip(),
-            bot_user_id=os.getenv("FEISHU_BOT_USER_ID", "").strip(),
-            bot_name=os.getenv("FEISHU_BOT_NAME", "").strip(),
+            bot_open_id=str(extra.get("bot_open_id") or get_secret("FEISHU_BOT_OPEN_ID", "")).strip(),
+            bot_user_id=str(extra.get("bot_user_id") or get_secret("FEISHU_BOT_USER_ID", "")).strip(),
+            bot_name=str(extra.get("bot_name") or get_secret("FEISHU_BOT_NAME", "")).strip(),
             dedup_cache_size=max(
                 32,
                 env_int("HERMES_FEISHU_DEDUP_CACHE_SIZE", _DEFAULT_DEDUP_CACHE_SIZE),
@@ -1580,13 +1595,13 @@ class FeishuAdapter(BasePlatformAdapter):
                 "HERMES_FEISHU_MEDIA_BATCH_DELAY_SECONDS", _DEFAULT_MEDIA_BATCH_DELAY_SECONDS
             ),
             webhook_host=str(
-                extra.get("webhook_host") or os.getenv("FEISHU_WEBHOOK_HOST", _DEFAULT_WEBHOOK_HOST)
+                extra.get("webhook_host") or get_secret("FEISHU_WEBHOOK_HOST", _DEFAULT_WEBHOOK_HOST)
             ).strip(),
             webhook_port=int(
-                extra.get("webhook_port") or os.getenv("FEISHU_WEBHOOK_PORT", str(_DEFAULT_WEBHOOK_PORT))
+                extra.get("webhook_port") or profile_env_int("FEISHU_WEBHOOK_PORT", _DEFAULT_WEBHOOK_PORT)
             ),
             webhook_path=(
-                str(extra.get("webhook_path") or os.getenv("FEISHU_WEBHOOK_PATH", _DEFAULT_WEBHOOK_PATH)).strip()
+                str(extra.get("webhook_path") or get_secret("FEISHU_WEBHOOK_PATH", _DEFAULT_WEBHOOK_PATH)).strip()
                 or _DEFAULT_WEBHOOK_PATH
             ),
             ws_reconnect_nonce=_coerce_required_int(extra.get("ws_reconnect_nonce"), default=30, min_value=0),
@@ -1598,7 +1613,7 @@ class FeishuAdapter(BasePlatformAdapter):
             group_rules=group_rules,
             allow_bots=allow_bots,
             require_mention=_to_boolean(
-                extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
+                extra.get("require_mention", get_secret("FEISHU_REQUIRE_MENTION", "true"))
             ),
         )
 
@@ -1897,11 +1912,21 @@ class FeishuAdapter(BasePlatformAdapter):
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        # When chunking splits a long markdown response, an individual chunk
+        # can end up as plain prose that doesn't match the per-chunk hint
+        # regex — so it would be sent as ``msg_type=text`` and the user would
+        # see literal ``**bold``/``## heading``/code fences in the Feishu
+        # client while other chunks render correctly. Lock the markdown
+        # decision at the whole-message level so every chunk consistently
+        # uses ``post``. See #26841.
+        prefer_post = bool(_MARKDOWN_HINT_RE.search(formatted))
         last_response = None
 
         try:
             for chunk in chunks:
-                msg_type, payload = self._build_outbound_payload(chunk)
+                msg_type, payload = self._build_outbound_payload(
+                    chunk, prefer_post=prefer_post,
+                )
                 try:
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
@@ -3063,7 +3088,7 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _reactions_enabled(self) -> bool:
-        return os.getenv("FEISHU_REACTIONS", "true").strip().lower() not in {"false", "0", "no"}
+        return str(get_secret("FEISHU_REACTIONS", "true")).strip().lower() not in {"false", "0", "no"}
 
     async def _add_reaction(self, message_id: str, emoji_type: str) -> Optional[str]:
         """Return the reaction_id on success, else None. The id is needed later for deletion."""
@@ -4265,9 +4290,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 return "bot_not_mentioned"
 
         if not is_group:
-            if os.getenv("FEISHU_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+            if str(get_secret("FEISHU_ALLOW_ALL_USERS", "")).strip().lower() in {"true", "1", "yes"}:
                 return None
-            if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+            if str(get_secret("GATEWAY_ALLOW_ALL_USERS", "")).strip().lower() in {"true", "1", "yes"}:
                 return None
             # Empty FEISHU_ALLOWED_USERS is the pairing-mode default from setup:
             # forward DMs to gateway intake so the pairing handshake can run.
@@ -4532,14 +4557,21 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound payload construction and send pipeline
     # =========================================================================
 
-    def _build_outbound_payload(self, content: str) -> tuple[str, str]:
-        # Feishu post-type 'md' elements do not render markdown tables; sending
-        # table content as post causes the message to appear blank on the client.
-        # Force plain text for anything that looks like a markdown table.
-        if _MARKDOWN_TABLE_RE.search(content):
-            text_payload = {"text": content}
-            return "text", json.dumps(text_payload, ensure_ascii=False)
-        if _MARKDOWN_HINT_RE.search(content):
+    def _build_outbound_payload(
+        self, content: str, *, prefer_post: bool = False,
+    ) -> tuple[str, str]:
+        # Empirically (issue #52786), current Feishu clients render markdown
+        # tables inside ``post``-type ``md`` elements natively. The previous
+        # table-downgrade branch forced any table-containing message to
+        # ``text``, which left Feishu readers seeing the raw pipe-and-dash
+        # source instead of a rendered table. Trust the common markdown path
+        # for table content too.
+        #
+        # ``prefer_post`` lets ``send`` treat the chunk as part of a larger
+        # markdown document: when a long markdown reply is split at
+        # MAX_MESSAGE_LENGTH, the per-chunk regex would otherwise
+        # mis-classify a plain-prose chunk as ``text``. See #26841.
+        if prefer_post or _MARKDOWN_HINT_RE.search(content):
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
@@ -5639,6 +5671,8 @@ def _apply_yaml_config(yaml_cfg: dict, feishu_cfg: dict) -> dict | None:
     feishu_cfg block from gateway/config.py::load_gateway_config() (allow_bots).
     Env vars take precedence over YAML. Returns None — flows through env.
     """
+    if is_multiplex_active():
+        return dict(feishu_cfg)
     if "allow_bots" in feishu_cfg and not os.getenv("FEISHU_ALLOW_BOTS"):
         os.environ["FEISHU_ALLOW_BOTS"] = str(feishu_cfg["allow_bots"]).lower()
     return None

@@ -62,13 +62,12 @@ import {
   toggleSidebarMessagingOpen,
   unpinSession
 } from '@/store/layout'
-import { notify, notifyError } from '@/store/notifications'
 import {
-  $activeGatewayProfile,
   $newChatProfile,
   $profiles,
   $profileScope,
   ALL_PROFILES,
+  captureActiveGatewayProfileContext,
   normalizeProfileKey
 } from '@/store/profile'
 import {
@@ -79,9 +78,7 @@ import {
   $projectTreeLoading,
   $removedSessionIds,
   $reposScanning,
-  $sessionProjectAssignments,
   ALL_PROJECTS,
-  assignSessionToProject,
   enterProject,
   exitProjectScope,
   fetchProjectSessions,
@@ -140,7 +137,7 @@ import {
   useRepoWorktreeMap
 } from './projects'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
-import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
+import { bindWorkspaceSessionOwner, SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 
 // Non-session groups (messaging platforms) stay compact: show a few rows up
@@ -241,7 +238,7 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
   onBranchSession: (sessionId: string) => void
-  onNewSessionInWorkspace: (path: null | string) => void
+  onNewSessionInWorkspace: (path: null | string, profile?: string, generation?: number) => void
   /** Create a brand-new session and open it as a tile on `dir`. */
   onNewSessionSplit: (dir: SplitDir) => void
   onManageCronJob: (jobId: string) => void
@@ -265,6 +262,17 @@ export function ChatSidebar({
 }: ChatSidebarProps) {
   const { t } = useI18n()
   const s = t.sidebar
+  const { generation: newSessionGeneration, profile: newSessionProfile } = captureActiveGatewayProfileContext()
+
+  const onOwnedNewSessionInWorkspace = useMemo(
+    () =>
+      bindWorkspaceSessionOwner(onNewSessionInWorkspace, {
+        generation: newSessionGeneration,
+        profile: newSessionProfile
+      }),
+    [newSessionGeneration, newSessionProfile, onNewSessionInWorkspace]
+  )
+
   const { pathname } = useLocation()
   // Contributed nav rows (plugins pairing a page with a sidebar entry) render
   // below the built-ins with the same chrome; active = at their route.
@@ -314,7 +322,6 @@ export function ChatSidebar({
   const workingSessionIds = useStore($workingSessionIds)
   const profiles = useStore($profiles)
   const profileScope = useStore($profileScope)
-  const activeGatewayProfile = useStore($activeGatewayProfile)
   // Only surface the profile switcher when more than one profile exists, so
   // single-profile users see the unchanged sidebar.
   const multiProfile = profiles.length > 1
@@ -331,7 +338,6 @@ export function ChatSidebar({
   const projectTree = useStore($projectTree)
   const projectTreeLoading = useStore($projectTreeLoading)
   const removedSessionIds = useStore($removedSessionIds)
-  const sessionProjectAssignments = useStore($sessionProjectAssignments)
   const reposScanning = useStore($reposScanning)
   const activeProjectId = useStore($activeProjectId)
   const projectScope = useStore($projectScope)
@@ -707,9 +713,8 @@ export function ChatSidebar({
   // backend now seeds each project folder as an (empty) repo, so the overlay
   // always has a lane to place a new in-project session into.
   const enteredProjectContent = useMemo(
-    () =>
-      enteredProject ? overlayLiveLanes(enteredProject, agentSessions, removedSessionIds, sessionProjectAssignments) : undefined,
-    [enteredProject, agentSessions, removedSessionIds, sessionProjectAssignments]
+    () => (enteredProject ? overlayLiveLanes(enteredProject, agentSessions, removedSessionIds) : undefined),
+    [enteredProject, agentSessions, removedSessionIds]
   )
 
   const scopedRepoPaths = useMemo(
@@ -729,7 +734,7 @@ export function ChatSidebar({
   // session settles (its turn finished) or the window refocuses (an external
   // terminal may have changed things) — only while a project is entered, and
   // only the cheap per-repo `git worktree list`, never the heavy tree scan.
-  const prevWorkingIdsRef = useRef<string[]>(workingSessionIds)
+  const prevWorkingIdsRef = useRef<readonly string[]>(workingSessionIds)
 
   useEffect(() => {
     const prev = prevWorkingIdsRef.current
@@ -799,16 +804,8 @@ export function ChatSidebar({
   // session shows under its project instantly (and with its working arc),
   // matching the flat Recents list. Keyed by project path for the rows.
   const overviewPreviews = useMemo<Record<string, SessionInfo[]>>(
-    () =>
-      overlayLivePreviews(
-        projectOverview ?? [],
-        agentSessions,
-        projects,
-        PROJECT_PREVIEW_COUNT,
-        removedSessionIds,
-        sessionProjectAssignments
-      ),
-    [projectOverview, agentSessions, projects, removedSessionIds, sessionProjectAssignments]
+    () => overlayLivePreviews(projectOverview ?? [], agentSessions, projects, PROJECT_PREVIEW_COUNT, removedSessionIds),
+    [projectOverview, agentSessions, projects, removedSessionIds]
   )
 
   const onEnterProject = useCallback(
@@ -822,27 +819,6 @@ export function ChatSidebar({
       enterProject(id)
     },
     [projectModel, syncProjectCwd]
-  )
-
-  const onAssignSessionToProject = useCallback(
-    async (sessionId: string, projectId: string, profile?: string) => {
-      const project = projectModel.find(node => node.id === projectId)
-
-      try {
-        if (normalizeProfileKey(profile) !== normalizeProfileKey(activeGatewayProfile)) {
-          throw new Error('Switch to this session profile before moving it into a project')
-        }
-        await assignSessionToProject(sessionId, projectId)
-        notify({
-          durationMs: 2_000,
-          kind: 'success',
-          message: s.row.movedToProject(project?.label ?? s.projects.sectionLabel)
-        })
-      } catch (err) {
-        notifyError(err, s.row.moveToProjectFailed)
-      }
-    },
-    [activeGatewayProfile, projectModel, s.projects.sectionLabel, s.row]
   )
 
   // The Sessions section is a project switcher in grouped mode: its label reads
@@ -1348,7 +1324,7 @@ export function ChatSidebar({
                   inProject && enteredProject ? (
                     <div className="group/workspace flex shrink-0 items-center gap-0.5">
                       {enteredProject.path && (
-                        <StartWorkButton onStarted={onNewSessionInWorkspace} repoPath={enteredProject.path} />
+                        <StartWorkButton onStarted={onOwnedNewSessionInWorkspace} repoPath={enteredProject.path} />
                       )}
                       <ProjectMenu
                         isActive={enteredProject.id === activeProjectId}
@@ -1383,7 +1359,7 @@ export function ChatSidebar({
                             if (agentsGrouped) {
                               openProjectCreate()
                             } else {
-                              onNewSessionInWorkspace(null)
+                              onOwnedNewSessionInWorkspace(null)
                             }
                           }}
                           size="icon-xs"
@@ -1427,7 +1403,6 @@ export function ChatSidebar({
                 }
                 liveSessions={inProject ? agentSessions : undefined}
                 onArchiveSession={onArchiveSession}
-                onAssignSessionToProject={onAssignSessionToProject}
                 onBranchSession={onBranchSession}
                 onDeleteSession={onDeleteSession}
                 onEnterProject={onEnterProject}
@@ -1452,7 +1427,6 @@ export function ChatSidebar({
                   'min-h-32 flex-1 overflow-hidden p-0',
                   !recentsVirtualizes && 'compact:min-h-0 compact:flex-none compact:overflow-visible'
                 )}
-                sessionProjectAssignments={inProject ? sessionProjectAssignments : undefined}
                 sessions={displayAgentSessions}
                 sortable={!showAllProfiles && agentSessions.length > 1}
                 workingSessionIdSet={workingSessionIdSet}

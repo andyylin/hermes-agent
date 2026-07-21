@@ -17,36 +17,6 @@ export interface SessionDragPayload {
   title: string
 }
 
-/** MIME for the project-tree native drag path. Upstream session tiles use the
- * in-memory pointer drag session; the Projects sidebar still needs this
- * compatibility payload for its existing HTML DnD surface. */
-export const HERMES_SESSION_MIME = 'application/x-hermes-session'
-
-export function writeSessionDrag(transfer: DataTransfer, payload: SessionDragPayload) {
-  transfer.setData(HERMES_SESSION_MIME, JSON.stringify(payload))
-  transfer.effectAllowed = 'copyMove'
-}
-
-export function dragHasSession(transfer: DataTransfer | null) {
-  return Boolean(transfer) && Array.from(transfer!.types || []).includes(HERMES_SESSION_MIME)
-}
-
-export function readSessionDrag(transfer: DataTransfer | null): null | SessionDragPayload {
-  const raw = transfer?.getData(HERMES_SESSION_MIME)
-
-  if (!raw) {
-    return null
-  }
-
-  try {
-    const parsed = JSON.parse(raw) as Partial<SessionDragPayload>
-
-    return parsed.id ? { id: parsed.id, profile: parsed.profile || 'default', title: parsed.title || '' } : null
-  } catch {
-    return null
-  }
-}
-
 /** A session's friendly display label — its title, or a localized fallback. */
 export const sessionLabel = ({ id, title }: SessionDragPayload) =>
   title || translateNow('sidebar.row.untitledChat', id.slice(0, 8))

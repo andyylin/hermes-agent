@@ -44,6 +44,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
+from agent.secret_scope import get_secret
+
 try:
     import aiohttp
     AIOHTTP_AVAILABLE = True
@@ -71,6 +73,11 @@ from gateway.platforms.base import (
 from utils import env_float
 
 logger = logging.getLogger(__name__)
+
+
+def _scoped_env(name: str, default: str = "") -> str:
+    value = get_secret(name, default)
+    return default if value is None or str(value) == "" else str(value)
 
 DEFAULT_WS_URL = "wss://openws.work.weixin.qq.com"
 
@@ -153,15 +160,15 @@ class WeComAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.WECOM)
 
         extra = config.extra or {}
-        self._bot_id = str(extra.get("bot_id") or os.getenv("WECOM_BOT_ID", "")).strip()
-        self._secret = str(extra.get("secret") or os.getenv("WECOM_SECRET", "")).strip()
+        self._bot_id = str(extra.get("bot_id") or _scoped_env("WECOM_BOT_ID")).strip()
+        self._secret = str(extra.get("secret") or _scoped_env("WECOM_SECRET")).strip()
         self._ws_url = str(
             extra.get("websocket_url")
             or extra.get("websocketUrl")
-            or os.getenv("WECOM_WEBSOCKET_URL", DEFAULT_WS_URL)
+            or _scoped_env("WECOM_WEBSOCKET_URL", DEFAULT_WS_URL)
         ).strip() or DEFAULT_WS_URL
 
-        self._dm_policy = str(extra.get("dm_policy") or os.getenv("WECOM_DM_POLICY", "pairing")).strip().lower()
+        self._dm_policy = str(extra.get("dm_policy") or _scoped_env("WECOM_DM_POLICY", "pairing")).strip().lower()
         # dm_policy already honors WECOM_DM_POLICY, so the allowlist must honor
         # WECOM_ALLOWED_USERS too. Without the env fallback an env-only setup
         # (dm_policy=allowlist via env, no config extra) runs with an empty
@@ -169,10 +176,10 @@ class WeComAdapter(BasePlatformAdapter):
         self._allow_from = _coerce_list(
             extra.get("allow_from")
             or extra.get("allowFrom")
-            or os.getenv("WECOM_ALLOWED_USERS", "")
+            or _scoped_env("WECOM_ALLOWED_USERS")
         )
 
-        self._group_policy = str(extra.get("group_policy") or os.getenv("WECOM_GROUP_POLICY", "pairing")).strip().lower()
+        self._group_policy = str(extra.get("group_policy") or _scoped_env("WECOM_GROUP_POLICY", "pairing")).strip().lower()
         self._group_allow_from = _coerce_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
         self._groups = extra.get("groups") if isinstance(extra.get("groups"), dict) else {}
 
@@ -863,9 +870,9 @@ class WeComAdapter(BasePlatformAdapter):
         return True
 
     def _open_dm_opted_in(self) -> bool:
-        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+        if _scoped_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
             return True
-        return os.getenv("WECOM_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+        return _scoped_env("WECOM_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
 
     def _is_dm_allowed(self, sender_id: str) -> bool:
         if self._dm_policy == "disabled":

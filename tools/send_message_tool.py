@@ -19,6 +19,28 @@ from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
 
+
+def _live_adapter_for_session(runner, platform):
+    """Resolve the live adapter owned by the current routed profile.
+
+    ``runner.adapters`` belongs to the gateway's primary profile. In multiplex
+    mode a turn routed to another profile must never fall back to that map.
+    """
+    if runner is None:
+        return None
+    if not getattr(getattr(runner, "config", None), "multiplex_profiles", False):
+        return runner.adapters.get(platform)
+
+    from gateway.session_context import get_session_env
+
+    profile = (get_session_env("HERMES_SESSION_PROFILE", "") or "").strip()
+    if not profile:
+        return None
+    active_profile = runner._active_profile_name()
+    if profile == active_profile:
+        return runner.adapters.get(platform)
+    return runner._profile_adapters.get(profile, {}).get(platform)
+
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
 _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
 # Slack conversation IDs: C (public channel), G (private/group channel), D (DM).
@@ -326,7 +348,7 @@ def _handle_react(args, remove=False):
         runner = _gateway_runner_ref()
     except Exception:
         runner = None
-    adapter = runner.adapters.get(platform) if runner is not None else None
+    adapter = _live_adapter_for_session(runner, platform)
     if adapter is None:
         return tool_error(
             f"Reactions require a live {platform_name} adapter in the running "
@@ -448,7 +470,7 @@ def _handle_send(args):
     if not chat_id:
         home = config.get_home_channel(platform)
         if not home and platform_name == "weixin":
-            wx_home = os.getenv("WEIXIN_HOME_CHANNEL", "").strip()
+            wx_home = (get_secret("WEIXIN_HOME_CHANNEL") or "").strip()
             if wx_home:
                 from gateway.config import HomeChannel
                 home = HomeChannel(platform=platform, chat_id=wx_home, name="Weixin Home")
@@ -724,7 +746,7 @@ async def _send_via_adapter(
 
     if runner is not None:
         try:
-            adapter = runner.adapters.get(platform)
+            adapter = _live_adapter_for_session(runner, platform)
         except Exception:
             adapter = None
         if adapter is not None:
@@ -1708,7 +1730,7 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
     if runner is not None:
         try:
             from gateway.config import Platform
-            live_adapter = runner.adapters.get(Platform.MATRIX)
+            live_adapter = _live_adapter_for_session(runner, Platform.MATRIX)
         except Exception:
             logger.warning(
                 "Matrix: live gateway adapter lookup failed; falling back to an "
@@ -1888,9 +1910,9 @@ async def _send_qqbot(pconfig, chat_id, message):
         return _error("QQBot direct send requires httpx. Run: pip install httpx")
 
     extra = pconfig.extra or {}
-    appid = extra.get("app_id") or os.getenv("QQ_APP_ID", "")
+    appid = extra.get("app_id") or get_secret("QQ_APP_ID", "")
     secret = (pconfig.token or extra.get("client_secret")
-              or os.getenv("QQ_CLIENT_SECRET", ""))
+              or get_secret("QQ_CLIENT_SECRET", ""))
     if not appid or not secret:
         return _error("QQBot: QQ_APP_ID / QQ_CLIENT_SECRET not configured.")
 
@@ -1959,11 +1981,14 @@ async def _send_yuanbao(chat_id, message, media_files=None):
       - DM:    "direct:<account_id>" or just "<account_id>"
     """
     try:
-        from gateway.platforms.yuanbao import get_active_adapter, send_yuanbao_direct
+        from gateway.config import Platform
+        from gateway.platforms.yuanbao import send_yuanbao_direct
+        from gateway.run import _gateway_runner_ref
     except ImportError:
         return _error("Yuanbao adapter module not available.")
 
-    adapter = get_active_adapter()
+    runner = _gateway_runner_ref()
+    adapter = _live_adapter_for_session(runner, Platform.YUANBAO)
     if adapter is None:
         return _error(
             "Yuanbao adapter is not running. "

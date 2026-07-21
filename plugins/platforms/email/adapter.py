@@ -35,6 +35,7 @@ from html import escape, unescape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from agent.secret_scope import UnscopedSecretError, get_secret, is_multiplex_active, profile_env_bool, profile_env_int
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -44,7 +45,7 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
 )
 from gateway.config import Platform, PlatformConfig
-from utils import env_int, env_bool
+
 
 logger = logging.getLogger(__name__)
 # Automated sender patterns — emails from these are silently ignored
@@ -165,10 +166,13 @@ def check_email_requirements() -> bool:
     Treats blank/whitespace-only values as missing so an abandoned setup that
     left empty ``EMAIL_*`` keys in ``.env`` does not enable the platform (#40715).
     """
-    addr = os.getenv("EMAIL_ADDRESS", "").strip()
-    pwd = os.getenv("EMAIL_PASSWORD", "").strip()
-    imap = os.getenv("EMAIL_IMAP_HOST", "").strip()
-    smtp = os.getenv("EMAIL_SMTP_HOST", "").strip()
+    try:
+        addr = str(get_secret("EMAIL_ADDRESS", "")).strip()
+        pwd = str(get_secret("EMAIL_PASSWORD", "")).strip()
+        imap = str(get_secret("EMAIL_IMAP_HOST", "")).strip()
+        smtp = str(get_secret("EMAIL_SMTP_HOST", "")).strip()
+    except UnscopedSecretError:
+        return False
     return all([addr, pwd, imap, smtp])
 
 
@@ -448,13 +452,13 @@ class EmailAdapter(BasePlatformAdapter):
         # misleading ``[Errno 8] nodename nor servname`` (an unresolvable name)
         # instead of an obvious "host not set" error.
         extra = config.extra or {}
-        self._address = (os.getenv("EMAIL_ADDRESS", "") or extra.get("address", "")).strip()
-        self._password = os.getenv("EMAIL_PASSWORD", "")
-        self._imap_host = (os.getenv("EMAIL_IMAP_HOST", "") or extra.get("imap_host", "")).strip()
-        self._imap_port = env_int("EMAIL_IMAP_PORT", 993)
-        self._smtp_host = (os.getenv("EMAIL_SMTP_HOST", "") or extra.get("smtp_host", "")).strip()
-        self._smtp_port = env_int("EMAIL_SMTP_PORT", 587)
-        self._poll_interval = env_int("EMAIL_POLL_INTERVAL", 15)
+        self._address = (get_secret("EMAIL_ADDRESS", "") or extra.get("address", "")).strip()
+        self._password = get_secret("EMAIL_PASSWORD", "")
+        self._imap_host = (get_secret("EMAIL_IMAP_HOST", "") or extra.get("imap_host", "")).strip()
+        self._imap_port = profile_env_int("EMAIL_IMAP_PORT", 993)
+        self._smtp_host = (get_secret("EMAIL_SMTP_HOST", "") or extra.get("smtp_host", "")).strip()
+        self._smtp_port = profile_env_int("EMAIL_SMTP_PORT", 587)
+        self._poll_interval = profile_env_int("EMAIL_POLL_INTERVAL", 15)
 
         # Skip attachments — configured via config.yaml:
         #   platforms:
@@ -478,7 +482,7 @@ class EmailAdapter(BasePlatformAdapter):
         # gate below is skipped.
         if "require_authenticated_sender" in extra:
             self._require_authenticated_sender = bool(extra["require_authenticated_sender"])
-        elif env_bool("EMAIL_TRUST_FROM_HEADER", False):
+        elif profile_env_bool("EMAIL_TRUST_FROM_HEADER", False):
             self._require_authenticated_sender = False
         else:
             self._require_authenticated_sender = True
@@ -487,7 +491,7 @@ class EmailAdapter(BasePlatformAdapter):
         # own receiving server (defends against an injected header that sorts
         # first). Defaults to the From-domain of the agent's own address.
         self._authserv_id = (
-            extra.get("authserv_id", "") or os.getenv("EMAIL_AUTHSERV_ID", "")
+            extra.get("authserv_id", "") or get_secret("EMAIL_AUTHSERV_ID", "")
         ).strip().lower()
 
         # Track message IDs we've already processed to avoid duplicates
@@ -770,8 +774,8 @@ class EmailAdapter(BasePlatformAdapter):
         """
         truthy = {"true", "1", "yes"}
         return (
-            os.getenv("EMAIL_ALLOW_ALL_USERS", "").strip().lower() in truthy
-            or os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in truthy
+            str(get_secret("EMAIL_ALLOW_ALL_USERS", "")).strip().lower() in truthy
+            or str(get_secret("GATEWAY_ALLOW_ALL_USERS", "")).strip().lower() in truthy
         )
 
     @staticmethod
@@ -785,8 +789,8 @@ class EmailAdapter(BasePlatformAdapter):
         and the authentication gate is unnecessary.
         """
         return bool(
-            os.getenv("EMAIL_ALLOWED_USERS", "").strip()
-            or os.getenv("GATEWAY_ALLOWED_USERS", "").strip()
+            str(get_secret("EMAIL_ALLOWED_USERS", "")).strip()
+            or str(get_secret("GATEWAY_ALLOWED_USERS", "")).strip()
         )
 
     async def _dispatch_message(self, msg_data: Dict[str, Any]) -> None:
@@ -807,10 +811,10 @@ class EmailAdapter(BasePlatformAdapter):
         # that the gateway will never authorize.  Without this early guard,
         # a race between dispatch and authorization can result in the adapter
         # sending a reply even though the handler returned None.
-        allowed_raw = os.getenv("EMAIL_ALLOWED_USERS", "").strip()
+        allowed_raw = str(get_secret("EMAIL_ALLOWED_USERS", "")).strip()
         if not allowed_raw:
-            if os.getenv("EMAIL_ALLOW_ALL_USERS", "").strip().lower() not in {"true", "1", "yes"} and (
-                os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() not in {"true", "1", "yes"}
+            if str(get_secret("EMAIL_ALLOW_ALL_USERS", "")).strip().lower() not in {"true", "1", "yes"} and (
+                str(get_secret("GATEWAY_ALLOW_ALL_USERS", "")).strip().lower() not in {"true", "1", "yes"}
             ):
                 logger.debug(
                     "[Email] Dropping sender at dispatch — EMAIL_ALLOWED_USERS is unset "
@@ -1295,11 +1299,11 @@ async def _standalone_send(
     import ssl as _ssl
 
     extra = getattr(pconfig, "extra", {}) or {}
-    address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
-    password = os.getenv("EMAIL_PASSWORD", "")
-    smtp_host = extra.get("smtp_host") or os.getenv("EMAIL_SMTP_HOST", "")
+    address = extra.get("address") or get_secret("EMAIL_ADDRESS", "")
+    password = get_secret("EMAIL_PASSWORD", "")
+    smtp_host = extra.get("smtp_host") or get_secret("EMAIL_SMTP_HOST", "")
     try:
-        smtp_port = int(os.getenv("EMAIL_SMTP_PORT", "587"))
+        smtp_port = profile_env_int("EMAIL_SMTP_PORT", 587)
     except (ValueError, TypeError):
         smtp_port = 587
 
@@ -1369,7 +1373,10 @@ def _is_connected(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
     if extra.get("address"):
         return True
+    if is_multiplex_active():
+        return bool((get_secret("EMAIL_ADDRESS") or "").strip())
     import hermes_cli.gateway as gateway_mod
+
     return bool((gateway_mod.get_env_value("EMAIL_ADDRESS") or "").strip())
 
 

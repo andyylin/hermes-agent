@@ -120,6 +120,19 @@ export const $dismissedWorktreeIds = persistentAtom(
   [] as string[],
   Codecs.stringArray
 )
+
+// These ids and paths belong to one gateway filesystem. Until their storage
+// keys are profile-namespaced, clear them synchronously on profile swap so A's
+// hidden/collapsed/reordered worktrees cannot shape B's project tree.
+export function resetProfileBoundWorkspaceLayout(): void {
+  $sidebarWorkspaceOrderIds.set([])
+  $sidebarWorkspaceParentOrderIds.set([])
+  $sidebarProjectOrderIds.set([])
+  $sidebarWorkspaceCollapsedIds.set([])
+  $dismissedAutoProjectIds.set([])
+  $dismissedWorktreeIds.set([])
+}
+
 export const $sidebarPinsOpen = atom(true)
 export const $sidebarRecentsOpen = atom(true)
 // Cron-job sessions live in their own section below recents, collapsed by

@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -8,6 +8,11 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import type { HermesGitBaseBranch } from '@/global'
 import { useI18n } from '@/i18n'
 import { $repoStatus } from '@/store/coding-status'
+import {
+  $activeGatewayProfile,
+  $activeGatewayProfileGeneration,
+  activeGatewayProfileContextIsCurrent
+} from '@/store/profile'
 import { listBaseBranches } from '@/store/projects'
 
 // Filterable combobox for picking the base branch of a new worktree. Lists
@@ -32,6 +37,20 @@ export function BaseBranchPicker({
   const [branches, setBranches] = useState<HermesGitBaseBranch[]>([])
   const [loading, setLoading] = useState(false)
   const [open, setOpen] = useState(false)
+  const branchRequestRef = useRef(0)
+  const activeProfile = useStore($activeGatewayProfile)
+  const profileGeneration = useStore($activeGatewayProfileGeneration)
+
+  const owner = useMemo(
+    () => ({ generation: profileGeneration, profile: activeProfile }),
+    [activeProfile, profileGeneration]
+  )
+
+  useEffect(() => {
+    branchRequestRef.current += 1
+    setBranches([])
+    setLoading(false)
+  }, [profileGeneration, repoPath])
 
   const currentBranch = repoStatus?.detached ? null : (repoStatus?.branch ?? null)
 
@@ -40,10 +59,16 @@ export function BaseBranchPicker({
       return
     }
 
+    const request = ++branchRequestRef.current
     setLoading(true)
 
     try {
-      const list = await listBaseBranches(repoPath)
+      const list = await listBaseBranches(repoPath, owner)
+
+      if (branchRequestRef.current !== request || !activeGatewayProfileContextIsCurrent(owner)) {
+        return
+      }
+
       setBranches(list)
 
       // Default to the remote default (origin/HEAD). Fall back to the local
@@ -57,11 +82,15 @@ export function BaseBranchPicker({
         onValueChange(list[0]?.name ?? '')
       }
     } catch {
-      setBranches([])
+      if (branchRequestRef.current === request && activeGatewayProfileContextIsCurrent(owner)) {
+        setBranches([])
+      }
     } finally {
-      setLoading(false)
+      if (branchRequestRef.current === request && activeGatewayProfileContextIsCurrent(owner)) {
+        setLoading(false)
+      }
     }
-  }, [repoPath, onValueChange])
+  }, [repoPath, onValueChange, owner])
 
   // Load on mount so the default branch fills in before the user opens the
   // popover — otherwise the button reads "branch off " with nothing after it.

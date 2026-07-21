@@ -10,6 +10,7 @@ Uses discord.py library for:
 """
 
 import asyncio
+import datetime as dt
 import hashlib
 import inspect
 import io
@@ -52,6 +53,7 @@ _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_NONCONVERSATIONAL_STATE_FILENAME = "discord_nonconversational_messages.json"
+
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
 # Discord enforces a hard cap of 100 global application (slash) commands per
@@ -302,16 +304,20 @@ def _clean_discord_id(entry: str) -> str:
     return entry.strip()
 
 
-def _discord_bool_env(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
+def _discord_bool_env(name: str, default: bool = False, getenv=os.getenv) -> bool:
+    raw = getenv(name)
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _discord_thread_auto_archive_minutes() -> int:
+def _discord_thread_auto_archive_minutes(getenv=None) -> int:
     """Return the configured Discord thread auto-archive duration."""
-    raw = os.getenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", "").strip()
+    if getenv is None:
+        from agent.secret_scope import get_secret
+
+        getenv = get_secret
+    raw = getenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", "").strip()
     try:
         value = int(raw) if raw else DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES
     except ValueError:
@@ -430,7 +436,7 @@ def check_discord_requirements() -> bool:
     return True
 
 
-def _build_allowed_mentions():
+def _build_allowed_mentions(getenv=os.getenv):
     """Build Discord ``AllowedMentions`` with safe defaults, overridable via env.
 
     Discord bots default to parsing ``@everyone``, ``@here``, role pings, and
@@ -452,7 +458,7 @@ def _build_allowed_mentions():
         return None
 
     def _b(name: str, default: bool) -> bool:
-        raw = os.getenv(name, "").strip().lower()
+        raw = getenv(name, "").strip().lower()
         if not raw:
             return default
         return raw in {"true", "1", "yes", "on"}
@@ -1046,12 +1052,20 @@ class DiscordAdapter(BasePlatformAdapter):
         # bot task's done callback uses this to distinguish an operator/service
         # shutdown from a runtime websocket crash.
         self._disconnecting = False
+        self._missed_message_backfill_task: Optional[asyncio.Task] = None
+        from hermes_constants import get_hermes_home
+        from plugins.platforms.discord.recovery import DiscordRecoveryStore
+        self._discord_recovery_store = DiscordRecoveryStore(get_hermes_home())
         # Dedup cache: prevents duplicate bot responses when Discord
         # RESUME replays events after reconnects.
         self._dedup = MessageDeduplicator()
         # Reply threading mode: "off" (no replies), "first" (reply on first
         # chunk only, default), "all" (reply-reference on every chunk).
-        self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
+        _policy = config.extra.get("_discord_env") if isinstance(config.extra, dict) else None
+        _configured_reply_mode = getattr(config, "reply_to_mode", "first")
+        if isinstance(_policy, dict) and "DISCORD_REPLY_TO_MODE" in _policy:
+            _configured_reply_mode = _policy["DISCORD_REPLY_TO_MODE"]
+        self._reply_to_mode = str(_configured_reply_mode or "first")
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
         # In-memory cache of the bot's last message ID per channel, used by
         # history backfill to skip the full scan on hot paths.  Falls back to
@@ -1078,6 +1092,30 @@ class DiscordAdapter(BasePlatformAdapter):
         if value is None and env_key:
             value = os.getenv(env_key)
         return default if value is None or value == "" else value
+
+    def _discord_env(self, name: str, default: Optional[str] = None) -> Optional[str]:
+        """Resolve profile-bound Discord policy before legacy process env.
+
+        Multiplexed adapters share one process, so ``os.environ`` cannot safely
+        carry per-profile authorization or routing policy. The YAML plugin hook
+        snapshots those values into ``PlatformConfig.extra``. In multiplex mode
+        an absent profile value falls back to the caller's safe default instead
+        of inheriting whichever profile happened to mutate the process first.
+        """
+        config = getattr(self, "config", None)
+        extra = config.extra if isinstance(getattr(config, "extra", None), dict) else {}
+        policy = extra.get("_discord_env")
+
+        from agent.secret_scope import is_multiplex_active
+
+        if not is_multiplex_active():
+            return os.getenv(name, default)
+
+        if isinstance(policy, dict) and name in policy:
+            value = policy[name]
+            return default if value is None else str(value)
+
+        return default
 
     def _finite_positive_config_float(
         self, key: str, default: float, *, env_key: Optional[str] = None
@@ -1207,16 +1245,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 return False
 
             # Parse allowed user entries (may contain usernames or IDs)
-            allowed_env = os.getenv("DISCORD_ALLOWED_USERS", "")
+            allowed_env = self._discord_env("DISCORD_ALLOWED_USERS", "")
             if allowed_env:
                 self._allowed_user_ids = {
                     _clean_discord_id(uid) for uid in allowed_env.split(",")
                     if uid.strip()
                 }
+            if self._discord_env("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {
+                "true", "1", "yes",
+            }:
+                self._allowed_user_ids.add("*")
 
             # Parse DISCORD_ALLOWED_ROLES — comma-separated role IDs.
             # Users with ANY of these roles can interact with the bot.
-            roles_env = os.getenv("DISCORD_ALLOWED_ROLES", "")
+            roles_env = self._discord_env("DISCORD_ALLOWED_ROLES", "")
             if roles_env:
                 self._allowed_role_ids = {
                     int(rid.strip()) for rid in roles_env.split(",")
@@ -1274,7 +1316,7 @@ class DiscordAdapter(BasePlatformAdapter):
             self._client = commands.Bot(
                 command_prefix="!",  # Not really used, we handle raw messages
                 intents=intents,
-                allowed_mentions=_build_allowed_mentions(),
+                allowed_mentions=_build_allowed_mentions(self._discord_env),
                 **_discord_app_command_scope_kwargs(),
                 **proxy_kwargs_for_bot(proxy_url),
             )
@@ -1294,116 +1336,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 adapter_self._post_connect_task = asyncio.create_task(
                     adapter_self._run_post_connect_initialization()
                 )
+                if adapter_self._missed_message_backfill_enabled():
+                    adapter_self._ensure_missed_message_backfill_task()
 
             @self._client.event
             async def on_message(message: DiscordMessage):
-                # Block until _resolve_allowed_usernames has swapped
-                # any raw usernames in DISCORD_ALLOWED_USERS for numeric
-                # IDs (otherwise on_message's author.id lookup can miss).
-                if not adapter_self._ready_event.is_set():
-                    try:
-                        await asyncio.wait_for(adapter_self._ready_event.wait(), timeout=30.0)
-                    except asyncio.TimeoutError:
-                        pass
-
-                # Dedup: Discord RESUME replays events after reconnects (#4777)
-                if adapter_self._dedup.is_duplicate(str(message.id)):
-                    return
-
-                # Always ignore our own messages
-                if message.author == self._client.user:
-                    return
-
-                # Ignore Discord system messages (thread renames, pins, member joins, etc.)
-                # Allow both default and reply types — replies have a distinct MessageType.
-                if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
-                    return
-
-                # Bot message filtering (DISCORD_ALLOW_BOTS):
-                #   "none"     — ignore all other bots (default)
-                #   "mentions" — accept bot messages only when they @mention us
-                #   "all"      — accept all bot messages
-                # Must run BEFORE the user allowlist check so that bots
-                # permitted by DISCORD_ALLOW_BOTS are not rejected for
-                # not being in DISCORD_ALLOWED_USERS (fixes #4466).
-                _role_authorized = False
-                if getattr(message.author, "bot", False):
-                    allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
-                    if allow_bots == "none":
-                        return
-                    elif allow_bots == "mentions":
-                        if not self._self_is_explicitly_mentioned(message):
-                            return
-                    if (
-                        self._discord_bots_require_inline_mention()
-                        and not self._self_is_raw_mentioned(message)
-                    ):
-                        return
-                    # "all" falls through; bot is permitted — skip the
-                    # human-user allowlist below (bots aren't in it).
-                else:
-                    # Non-bot: enforce the configured user/role allowlists.
-                    # Pass guild + is_dm so role checks are scoped to the
-                    # originating guild (prevents cross-guild DM bypass, see
-                    # _is_allowed_user docstring).
-                    _msg_guild = getattr(message, "guild", None)
-                    _is_dm = isinstance(message.channel, discord.DMChannel) or _msg_guild is None
-                    _msg_channel_ids = None
-                    if not _is_dm:
-                        _msg_channel_ids = {str(message.channel.id)}
-                        _parent_id = adapter_self._get_parent_channel_id(message.channel)
-                        if _parent_id:
-                            _msg_channel_ids.add(_parent_id)
-                    if not self._is_allowed_user(
-                        str(message.author.id),
-                        message.author,
-                        guild=_msg_guild,
-                        is_dm=_is_dm,
-                        channel_ids=_msg_channel_ids,
-                    ):
-                        self._warn_if_fail_closed_default()
-                        return
-                    _role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
-                
-                # Multi-agent filtering: if the message mentions specific bots
-                # but NOT this bot, the sender is talking to another agent —
-                # stay silent.  Messages with no bot mentions (general chat)
-                # still fall through to _handle_message for the existing
-                # DISCORD_REQUIRE_MENTION check.
-                #
-                # This replaces the older DISCORD_IGNORE_NO_MENTION logic
-                # with bot-aware filtering that works correctly when multiple
-                # agents share a channel.
-                _raw_self_mention = self._self_is_explicitly_mentioned(message)
-                if not isinstance(message.channel, discord.DMChannel) and (
-                    message.mentions or _raw_self_mention
-                ):
-                    _self_mentioned = _raw_self_mention
-                    _other_bots_mentioned = any(
-                        m.bot and m != self._client.user
-                        for m in message.mentions
-                    )
-                    # If other bots are mentioned but we're not → not for us
-                    if _other_bots_mentioned and not _self_mentioned:
-                        return
-                    # If humans are mentioned but we're not → not for us
-                    # (preserves old DISCORD_IGNORE_NO_MENTION=true behavior)
-                    # EXCEPT in free-response channels where the bot should
-                    # answer regardless of who is mentioned.
-                    _ignore_no_mention = os.getenv(
-                        "DISCORD_IGNORE_NO_MENTION", "true"
-                    ).lower() in {"true", "1", "yes"}
-                    if _ignore_no_mention and not _self_mentioned and not _other_bots_mentioned:
-                        _channel_id = str(message.channel.id)
-                        _parent_id = None
-                        if hasattr(message.channel, "parent_id") and message.channel.parent_id:
-                            _parent_id = str(message.channel.parent_id)
-                        _free_channels = adapter_self._discord_free_response_channels()
-                        _channel_keys = adapter_self._discord_channel_keys(message, _parent_id)
-                        if "*" not in _free_channels and not (_channel_keys & _free_channels):
-                            return
-
-                await self._handle_message(message, role_authorized=_role_authorized)
+                await adapter_self._dispatch_discord_message(message)
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
@@ -1477,6 +1415,96 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._cancel_bot_task()
             self._release_platform_lock()
             return False
+
+    def _discord_message_admission(
+        self,
+        message: Any,
+        *,
+        claim: bool,
+    ) -> tuple[bool, bool]:
+        """Return ``(admitted, role_authorized)`` for one Discord event."""
+        message_id = str(getattr(message, "id", ""))
+        if claim:
+            if self._dedup.is_duplicate(message_id):
+                return False, False
+        elif self._dedup.contains(message_id):
+            return False, False
+        if message.author == self._client.user:
+            return False, False
+        if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
+            return False, False
+
+        role_authorized = False
+        if getattr(message.author, "bot", False):
+            allow_bots = self._discord_env("DISCORD_ALLOW_BOTS", "none").lower().strip()
+            if allow_bots == "none":
+                return False, False
+            if allow_bots == "mentions" and not self._self_is_explicitly_mentioned(message):
+                return False, False
+            if (
+                self._discord_bots_require_inline_mention()
+                and not self._self_is_raw_mentioned(message)
+            ):
+                return False, False
+        else:
+            msg_guild = getattr(message, "guild", None)
+            is_dm = isinstance(message.channel, discord.DMChannel) or msg_guild is None
+            msg_channel_ids = None
+            if not is_dm:
+                msg_channel_ids = {str(message.channel.id)}
+                parent_id = self._get_parent_channel_id(message.channel)
+                if parent_id:
+                    msg_channel_ids.add(parent_id)
+            if not self._is_allowed_user(
+                str(message.author.id),
+                message.author,
+                guild=msg_guild,
+                is_dm=is_dm,
+                channel_ids=msg_channel_ids,
+            ):
+                self._warn_if_fail_closed_default()
+                return False, False
+            role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
+
+        raw_self_mention = self._self_is_explicitly_mentioned(message)
+        if not isinstance(message.channel, discord.DMChannel) and (
+            message.mentions or raw_self_mention
+        ):
+            other_bots_mentioned = any(
+                mentioned.bot and mentioned != self._client.user
+                for mentioned in message.mentions
+            )
+            if other_bots_mentioned and not raw_self_mention:
+                return False, False
+            ignore_no_mention = self._discord_env(
+                "DISCORD_IGNORE_NO_MENTION", "true"
+            ).lower() in {"true", "1", "yes"}
+            if ignore_no_mention and not raw_self_mention and not other_bots_mentioned:
+                parent_id = None
+                if hasattr(message.channel, "parent_id") and message.channel.parent_id:
+                    parent_id = str(message.channel.parent_id)
+                free_channels = self._discord_free_response_channels()
+                channel_keys = self._discord_channel_keys(message, parent_id)
+                if "*" not in free_channels and not (channel_keys & free_channels):
+                    return False, False
+
+        return True, role_authorized
+
+    async def _dispatch_discord_message(self, message: Any) -> bool:
+        """Apply Discord ingress policy and dispatch one live event."""
+        if not self._ready_event.is_set():
+            try:
+                await asyncio.wait_for(self._ready_event.wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                pass
+        admitted, role_authorized = self._discord_message_admission(
+            message, claim=True,
+        )
+        if not admitted:
+            return False
+        return await self._handle_message(
+            message, role_authorized=role_authorized,
+        )
 
     async def _cancel_bot_task(self) -> None:
         """Cancel and await the background client.start() task, if running."""
@@ -1770,12 +1798,19 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._post_connect_task
             except asyncio.CancelledError:
                 pass
+        if self._missed_message_backfill_task and not self._missed_message_backfill_task.done():
+            self._missed_message_backfill_task.cancel()
+            try:
+                await self._missed_message_backfill_task
+            except asyncio.CancelledError:
+                pass
 
         self._running = False
         self._client = None
         self._ready_event.clear()
         self._post_connect_task = None
         self._liveness_task = None
+        self._missed_message_backfill_task = None
 
         self._release_platform_lock()
 
@@ -2043,8 +2078,663 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:  # pragma: no cover - defensive logging
             logger.warning("[%s] Slash command sync failed: %s", self.name, e, exc_info=True)
 
+    def _missed_message_backfill_enabled(self) -> bool:
+        """Whether to reconcile Discord messages missed while the gateway was down."""
+        configured = self.config.extra.get("missed_message_backfill")
+        if isinstance(configured, dict) and "enabled" in configured:
+            value = configured["enabled"]
+            if isinstance(value, str):
+                return value.strip().lower() in ("true", "1", "yes", "on")
+            return bool(value)
+        raw = self._discord_env("DISCORD_MISSED_MESSAGE_BACKFILL", "false")
+        return str(raw).strip().lower() in ("true", "1", "yes", "on")
+
+    def _missed_message_backfill_channels(self) -> set[str]:
+        """Channels to scan for missed messages after Discord reconnects.
+
+        Defaults to the union of allowed and free-response channels so both
+        mention-gated requests and mention-free work can be recovered.
+        Operators can set ``channels: "*"`` to scan every reachable text
+        channel, but the safe default is scoped.
+        """
+        configured = self.config.extra.get("missed_message_backfill")
+        if isinstance(configured, dict) and "channels" in configured:
+            raw = configured.get("channels")
+            if isinstance(raw, list):
+                return {str(item).strip() for item in raw if str(item).strip()}
+            raw = str(raw or "")
+            if raw.strip():
+                return {item.strip() for item in raw.split(",") if item.strip()}
+        raw = self._discord_env("DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS", "")
+        if not raw.strip():
+            allowed = {
+                item.strip()
+                for item in self._discord_env("DISCORD_ALLOWED_CHANNELS", "").split(",")
+                if item.strip()
+            }
+            return allowed | self._discord_free_response_channels()
+        return {item.strip() for item in raw.split(",") if item.strip()}
+
+    def _missed_message_backfill_window_seconds(self) -> float:
+        configured = self.config.extra.get("missed_message_backfill")
+        raw = (
+            configured.get("window_seconds", 21600)
+            if isinstance(configured, dict)
+            else self._discord_env("DISCORD_MISSED_MESSAGE_BACKFILL_WINDOW_SECONDS", "21600")
+        )
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = 21600.0
+        return max(60.0, value)
+
+    def _missed_message_backfill_limit(self) -> int:
+        configured = self.config.extra.get("missed_message_backfill")
+        raw = (
+            configured.get("limit", 100)
+            if isinstance(configured, dict)
+            else self._discord_env("DISCORD_MISSED_MESSAGE_BACKFILL_LIMIT", "100")
+        )
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 100
+        return max(1, min(value, 500))
+
+    def _missed_message_backfill_max_dispatches(self) -> int:
+        configured = self.config.extra.get("missed_message_backfill")
+        raw = (
+            configured.get("max_dispatches", 10)
+            if isinstance(configured, dict)
+            else self._discord_env("DISCORD_MISSED_MESSAGE_BACKFILL_MAX_DISPATCHES", "10")
+        )
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 10
+        return max(1, min(value, 100))
+
+    def _ensure_missed_message_backfill_task(self) -> asyncio.Task:
+        """Return the active recovery task, or start one when none is running."""
+        task = self._missed_message_backfill_task
+        if task is not None and not task.done():
+            return task
+        task = asyncio.create_task(self._run_missed_message_backfill())
+        self._missed_message_backfill_task = task
+        runner = getattr(self, "gateway_runner", None)
+        if runner is not None and getattr(runner, "_startup_restore_in_progress", False):
+            tasks = getattr(runner, "_startup_restore_tasks", None)
+            if tasks is None:
+                tasks = []
+                runner._startup_restore_tasks = tasks
+            tasks.append(task)
+        return task
+
+    async def _run_missed_message_backfill(self) -> None:
+        """Find and enqueue recent Discord messages missed while the bot was down.
+
+        Discord gateway events are not replayed for messages sent while the bot
+        is offline. Normal startup resume only handles sessions already marked
+        resume_pending; this pass scans recent channel/thread history, records
+        what it saw durably, and reuses the normal message handler for messages
+        that lack a substantive non-outage Hermes response. Emoji-only acks are
+        deliberately not sufficient completion evidence.
+        """
+        if not self._client:
+            return
+        channels = self._missed_message_backfill_channels()
+        ledger_ok = await self._with_discord_recovery_db_async(
+            lambda conn: conn.execute("SELECT 1").fetchone() is not None,
+            False,
+        )
+        if not ledger_ok:
+            logger.error(
+                "[%s] Missed-message recovery aborted: durable ledger unavailable",
+                self.name,
+            )
+            return
+        scan_id = await asyncio.to_thread(
+            self._record_recovery_scan_start,
+            channels,
+        )
+        if not channels:
+            logger.info("[%s] Missed-message backfill enabled but no channels configured", self.name)
+            await asyncio.to_thread(
+                self._record_recovery_scan_complete,
+                scan_id,
+                status="skipped",
+                scanned=0,
+                missed=0,
+                dispatched=0,
+            )
+            return
+
+        max_dispatches = self._missed_message_backfill_max_dispatches()
+        dispatched = 0
+        scanned = 0
+        missed = 0
+        try:
+            async for message in self._iter_missed_message_backfill_candidates(channels):
+                scanned += 1
+                message_id = str(getattr(message, "id", ""))
+                self._record_discord_message_seen(message, status="discovered")
+                # A live gateway event may race this REST scan. Check without
+                # claiming the ID; the shared ingress helper owns the dedup
+                # write immediately before normal auth/filter dispatch.
+                if self._dedup.contains(message_id):
+                    continue
+                if not await self._should_backfill_discord_message(message):
+                    continue
+                missed += 1
+                logger.info(
+                    "[%s] Backfilling missed Discord message %s in channel %s",
+                    self.name,
+                    getattr(message, "id", "unknown"),
+                    getattr(getattr(message, "channel", None), "id", "unknown"),
+                )
+                self._record_recovery_attempt(message, status="queued")
+                try:
+                    admitted = await self._dispatch_recovered_message(message)
+                    if admitted:
+                        dispatched += 1
+                except asyncio.CancelledError:
+                    self._dedup.discard(message_id)
+                    self._record_recovery_attempt(message, status="cancelled")
+                    raise
+                except Exception as exc:
+                    self._dedup.discard(message_id)
+                    self._record_recovery_attempt(message, status="failed", error=str(exc))
+                    raise
+                if dispatched >= max_dispatches:
+                    break
+            await asyncio.to_thread(
+                self._record_recovery_scan_complete,
+                scan_id,
+                status="success",
+                scanned=scanned,
+                missed=missed,
+                dispatched=dispatched,
+            )
+            logger.info(
+                "[%s] Missed-message backfill complete: scanned=%d missed=%d dispatched=%d",
+                self.name,
+                scanned,
+                missed,
+                dispatched,
+            )
+        except asyncio.CancelledError:
+            await asyncio.to_thread(
+                self._record_recovery_scan_complete,
+                scan_id,
+                status="cancelled",
+                scanned=scanned,
+                missed=missed,
+                dispatched=dispatched,
+            )
+            raise
+        except Exception as exc:  # pragma: no cover - defensive logging
+            await asyncio.to_thread(
+                self._record_recovery_scan_complete,
+                scan_id,
+                status="failed",
+                scanned=scanned,
+                missed=missed,
+                dispatched=dispatched,
+                error=str(exc),
+            )
+            logger.warning("[%s] Missed-message backfill failed: %s", self.name, exc, exc_info=True)
+
+    async def _dispatch_recovered_message(self, message: Any) -> bool:
+        """Run one recovered message through the live Discord ingress gates."""
+        if not isinstance(message.channel, discord.DMChannel):
+            parent_id = self._get_parent_channel_id(message.channel)
+            channel_keys = self._discord_channel_keys(message, parent_id)
+            free_channels = self._discord_free_response_channels()
+            in_bot_thread = (
+                isinstance(message.channel, discord.Thread)
+                and str(message.channel.id) in self._threads
+                and not self._discord_thread_require_mention()
+            )
+            if (
+                self._discord_require_mention()
+                and "*" not in free_channels
+                and not (channel_keys & free_channels)
+                and not in_bot_thread
+                and not self._self_is_explicitly_mentioned(message)
+            ):
+                return False
+        admitted, role_authorized = self._discord_message_admission(
+            message, claim=False,
+        )
+        if not admitted:
+            return False
+        return await self._handle_message(
+            message,
+            role_authorized=role_authorized,
+            recovered=True,
+        )
+
+    async def _iter_missed_message_backfill_candidates(self, channel_ids: set[str]):
+        if not self._client:
+            return
+        after = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+            seconds=self._missed_message_backfill_window_seconds()
+        )
+        limit = self._missed_message_backfill_limit()
+        seen: set[str] = set()
+
+        candidate_channels = []
+        if "*" in channel_ids:
+            for guild in getattr(self._client, "guilds", []) or []:
+                candidate_channels.extend(getattr(guild, "text_channels", []) or [])
+        else:
+            for channel_id in sorted(channel_ids):
+                channel = None
+                try:
+                    channel = self._client.get_channel(int(channel_id))
+                except Exception:
+                    channel = None
+                if channel is None:
+                    try:
+                        channel = await self._client.fetch_channel(int(channel_id))
+                    except Exception as exc:
+                        logger.debug("[%s] Cannot fetch backfill channel %s: %s", self.name, channel_id, exc)
+                        continue
+                candidate_channels.append(channel)
+
+        iterators = [
+            self._iter_channel_and_thread_messages(
+                channel,
+                limit=limit,
+                after=after,
+                seen_channels=seen,
+            ).__aiter__()
+            for channel in candidate_channels
+        ]
+        yielded = 0
+        while iterators and yielded < limit:
+            next_round = []
+            for iterator in iterators:
+                try:
+                    item = await iterator.__anext__()
+                except StopAsyncIteration:
+                    continue
+                yield item
+                yielded += 1
+                next_round.append(iterator)
+                if yielded >= limit:
+                    return
+            iterators = next_round
+
+    async def _iter_channel_and_thread_messages(self, channel: Any, *, limit: int, after: Any, seen_channels: set[str]):
+        """Yield history from a channel plus active/recent archived child threads."""
+        channel_key = str(getattr(channel, "id", ""))
+        if not channel_key or channel_key in seen_channels:
+            return
+        seen_channels.add(channel_key)
+
+        cursor = self._discord_recovery_cursor(channel_key)
+        if cursor:
+            with suppress(ValueError, TypeError):
+                after = discord.Object(id=int(cursor))
+        history = getattr(channel, "history", None)
+        if callable(history):
+            try:
+                # Fetch the latest N messages in the window, then restore
+                # chronological dispatch order. With oldest_first=True the API
+                # returns the earliest N and can permanently starve newer work.
+                history_iter = history(
+                    limit=limit,
+                    after=after,
+                    oldest_first=False,
+                )
+                messages = []
+                async for message in history_iter:  # type: ignore[attr-defined]
+                    messages.append(message)
+                for message in reversed(messages):
+                    yield message
+            except Exception as exc:
+                logger.debug("[%s] Cannot read history for %s: %s", self.name, channel_key, exc)
+
+        child_threads = list(getattr(channel, "threads", []) or [])
+        archived_threads = getattr(channel, "archived_threads", None)
+        if callable(archived_threads):
+            try:
+                async for thread in archived_threads(limit=limit):
+                    child_threads.append(thread)
+            except Exception as exc:
+                logger.debug("[%s] Cannot list archived threads for %s: %s", self.name, channel_key, exc)
+
+        for thread in child_threads:
+            thread_key = str(getattr(thread, "id", ""))
+            if not thread_key or thread_key in seen_channels:
+                continue
+            async for message in self._iter_channel_and_thread_messages(thread, limit=limit, after=after, seen_channels=seen_channels):
+                yield message
+
+    def _discord_recovery_cursor(self, channel_id: str) -> Optional[str]:
+        if not channel_id:
+            return None
+
+        def _op(conn):
+            row = conn.execute(
+                "SELECT last_message_id FROM discord_recovery_cursors WHERE channel_id=?",
+                (channel_id,),
+            ).fetchone()
+            return str(row[0]) if row else None
+
+        return self._with_discord_recovery_db(_op)
+
+    def _advance_discord_recovery_cursor(self, channel_id: str, message_id: str) -> None:
+        if not channel_id or not message_id:
+            return
+        now = self._utc_now_iso()
+
+        def _op(conn):
+            conn.execute(
+                """
+                INSERT INTO discord_recovery_cursors (channel_id, last_message_id, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    last_message_id=excluded.last_message_id,
+                    updated_at=excluded.updated_at
+                """,
+                (channel_id, message_id, now),
+            )
+
+        self._with_discord_recovery_db(_op)
+
+    async def _should_backfill_discord_message(self, message: Any) -> bool:
+        """Return True when a recent Discord message still needs Hermes work."""
+        if not self._client or not getattr(self._client, "user", None):
+            return False
+        if getattr(getattr(message, "author", None), "id", None) == getattr(self._client.user, "id", None):
+            return False
+        if self._discord_message_is_persistently_complete(str(getattr(message, "id", ""))):
+            return False
+        if self._discord_message_has_active_claim(str(getattr(message, "id", ""))):
+            return False
+        # A success reaction alone is only an acknowledgement.  It is not
+        # enough evidence that the substantive response/action completed.
+        if await self._message_has_non_down_bot_response(message):
+            return False
+        return True
+
+    def _is_down_notice_content(self, content: str) -> bool:
+        """Recognize only explicit Hermes/gateway outage notices."""
+        text = (content or "").lower()
+        subject = r"(?:hermes|the agent|agent|the gateway|gateway|bmo)"
+        state = r"(?:is|was|appears to be|is currently|was currently)"
+        condition = r"(?:down|offline|unavailable|not running)"
+        return re.search(rf"\b{subject}\s+{state}\s+{condition}\b", text) is not None
+
+    async def _message_has_non_down_bot_response(self, message: Any) -> bool:
+        """Detect an already-addressed message without trusting down notices."""
+        bot_user = getattr(self._client, "user", None) if self._client else None
+        bot_id = getattr(bot_user, "id", None)
+        if bot_id is None:
+            return False
+
+        async def _scan_history(channel: Any) -> bool:
+            history = getattr(channel, "history", None)
+            if not callable(history):
+                return False
+            try:
+                async for candidate in history(limit=25, after=getattr(message, "created_at", None), oldest_first=True):
+                    author = getattr(candidate, "author", None)
+                    if getattr(author, "id", None) != bot_id:
+                        continue
+                    if self._is_down_notice_content(getattr(candidate, "content", "")):
+                        continue
+                    reference = getattr(candidate, "reference", None)
+                    ref_id = str(getattr(reference, "message_id", "") or "")
+                    if ref_id == str(getattr(message, "id", "")):
+                        return True
+            except Exception:
+                return False
+            return False
+
+        message_channel = getattr(message, "channel", None)
+        # Only an explicit reply reference proves which input a bot response
+        # completed. An arbitrary later bot post can otherwise mask multiple
+        # unanswered requests in the same parent channel or thread.
+        if await _scan_history(message_channel):
+            return True
+
+        thread = getattr(message, "thread", None)
+        if thread is not None and await _scan_history(thread):
+            return True
+        return False
+
+    def _discord_recovery_db_path(self) -> _Path:
+        return self._discord_recovery_store.path()
+
+    def _with_discord_recovery_db(self, fn, default=None):
+        return self._discord_recovery_store.call(fn, default)
+
+    async def _with_discord_recovery_db_async(self, fn, default=None):
+        return await asyncio.to_thread(
+            self._discord_recovery_store.call,
+            fn,
+            default,
+        )
+
+    @staticmethod
+    def _utc_now_iso() -> str:
+        import datetime as _dt
+        return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+    def _message_channel_ids(self, message: Any) -> tuple[str, Optional[str], Optional[str]]:
+        channel = getattr(message, "channel", None)
+        channel_id = str(getattr(channel, "id", "") or "")
+        parent_id = str(getattr(channel, "parent_id", "") or "") or None
+        thread_id = channel_id if parent_id else None
+        return channel_id, thread_id, parent_id
+
+    def _record_discord_message_seen(self, message: Any, *, status: str) -> None:
+        if not self._missed_message_backfill_enabled():
+            return
+        message_id = str(getattr(message, "id", "") or "")
+        if not message_id:
+            return
+        channel_id, thread_id, parent_id = self._message_channel_ids(message)
+        author_id = str(getattr(getattr(message, "author", None), "id", "") or "")
+        created_at = getattr(message, "created_at", None)
+        created_text = created_at.isoformat() if hasattr(created_at, "isoformat") else None
+        now = self._utc_now_iso()
+
+        def _op(conn):
+            existing = conn.execute("SELECT status FROM discord_messages WHERE message_id=?", (message_id,)).fetchone()
+            final_status = existing[0] if existing and existing[0] == "responded" else status
+            conn.execute(
+                """
+                INSERT INTO discord_messages (message_id, channel_id, thread_id, parent_channel_id, author_id, created_at, status, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(message_id) DO UPDATE SET
+                    channel_id=excluded.channel_id,
+                    thread_id=excluded.thread_id,
+                    parent_channel_id=excluded.parent_channel_id,
+                    author_id=excluded.author_id,
+                    created_at=COALESCE(discord_messages.created_at, excluded.created_at),
+                    status=?,
+                    updated_at=excluded.updated_at
+                """,
+                (message_id, channel_id, thread_id, parent_id, author_id, created_text, final_status, now, final_status),
+            )
+
+        self._with_discord_recovery_db(_op)
+
+    def _record_recovery_attempt(self, message: Any, *, status: str, error: Optional[str] = None) -> None:
+        if not self._missed_message_backfill_enabled():
+            return
+        self._record_discord_message_seen(message, status=status)
+        message_id = str(getattr(message, "id", "") or "")
+        if not message_id:
+            return
+        now = self._utc_now_iso()
+
+        def _op(conn):
+            conn.execute(
+                """
+                UPDATE discord_messages
+                   SET status=?, attempts=attempts+1, last_attempt_at=?, last_error=?, updated_at=?
+                 WHERE message_id=?
+                """,
+                (status, now, error, now, message_id),
+            )
+
+        self._with_discord_recovery_db(_op)
+
+    def _record_discord_processing_start(self, event: MessageEvent, *, emoji_ack: bool) -> None:
+        if not self._missed_message_backfill_enabled():
+            return
+        message = event.raw_message
+        self._record_discord_message_seen(message, status="processing")
+        message_id = str(getattr(message, "id", "") or getattr(event, "message_id", "") or "")
+        if not message_id:
+            return
+        now = self._utc_now_iso()
+
+        def _op(conn):
+            conn.execute(
+                "UPDATE discord_messages SET status='processing', emoji_ack=?, updated_at=? WHERE message_id=?",
+                (1 if emoji_ack else 0, now, message_id),
+            )
+
+        self._with_discord_recovery_db(_op)
+
+    def _record_discord_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        if not self._missed_message_backfill_enabled():
+            return
+        message_id = str(getattr(getattr(event, "raw_message", None), "id", "") or getattr(event, "message_id", "") or "")
+        if not message_id:
+            return
+        status = "processed" if outcome == ProcessingOutcome.SUCCESS else ("cancelled" if outcome == ProcessingOutcome.CANCELLED else "failed")
+        now = self._utc_now_iso()
+
+        def _op(conn):
+            conn.execute(
+                "UPDATE discord_messages "
+                "SET status=CASE WHEN status='responded' THEN status ELSE ? END, "
+                "updated_at=? WHERE message_id=?",
+                (status, now, message_id),
+            )
+
+        self._with_discord_recovery_db(_op)
+
+    def _record_discord_response(
+        self,
+        *,
+        reply_to: Optional[str],
+        result: SendResult,
+        content: str,
+        final: bool,
+    ) -> None:
+        if not self._missed_message_backfill_enabled() or not reply_to:
+            return
+        now = self._utc_now_iso()
+        completed = bool(final and result.success)
+        status = "responded" if completed else "failed"
+
+        def _op(conn):
+            conn.execute(
+                """
+                INSERT INTO discord_messages (message_id, status, replied, outage_response, response_message_id, updated_at)
+                VALUES (?, ?, ?, 0, ?, ?)
+                ON CONFLICT(message_id) DO UPDATE SET
+                    status=CASE WHEN ? THEN 'responded' ELSE discord_messages.status END,
+                    replied=CASE WHEN ? THEN 1 ELSE discord_messages.replied END,
+                    outage_response=CASE WHEN ? THEN 0 ELSE discord_messages.outage_response END,
+                    response_message_id=COALESCE(?, response_message_id),
+                    updated_at=?
+                """,
+                (
+                    reply_to,
+                    status,
+                    1 if completed else 0,
+                    result.message_id,
+                    now,
+                    1 if completed else 0,
+                    1 if completed else 0,
+                    1 if completed else 0,
+                    result.message_id,
+                    now,
+                ),
+            )
+
+        self._with_discord_recovery_db(_op)
+        if completed:
+            def _channel_for_message(conn):
+                row = conn.execute(
+                    "SELECT COALESCE(thread_id, channel_id) FROM discord_messages "
+                    "WHERE message_id=?",
+                    (reply_to,),
+                ).fetchone()
+                return str(row[0]) if row and row[0] else None
+
+            channel_id = self._with_discord_recovery_db(_channel_for_message)
+            if channel_id:
+                self._advance_discord_recovery_cursor(channel_id, reply_to)
+
+    def _discord_message_is_persistently_complete(self, message_id: str) -> bool:
+        if not message_id:
+            return False
+
+        def _op(conn):
+            row = conn.execute("SELECT status, replied, outage_response FROM discord_messages WHERE message_id=?", (message_id,)).fetchone()
+            if not row:
+                return False
+            status, replied, outage = row
+            return status == "responded" and bool(replied) and not bool(outage)
+
+        return bool(self._with_discord_recovery_db(_op, default=False))
+
+    def _discord_message_has_active_claim(self, message_id: str) -> bool:
+        if not message_id:
+            return False
+        cutoff = (
+            dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)
+        ).isoformat()
+
+        def _op(conn):
+            row = conn.execute(
+                "SELECT status, updated_at FROM discord_messages WHERE message_id=?",
+                (message_id,),
+            ).fetchone()
+            return bool(
+                row
+                and row[0] in {"queued", "processing"}
+                and row[1] >= cutoff
+            )
+
+        return bool(self._with_discord_recovery_db(_op, default=True))
+
+    def _record_recovery_scan_start(self, channels: set[str]) -> str:
+        scan_id = f"{int(time.time() * 1000)}-{os.getpid()}"
+        now = self._utc_now_iso()
+
+        def _op(conn):
+            conn.execute(
+                "INSERT OR REPLACE INTO discord_recovery_scans (scan_id, started_at, status, channels, window_seconds, limit_count) VALUES (?, ?, ?, ?, ?, ?)",
+                (scan_id, now, "running", json.dumps(sorted(channels)), self._missed_message_backfill_window_seconds(), self._missed_message_backfill_limit()),
+            )
+
+        self._with_discord_recovery_db(_op)
+        return scan_id
+
+    def _record_recovery_scan_complete(self, scan_id: str, *, status: str, scanned: int, missed: int, dispatched: int, error: Optional[str] = None) -> None:
+        now = self._utc_now_iso()
+
+        def _op(conn):
+            conn.execute(
+                "UPDATE discord_recovery_scans SET completed_at=?, status=?, scanned=?, missed=?, dispatched=?, error=? WHERE scan_id=?",
+                (now, status, scanned, missed, dispatched, error, scan_id),
+            )
+
+        self._with_discord_recovery_db(_op)
+
     def _get_discord_command_sync_policy(self) -> str:
-        raw = str(os.getenv("DISCORD_COMMAND_SYNC_POLICY", "safe") or "").strip().lower()
+        raw = str(self._discord_env("DISCORD_COMMAND_SYNC_POLICY", "safe") or "").strip().lower()
         if raw in _DISCORD_COMMAND_SYNC_POLICIES:
             return raw
         if raw:
@@ -2262,18 +2952,27 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
-        return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
+        return self._discord_env("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add an in-progress reaction for normal Discord message events."""
-        if not self._reactions_enabled():
-            return
+        """Add an in-progress reaction and record durable handling state."""
         message = event.raw_message
-        if hasattr(message, "add_reaction"):
-            await self._add_reaction(message, "👀")
+        acked = False
+        if self._reactions_enabled() and hasattr(message, "add_reaction"):
+            acked = await self._add_reaction(message, "👀")
+        await asyncio.to_thread(
+            self._record_discord_processing_start,
+            event,
+            emoji_ack=acked,
+        )
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Swap the in-progress reaction for a final success/failure reaction."""
+        """Swap the in-progress reaction for final reaction and durable state."""
+        await asyncio.to_thread(
+            self._record_discord_processing_complete,
+            event,
+            outcome,
+        )
         if not self._reactions_enabled():
             return
         message = event.raw_message
@@ -2381,6 +3080,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if metadata and metadata.get("thread_id"):
                 thread_id = metadata["thread_id"]
             nonconversational = _metadata_marks_nonconversational(metadata)
+            final_delivery = bool(metadata and metadata.get("notify"))
 
             if thread_id:
                 # Fetch the thread directly — threads are addressed by their own ID.
@@ -2413,7 +3113,15 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
-                return await self._send_to_forum(channel, content)
+                result = await self._send_to_forum(channel, content)
+                await asyncio.to_thread(
+                    self._record_discord_response,
+                    reply_to=reply_to,
+                    result=result,
+                    content=content,
+                    final=final_delivery,
+                )
+                return result
 
             # Keep only explicitly copy-marked fences in standalone Discord
             # messages. Ordinary fences remain with their surrounding prose.
@@ -2477,15 +3185,31 @@ class DiscordAdapter(BasePlatformAdapter):
                 elif not _looks_like_nonconversational_history_message(content):
                     self._last_self_message_id[_target_id] = message_ids[-1]
 
-            return SendResult(
+            result = SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
                 raw_response={"message_ids": message_ids}
             )
+            await asyncio.to_thread(
+                self._record_discord_response,
+                reply_to=reply_to,
+                result=result,
+                content=content,
+                final=final_delivery,
+            )
+            return result
 
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
-            return SendResult(success=False, error=str(e))
+            result = SendResult(success=False, error=str(e))
+            await asyncio.to_thread(
+                self._record_discord_response,
+                reply_to=reply_to,
+                result=result,
+                content=content,
+                final=bool(metadata and metadata.get("notify")),
+            )
+            return result
 
     async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
@@ -2609,6 +3333,7 @@ class DiscordAdapter(BasePlatformAdapter):
         content: str,
         *,
         finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a previously sent Discord message.
 
@@ -2716,7 +3441,16 @@ class DiscordAdapter(BasePlatformAdapter):
                     self._last_overflow_preview[_preview_key] = truncated
                 else:
                     raise
-            return SendResult(success=True, message_id=message_id)
+            result = SendResult(success=True, message_id=message_id)
+            if finalize:
+                await asyncio.to_thread(
+                    self._record_discord_response,
+                    reply_to=(metadata or {}).get("reply_to_message_id"),
+                    result=result,
+                    content=content,
+                    final=True,
+                )
+            return result
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
             return SendResult(success=False, error=str(e))
@@ -3639,7 +4373,7 @@ class DiscordAdapter(BasePlatformAdapter):
         """True when *channel_ids* intersect ``DISCORD_ALLOWED_CHANNELS``."""
         if not channel_ids:
             return False
-        allowed_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "").strip()
+        allowed_raw = self._discord_env("DISCORD_ALLOWED_CHANNELS", "").strip()
         if not allowed_raw:
             return False
         allowed = {c.strip() for c in allowed_raw.split(",") if c.strip()}
@@ -3651,6 +4385,10 @@ class DiscordAdapter(BasePlatformAdapter):
         """True when the Discord user has an explicit Hermes pairing grant."""
         user_id = str(user_id or "").strip()
         if not user_id:
+            return False
+        from agent.secret_scope import is_multiplex_active
+
+        if is_multiplex_active():
             return False
         try:
             from gateway.pairing import PairingStore
@@ -3692,6 +4430,8 @@ class DiscordAdapter(BasePlatformAdapter):
             channel_ids: Resolved text-channel ids for guild traffic when an
                 upstream gate has already scoped the message to a channel.
         """
+        from agent.secret_scope import is_multiplex_active
+
         # ``getattr`` fallbacks here guard against test fixtures that build
         # an adapter via ``object.__new__(DiscordAdapter)`` and skip __init__
         # (see AGENTS.md pitfall #17 — same pattern as gateway.run).
@@ -3708,9 +4448,11 @@ class DiscordAdapter(BasePlatformAdapter):
             return True
 
         if not has_users and not has_roles:
-            if os.getenv("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+            if self._discord_env("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
                 return True
-            if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+            if not is_multiplex_active() and os.getenv(
+                "GATEWAY_ALLOW_ALL_USERS", ""
+            ).strip().lower() in {"true", "1", "yes"}:
                 return True
             # Channel-scoped guild access requires validated channel context.
             # Do not treat DISCORD_ALLOWED_CHANNELS alone as a user-wide bypass
@@ -3777,17 +4519,21 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _warn_if_fail_closed_default(self) -> None:
         """Log once when Discord is rejecting traffic with no allowlist set."""
+        from agent.secret_scope import is_multiplex_active
+
         if getattr(self, "_warned_fail_closed_default", False):
             return
         allowed_users = getattr(self, "_allowed_user_ids", set()) or set()
         allowed_roles = getattr(self, "_allowed_role_ids", set()) or set()
         if allowed_users or allowed_roles:
             return
-        if os.getenv("DISCORD_ALLOWED_CHANNELS", "").strip():
+        if self._discord_env("DISCORD_ALLOWED_CHANNELS", "").strip():
             return
-        if os.getenv("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+        if self._discord_env("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
             return
-        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+        if not is_multiplex_active() and os.getenv(
+            "GATEWAY_ALLOW_ALL_USERS", ""
+        ).strip().lower() in {"true", "1", "yes"}:
             return
         self._warned_fail_closed_default = True
         logger.warning(
@@ -3866,7 +4612,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 else None,
             )
 
-            allowed_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "")
+            allowed_raw = self._discord_env("DISCORD_ALLOWED_CHANNELS", "")
             if allowed_raw:
                 allowed = {c.strip() for c in allowed_raw.split(",") if c.strip()}
                 if "*" not in allowed:
@@ -3883,7 +4629,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # Ignored beats allowed: even when a thread's parent channel
             # is on the allowlist, an explicit DISCORD_IGNORED_CHANNELS
             # entry on the thread or its parent rejects the interaction.
-            ignored_raw = os.getenv("DISCORD_IGNORED_CHANNELS", "")
+            ignored_raw = self._discord_env("DISCORD_IGNORED_CHANNELS", "")
             if ignored_raw and channel_ids:
                 ignored = {c.strip() for c in ignored_raw.split(",") if c.strip()}
                 if "*" in ignored or (channel_keys & ignored):
@@ -4006,6 +4752,13 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         runner = getattr(self, "gateway_runner", None)
         if not runner:
+            return
+        # The legacy admin-alert route uses the primary profile's home-channel
+        # config. A secondary multiplex adapter must not send its security event
+        # through that profile; until alerts have an explicit per-profile target,
+        # fail closed rather than leaking across the boundary.
+        if getattr(self, "_multiplex_profile_name", None):
+            logger.warning("[Discord] Suppressing cross-profile admin alert for multiplexed adapter")
             return
         for target in (Platform.TELEGRAM, Platform.SLACK):
             try:
@@ -4406,11 +5159,12 @@ class DiscordAdapter(BasePlatformAdapter):
         if to_resolve:
             print(f"[{self.name}] Could not resolve usernames: {', '.join(to_resolve)}")
 
-        # Update internal set and env var so gateway auth checks use IDs
+        # Keep resolved authorization profile-local. Multiplexed adapters share
+        # one process, so writing this into os.environ would leak one profile's
+        # resolved IDs into every other profile.
         self._allowed_user_ids = numeric_ids
-        os.environ["DISCORD_ALLOWED_USERS"] = ",".join(sorted(numeric_ids))
         if resolved_count:
-            print(f"[{self.name}] Updated DISCORD_ALLOWED_USERS with {resolved_count} resolved ID(s)")
+            print(f"[{self.name}] Updated resolved Discord allowlist with {resolved_count} ID(s)")
 
     def format_message(self, content: str) -> str:
         """Format message for Discord.
@@ -4792,7 +5546,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # UX so users don't see commands they can't invoke. Off by default
         # to preserve the slash UX for deployments that intentionally allow
         # everyone in the guild.
-        if os.getenv("DISCORD_HIDE_SLASH_COMMANDS", "false").strip().lower() in {
+        if self._discord_env("DISCORD_HIDE_SLASH_COMMANDS", "false").strip().lower() in {
             "true", "1", "yes", "on",
         }:
             self._apply_owner_only_visibility(tree)
@@ -5195,7 +5949,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
-        return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
+        return self._discord_env("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
 
     def _discord_allow_any_attachment(self) -> bool:
         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.
@@ -5210,7 +5964,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() not in {"false", "0", "no", "off", ""}
             return bool(configured)
-        return os.getenv("DISCORD_ALLOW_ANY_ATTACHMENT", "false").lower() in {"true", "1", "yes", "on"}
+        return self._discord_env("DISCORD_ALLOW_ANY_ATTACHMENT", "false").lower() in {"true", "1", "yes", "on"}
 
     def _discord_max_attachment_bytes(self) -> int:
         """Return the per-attachment byte cap. 0 means unlimited.
@@ -5221,7 +5975,7 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         configured = self.config.extra.get("max_attachment_bytes")
         if configured is None:
-            configured = os.getenv("DISCORD_MAX_ATTACHMENT_BYTES")
+            configured = self._discord_env("DISCORD_MAX_ATTACHMENT_BYTES")
         if configured is None or configured == "":
             return 32 * 1024 * 1024
         try:
@@ -5261,7 +6015,7 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         raw = self.config.extra.get("free_response_channels")
         if raw is None:
-            raw = os.getenv("DISCORD_FREE_RESPONSE_CHANNELS", "")
+            raw = self._discord_env("DISCORD_FREE_RESPONSE_CHANNELS", "")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         # Coerce non-list scalars (str/int/float) to str before splitting.
@@ -5330,7 +6084,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION", "false").lower() in {
+        return self._discord_env("DISCORD_BOTS_REQUIRE_INLINE_MENTION", "false").lower() in {
             "true",
             "1",
             "yes",
@@ -5398,7 +6152,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
-        return os.getenv("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
+        return self._discord_env("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
 
     def _discord_history_backfill(self) -> bool:
         """Return whether history backfill is enabled for shared sessions."""
@@ -5407,7 +6161,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
-        return os.getenv("DISCORD_HISTORY_BACKFILL", "true").lower() in {"true", "1", "yes"}
+        return self._discord_env("DISCORD_HISTORY_BACKFILL", "true").lower() in {"true", "1", "yes"}
 
     def _discord_history_backfill_limit(self) -> int:
         """Return the max number of messages to scan backwards for context.
@@ -5423,7 +6177,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 return int(configured)
             except (ValueError, TypeError):
                 pass
-        raw = os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT", "50")
+        raw = self._discord_env("DISCORD_HISTORY_BACKFILL_LIMIT", "50")
         try:
             return int(raw)
         except (ValueError, TypeError):
@@ -5461,7 +6215,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return ""
 
         # Determine which bot messages to include in context
-        allow_bots_raw = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
+        allow_bots_raw = self._discord_env("DISCORD_ALLOW_BOTS", "none").lower().strip()
         include_other_bots = allow_bots_raw != "none"
 
         # Use the in-memory cache to narrow the fetch window on hot paths.
@@ -5761,7 +6515,7 @@ class DiscordAdapter(BasePlatformAdapter):
         placeholder; semantic LLM retitling still happens after the first agent
         turn and is guarded against clobbering human renames.
         """
-        if _discord_bool_env("DISCORD_SMART_THREAD_TITLES", False):
+        if _discord_bool_env("DISCORD_SMART_THREAD_TITLES", False, self._discord_env):
             return _build_auto_thread_name(content)
         return _legacy_auto_thread_name(content)
 
@@ -5785,7 +6539,7 @@ class DiscordAdapter(BasePlatformAdapter):
             try:
                 thread = await message.create_thread(
                     name=thread_name,
-                    auto_archive_duration=_discord_thread_auto_archive_minutes(),
+                    auto_archive_duration=_discord_thread_auto_archive_minutes(self._discord_env),
                 )
                 try:
                     setattr(thread, "_hermes_auto_thread_initial_name", thread_name)
@@ -5800,7 +6554,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     )
                     thread = await seed_msg.create_thread(
                         name=thread_name,
-                        auto_archive_duration=_discord_thread_auto_archive_minutes(),
+                        auto_archive_duration=_discord_thread_auto_archive_minutes(self._discord_env),
                         reason=reason,
                     )
                     try:
@@ -5949,7 +6703,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if create is not None:
                 thread = await create(
                     name=thread_name,
-                    auto_archive_duration=_discord_thread_auto_archive_minutes(),
+                    auto_archive_duration=_discord_thread_auto_archive_minutes(self._discord_env),
                     reason=reason,
                 )
                 return str(thread.id)
@@ -5967,7 +6721,7 @@ class DiscordAdapter(BasePlatformAdapter):
             seed_msg = await send(f"\U0001f9f5 Hermes handoff: **{thread_name}**")
             thread = await seed_msg.create_thread(
                 name=thread_name,
-                auto_archive_duration=_discord_thread_auto_archive_minutes(),
+                auto_archive_duration=_discord_thread_auto_archive_minutes(self._discord_env),
                 reason=reason,
             )
             return str(thread.id)
@@ -6008,7 +6762,9 @@ class DiscordAdapter(BasePlatformAdapter):
         ``DISCORD_APPROVAL_MENTIONS`` env var). Only numeric allowlist entries
         can be mentioned; default off avoids surprise pings.
         """
-        if not _env_bool("DISCORD_APPROVAL_MENTIONS", False):
+        if self._discord_env("DISCORD_APPROVAL_MENTIONS", "false").lower() not in {
+            "true", "1", "yes", "on",
+        }:
             return None
         user_ids = sorted(uid for uid in self._allowed_user_ids if str(uid).isdigit())
         if not user_ids:
@@ -6620,8 +7376,14 @@ class DiscordAdapter(BasePlatformAdapter):
                     raise Exception(f"HTTP {resp.status}")
                 return await resp.read()
 
-    async def _handle_message(self, message: DiscordMessage, role_authorized: bool = False) -> None:
-        """Handle incoming Discord messages."""
+    async def _handle_message(
+        self,
+        message: DiscordMessage,
+        role_authorized: bool = False,
+        *,
+        recovered: bool = False,
+    ) -> bool:
+        """Handle one Discord message and report whether it reached dispatch."""
         # In server channels (not DMs), require the bot to be @mentioned
         # UNLESS the channel is in the free-response list or the message is
         # in a thread where the bot has already participated.
@@ -6672,19 +7434,19 @@ class DiscordAdapter(BasePlatformAdapter):
             channel_keys = self._discord_channel_keys(message, parent_channel_id)
 
             # Check allowed channels - if set, only respond in these channels
-            allowed_channels_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "")
+            allowed_channels_raw = self._discord_env("DISCORD_ALLOWED_CHANNELS", "")
             if allowed_channels_raw:
                 allowed_channels = {ch.strip() for ch in allowed_channels_raw.split(",") if ch.strip()}
                 if "*" not in allowed_channels and not (channel_keys & allowed_channels):
                     logger.debug("[%s] Ignoring message in non-allowed channel: %s", self.name, channel_keys)
-                    return
+                    return False
 
             # Check ignored channels - never respond even when mentioned
-            ignored_channels_raw = os.getenv("DISCORD_IGNORED_CHANNELS", "")
+            ignored_channels_raw = self._discord_env("DISCORD_IGNORED_CHANNELS", "")
             ignored_channels = {ch.strip() for ch in ignored_channels_raw.split(",") if ch.strip()}
             if "*" in ignored_channels or (channel_keys & ignored_channels):
                 logger.debug("[%s] Ignoring message in ignored channel: %s", self.name, channel_keys)
-                return
+                return False
 
             free_channels = self._discord_free_response_channels()
 
@@ -6713,17 +7475,17 @@ class DiscordAdapter(BasePlatformAdapter):
 
             if require_mention and not is_free_channel and not in_bot_thread:
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
-                    return
+                    return False
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
         # Messages already inside threads or DMs are unaffected.
         # no_thread_channels: channels where bot responds directly without thread.
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
-            no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
+            no_thread_channels_raw = self._discord_env("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
             skip_thread = bool(channel_keys & no_thread_channels)
-            auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
+            auto_thread = self._discord_env("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
                 thread = await self._auto_create_thread(message)
@@ -6762,7 +7524,7 @@ class DiscordAdapter(BasePlatformAdapter):
                             self.name,
                             notify_error,
                         )
-                    return
+                    return False
 
         referenced_attachments = []
         reference = getattr(message, "reference", None)
@@ -7059,7 +7821,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     getattr(message.author, "display_name", getattr(message.author, "name", "unknown")),
                     getattr(message.channel, "id", "unknown"),
                 )
-                return
+                return False
             event_text = "(The user sent a message with no text content)"
 
         _chan = message.channel
@@ -7096,12 +7858,18 @@ class DiscordAdapter(BasePlatformAdapter):
         if thread_id:
             self._threads.mark(thread_id)
 
-        # Only batch plain text messages — commands, media, etc. dispatch
-        # immediately since they won't be split by the Discord client.
-        if msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
+        # Only live plain text messages use split-message batching. Recovery
+        # candidates are already complete historical messages; coalescing them
+        # would lose constituent IDs and make later restarts replay them.
+        if (
+            not recovered
+            and msg_type == MessageType.TEXT
+            and self._text_batch_delay_seconds > 0
+        ):
             self._enqueue_text_event(event)
         else:
             await self.handle_message(event)
+        return True
 
     # ------------------------------------------------------------------
     # Text message aggregation (handles Discord client-side splits)
@@ -7225,18 +7993,24 @@ def _component_check_auth(
     if user is None or getattr(user, "id", None) is None:
         return False
 
-    if os.getenv("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+    from agent.secret_scope import is_multiplex_active
+
+    if not is_multiplex_active() and os.getenv(
+        "DISCORD_ALLOW_ALL_USERS", ""
+    ).strip().lower() in {"true", "1", "yes"}:
         return True
-    if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+    if not is_multiplex_active() and os.getenv(
+        "GATEWAY_ALLOW_ALL_USERS", ""
+    ).strip().lower() in {"true", "1", "yes"}:
         return True
 
     user_set = {str(uid).strip() for uid in (allowed_user_ids or set()) if str(uid).strip()}
-    global_allowed = {
-        uid.strip()
-        for uid in os.getenv("GATEWAY_ALLOWED_USERS", "").split(",")
-        if uid.strip()
-    }
-    user_set.update(global_allowed)
+    if not is_multiplex_active():
+        user_set.update(
+            uid.strip()
+            for uid in os.getenv("GATEWAY_ALLOWED_USERS", "").split(",")
+            if uid.strip()
+        )
     role_set = set(allowed_role_ids or set())
     has_users = bool(user_set)
     has_roles = bool(role_set)
@@ -7269,7 +8043,9 @@ def _component_check_auth(
     # Check pairing store — mirrors ``authz_mixin._check_authorization``
     # so users approved via ``hermes pairing approve`` can interact with
     # component buttons even without DISCORD_ALLOWED_USERS set.
-    if uid:
+    from agent.secret_scope import is_multiplex_active
+
+    if uid and not is_multiplex_active():
         try:
             from gateway.pairing import PairingStore
             store = PairingStore()
@@ -8513,7 +9289,12 @@ async def _standalone_send(
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
 
-    token = (getattr(pconfig, "token", None) or os.getenv("DISCORD_BOT_TOKEN", "")).strip()
+    token = (getattr(pconfig, "token", None) or "").strip()
+    if not token:
+        from agent.secret_scope import is_multiplex_active
+
+        if not is_multiplex_active():
+            token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
     if not token:
         return {"error": "Discord standalone send: DISCORD_BOT_TOKEN is not set"}
 
@@ -8841,30 +9622,21 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     legacy ``discord_cfg`` block that used to live in
     ``gateway/config.py::load_gateway_config()`` before this migration.
 
-    The DiscordAdapter reads its runtime configuration via ``os.getenv()``
-    throughout the connect / handle code paths (``DISCORD_ALLOWED_USERS``,
-    ``DISCORD_REQUIRE_MENTION``, ``DISCORD_FREE_RESPONSE_CHANNELS``,
-    ``DISCORD_AUTO_THREAD``, ``DISCORD_REACTIONS``,
-    ``DISCORD_IGNORED_CHANNELS``, ``DISCORD_ALLOWED_CHANNELS``,
-    ``DISCORD_NO_THREAD_CHANNELS``, ``DISCORD_HISTORY_BACKFILL``,
-    ``DISCORD_HISTORY_BACKFILL_LIMIT``, ``DISCORD_ALLOW_MENTION_*``,
-    ``DISCORD_REPLY_TO_MODE``, ``DISCORD_THREAD_REQUIRE_MENTION``,
-    ``DISCORD_BOTS_REQUIRE_INLINE_MENTION``).
-    Rather than rewrite ~50 call sites inside the adapter to read from
-    ``PlatformConfig.extra`` instead, this hook keeps the existing
-    env-driven model and merely owns the YAML→env translation here, next to
-    the adapter that consumes it.
-
-    ``PlatformConfig.extra`` is the per-adapter source of truth for liveness
-    settings, which keeps multiplexed profiles isolated. The legacy env bridge
-    remains only for existing callers that construct adapters without config
-    extras. Returns canonical WebSocket liveness settings to seed that extra.
+    ``PlatformConfig.extra`` is the per-adapter source of truth for Discord
+    policy and liveness settings, which keeps multiplexed profiles isolated.
+    The legacy environment bridge remains only for single-profile callers;
+    multiplex mode neither writes nor reads profile policy through
+    process-global environment state. Returns canonical settings to seed the
+    adapter extra.
     """
-    if "require_mention" in discord_cfg and not os.getenv("DISCORD_REQUIRE_MENTION"):
+    from agent.secret_scope import is_multiplex_active
+
+    _legacy_env_bridge = not is_multiplex_active()
+    if _legacy_env_bridge and "require_mention" in discord_cfg and not os.getenv("DISCORD_REQUIRE_MENTION"):
         os.environ["DISCORD_REQUIRE_MENTION"] = str(discord_cfg["require_mention"]).lower()
-    if "thread_require_mention" in discord_cfg and not os.getenv("DISCORD_THREAD_REQUIRE_MENTION"):
+    if _legacy_env_bridge and "thread_require_mention" in discord_cfg and not os.getenv("DISCORD_THREAD_REQUIRE_MENTION"):
         os.environ["DISCORD_THREAD_REQUIRE_MENTION"] = str(discord_cfg["thread_require_mention"]).lower()
-    if "bots_require_inline_mention" in discord_cfg and not os.getenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION"):
+    if _legacy_env_bridge and "bots_require_inline_mention" in discord_cfg and not os.getenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION"):
         os.environ["DISCORD_BOTS_REQUIRE_INLINE_MENTION"] = str(discord_cfg["bots_require_inline_mention"]).lower()
     platforms_cfg = yaml_cfg.get("platforms")
     platform_extra_cfg = {}
@@ -8878,7 +9650,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         discord_cfg["allow_from"] if "allow_from" in discord_cfg
         else platform_extra_cfg.get("allow_from")
     )
-    if allowed_users_cfg is not None and not os.getenv("DISCORD_ALLOWED_USERS"):
+    if _legacy_env_bridge and allowed_users_cfg is not None and not os.getenv("DISCORD_ALLOWED_USERS"):
         if isinstance(allowed_users_cfg, list):
             allowed_users_cfg = ",".join(str(v) for v in allowed_users_cfg)
         os.environ["DISCORD_ALLOWED_USERS"] = str(allowed_users_cfg)
@@ -8886,46 +9658,50 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         discord_cfg["approval_mentions"] if "approval_mentions" in discord_cfg
         else platform_extra_cfg.get("approval_mentions")
     )
-    if approval_mentions_cfg is not None and not os.getenv("DISCORD_APPROVAL_MENTIONS"):
+    if _legacy_env_bridge and approval_mentions_cfg is not None and not os.getenv("DISCORD_APPROVAL_MENTIONS"):
         os.environ["DISCORD_APPROVAL_MENTIONS"] = str(approval_mentions_cfg).lower()
     frc = discord_cfg.get("free_response_channels")
-    if frc is not None and not os.getenv("DISCORD_FREE_RESPONSE_CHANNELS"):
+    if _legacy_env_bridge and frc is not None and not os.getenv("DISCORD_FREE_RESPONSE_CHANNELS"):
         if isinstance(frc, list):
             frc = ",".join(str(v) for v in frc)
         os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
-    if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
+    if _legacy_env_bridge and "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
-    if "thread_auto_archive_minutes" in discord_cfg and not os.getenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES"):
+    if _legacy_env_bridge and "thread_auto_archive_minutes" in discord_cfg and not os.getenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES"):
         os.environ["DISCORD_THREAD_AUTO_ARCHIVE_MINUTES"] = str(discord_cfg["thread_auto_archive_minutes"])
-    if "smart_thread_titles" in discord_cfg and not os.getenv("DISCORD_SMART_THREAD_TITLES"):
+    if _legacy_env_bridge and "smart_thread_titles" in discord_cfg and not os.getenv("DISCORD_SMART_THREAD_TITLES"):
         os.environ["DISCORD_SMART_THREAD_TITLES"] = str(discord_cfg["smart_thread_titles"]).lower()
-    if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
+    if _legacy_env_bridge and "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
         os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
+    seeded_extra = {}
+    backfill_cfg = discord_cfg.get("missed_message_backfill")
+    if isinstance(backfill_cfg, dict):
+        seeded_extra["missed_message_backfill"] = dict(backfill_cfg)
     # ignored_channels: channels where bot never responds (even when mentioned)
     ic = discord_cfg.get("ignored_channels")
-    if ic is not None and not os.getenv("DISCORD_IGNORED_CHANNELS"):
+    if _legacy_env_bridge and ic is not None and not os.getenv("DISCORD_IGNORED_CHANNELS"):
         if isinstance(ic, list):
             ic = ",".join(str(v) for v in ic)
         os.environ["DISCORD_IGNORED_CHANNELS"] = str(ic)
     # allowed_channels: if set, bot ONLY responds in these channels (whitelist)
     ac = discord_cfg.get("allowed_channels")
-    if ac is not None and not os.getenv("DISCORD_ALLOWED_CHANNELS"):
+    if _legacy_env_bridge and ac is not None and not os.getenv("DISCORD_ALLOWED_CHANNELS"):
         if isinstance(ac, list):
             ac = ",".join(str(v) for v in ac)
         os.environ["DISCORD_ALLOWED_CHANNELS"] = str(ac)
     # no_thread_channels: channels where bot responds directly without creating thread
     ntc = discord_cfg.get("no_thread_channels")
-    if ntc is not None and not os.getenv("DISCORD_NO_THREAD_CHANNELS"):
+    if _legacy_env_bridge and ntc is not None and not os.getenv("DISCORD_NO_THREAD_CHANNELS"):
         if isinstance(ntc, list):
             ntc = ",".join(str(v) for v in ntc)
         os.environ["DISCORD_NO_THREAD_CHANNELS"] = str(ntc)
     # history_backfill: recover missed channel messages for shared sessions
     # when require_mention is active.  Fetches messages between bot turns
     # and prepends them to the user message for context.
-    if "history_backfill" in discord_cfg and not os.getenv("DISCORD_HISTORY_BACKFILL"):
+    if _legacy_env_bridge and "history_backfill" in discord_cfg and not os.getenv("DISCORD_HISTORY_BACKFILL"):
         os.environ["DISCORD_HISTORY_BACKFILL"] = str(discord_cfg["history_backfill"]).lower()
     hbl = discord_cfg.get("history_backfill_limit")
-    if hbl is not None and not os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT"):
+    if _legacy_env_bridge and hbl is not None and not os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT"):
         os.environ["DISCORD_HISTORY_BACKFILL_LIMIT"] = str(hbl)
     # allow_mentions: granular control over what the bot can ping.
     # Safe defaults (no @everyone/roles) are applied in the adapter;
@@ -8939,7 +9715,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             ("users", "DISCORD_ALLOW_MENTION_USERS"),
             ("replied_user", "DISCORD_ALLOW_MENTION_REPLIED_USER"),
         ):
-            if yaml_key in allow_mentions_cfg and not os.getenv(env_key):
+            if _legacy_env_bridge and yaml_key in allow_mentions_cfg and not os.getenv(env_key):
                 os.environ[env_key] = str(allow_mentions_cfg[yaml_key]).lower()
     # reply_to_mode: top-level preferred, falls back to extra.reply_to_mode.
     # YAML 1.1 parses bare 'off' as boolean False — coerce to string "off".
@@ -8948,9 +9724,10 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         discord_cfg["reply_to_mode"] if "reply_to_mode" in discord_cfg
         else _discord_extra.get("reply_to_mode")
     )
-    if _discord_rtm is not None and not os.getenv("DISCORD_REPLY_TO_MODE"):
+    if _discord_rtm is not None:
         _rtm_str = "off" if _discord_rtm is False else str(_discord_rtm).lower()
-        os.environ["DISCORD_REPLY_TO_MODE"] = _rtm_str
+        if _legacy_env_bridge and not os.getenv("DISCORD_REPLY_TO_MODE"):
+            os.environ["DISCORD_REPLY_TO_MODE"] = _rtm_str
     _websocket_extra_cfg = discord_cfg.get("extra")
     if not isinstance(_websocket_extra_cfg, dict):
         _websocket_extra_cfg = {}
@@ -8977,16 +9754,79 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         ("websocket_heartbeat_ack_max_age_seconds", None, None),
         ("websocket_max_latency_seconds", None, None),
     )
-    seeded = {}
     for primary_key, legacy_key, env_key in _websocket_liveness_keys:
         value = _websocket_liveness_cfg.get(primary_key)
         if value is None and legacy_key:
             value = _websocket_liveness_cfg.get(legacy_key)
         if value is not None:
-            seeded[primary_key] = value
-            if env_key and not os.getenv(env_key):
+            seeded_extra[primary_key] = value
+            if _legacy_env_bridge and env_key and not os.getenv(env_key):
                 os.environ[env_key] = str(value)
-    return seeded or None
+
+    # Snapshot every profile-sensitive Discord authorization/routing setting
+    # into adapter-local config. The legacy YAML→environment bridge above stays
+    # for single-profile compatibility, but multiplexed adapters must never
+    # consume another profile's process-global values.
+    _policy_source = {
+        **platform_extra_cfg,
+        **_websocket_extra_cfg,
+        **discord_cfg,
+    }
+    _policy_env = {}
+    _policy_keys = {
+        "allow_all_users": "DISCORD_ALLOW_ALL_USERS",
+        "allow_any_attachment": "DISCORD_ALLOW_ANY_ATTACHMENT",
+        "allow_bots": "DISCORD_ALLOW_BOTS",
+        "allowed_channels": "DISCORD_ALLOWED_CHANNELS",
+        "allowed_roles": "DISCORD_ALLOWED_ROLES",
+        "auto_thread": "DISCORD_AUTO_THREAD",
+        "bots_require_inline_mention": "DISCORD_BOTS_REQUIRE_INLINE_MENTION",
+        "command_sync_policy": "DISCORD_COMMAND_SYNC_POLICY",
+        "free_response_channels": "DISCORD_FREE_RESPONSE_CHANNELS",
+        "hide_slash_commands": "DISCORD_HIDE_SLASH_COMMANDS",
+        "history_backfill": "DISCORD_HISTORY_BACKFILL",
+        "history_backfill_limit": "DISCORD_HISTORY_BACKFILL_LIMIT",
+        "ignore_no_mention": "DISCORD_IGNORE_NO_MENTION",
+        "ignored_channels": "DISCORD_IGNORED_CHANNELS",
+        "max_attachment_bytes": "DISCORD_MAX_ATTACHMENT_BYTES",
+        "no_thread_channels": "DISCORD_NO_THREAD_CHANNELS",
+        "reactions": "DISCORD_REACTIONS",
+        "require_mention": "DISCORD_REQUIRE_MENTION",
+        "smart_thread_titles": "DISCORD_SMART_THREAD_TITLES",
+        "thread_auto_archive_minutes": "DISCORD_THREAD_AUTO_ARCHIVE_MINUTES",
+        "thread_require_mention": "DISCORD_THREAD_REQUIRE_MENTION",
+    }
+    for _config_key, _env_key in _policy_keys.items():
+        if _config_key not in _policy_source:
+            continue
+        _value = _policy_source[_config_key]
+        if isinstance(_value, list):
+            _value = ",".join(str(item) for item in _value)
+        elif isinstance(_value, bool):
+            _value = str(_value).lower()
+        _policy_env[_env_key] = str(_value)
+
+    if allowed_users_cfg is not None:
+        _policy_allowed_users = allowed_users_cfg
+        if isinstance(_policy_allowed_users, list):
+            _policy_allowed_users = ",".join(str(item) for item in _policy_allowed_users)
+        _policy_env["DISCORD_ALLOWED_USERS"] = str(_policy_allowed_users)
+    if approval_mentions_cfg is not None:
+        _policy_env["DISCORD_APPROVAL_MENTIONS"] = str(approval_mentions_cfg).lower()
+    if _discord_rtm is not None:
+        _policy_env["DISCORD_REPLY_TO_MODE"] = _rtm_str
+    if isinstance(allow_mentions_cfg, dict):
+        for _yaml_key, _env_key in (
+            ("everyone", "DISCORD_ALLOW_MENTION_EVERYONE"),
+            ("roles", "DISCORD_ALLOW_MENTION_ROLES"),
+            ("users", "DISCORD_ALLOW_MENTION_USERS"),
+            ("replied_user", "DISCORD_ALLOW_MENTION_REPLIED_USER"),
+        ):
+            if _yaml_key in allow_mentions_cfg:
+                _policy_env[_env_key] = str(allow_mentions_cfg[_yaml_key]).lower()
+    if _policy_env:
+        seeded_extra["_discord_env"] = _policy_env
+    return seeded_extra or None
 
 
 def _is_connected(config) -> bool:
@@ -8998,8 +9838,17 @@ def _is_connected(config) -> bool:
     ``DISCORD_BOT_TOKEN`` env vars. Matches what the legacy
     ``_PLATFORMS["discord"]`` dispatch did before this migration.
     """
-    import hermes_cli.gateway as gateway_mod
-    return bool((gateway_mod.get_env_value("DISCORD_BOT_TOKEN") or "").strip())
+    from agent.secret_scope import UnscopedSecretError, get_secret, is_multiplex_active
+
+    if not is_multiplex_active():
+        import hermes_cli.gateway as gateway_mod
+
+        return bool((gateway_mod.get_env_value("DISCORD_BOT_TOKEN") or "").strip())
+
+    try:
+        return bool((get_secret("DISCORD_BOT_TOKEN", "") or "").strip())
+    except UnscopedSecretError:
+        return False
 
 
 def _build_adapter(config):

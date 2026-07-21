@@ -17,9 +17,12 @@ import os
 import html as _html
 import re
 import threading
+import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
+
+from agent.secret_scope import get_secret, is_multiplex_active, profile_env_int
 
 logger = logging.getLogger(__name__)
 
@@ -543,6 +546,24 @@ _UPDATER_STOP_TIMEOUT = 15.0
 # reconnect ladder from stalling indefinitely and allows the heartbeat loop to
 # trigger its own recovery path. Refs: NousResearch/hermes-agent#59614
 _UPDATER_START_TIMEOUT = 30.0
+# shutdown()/initialize() on the getUpdates httpx request close and rebuild the
+# connection pool. When a connection is wedged on a stale CLOSE-WAIT socket that
+# close can block forever, hanging _drain_polling_connections() and freezing the
+# whole reconnect ladder (the tracked _polling_error_task never completes, so
+# every escalation path stays gated behind its in-flight guard). Bound the drain
+# so the ladder always advances toward the fatal-restart escalation. Matches
+# _UPDATER_STOP_TIMEOUT. Refs: NousResearch/hermes-agent#66377
+_DRAIN_TIMEOUT = 15.0
+# Cause-agnostic wedged-recovery watchdog (#66377). Every recovery path (the
+# reconnect ladder's re-entry, the pending-update probe, PTB's error callback)
+# gates new recovery on ``_polling_error_task.done()``; if that task ever wedges
+# on a hung await that no local bound covers, the whole gateway goes silently
+# deaf with nothing retrying. The heartbeat loop force-escalates a recovery task
+# that stays in-flight far longer than any healthy ladder attempt could take —
+# stop (_UPDATER_STOP_TIMEOUT) + drain (2x_DRAIN_TIMEOUT) + start
+# (_UPDATER_START_TIMEOUT) + max backoff (60s) is ~135s, so 300s is
+# unambiguously stuck.
+_POLLING_ERROR_TASK_STUCK_TIMEOUT = 300.0
 # A generation is not healthy until the dedicated getUpdates request returns
 # successfully. This exceeds a normal long-poll cycle for healthy idle bots.
 _POLLING_PROGRESS_TIMEOUT = 60.0
@@ -892,13 +913,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
 
-        allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
+        allowed_csv = str(get_secret("TELEGRAM_ALLOWED_USERS", "")).strip()
         if not allowed_csv:
             # Fail-closed: no allowlist means deny by default.
             # The runner auth path in _is_user_authorized() handles
             # GATEWAY_ALLOW_ALL_USERS; this fallback must not silently
             # allow everyone (fixes #24457).
-            return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+            return str(get_secret("GATEWAY_ALLOW_ALL_USERS", "")).lower() in {"true", "1", "yes"}
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or normalized_user_id in allowed_ids
 
@@ -972,7 +993,7 @@ class TelegramAdapter(BasePlatformAdapter):
             "GATEWAY_ALLOWED_USERS",
             "GATEWAY_ALLOW_ALL_USERS",
         )
-        return any(os.getenv(key, "").strip() for key in keys)
+        return any(str(get_secret(key, "")).strip() for key in keys)
 
     def _is_user_authorized_from_message(self, message: Message) -> bool:
         """Check if the sender of a Telegram message is authorized.
@@ -1036,7 +1057,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
 
-        allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
+        allowed_csv = str(get_secret("TELEGRAM_ALLOWED_USERS", "")).strip()
         if not allowed_csv:
             return True
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
@@ -1987,20 +2008,22 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             return
         try:
-            await polling_req.shutdown()
+            # Bounded: a wedged CLOSE-WAIT socket can make this close hang
+            # forever and freeze the reconnect ladder (#66377).
+            await asyncio.wait_for(polling_req.shutdown(), timeout=_DRAIN_TIMEOUT)
         except Exception:
             logger.debug(
-                "[%s] Polling request shutdown failed (non-fatal)",
+                "[%s] Polling request shutdown failed/timed out (non-fatal)",
                 self.name, exc_info=True,
             )
         try:
-            await polling_req.initialize()
+            await asyncio.wait_for(polling_req.initialize(), timeout=_DRAIN_TIMEOUT)
             logger.debug(
                 "[%s] Polling request pool drained before reconnect", self.name
             )
         except Exception:
             logger.debug(
-                "[%s] Polling request re-initialize failed (non-fatal)",
+                "[%s] Polling request re-initialize failed/timed out (non-fatal)",
                 self.name, exc_info=True,
             )
 
@@ -2486,6 +2509,16 @@ class TelegramAdapter(BasePlatformAdapter):
         HEARTBEAT_INTERVAL = 90   # seconds between probes
         PROBE_TIMEOUT = 15        # seconds before declaring the path dead
 
+        # Wedged-recovery watchdog state (#66377). Tracked locally so no
+        # _polling_error_task assignment site needs to stamp a timestamp: the
+        # heartbeat notes when it first observes a given recovery task still
+        # in-flight, and force-escalates if the *same* task object is still
+        # running after _POLLING_ERROR_TASK_STUCK_TIMEOUT. A healthy ladder
+        # attempt completes (task done) or chains to a new task well before
+        # then, so a single long-lived task is unambiguously wedged.
+        stuck_task_ref: Optional[asyncio.Task] = None
+        stuck_task_since = 0.0
+
         while True:
             try:
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -2493,6 +2526,42 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
                 if self.has_fatal_error:
                     return
+
+                # Independent wedged-recovery watchdog (#66377): if the tracked
+                # recovery task has hung (any await no local bound covers), every
+                # other recovery path is gated behind it and returns early
+                # forever — the gateway stays alive but deaf. Force a
+                # retryable-fatal so the background reconnector rebuilds the
+                # adapter instead of relying on the frozen ladder.
+                recovery_task = self._polling_error_task
+                if recovery_task is not None and not recovery_task.done():
+                    now = time.monotonic()
+                    if recovery_task is not stuck_task_ref:
+                        stuck_task_ref = recovery_task
+                        stuck_task_since = now
+                    elif now - stuck_task_since > _POLLING_ERROR_TASK_STUCK_TIMEOUT:
+                        stuck_for = now - stuck_task_since
+                        logger.error(
+                            "[%s] Telegram reconnect task wedged for %.0fs with no "
+                            "ladder progress; forcing retryable-fatal so the gateway "
+                            "reconnects instead of staying silently deaf.",
+                            self.name, stuck_for,
+                        )
+                        try:
+                            recovery_task.cancel()
+                        except Exception:
+                            pass
+                        self._set_fatal_error(
+                            "telegram_network_error",
+                            "Telegram reconnect task wedged for %.0fs; forcing "
+                            "gateway reconnect." % stuck_for,
+                            retryable=True,
+                        )
+                        await self._notify_fatal_error()
+                        return
+                else:
+                    stuck_task_ref = None
+
                 bot = self._app.bot if self._app else None
                 if bot is None:
                     continue
@@ -3623,7 +3692,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._app.start()
 
             # Decide between webhook and polling mode
-            webhook_url = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
+            webhook_url = str(get_secret("TELEGRAM_WEBHOOK_URL", "")).strip()
 
             if webhook_url:
                 # ── Webhook mode ─────────────────────────────────────
@@ -3637,8 +3706,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 # inject forged updates as if from Telegram. Refuse to
                 # start rather than silently run in fail-open mode.
                 # See GHSA-3vpc-7q5r-276h.
-                webhook_port = env_int("TELEGRAM_WEBHOOK_PORT", 8443)
-                webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+                webhook_port = profile_env_int("TELEGRAM_WEBHOOK_PORT", 8443)
+                webhook_secret = str(get_secret("TELEGRAM_WEBHOOK_SECRET", "")).strip()
                 if not webhook_secret:
                     raise RuntimeError(
                         "TELEGRAM_WEBHOOK_SECRET is required when "
@@ -7238,7 +7307,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
+        return str(get_secret("TELEGRAM_REQUIRE_MENTION", "false")).lower() in {"true", "1", "yes", "on"}
 
     def _telegram_observe_unmentioned_group_messages(self) -> bool:
         """Return whether skipped unmentioned group messages are stored as context.
@@ -7255,7 +7324,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false").lower() in {"true", "1", "yes", "on"}
+        return str(get_secret("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false")).lower() in {"true", "1", "yes", "on"}
 
     def _telegram_guest_mode(self) -> bool:
         """Return whether non-allowlisted groups may trigger via direct @mention."""
@@ -7264,7 +7333,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_GUEST_MODE", "false").lower() in {"true", "1", "yes", "on"}
+        return str(get_secret("TELEGRAM_GUEST_MODE", "false")).lower() in {"true", "1", "yes", "on"}
 
     def _telegram_exclusive_bot_mentions(self) -> bool:
         """Return whether explicit @...bot mentions exclusively route group messages."""
@@ -7273,12 +7342,12 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_EXCLUSIVE_BOT_MENTIONS", "true").lower() in {"true", "1", "yes", "on"}
+        return str(get_secret("TELEGRAM_EXCLUSIVE_BOT_MENTIONS", "true")).lower() in {"true", "1", "yes", "on"}
 
     def _telegram_free_response_chats(self) -> set[str]:
         raw = self.config.extra.get("free_response_chats")
         if raw is None:
-            raw = os.getenv("TELEGRAM_FREE_RESPONSE_CHATS", "")
+            raw = get_secret("TELEGRAM_FREE_RESPONSE_CHATS", "")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -7292,7 +7361,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         raw = self.config.extra.get("free_response_topics")
         if raw is None:
-            raw = os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS", "")
+            raw = get_secret("TELEGRAM_FREE_RESPONSE_TOPICS", "")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -7319,7 +7388,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         raw = self.config.extra.get("allowed_chats")
         if raw is None:
-            raw = os.getenv("TELEGRAM_ALLOWED_CHATS", "")
+            raw = get_secret("TELEGRAM_ALLOWED_CHATS", "")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -7328,7 +7397,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Return Telegram chats authorized at group scope."""
         raw = self.config.extra.get("group_allowed_chats")
         if raw is None:
-            raw = os.getenv("TELEGRAM_GROUP_ALLOWED_CHATS", "")
+            raw = get_secret("TELEGRAM_GROUP_ALLOWED_CHATS", "")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -7358,7 +7427,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         raw = self.config.extra.get("allowed_topics")
         if raw is None:
-            raw = os.getenv("TELEGRAM_ALLOWED_TOPICS", "")
+            raw = get_secret("TELEGRAM_ALLOWED_TOPICS", "")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -7366,7 +7435,7 @@ class TelegramAdapter(BasePlatformAdapter):
     def _telegram_ignored_threads(self) -> set[int]:
         raw = self.config.extra.get("ignored_threads")
         if raw is None:
-            raw = os.getenv("TELEGRAM_IGNORED_THREADS", "")
+            raw = get_secret("TELEGRAM_IGNORED_THREADS", "")
 
         if isinstance(raw, list):
             values = raw
@@ -7388,7 +7457,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Compile optional regex wake-word patterns for group triggers."""
         patterns = self.config.extra.get("mention_patterns")
         if patterns is None:
-            raw = os.getenv("TELEGRAM_MENTION_PATTERNS", "").strip()
+            raw = str(get_secret("TELEGRAM_MENTION_PATTERNS", "")).strip()
             if raw:
                 try:
                     loaded = json.loads(raw)
@@ -9072,7 +9141,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
-        return os.getenv("TELEGRAM_REACTIONS", "false").lower() not in {"false", "0", "no"}
+        return str(get_secret("TELEGRAM_REACTIONS", "false")).lower() not in {"false", "0", "no"}
 
     async def _set_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Set a single emoji reaction on a Telegram message."""
@@ -9212,8 +9281,12 @@ def _is_connected(config) -> bool:
     """
     token = getattr(config, "token", None)
     if not token:
-        import hermes_cli.gateway as gateway_mod
-        token = gateway_mod.get_env_value("TELEGRAM_BOT_TOKEN") or ""
+        if is_multiplex_active():
+            token = get_secret("TELEGRAM_BOT_TOKEN") or ""
+        else:
+            import hermes_cli.gateway as gateway_mod
+
+            token = gateway_mod.get_env_value("TELEGRAM_BOT_TOKEN") or ""
     return bool(str(token).strip())
 
 
@@ -9232,7 +9305,7 @@ async def _standalone_send(
     parse-mode fallback). Implements the standalone_sender_fn contract so
     deliver=telegram cron jobs succeed when cron runs separately from the
     gateway."""
-    token = getattr(pconfig, "token", None) or os.getenv("TELEGRAM_BOT_TOKEN", "")
+    token = getattr(pconfig, "token", None) or get_secret("TELEGRAM_BOT_TOKEN", "")
     disable_link_previews = bool(
         getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews")
     )
@@ -9276,6 +9349,14 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         extras.setdefault("disable_topic_auto_rename", telegram_cfg["disable_topic_auto_rename"])
 
     _effective_rm = telegram_cfg.get("require_mention", yaml_cfg.get("require_mention"))
+    if is_multiplex_active():
+        nested_extra = telegram_cfg.get("extra") if isinstance(telegram_cfg.get("extra"), dict) else {}
+        extras.update({key: value for key, value in telegram_cfg.items() if key != "extra"})
+        extras.update(nested_extra)
+        if _effective_rm is not None:
+            extras.setdefault("require_mention", _effective_rm)
+        return extras
+
     if _effective_rm is not None and not os.getenv("TELEGRAM_REQUIRE_MENTION"):
         os.environ["TELEGRAM_REQUIRE_MENTION"] = str(_effective_rm).lower()
     if "mention_patterns" in telegram_cfg and not os.getenv("TELEGRAM_MENTION_PATTERNS"):

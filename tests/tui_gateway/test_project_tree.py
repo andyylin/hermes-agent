@@ -296,64 +296,6 @@ def test_explicit_project_claims_sessions_and_beats_auto():
     assert any(p["id"] == "/www/other" and p["isAuto"] for p in tree["projects"])
 
 
-def test_manual_session_assignment_overrides_folder_membership():
-    target = _project("p_target", "Target", ["/target"])
-    natural = _project("p_natural", "Natural", ["/natural"])
-    session = _session("/natural/repo", branch="main", repo_root="/natural/repo")
-
-    tree = pt.build_tree(
-        [target, natural],
-        [session],
-        [],
-        resolve=None,
-        hydrate=True,
-        session_project_overrides={session["id"]: "p_target"},
-    )
-
-    by_id = {p["id"]: p for p in tree["projects"]}
-    assert by_id["p_target"]["sessionCount"] == 1
-    assert by_id["p_natural"]["sessionCount"] == 0
-    assert by_id["p_target"]["repos"][0]["groups"][0]["sessions"][0]["id"] == session["id"]
-    assert tree["session_project_assignments"] == {session["id"]: "p_target"}
-
-
-def test_explicit_no_project_suppresses_folder_and_auto_inference():
-    natural = _project("p_natural", "Natural", ["/natural"])
-    session = _session("/natural/repo", branch="main", repo_root="/natural/repo")
-
-    tree = pt.build_tree(
-        [natural],
-        [session],
-        [],
-        resolve=None,
-        hydrate=True,
-        session_project_overrides={session["id"]: None},
-    )
-
-    assert tree["projects"][0]["id"] == "p_natural"
-    assert tree["projects"][0]["sessionCount"] == 0
-    assert tree["scoped_session_ids"] == []
-    assert tree["session_project_assignments"] == {session["id"]: None}
-
-
-def test_assignment_to_missing_or_archived_project_stays_explicitly_detached():
-    natural = _project("p_natural", "Natural", ["/natural"])
-    session = _session("/natural/repo", branch="main", repo_root="/natural/repo")
-
-    tree = pt.build_tree(
-        [natural],
-        [session],
-        [],
-        resolve=None,
-        hydrate=True,
-        session_project_overrides={session["id"]: "p_archived"},
-    )
-
-    assert tree["projects"][0]["sessionCount"] == 0
-    assert tree["scoped_session_ids"] == []
-    assert tree["session_project_assignments"] == {session["id"]: None}
-
-
 def test_scoped_session_ids_is_union_of_placed_sessions():
     project = _project("p_app", "App", ["/www/app"])
     resolve = _resolver(

@@ -10,6 +10,7 @@ import {
   mergeRepoWorktreeGroups,
   overlayLiveLanes,
   overlayLivePreviews,
+  sessionProjectColor,
   type SidebarProjectTree,
   type SidebarSessionGroup,
   sortWorktreeGroups
@@ -470,6 +471,15 @@ describe('liveSessionProjectId', () => {
     expect(id).toBe('p_app')
   })
 
+  it('anchors a cwd-less session on its git_repo_root (backend groups it there too)', () => {
+    // Older/imported rows carry only a repo root; the sidebar files them under
+    // the repo's project, so membership (and color) must resolve from the root.
+    expect(liveSessionProjectId(makeSession(null, { git_repo_root: '/www/app' }), [])).toBe('/www/app')
+    expect(
+      liveSessionProjectId(makeSession(null, { git_repo_root: '/www/app' }), [makeProject('p_app', ['/www/app'])])
+    ).toBe('p_app')
+  })
+
   it('skips cwd-less, kanban-task, and out-of-tree (sibling) worktree sessions', () => {
     expect(liveSessionProjectId(makeSession(null), [])).toBeNull()
     // Kanban task worktree → folds into the kanban bucket, not a project preview.
@@ -516,6 +526,52 @@ describe('liveSessionProjectId', () => {
     expect(liveSessionProjectId(makeSession('/work/notes'), [makeProject('p_notes', ['/Work/Notes'])])).toBe(
       '/work/notes'
     )
+  })
+})
+
+describe('sessionProjectColor', () => {
+  const colored = (id: string, folders: string[], color: string): ProjectInfo => ({
+    ...makeProject(id, folders),
+    color
+  })
+
+  it('inherits the color of the explicit project the session belongs to', () => {
+    const session = makeSession('/www/app/src', { git_repo_root: '/www/app' })
+
+    expect(sessionProjectColor(session, [colored('p_app', ['/www/app'], '#4a9eff')])).toBe('#4a9eff')
+  })
+
+  it('returns null when the owning project has no color set', () => {
+    const session = makeSession('/www/app/src', { git_repo_root: '/www/app' })
+
+    expect(sessionProjectColor(session, [makeProject('p_app', ['/www/app'])])).toBeNull()
+  })
+
+  it('colors a cwd-less session by its git_repo_root project (the grouped-but-grey fix)', () => {
+    const session = makeSession(null, { git_repo_root: '/www/app' })
+
+    expect(sessionProjectColor(session, [colored('p_app', ['/www/app'], '#4a9eff')])).toBe('#4a9eff')
+  })
+
+  it('returns null for a session that only maps to an auto repo root (no explicit project)', () => {
+    // liveSessionProjectId falls back to the repo root id, which is not a
+    // project row and therefore carries no color.
+    expect(sessionProjectColor(makeSession('/www/app'), [])).toBeNull()
+  })
+
+  it('returns null for an unplaceable (cwd-less) session', () => {
+    expect(sessionProjectColor(makeSession(null), [colored('p_app', ['/www/app'], '#4a9eff')])).toBeNull()
+  })
+
+  it('uses the longest-prefix project when nested projects both match', () => {
+    const session = makeSession('/www/app/packages/api/src', { git_repo_root: '/www/app' })
+
+    const projects = [
+      colored('p_root', ['/www/app'], '#111111'),
+      colored('p_api', ['/www/app/packages/api'], '#222222')
+    ]
+
+    expect(sessionProjectColor(session, projects)).toBe('#222222')
   })
 })
 
@@ -680,66 +736,6 @@ describe('overlayLiveLanes', () => {
     expect(lane?.sessions.map(s => s.id)).toEqual(['fresh'])
   })
 
-  it('does not inject a live session into its cwd-inferred project after explicit reassignment', () => {
-    const moved = makeSession('/natural/repo', { git_repo_root: '/natural/repo', id: 'moved' })
-    const natural = projectNode({
-      id: 'p_natural',
-      repos: [{ id: '/natural/repo', label: 'repo', path: '/natural/repo', sessionCount: 0, groups: [] }]
-    })
-
-    const overlaid = overlayLiveLanes(natural, [moved], new Set(), { moved: 'p_target' })
-
-    expect(overlaid.sessionCount).toBe(0)
-    expect(overlaid.repos[0].groups).toEqual([])
-  })
-
-  it('does not inject an explicitly detached live session through cwd inference', () => {
-    const detached = makeSession('/natural/repo', { git_repo_root: '/natural/repo', id: 'detached' })
-    const natural = projectNode({
-      id: 'p_natural',
-      repos: [{ id: '/natural/repo', label: 'repo', path: '/natural/repo', sessionCount: 0, groups: [] }]
-    })
-
-    const overlaid = overlayLiveLanes(natural, [detached], new Set(), { detached: null })
-
-    expect(overlaid.sessionCount).toBe(0)
-    expect(overlaid.repos[0].groups).toEqual([])
-  })
-
-  it('removes a stale snapshot row immediately after an optimistic detach', () => {
-    const detached = makeSession('/natural/repo', { git_repo_root: '/natural/repo', id: 'detached' })
-    const natural = projectNode({
-      id: 'p_natural',
-      repos: [
-        {
-          groups: [lane({ id: 'main', isMain: true, label: 'main', path: '/natural/repo', sessions: [detached] })],
-          id: '/natural/repo',
-          label: 'repo',
-          path: '/natural/repo',
-          sessionCount: 1
-        }
-      ]
-    })
-
-    const overlaid = overlayLiveLanes(natural, [], new Set(), { detached: null })
-
-    expect(overlaid.sessionCount).toBe(0)
-    expect(overlaid.repos[0].groups).toEqual([])
-  })
-
-  it('still injects a reassigned live session into the assigned project', () => {
-    const moved = makeSession('/natural/repo', { git_repo_root: '/natural/repo', id: 'moved' })
-    const target = projectNode({
-      id: 'p_target',
-      repos: [{ id: '/natural/repo', label: 'repo', path: '/natural/repo', sessionCount: 0, groups: [] }]
-    })
-
-    const overlaid = overlayLiveLanes(target, [moved], new Set(), { moved: 'p_target' })
-
-    expect(overlaid.sessionCount).toBe(1)
-    expect(overlaid.repos[0].groups.flatMap(group => group.sessions.map(session => session.id))).toEqual(['moved'])
-  })
-
   it('evicts a deleted/archived snapshot row (and drops the lane once empty)', () => {
     const a = makeSession('/www/app', { id: 'keep', git_branch: 'main' })
     const b = makeSession('/www/app/.worktrees/baby', { id: 'gone' })
@@ -795,23 +791,5 @@ describe('overlayLivePreviews', () => {
     const previews = overlayLivePreviews([project], [], [], 3, new Set(['gone']))
 
     expect(previews['/www/app'].map(s => s.id)).toEqual(['old'])
-  })
-
-  it('uses explicit session assignments before cwd inference for live preview rows', () => {
-    const target = projectNode({ id: 'p_target', path: '/target' })
-    const natural = projectNode({ id: 'p_natural', path: '/natural' })
-    const moved = makeSession('/natural/repo', { git_repo_root: '/natural/repo', id: 'moved', last_active: 99 })
-
-    const previews = overlayLivePreviews(
-      [target, natural],
-      [moved],
-      [makeProject('p_target', ['/target']), makeProject('p_natural', ['/natural'])],
-      3,
-      new Set(),
-      { moved: 'p_target' }
-    )
-
-    expect(previews['/target'].map(s => s.id)).toEqual(['moved'])
-    expect(previews['/natural']).toBeUndefined()
   })
 })

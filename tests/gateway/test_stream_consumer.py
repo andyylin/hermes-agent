@@ -6,7 +6,97 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+from gateway import delivery_ledger as dl
+from gateway.stream_consumer import (
+    GatewayStreamConsumer,
+    StreamConsumerConfig,
+    StreamDeliveryContext,
+)
+
+
+def test_stream_send_metadata_carries_original_reply_anchor():
+    consumer = GatewayStreamConsumer(
+        adapter=MagicMock(),
+        chat_id="123",
+        initial_reply_to_id="456",
+    )
+
+    assert consumer._metadata_for_send(final=False) == {
+        "reply_to_message_id": "456",
+    }
+    assert consumer._metadata_for_send(final=True) == {
+        "reply_to_message_id": "456",
+        "notify": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_final_stream_send_is_ledgered_before_transport(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(dl, "_db_path", lambda: home / "state.db")
+    states_at_send = []
+
+    async def send(**kwargs):
+        with dl._connect() as conn:
+            row = conn.execute("SELECT state FROM delivery_obligations").fetchone()
+        states_at_send.append(None if row is None else row[0])
+        return SimpleNamespace(success=True, message_id="stream-final")
+
+    adapter = MagicMock()
+    adapter.send = AsyncMock(side_effect=send)
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    consumer = GatewayStreamConsumer(
+        adapter=adapter,
+        chat_id="C1",
+        config=StreamConsumerConfig(buffer_only=True, cursor=""),
+        delivery_context=StreamDeliveryContext(
+            session_key="agent:main:slack:channel:C1",
+            message_ref="msg-42",
+            platform="slack",
+            thread_id="171.001",
+        ),
+    )
+    consumer.on_delta("final answer")
+    consumer.finish()
+
+    await consumer.run()
+
+    assert states_at_send == ["attempting"]
+    with dl._connect() as conn:
+        row = conn.execute("SELECT state, content FROM delivery_obligations").fetchone()
+    assert row == ("delivered", "final answer")
+
+
+@pytest.mark.asyncio
+async def test_definitive_final_stream_failure_marks_ledger_failed(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(dl, "_db_path", lambda: home / "state.db")
+
+    adapter = MagicMock()
+    adapter.send = AsyncMock(
+        return_value=SimpleNamespace(success=False, message_id=None, error="rejected")
+    )
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    consumer = GatewayStreamConsumer(
+        adapter=adapter,
+        chat_id="C1",
+        config=StreamConsumerConfig(buffer_only=True, cursor=""),
+        delivery_context=StreamDeliveryContext(
+            session_key="agent:main:slack:channel:C1",
+            message_ref="msg-failed",
+            platform="slack",
+        ),
+    )
+    consumer.on_delta("final answer")
+    consumer.finish("final answer")
+
+    await consumer.run()
+
+    with dl._connect() as conn:
+        row = conn.execute("SELECT state FROM delivery_obligations").fetchone()
+    assert row == ("failed",)
 
 
 # ── _clean_for_display unit tests ────────────────────────────────────────
@@ -2363,3 +2453,40 @@ class TestStripOrphanCloseTags:
             assert tag not in consumer._accumulated
         assert "trailing prose" in consumer._accumulated
         assert "more" in consumer._accumulated
+
+
+class TestHasDeliveredTextAfterSegmentBreak:
+    """has_delivered_text must find a delivered segment after a segment break,
+    but must not claim text from a failed delivery. (#65919 review)"""
+
+    def test_finds_delivered_segment_after_segment_break(self):
+        """A successfully delivered segment must still be found by
+        has_delivered_text after _reset_segment_state runs."""
+        c = _make_consumer()
+        # Simulate a successfully delivered segment
+        c._last_sent_text = "Here is the first segment"
+        c._reset_segment_state()
+        # After the reset, has_delivered_text must still find it
+        assert c.has_delivered_text("Here is the first segment") is True
+
+    def test_does_not_find_undelivered_text(self):
+        """Text that was never delivered must not be claimed."""
+        c = _make_consumer()
+        c._last_sent_text = "delivered text"
+        c._reset_segment_state()
+        assert c.has_delivered_text("never sent text") is False
+
+    def test_finds_commentary_text(self):
+        """has_delivered_text must find commentary text delivered via
+        on_commentary."""
+        c = _make_consumer()
+        c._delivered_commentary_texts.append("interim commentary")
+        assert c.has_delivered_text("interim commentary") is True
+
+    def test_does_not_match_empty(self):
+        """Empty/whitespace text must not match."""
+        c = _make_consumer()
+        c._last_sent_text = "some text"
+        c._reset_segment_state()
+        assert c.has_delivered_text("") is False
+        assert c.has_delivered_text("   ") is False

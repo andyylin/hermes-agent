@@ -2,10 +2,15 @@ import { useStore } from '@nanostores/react'
 import { atom } from 'nanostores'
 import { useCallback, useEffect, useMemo } from 'react'
 
+import {
+  $activeGatewayProfile,
+  $activeGatewayProfileGeneration,
+  activeGatewayProfileContextIsCurrent
+} from '@/store/profile'
 import { $connection } from '@/store/session'
-import { $workspaceChangeTick } from '@/store/workspace-events'
+import { $workspaceChangeTick, consumeWorkspaceChange } from '@/store/workspace-events'
 
-import { clearProjectDirCache, readProjectDir } from './ipc'
+import { clearProjectDirCache, type ProjectTreeEntry, type ProjectTreeOwner, readProjectDir } from './ipc'
 
 export interface TreeNode {
   /** Absolute filesystem path. Doubles as react-arborist node id. */
@@ -46,6 +51,33 @@ function patchNode(nodes: TreeNode[] | undefined | null, id: string, patch: (n: 
 
     return n
   })
+}
+
+function findNode(nodes: TreeNode[], id: string): null | TreeNode {
+  for (const node of nodes) {
+    if (node.id === id) {
+      return node
+    }
+
+    if (node.children?.length) {
+      const hit = findNode(node.children, id)
+
+      if (hit) {
+        return hit
+      }
+    }
+  }
+
+  return null
+}
+
+// Merge a freshly-read dir's entries into its existing children: keep surviving
+// nodes (subtrees intact), add new, drop deleted. Non-recursive — a grandchild
+// dir only re-reads when it's itself in the change set.
+function mergeChildren(existing: TreeNode[], entries: ProjectTreeEntry[]): TreeNode[] {
+  const byId = new Map(existing.filter(node => !node.placeholder).map(node => [node.id, node]))
+
+  return entries.map(entry => byId.get(entry.path) ?? makeNode(entry.path, entry.name, entry.isDirectory))
 }
 
 function placeholderChild(parentId: string): TreeNode {
@@ -107,6 +139,7 @@ const inflight = new Set<string>()
 const $projectTree = atom<ProjectTreeState>(initialState)
 let nextRootRequestId = 0
 let lastConnectionKey = ''
+let lastOwnerKey = ''
 
 // While the root is errored (ENOENT during a session's cwd race, a folder that
 // reappears after a checkout, a remote that wasn't ready), keep retrying on a
@@ -128,7 +161,11 @@ function clearProjectTree() {
  *  than bricking the tree, display the sanitized workspace fallback (main
  *  prefers the configured default project dir). Local connections only —
  *  remote trees are read through the remote bridge. */
-async function fallbackRootFor(cwd: string): Promise<string | null> {
+async function fallbackRootFor(cwd: string, owner: ProjectTreeOwner): Promise<string | null> {
+  if (!activeGatewayProfileContextIsCurrent(owner)) {
+    return null
+  }
+
   if ($connection.get()?.mode === 'remote') {
     return null
   }
@@ -142,13 +179,21 @@ async function fallbackRootFor(cwd: string): Promise<string | null> {
   try {
     const { cwd: fallback, sanitized } = await sanitize(cwd)
 
+    if (!activeGatewayProfileContextIsCurrent(owner)) {
+      return null
+    }
+
     return sanitized && fallback && fallback !== cwd ? fallback : null
   } catch {
     return null
   }
 }
 
-async function loadRoot(cwd: string, { force = false }: { force?: boolean } = {}) {
+async function loadRoot(cwd: string, owner: ProjectTreeOwner, { force = false }: { force?: boolean } = {}) {
+  if (!activeGatewayProfileContextIsCurrent(owner)) {
+    return
+  }
+
   if (!cwd) {
     clearProjectTree()
 
@@ -182,13 +227,17 @@ async function loadRoot(cwd: string, { force = false }: { force?: boolean } = {}
   })
 
   let resolvedCwd = cwd
-  let { entries, error } = await readProjectDir(cwd, cwd)
+  let { entries, error } = await readProjectDir(cwd, cwd, owner)
+
+  if (!activeGatewayProfileContextIsCurrent(owner)) {
+    return
+  }
 
   if (error) {
-    const fallback = await fallbackRootFor(cwd)
+    const fallback = await fallbackRootFor(cwd, owner)
 
     if (fallback) {
-      const retry = await readProjectDir(fallback, fallback)
+      const retry = await readProjectDir(fallback, fallback, owner)
 
       if (!retry.error) {
         resolvedCwd = fallback
@@ -199,7 +248,7 @@ async function loadRoot(cwd: string, { force = false }: { force?: boolean } = {}
   }
 
   setProjectTree(latest => {
-    if (latest.cwd !== cwd || latest.requestId !== requestId) {
+    if (latest.cwd !== cwd || latest.requestId !== requestId || !activeGatewayProfileContextIsCurrent(owner)) {
       return latest
     }
 
@@ -216,54 +265,98 @@ async function loadRoot(cwd: string, { force = false }: { force?: boolean } = {}
 
 export function resetProjectTreeState() {
   lastConnectionKey = ''
+  lastOwnerKey = ''
   clearProjectTree()
   clearProjectDirCache()
 }
 
-// Non-destructive refresh: re-read every currently-loaded directory and merge
-// entries (add new files/folders, drop deleted ones) while preserving expansion
-// and already-loaded subtrees. Unlike `loadRoot({force})` this never collapses
-// the tree, so it's safe to run live as the agent edits — and because node ids
-// (absolute paths) stay stable across merges, rows can animate in/out.
-async function revalidateTree(cwd: string): Promise<void> {
+// Non-destructive live refresh as the agent edits: preserves expansion + loaded
+// subtrees (stable absolute-path ids let rows animate in/out), never collapses.
+// Targeted by default — re-reads only the changed dirs in `change`; the root and
+// untouched folders never touch the filesystem or re-render. Falls back to
+// re-reading every loaded dir only when the mutation is opaque (a terminal
+// command / a path we couldn't resolve) — see store/workspace-events.
+async function revalidateTree(
+  cwd: string,
+  owner: ProjectTreeOwner,
+  change: { dirs: string[]; full: boolean }
+): Promise<void> {
   const state = $projectTree.get()
 
-  if (!cwd || state.cwd !== cwd || !state.loaded) {
+  if (!cwd || state.cwd !== cwd || !state.loaded || !activeGatewayProfileContextIsCurrent(owner)) {
     return
   }
 
   const rootPath = state.resolvedCwd || cwd
-  clearProjectDirCache()
 
+  if (!change.full && change.dirs.length) {
+    // Only re-read changed dirs that are actually loaded (root, or an expanded
+    // folder); a change inside a collapsed/absent dir isn't visible → skip.
+    const targets = change.dirs.filter(dir => dir === rootPath || findNode(state.data, dir)?.children)
+
+    if (!targets.length) {
+      return
+    }
+
+    const reads = await Promise.all(targets.map(async dir => ({ dir, ...(await readProjectDir(dir, rootPath, owner)) })))
+
+    setProjectTree(latest => {
+      if (latest.cwd !== cwd || !latest.loaded || !activeGatewayProfileContextIsCurrent(owner)) {
+        return latest
+      }
+
+      let data = latest.data
+
+      for (const { dir, entries, error } of reads) {
+        if (error) {
+          continue // keep last-known children on a transient read error
+        }
+
+        data =
+          dir === rootPath
+            ? mergeChildren(data, entries)
+            : patchNode(data, dir, node =>
+                node.children ? { ...node, children: mergeChildren(node.children, entries) } : node
+              )
+      }
+
+      return data === latest.data ? latest : { ...latest, data }
+    })
+
+    return
+  }
+
+  // Opaque fallback: reconcile every loaded dir. Siblings read concurrently
+  // (Promise.all keeps order); loaded subfolders recurse.
   const reconcile = async (dirPath: string, existing: TreeNode[]): Promise<TreeNode[]> => {
-    const { entries, error } = await readProjectDir(dirPath, rootPath)
+    const { entries, error } = await readProjectDir(dirPath, rootPath, owner)
 
     if (error) {
-      return existing // keep the last-known children on a transient read error
+      return existing
     }
 
     const byId = new Map(existing.filter(node => !node.placeholder).map(node => [node.id, node]))
-    const merged: TreeNode[] = []
 
-    for (const entry of entries) {
-      const prev = byId.get(entry.path)
+    return Promise.all(
+      entries.map(async entry => {
+        const prev = byId.get(entry.path)
 
-      if (prev?.isDirectory && prev.children) {
-        // Loaded folder: recurse so deep edits surface without a re-expand.
-        merged.push({ ...prev, children: await reconcile(prev.id, prev.children) })
-      } else if (prev) {
-        merged.push(prev)
-      } else {
-        merged.push(makeNode(entry.path, entry.name, entry.isDirectory))
-      }
-    }
+        if (prev?.isDirectory && prev.children) {
+          return { ...prev, children: await reconcile(prev.id, prev.children) }
+        }
 
-    return merged
+        return prev ?? makeNode(entry.path, entry.name, entry.isDirectory)
+      })
+    )
   }
 
   const nextData = await reconcile(rootPath, state.data)
 
-  setProjectTree(latest => (latest.cwd === cwd && latest.loaded ? { ...latest, data: nextData } : latest))
+  setProjectTree(latest =>
+    latest.cwd === cwd && latest.loaded && activeGatewayProfileContextIsCurrent(owner)
+      ? { ...latest, data: nextData }
+      : latest
+  )
 }
 
 /**
@@ -277,14 +370,30 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
   const state = useStore($projectTree)
   const connection = useStore($connection)
   const workspaceTick = useStore($workspaceChangeTick)
-  const connectionKey = `${connection?.mode || 'local'}:${connection?.profile || ''}:${connection?.baseUrl || ''}`
+  const ownerProfile = useStore($activeGatewayProfile)
+  const ownerGeneration = useStore($activeGatewayProfileGeneration)
 
-  const refreshRoot = useCallback(() => loadRoot(cwd, { force: true }), [cwd])
+  const owner = useMemo(
+    () => ({ generation: ownerGeneration, profile: ownerProfile }),
+    [ownerGeneration, ownerProfile]
+  )
+
+  const connectionKey = `${connection?.mode || 'local'}:${connection?.profile || ''}:${connection?.baseUrl || ''}`
+  const ownerKey = `${owner.profile}:${owner.generation}`
+
+  const refreshRoot = useCallback(
+    () => loadRoot(cwd, owner, { force: true }),
+    [cwd, owner]
+  )
 
   const setNodeOpen = useCallback(
     (id: string, open: boolean) => {
       setProjectTree(current => {
-        if (current.cwd !== cwd || current.openState[id] === open) {
+        if (
+          current.cwd !== cwd ||
+          current.openState[id] === open ||
+          !activeGatewayProfileContextIsCurrent(owner)
+        ) {
           return current
         }
 
@@ -297,7 +406,7 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
         }
       })
     },
-    [cwd]
+    [cwd, owner]
   )
 
   // Clears the recorded open state and bumps the nonce; the tree is keyed on
@@ -305,24 +414,24 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
   // cached in `data`, just hidden).
   const collapseAll = useCallback(() => {
     setProjectTree(current => {
-      if (current.cwd !== cwd) {
+      if (current.cwd !== cwd || !activeGatewayProfileContextIsCurrent(owner)) {
         return current
       }
 
       return { ...current, collapseNonce: current.collapseNonce + 1, openState: {} }
     })
-  }, [cwd])
+  }, [cwd, owner])
 
   const loadChildren = useCallback(
     async (id: string) => {
-      if (!cwd || inflight.has(id)) {
+      if (!cwd || inflight.has(id) || !activeGatewayProfileContextIsCurrent(owner)) {
         return
       }
 
       inflight.add(id)
 
       setProjectTree(current => {
-        if (current.cwd !== cwd) {
+        if (current.cwd !== cwd || !activeGatewayProfileContextIsCurrent(owner)) {
           return current
         }
 
@@ -333,12 +442,12 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
       })
 
       const rootPath = $projectTree.get().resolvedCwd || cwd
-      const { entries, error } = await readProjectDir(id, rootPath)
+      const { entries, error } = await readProjectDir(id, rootPath, owner)
 
       inflight.delete(id)
 
       setProjectTree(current => {
-        if (current.cwd !== cwd) {
+        if (current.cwd !== cwd || !activeGatewayProfileContextIsCurrent(owner)) {
           return current
         }
 
@@ -353,30 +462,29 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
         }
       })
     },
-    [cwd]
+    [cwd, owner]
   )
 
   // Live, non-destructive refresh when the agent touches the tree (skip the
   // very first render: tick 0 is the initial value, not a real change).
   useEffect(() => {
     if (workspaceTick > 0) {
-      void revalidateTree(cwd)
+      void revalidateTree(cwd, owner, consumeWorkspaceChange())
     }
-  }, [workspaceTick, cwd])
+  }, [workspaceTick, cwd, owner])
 
   useEffect(() => {
     const connectionChanged = lastConnectionKey !== '' && lastConnectionKey !== connectionKey
+    const ownerChanged = lastOwnerKey !== '' && lastOwnerKey !== ownerKey
     lastConnectionKey = connectionKey
+    lastOwnerKey = ownerKey
 
     if (connectionChanged) {
       clearProjectDirCache()
-      void loadRoot(cwd, { force: true })
-
-      return
     }
 
-    void loadRoot(cwd)
-  }, [connectionKey, cwd])
+    void loadRoot(cwd, owner, { force: connectionChanged || ownerChanged })
+  }, [connectionKey, cwd, owner, ownerKey])
 
   // Self-heal: an errored root re-probes every few seconds while the tree is
   // mounted. Each attempt bumps requestId, so a persistent error re-arms the
@@ -386,10 +494,10 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
       return
     }
 
-    const timer = window.setTimeout(() => void loadRoot(cwd, { force: true }), ROOT_ERROR_RETRY_MS)
+    const timer = window.setTimeout(() => void loadRoot(cwd, owner, { force: true }), ROOT_ERROR_RETRY_MS)
 
     return () => window.clearTimeout(timer)
-  }, [cwd, state.cwd, state.requestId, state.rootError])
+  }, [cwd, owner, state.cwd, state.requestId, state.rootError])
 
   // While showing the fallback root, quietly re-probe the session's real cwd
   // (a worktree re-created, a checkout restored) and switch back when it
@@ -404,9 +512,9 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
     let cancelled = false
 
     const timer = window.setInterval(() => {
-      void readProjectDir(cwd, cwd).then(({ error }) => {
-        if (!cancelled && !error) {
-          void loadRoot(cwd, { force: true })
+      void readProjectDir(cwd, cwd, owner).then(({ error }) => {
+        if (!cancelled && !error && activeGatewayProfileContextIsCurrent(owner)) {
+          void loadRoot(cwd, owner, { force: true })
         }
       })
     }, ROOT_ERROR_RETRY_MS)
@@ -415,7 +523,7 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
       cancelled = true
       window.clearInterval(timer)
     }
-  }, [cwd, usingFallback])
+  }, [cwd, owner, usingFallback])
 
   return useMemo(
     () => ({

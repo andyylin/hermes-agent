@@ -187,6 +187,7 @@ def _secondary_recovery_runner(*, running=True):
     runner.config = GatewayConfig(multiplex_profiles=True)
     runner._running = running
     runner._profile_adapters = {}
+    runner.pairing_stores = {"reviewer": object()}
     runner._profile_failed_platforms = {}
     runner._background_tasks = set()
     runner.session_store = object()

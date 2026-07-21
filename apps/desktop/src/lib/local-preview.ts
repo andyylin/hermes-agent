@@ -1,5 +1,6 @@
-import { isDesktopFsRemoteMode, readDesktopFileText } from '@/lib/desktop-fs'
+import { isDesktopFsRemoteMode, readDesktopFileTextForProfile } from '@/lib/desktop-fs'
 import type { PreviewTarget } from '@/store/preview'
+import { activeGatewayProfileContextIsCurrent, captureActiveGatewayProfileContext } from '@/store/profile'
 
 const HTML_EXTENSIONS = new Set(['.htm', '.html'])
 const IMAGE_EXTENSIONS = new Set(['.bmp', '.gif', '.jpeg', '.jpg', '.png', '.svg', '.webp'])
@@ -108,13 +109,28 @@ export function localPreviewTarget(rawTarget: string, cwd?: string | null): Prev
   }
 }
 
-async function enrichPreviewTarget(target: PreviewTarget | null): Promise<PreviewTarget | null> {
+async function enrichPreviewTarget(
+  target: PreviewTarget | null,
+  context: ReturnType<typeof captureActiveGatewayProfileContext>
+): Promise<PreviewTarget | null> {
+  if (!activeGatewayProfileContextIsCurrent(context)) {
+    return null
+  }
+
   if (!isDesktopFsRemoteMode() || !target || target.kind !== 'file' || target.previewKind === 'image') {
     return target
   }
 
   try {
-    const result = await readDesktopFileText(target.path || target.source)
+    const result = await readDesktopFileTextForProfile(
+      context.profile,
+      context.generation,
+      target.path || target.source
+    )
+
+    if (!activeGatewayProfileContextIsCurrent(context)) {
+      return null
+    }
 
     return {
       ...target,
@@ -133,16 +149,30 @@ export async function normalizeOrLocalPreviewTarget(
   rawTarget: string,
   cwd?: string | null
 ): Promise<PreviewTarget | null> {
+  const context = captureActiveGatewayProfileContext()
+
   try {
     const normalized = await window.hermesDesktop?.normalizePreviewTarget?.(rawTarget, cwd || undefined)
 
+    if (!activeGatewayProfileContextIsCurrent(context)) {
+      return null
+    }
+
     if (normalized) {
-      return enrichPreviewTarget(normalized)
+      const enriched = await enrichPreviewTarget(normalized, context)
+
+      return activeGatewayProfileContextIsCurrent(context) ? enriched : null
     }
   } catch {
+    if (!activeGatewayProfileContextIsCurrent(context)) {
+      return null
+    }
+
     // Running Electron may still have the old HTML-only preview IPC. Fall
     // through to renderer-side local classification so text/images still open.
   }
 
-  return enrichPreviewTarget(localPreviewTarget(rawTarget, cwd))
+  const enriched = await enrichPreviewTarget(localPreviewTarget(rawTarget, cwd), context)
+
+  return activeGatewayProfileContextIsCurrent(context) ? enriched : null
 }

@@ -63,6 +63,11 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
 
 logger = logging.getLogger(__name__)
 
+
+def _scoped_env(name: str, default: str = "") -> str:
+    value = get_secret(name, default)
+    return default if value is None or str(value) == "" else str(value)
+
 # ContextVar carrying the user_id of the slash-command invoker.
 # Set in _handle_slash_command, read in send() to match the correct
 # stashed response_url when multiple users issue commands on the same
@@ -421,6 +426,9 @@ class SlackAdapter(BasePlatformAdapter):
 
     MAX_MESSAGE_LENGTH = 39000  # Slack API allows 40,000 chars; leave margin
     supports_code_blocks = True  # Slack mrkdwn renders fenced code blocks
+    # Slack's typing indicator is a text status line (assistant.threads
+    # .setStatus), so the gateway feeds it live per-tool phrases.
+    supports_status_text = True
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     # Slack blocks typed native slash commands inside threads ("/approve is
     # not supported in threads. Sorry!").  The adapter rewrites a leading
@@ -983,7 +991,7 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             app_token = get_secret("SLACK_APP_TOKEN")
         except UnscopedSecretError:
-            app_token = os.getenv("SLACK_APP_TOKEN")
+            app_token = None
 
         if not raw_token:
             logger.error("[Slack] SLACK_BOT_TOKEN not set")
@@ -1574,7 +1582,8 @@ class SlackAdapter(BasePlatformAdapter):
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Show a typing/status indicator using assistant.threads.setStatus.
 
-        Displays "is thinking..." next to the bot name in a thread.
+        Displays "is thinking..." next to the bot name in a thread, or the
+        platform's ``typing_status_text`` config value when set.
         Requires the assistant:write or chat:write scope.
         Auto-clears when the bot sends a reply to the thread.
         """
@@ -1599,10 +1608,15 @@ class SlackAdapter(BasePlatformAdapter):
                 "team_id": str(team_id) if team_id else "",
             }
         try:
+            _status = (
+                getattr(self, "_status_text", {}).get(str(chat_id))
+                or getattr(self.config, "typing_status_text", None)
+                or "is thinking..."
+            )
             await self._get_client(chat_id, team_id=team_id).assistant_threads_setStatus(
                 channel_id=chat_id,
                 thread_ts=thread_ts,
-                status="is thinking...",
+                status=_status,
             )
         except Exception as e:
             # Silently ignore — may lack assistant:write scope or not be
@@ -2219,7 +2233,9 @@ class SlackAdapter(BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
-        return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
+        configured = self.config.extra.get("reactions")
+        value = configured if configured is not None else _scoped_env("SLACK_REACTIONS", "true")
+        return str(value).lower() not in {"false", "0", "no"}
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
@@ -3113,7 +3129,7 @@ class SlackAdapter(BasePlatformAdapter):
         if event.get("bot_id") or event.get("subtype") == "bot_message":
             allow_bots = self.config.extra.get("allow_bots", "")
             if not allow_bots:
-                allow_bots = os.getenv("SLACK_ALLOW_BOTS", "none")
+                allow_bots = _scoped_env("SLACK_ALLOW_BOTS", "none")
             allow_bots = str(allow_bots).lower().strip()
             if allow_bots == "none":
                 return
@@ -3994,20 +4010,11 @@ class SlackAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
 
-        if os.getenv("SLACK_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+        if _scoped_env("SLACK_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
             return True
 
         def _env(name: str) -> str:
-            # Multiplex: profile .env is in secret_scope, not process environ.
-            try:
-                from agent.secret_scope import get_secret
-
-                val = get_secret(name)
-                if val is not None and str(val).strip():
-                    return str(val).strip()
-            except Exception:
-                pass
-            return (os.getenv(name) or "").strip()
+            return _scoped_env(name).strip()
 
         allowed_ids = set()
         platform_allowlist = _env("SLACK_ALLOWED_USERS")
@@ -4764,7 +4771,7 @@ class SlackAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
-        return os.getenv("SLACK_REQUIRE_MENTION", "true").lower() not in {
+        return _scoped_env("SLACK_REQUIRE_MENTION", "true").lower() not in {
             "false",
             "0",
             "no",
@@ -4781,7 +4788,7 @@ class SlackAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("SLACK_STRICT_MENTION", "false").lower() in {
+        return _scoped_env("SLACK_STRICT_MENTION", "false").lower() in {
             "true",
             "1",
             "yes",
@@ -4792,7 +4799,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Return channel IDs where no @mention is required."""
         raw = self.config.extra.get("free_response_channels")
         if raw is None:
-            raw = os.getenv("SLACK_FREE_RESPONSE_CHANNELS", "")
+            raw = _scoped_env("SLACK_FREE_RESPONSE_CHANNELS")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         # Coerce non-list scalars (str/int/float) to str before splitting.
@@ -4815,7 +4822,7 @@ class SlackAdapter(BasePlatformAdapter):
         """
         raw = self.config.extra.get("allowed_channels")
         if raw is None:
-            raw = os.getenv("SLACK_ALLOWED_CHANNELS", "")
+            raw = _scoped_env("SLACK_ALLOWED_CHANNELS")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         if isinstance(raw, str) and raw.strip():
@@ -4839,7 +4846,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         patterns = self.config.extra.get("mention_patterns") if self.config.extra else None
         if patterns is None:
-            raw = os.getenv("SLACK_MENTION_PATTERNS", "").strip()
+            raw = _scoped_env("SLACK_MENTION_PATTERNS").strip()
             if raw:
                 try:
                     import json as _json
@@ -4913,7 +4920,9 @@ async def _standalone_send(
     throwaway ``SlackAdapter`` instance's ``format_message`` — so cron-delivered
     Slack messages render identically to gateway-delivered ones.
     """
-    token = getattr(pconfig, "token", None) or os.getenv("SLACK_BOT_TOKEN", "")
+    from agent.secret_scope import get_secret
+
+    token = getattr(pconfig, "token", None) or get_secret("SLACK_BOT_TOKEN", "")
     if not token:
         return {"error": "Slack send failed: SLACK_BOT_TOKEN not configured"}
 
@@ -5097,6 +5106,11 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
     survive a config.yaml update. Returns ``None`` because no extras are
     seeded into ``PlatformConfig.extra`` directly (everything flows through env).
     """
+    from agent.secret_scope import is_multiplex_active
+
+    if is_multiplex_active():
+        return dict(slack_cfg)
+
     if "require_mention" in slack_cfg and not os.getenv("SLACK_REQUIRE_MENTION"):
         os.environ["SLACK_REQUIRE_MENTION"] = str(slack_cfg["require_mention"]).lower()
     if "strict_mention" in slack_cfg and not os.getenv("SLACK_STRICT_MENTION"):
@@ -5126,9 +5140,17 @@ def _is_connected(config) -> bool:
     can suppress ambient ``SLACK_BOT_TOKEN`` env vars. Matches what the legacy
     ``Platform.SLACK`` connected-check did before this migration.
     """
-    import hermes_cli.gateway as gateway_mod
+    from agent.secret_scope import UnscopedSecretError, get_secret, is_multiplex_active
 
-    return bool((gateway_mod.get_env_value("SLACK_BOT_TOKEN") or "").strip())
+    if not is_multiplex_active():
+        import hermes_cli.gateway as gateway_mod
+
+        return bool((gateway_mod.get_env_value("SLACK_BOT_TOKEN") or "").strip())
+
+    try:
+        return bool((get_secret("SLACK_BOT_TOKEN", "") or "").strip())
+    except UnscopedSecretError:
+        return False
 
 
 def _build_adapter(config):

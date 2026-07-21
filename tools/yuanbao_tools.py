@@ -26,10 +26,13 @@ logger = logging.getLogger(__name__)
 
 
 def _get_active_adapter():
-    """Lazy import to avoid ImportError when gateway.platforms.yuanbao is unavailable."""
+    """Return the Yuanbao adapter owned by the current routed profile."""
     try:
-        from gateway.platforms.yuanbao import get_active_adapter
-        return get_active_adapter()
+        from gateway.config import Platform
+        from gateway.run import _gateway_runner_ref
+        from tools.send_message_tool import _live_adapter_for_session
+
+        return _live_adapter_for_session(_gateway_runner_ref(), Platform.YUANBAO)
     except ImportError:
         return None
 

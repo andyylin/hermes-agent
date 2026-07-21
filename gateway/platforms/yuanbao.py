@@ -42,6 +42,8 @@ import sys
 
 import httpx
 
+from agent.secret_scope import get_secret, is_multiplex_active
+
 try:
     import websockets
     import websockets.exceptions
@@ -1556,9 +1558,9 @@ class AccessPolicy:
         self._group_allow_from = group_allow_from
 
     def _open_dm_opted_in(self) -> bool:
-        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+        if str(get_secret("GATEWAY_ALLOW_ALL_USERS", "")).lower() in {"true", "1", "yes"}:
             return True
-        return os.getenv("YUANBAO_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+        return str(get_secret("YUANBAO_ALLOW_ALL_USERS", "")).lower() in {"true", "1", "yes"}
 
     def is_dm_allowed(self, sender_id: str) -> bool:
         """Strict DM authorization — pairing does not imply access."""
@@ -1650,7 +1652,7 @@ class AutoSetHomeMiddleware(InboundMiddleware):
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         adapter = ctx.adapter
         if not adapter._auto_sethome_done and adapter._sender_may_designate_home(ctx):
-            _cur_home = os.getenv("YUANBAO_HOME_CHANNEL", "")
+            _cur_home = adapter._home_channel
             _should_set = (
                 not _cur_home
                 or (_cur_home.startswith("group:") and ctx.chat_type == "dm")
@@ -1663,7 +1665,13 @@ class AutoSetHomeMiddleware(InboundMiddleware):
                     from hermes_cli.config import atomic_config_write
                     import yaml
 
-                    _home = get_hermes_home()
+                    if is_multiplex_active():
+                        _scoped_home = get_secret("HERMES_HOME")
+                        if not _scoped_home:
+                            raise RuntimeError("missing profile-scoped HERMES_HOME")
+                        _home = Path(_scoped_home)
+                    else:
+                        _home = get_hermes_home()
                     config_path = _home / "config.yaml"
                     user_config: dict = {}
                     if config_path.exists():
@@ -1671,7 +1679,9 @@ class AutoSetHomeMiddleware(InboundMiddleware):
                             user_config = yaml.safe_load(f) or {}
                     user_config["YUANBAO_HOME_CHANNEL"] = ctx.chat_id
                     atomic_config_write(config_path, user_config)
-                    os.environ["YUANBAO_HOME_CHANNEL"] = str(ctx.chat_id)
+                    if not is_multiplex_active():
+                        os.environ["YUANBAO_HOME_CHANNEL"] = str(ctx.chat_id)
+                    adapter._home_channel = str(ctx.chat_id)
                     logger.info(
                         "[%s] Auto-sethome: designated %s (%s) as Yuanbao home channel",
                         adapter.name, ctx.chat_id, ctx.chat_name,
@@ -5218,23 +5228,23 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # ------------------------------------------------------------------
         dm_policy: str = (
             _extra.get("dm_policy")
-            or os.getenv("YUANBAO_DM_POLICY", "pairing")
+            or get_secret("YUANBAO_DM_POLICY", "pairing")
         ).strip().lower()
 
         _dm_allow_from_raw: str = (
             _extra.get("dm_allow_from")
-            or os.getenv("YUANBAO_DM_ALLOW_FROM", "")
+            or get_secret("YUANBAO_DM_ALLOW_FROM", "")
         )
         dm_allow_from: list[str] = [x.strip() for x in _dm_allow_from_raw.split(",") if x.strip()]
 
         group_policy: str = (
             _extra.get("group_policy")
-            or os.getenv("YUANBAO_GROUP_POLICY", "pairing")
+            or get_secret("YUANBAO_GROUP_POLICY", "pairing")
         ).strip().lower()
 
         _group_allow_from_raw: str = (
             _extra.get("group_allow_from")
-            or os.getenv("YUANBAO_GROUP_ALLOW_FROM", "")
+            or get_secret("YUANBAO_GROUP_ALLOW_FROM", "")
         )
         group_allow_from: list[str] = [x.strip() for x in _group_allow_from_raw.split(",") if x.strip()]
 
@@ -5258,9 +5268,10 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # channel is a group chat (group:xxx), it stays eligible for
         # upgrade — the first DM will override it with direct:xxx.
         # ------------------------------------------------------------------
-        _existing_home = os.getenv("YUANBAO_HOME_CHANNEL") or (
+        _existing_home = get_secret("YUANBAO_HOME_CHANNEL") or (
             config.home_channel.chat_id if config.home_channel else ""
         )
+        self._home_channel = str(_existing_home)
         self._auto_sethome_done: bool = bool(_existing_home) and not _existing_home.startswith("group:")
 
     # ------------------------------------------------------------------
@@ -5299,7 +5310,8 @@ class YuanbaoAdapter(BasePlatformAdapter):
             if policy.dm_policy == "pairing":
                 from gateway.pairing import PairingStore
 
-                return PairingStore().is_approved(Platform.YUANBAO.value, sender)
+                pairing_store = getattr(self, "_profile_pairing_store", None) or PairingStore()
+                return pairing_store.is_approved(Platform.YUANBAO.value, sender)
             return False
         if ctx.chat_type == "group":
             group_code = str(ctx.group_code or "").strip()

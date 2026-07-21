@@ -81,7 +81,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote as _urlquote
 
+from agent.secret_scope import current_secret_scope, get_secret, is_multiplex_active
+
 logger = logging.getLogger(__name__)
+
+
+def _scoped_env(name: str, default: str = "") -> str:
+    value = get_secret(name, default)
+    return default if value is None or str(value) == "" else str(value)
+
+
+def _startup_env(name: str, default: str = "") -> str:
+    if is_multiplex_active() and current_secret_scope() is None:
+        return default
+    return _scoped_env(name, default)
 
 # ---------------------------------------------------------------------------
 # Lazy / function-level imports for gateway internals are NOT used here —
@@ -635,8 +648,10 @@ def _csv_list(value: str) -> List[str]:
 
 
 def _truthy_env(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
+    v = _scoped_env(name)
     if v is None:
+        return default
+    if v == "":
         return default
     return v.strip().lower() in {"1", "true", "yes", "on"}
 
@@ -659,19 +674,19 @@ class LineAdapter(BasePlatformAdapter):
 
         # Credentials
         self.channel_access_token = (
-            os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+            _startup_env("LINE_CHANNEL_ACCESS_TOKEN")
             or extra.get("channel_access_token", "")
         )
         self.channel_secret = (
-            os.getenv("LINE_CHANNEL_SECRET")
+            _startup_env("LINE_CHANNEL_SECRET")
             or extra.get("channel_secret", "")
         )
 
         # Webhook server
-        self.webhook_host = os.getenv("LINE_HOST") or extra.get("host", "0.0.0.0")
+        self.webhook_host = _startup_env("LINE_HOST") or extra.get("host", "0.0.0.0")
         try:
             self.webhook_port = int(
-                os.getenv("LINE_PORT") or extra.get("port", DEFAULT_WEBHOOK_PORT)
+                _startup_env("LINE_PORT") or extra.get("port", DEFAULT_WEBHOOK_PORT)
             )
         except (TypeError, ValueError):
             self.webhook_port = DEFAULT_WEBHOOK_PORT
@@ -680,7 +695,7 @@ class LineAdapter(BasePlatformAdapter):
         # Public base URL — required for media sending when bind isn't
         # publicly reachable.
         self.public_base_url = (
-            os.getenv("LINE_PUBLIC_URL")
+            _startup_env("LINE_PUBLIC_URL")
             or extra.get("public_url", "")
             or ""
         ).rstrip("/")
@@ -690,31 +705,31 @@ class LineAdapter(BasePlatformAdapter):
             "LINE_ALLOW_ALL_USERS", bool(extra.get("allow_all_users", False))
         )
         self.allowed_users = _csv_set(
-            os.getenv("LINE_ALLOWED_USERS", "")
+            _scoped_env("LINE_ALLOWED_USERS")
         ) | set(extra.get("allowed_users", []))
         self.allowed_groups = _csv_set(
-            os.getenv("LINE_ALLOWED_GROUPS", "")
+            _scoped_env("LINE_ALLOWED_GROUPS")
         ) | set(extra.get("allowed_groups", []))
         self.read_only_groups = _csv_set(
-            os.getenv("LINE_READ_ONLY_GROUPS", "")
+            _scoped_env("LINE_READ_ONLY_GROUPS")
         ) | set(extra.get("read_only_groups", []))
         self.archive_groups = _csv_set(
-            os.getenv("LINE_ARCHIVE_GROUPS", "")
+            _scoped_env("LINE_ARCHIVE_GROUPS")
         ) | set(extra.get("archive_groups", []))
         self.require_prefix_groups = _csv_set(
-            os.getenv("LINE_REQUIRE_PREFIX_GROUPS", "")
+            _scoped_env("LINE_REQUIRE_PREFIX_GROUPS")
         ) | set(extra.get("require_prefix_groups", []))
         self.group_prefixes = _csv_list(
-            os.getenv("LINE_GROUP_PREFIXES", "")
+            _scoped_env("LINE_GROUP_PREFIXES")
         ) or list(extra.get("group_prefixes", [])) or ["Hermes:"]
         self.allowed_rooms = _csv_set(
-            os.getenv("LINE_ALLOWED_ROOMS", "")
+            _scoped_env("LINE_ALLOWED_ROOMS")
         ) | set(extra.get("allowed_rooms", []))
 
         # Slow-LLM postback button threshold
         try:
             self.slow_response_threshold = float(
-                os.getenv("LINE_SLOW_RESPONSE_THRESHOLD")
+                _startup_env("LINE_SLOW_RESPONSE_THRESHOLD")
                 or extra.get("slow_response_threshold", DEFAULT_SLOW_RESPONSE_THRESHOLD)
             )
         except (TypeError, ValueError):
@@ -722,19 +737,19 @@ class LineAdapter(BasePlatformAdapter):
 
         # User-overridable copy
         self.pending_text = (
-            os.getenv("LINE_PENDING_TEXT")
+            _startup_env("LINE_PENDING_TEXT")
             or extra.get("pending_text", DEFAULT_PENDING_REPLY_TEXT)
         )
         self.button_label = (
-            os.getenv("LINE_BUTTON_LABEL")
+            _startup_env("LINE_BUTTON_LABEL")
             or extra.get("button_label", DEFAULT_BUTTON_LABEL)
         )
         self.delivered_text = (
-            os.getenv("LINE_DELIVERED_TEXT")
+            _startup_env("LINE_DELIVERED_TEXT")
             or extra.get("delivered_text", DEFAULT_DELIVERED_TEXT)
         )
         self.interrupted_text = (
-            os.getenv("LINE_INTERRUPTED_TEXT")
+            _startup_env("LINE_INTERRUPTED_TEXT")
             or extra.get("interrupted_text", DEFAULT_INTERRUPTED_TEXT)
         )
 
@@ -1614,9 +1629,9 @@ def _is_relative_to(child: Path, parent: Path) -> bool:
 
 def check_requirements() -> bool:
     """Plugin gate: require credentials AND aiohttp at runtime."""
-    if not os.getenv("LINE_CHANNEL_ACCESS_TOKEN"):
+    if not _startup_env("LINE_CHANNEL_ACCESS_TOKEN"):
         return False
-    if not os.getenv("LINE_CHANNEL_SECRET"):
+    if not _startup_env("LINE_CHANNEL_SECRET"):
         return False
     try:
         import aiohttp  # noqa: F401
@@ -1628,10 +1643,10 @@ def check_requirements() -> bool:
 def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
     has_token = bool(
-        os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or extra.get("channel_access_token")
+        _startup_env("LINE_CHANNEL_ACCESS_TOKEN") or extra.get("channel_access_token")
     )
     has_secret = bool(
-        os.getenv("LINE_CHANNEL_SECRET") or extra.get("channel_secret")
+        _startup_env("LINE_CHANNEL_SECRET") or extra.get("channel_secret")
     )
     return has_token and has_secret
 
@@ -1648,20 +1663,20 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
     in ``.env`` without a ``platforms.line`` block in ``config.yaml``.
     Mirrors the IRC plugin's pattern.
     """
-    if not (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") and os.getenv("LINE_CHANNEL_SECRET")):
+    if not (_startup_env("LINE_CHANNEL_ACCESS_TOKEN") and _startup_env("LINE_CHANNEL_SECRET")):
         return None
     seeded: Dict[str, Any] = {}
-    if os.getenv("LINE_PORT"):
+    if _startup_env("LINE_PORT"):
         try:
-            seeded["port"] = int(os.environ["LINE_PORT"])
+            seeded["port"] = int(_startup_env("LINE_PORT"))
         except ValueError:
             pass
-    if os.getenv("LINE_HOST"):
-        seeded["host"] = os.environ["LINE_HOST"]
-    if os.getenv("LINE_PUBLIC_URL"):
-        seeded["public_url"] = os.environ["LINE_PUBLIC_URL"]
-    if os.getenv("LINE_HOME_CHANNEL"):
-        seeded["home_channel"] = os.environ["LINE_HOME_CHANNEL"]
+    if _startup_env("LINE_HOST"):
+        seeded["host"] = _startup_env("LINE_HOST")
+    if _startup_env("LINE_PUBLIC_URL"):
+        seeded["public_url"] = _startup_env("LINE_PUBLIC_URL")
+    if _startup_env("LINE_HOME_CHANNEL"):
+        seeded["home_channel"] = _startup_env("LINE_HOME_CHANNEL")
     return seeded or {}
 
 
@@ -1688,7 +1703,7 @@ async def _standalone_send(
     """
     extra = getattr(pconfig, "extra", {}) or {}
     token = (
-        os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+        _startup_env("LINE_CHANNEL_ACCESS_TOKEN")
         or extra.get("channel_access_token", "")
     )
     if not token or not chat_id:

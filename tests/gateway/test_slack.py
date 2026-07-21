@@ -331,11 +331,8 @@ class TestAppMentionHandler:
         assert created_handlers[0].app_token == "xapp-profile"
 
     @pytest.mark.asyncio
-    async def test_connect_unscoped_multiplex_falls_back_to_env(self):
-        """Default-profile connect (multiplex active, NO scope installed) must
-        fall back to process env instead of raising UnscopedSecretError —
-        the primary startup loop and background reconnect rebuild both call
-        connect() unscoped (#59739 salvage follow-up)."""
+    async def test_connect_unscoped_multiplex_ignores_process_env(self):
+        """An unscoped multiplex connect must not inherit another profile's token."""
         config = PlatformConfig(enabled=True, token="xoxb-default")
         adapter = SlackAdapter(config)
 
@@ -393,9 +390,8 @@ class TestAppMentionHandler:
         finally:
             secret_scope.set_multiplex_active(False)
 
-        assert result is True
-        assert created_handlers
-        assert created_handlers[0].app_token == "xapp-default"
+        assert result is False
+        assert created_handlers == []
 
 
 class TestSlackConnectCleanup:
@@ -2191,6 +2187,74 @@ class TestSendTyping:
             channel_id="C123",
             thread_ts="parent_ts",
             status="is thinking...",
+        )
+
+    @pytest.mark.asyncio
+    async def test_custom_typing_status_text(self):
+        # typing_status_text overrides the default status wording.
+        config = PlatformConfig(
+            enabled=True, token="xoxb-fake-token",
+            typing_status_text="is pouncing… 🐾",
+        )
+        a = SlackAdapter(config)
+        a._app = MagicMock()
+        a._app.client = AsyncMock()
+        a._app.client.assistant_threads_setStatus = AsyncMock()
+        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        a._app.client.assistant_threads_setStatus.assert_called_once_with(
+            channel_id="C123",
+            thread_ts="parent_ts",
+            status="is pouncing… 🐾",
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_status_text_overrides_default(self, adapter):
+        # set_status_text() feeds the live per-tool phrase into the next
+        # typing refresh.
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        adapter.set_status_text("C123", "is running pytest…")
+        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
+            channel_id="C123",
+            thread_ts="parent_ts",
+            status="is running pytest…",
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_status_beats_configured_static_text(self):
+        # Dynamic per-tool phrase wins over typing_status_text while set;
+        # clearing it falls back to the configured static string.
+        config = PlatformConfig(
+            enabled=True, token="xoxb-fake-token",
+            typing_status_text="is pouncing… 🐾",
+        )
+        a = SlackAdapter(config)
+        a._app = MagicMock()
+        a._app.client = AsyncMock()
+        a._app.client.assistant_threads_setStatus = AsyncMock()
+        a.set_status_text("C123", "is reading docs/api.md…")
+        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        assert (
+            a._app.client.assistant_threads_setStatus.call_args.kwargs["status"]
+            == "is reading docs/api.md…"
+        )
+        a.set_status_text("C123", None)
+        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        assert (
+            a._app.client.assistant_threads_setStatus.call_args.kwargs["status"]
+            == "is pouncing… 🐾"
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_status_scoped_per_chat(self, adapter):
+        # A phrase for one channel must not leak into another channel's
+        # status line.
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        adapter.set_status_text("C_OTHER", "is running pytest…")
+        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        assert (
+            adapter._app.client.assistant_threads_setStatus.call_args.kwargs["status"]
+            == "is thinking..."
         )
 
     @pytest.mark.asyncio

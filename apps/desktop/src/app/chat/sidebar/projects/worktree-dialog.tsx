@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useStore } from '@nanostores/react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -16,6 +17,11 @@ import type { HermesGitBranch } from '@/global'
 import { useI18n } from '@/i18n'
 import { gitRef } from '@/lib/sanitize'
 import { notifyError } from '@/store/notifications'
+import {
+  $activeGatewayProfileGeneration,
+  activeGatewayProfileContextIsCurrent,
+  captureActiveGatewayProfileContext
+} from '@/store/profile'
 import { listRepoBranches, startWorkInRepo, switchBranchInRepo } from '@/store/projects'
 
 import { BaseBranchPicker } from './base-branch-picker'
@@ -38,7 +44,7 @@ export interface WorktreeDialogProps {
   /** Repo root path for git operations. */
   repoPath: string
   /** Called with the new/converted worktree path on success. */
-  onStarted: (path: string) => void
+  onStarted: (path: string, profile?: string, generation?: number) => void
   /** Controlled open state. */
   open: boolean
   /** Called when the user requests the dialog to close (cancel, Esc, backdrop). */
@@ -60,12 +66,17 @@ export interface WorktreeDialogProps {
 export function WorktreeDialog({ repoPath, onStarted, open, onOpenChange, initialBase }: WorktreeDialogProps) {
   const { t } = useI18n()
   const p = t.sidebar.projects
+  const owner = captureActiveGatewayProfileContext()
   const [name, setName] = useState('')
   const [pending, setPending] = useState(false)
   const [convertMode, setConvertMode] = useState(false)
   const [branches, setBranches] = useState<HermesGitBranch[]>([])
   const [branchesLoading, setBranchesLoading] = useState(false)
+  const branchRequestRef = useRef(0)
   const [selectedBase, setSelectedBase] = useState('')
+  const profileGeneration = useStore($activeGatewayProfileGeneration)
+  const branchOwnerKey = `${profileGeneration}:${repoPath}`
+  const previousBranchOwnerKeyRef = useRef(branchOwnerKey)
 
   // Reset to a fresh state each time the dialog opens, applying any pre-selected
   // base branch from the caller (e.g. "branch off from main" in the coding row's
@@ -84,16 +95,44 @@ export function WorktreeDialog({ repoPath, onStarted, open, onOpenChange, initia
       return
     }
 
+    const context = captureActiveGatewayProfileContext()
+    const request = ++branchRequestRef.current
     setBranchesLoading(true)
 
     try {
-      setBranches(await listRepoBranches(repoPath))
+      const next = await listRepoBranches(repoPath, {
+        generation: owner.generation,
+        profile: owner.profile
+      })
+
+      if (branchRequestRef.current === request && activeGatewayProfileContextIsCurrent(context)) {
+        setBranches(next)
+      }
     } catch {
-      setBranches([])
+      if (branchRequestRef.current === request && activeGatewayProfileContextIsCurrent(context)) {
+        setBranches([])
+      }
     } finally {
-      setBranchesLoading(false)
+      if (branchRequestRef.current === request && activeGatewayProfileContextIsCurrent(context)) {
+        setBranchesLoading(false)
+      }
     }
-  }, [repoPath])
+  }, [owner.generation, owner.profile, repoPath])
+
+  useEffect(() => {
+    if (previousBranchOwnerKeyRef.current === branchOwnerKey) {
+      return
+    }
+
+    previousBranchOwnerKeyRef.current = branchOwnerKey
+    branchRequestRef.current += 1
+    setBranches([])
+    setBranchesLoading(false)
+
+    if (open && convertMode) {
+      void loadBranches()
+    }
+  }, [branchOwnerKey, convertMode, loadBranches, open])
 
   const submit = async () => {
     const branch = name.trim()
@@ -105,10 +144,16 @@ export function WorktreeDialog({ repoPath, onStarted, open, onOpenChange, initia
     setPending(true)
 
     try {
-      const result = await startWorkInRepo(repoPath, { base: selectedBase || undefined, branch, name: branch })
+      const result = await startWorkInRepo(repoPath, {
+        base: selectedBase || undefined,
+        branch,
+        generation: owner.generation,
+        name: branch,
+        profile: owner.profile
+      })
 
-      if (result) {
-        onStarted(result.path)
+      if (result && activeGatewayProfileContextIsCurrent(owner)) {
+        onStarted(result.path, result.profile, result.generation)
         onOpenChange(false)
         setName('')
       }
@@ -127,19 +172,30 @@ export function WorktreeDialog({ repoPath, onStarted, open, onOpenChange, initia
     setPending(true)
 
     try {
-      let result: null | { branch: string; path: string }
+      let result: null | { branch: string; generation?: number; path: string; profile?: string }
 
       if (branch.worktreePath) {
-        result = { branch: branch.name, path: branch.worktreePath }
+        result = {
+          branch: branch.name,
+          generation: owner.generation,
+          path: branch.worktreePath,
+          profile: owner.profile
+        }
       } else if (branch.isDefault) {
-        await switchBranchInRepo(repoPath, branch.name)
-        result = { branch: branch.name, path: repoPath }
+        const switched = await switchBranchInRepo(repoPath, branch.name, owner)
+        result = switched
+          ? { branch: branch.name, generation: switched.generation, path: repoPath, profile: switched.profile }
+          : null
       } else {
-        result = await startWorkInRepo(repoPath, { existingBranch: branch.name })
+        result = await startWorkInRepo(repoPath, {
+          existingBranch: branch.name,
+          generation: owner.generation,
+          profile: owner.profile
+        })
       }
 
-      if (result) {
-        onStarted(result.path)
+      if (result && activeGatewayProfileContextIsCurrent(owner)) {
+        onStarted(result.path, result.profile, result.generation)
         onOpenChange(false)
       }
     } catch (err) {

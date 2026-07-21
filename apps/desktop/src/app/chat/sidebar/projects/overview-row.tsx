@@ -7,7 +7,6 @@ import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
 
-import { HERMES_SESSION_MIME, readSessionDrag } from '../../composer/inline-refs'
 import {
   SIDEBAR_LEAD_ICON_SIZE,
   SidebarRowBody,
@@ -69,7 +68,6 @@ interface ProjectOverviewRowProps {
   renderRows?: (sessions: SessionInfo[]) => React.ReactNode
   activeProjectId?: null | string
   previewSessions?: SessionInfo[]
-  onAssignSession?: (sessionId: string, projectId: string, profile?: string) => void
   reorderable?: boolean
   dragging?: boolean
   dragHandleProps?: React.HTMLAttributes<HTMLElement>
@@ -84,7 +82,6 @@ export function ProjectOverviewRow({
   renderRows,
   activeProjectId,
   previewSessions,
-  onAssignSession,
   reorderable = false,
   dragging = false,
   dragHandleProps,
@@ -126,28 +123,6 @@ export function ProjectOverviewRow({
           </>
         }
         className={cn('group/workspace', dragging && 'cursor-grabbing bg-(--ui-sidebar-surface-background)')}
-        onDragOver={event => {
-          if (!onAssignSession || project.isAuto || !event.dataTransfer.types.includes(HERMES_SESSION_MIME)) {
-            return
-          }
-
-          event.preventDefault()
-          event.dataTransfer.dropEffect = 'move'
-        }}
-        onDrop={event => {
-          if (!onAssignSession || project.isAuto) {
-            return
-          }
-
-          const payload = readSessionDrag(event.dataTransfer)
-
-          if (!payload?.id) {
-            return
-          }
-
-          event.preventDefault()
-          onAssignSession(payload.id, project.id, payload.profile)
-        }}
         ref={rowRef}
       >
         <SidebarRowCluster className="min-w-0 flex-1">

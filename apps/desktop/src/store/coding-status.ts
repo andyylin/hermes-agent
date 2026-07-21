@@ -1,10 +1,11 @@
 import { atom, computed } from 'nanostores'
 
 import type { HermesGitWorktree, HermesRepoStatus } from '@/global'
-import { desktopGit } from '@/lib/desktop-git'
+import { desktopGitForProfile } from '@/lib/desktop-git'
 
+import { $activeGatewayProfile, $activeGatewayProfileGeneration, normalizeProfileKey } from './profile'
 import { $worktreeRefreshToken } from './projects'
-import { $busy, $currentCwd } from './session'
+import { $busy, $currentCwd, $selectedStoredSessionId } from './session'
 import { $workspaceChangeTick } from './workspace-events'
 
 // Live working-tree status for the active session's cwd — the data backbone of
@@ -44,32 +45,33 @@ export const $repoChangeByPath = computed([$repoStatus, $currentCwd], (status, c
   return map
 })
 
-async function loadWorktrees(target: string): Promise<void> {
-  const list = desktopGit()?.worktreeList
-
-  if (!list) {
+async function loadWorktrees(request: RepoStatusRefreshRequest): Promise<void> {
+  if (!request.worktreeList) {
     $repoWorktrees.set([])
 
     return
   }
 
   try {
-    const worktrees = await list(target)
+    const worktrees = await request.worktreeList(request.target)
 
-    if (inflightCwd === target) {
+    if (isRepoStatusRequestCurrent(request)) {
       $repoWorktrees.set(worktrees)
     }
   } catch {
-    if (inflightCwd === target) {
+    if (isRepoStatusRequestCurrent(request)) {
       $repoWorktrees.set([])
     }
   }
 }
 
 interface RepoStatusRefreshRequest {
+  generation: number
+  profile: string
   probe: (cwd: string) => Promise<HermesRepoStatus | null>
   seq: number
   target: string
+  worktreeList?: (cwd: string) => Promise<HermesGitWorktree[]>
 }
 
 // Coalesce overlapping probes: many triggers can fire around a turn boundary
@@ -83,30 +85,47 @@ let repoStatusRefreshSeq = 0
 let repoStatusRefreshTimer: ReturnType<typeof setTimeout> | null = null
 
 const normalizeCwd = (cwd?: null | string): null | string => cwd?.trim() || null
+const activeProfileKey = () => normalizeProfileKey($activeGatewayProfile.get())
+
+const isRepoStatusRequestCurrent = (request: RepoStatusRefreshRequest) =>
+  request.seq === repoStatusRefreshSeq &&
+  inflightCwd === request.target &&
+  request.profile === activeProfileKey() &&
+  request.generation === $activeGatewayProfileGeneration.get()
 
 /**
  * Re-probe the working tree for `cwd` (defaults to the active session's cwd).
  * Best-effort: a non-repo, a remote backend, or a missing probe clears the
  * status so the rail hides rather than showing stale data.
  */
-async function runRepoStatusRefresh({ probe, seq, target }: RepoStatusRefreshRequest): Promise<void> {
+async function runRepoStatusRefresh({
+  generation,
+  probe,
+  profile,
+  seq,
+  target,
+  worktreeList
+}: RepoStatusRefreshRequest): Promise<void> {
   try {
     const status = await probe(target)
+    const request = { generation, probe, seq, target, profile, worktreeList }
 
     // Drop the result if the cwd moved on while we were probing (a fast session
     // switch) — the newer probe owns the atom.
-    if (seq === repoStatusRefreshSeq && inflightCwd === target) {
+    if (isRepoStatusRequestCurrent(request)) {
       $repoStatus.set(status)
 
       // Worktrees only matter inside a repo; clear them otherwise.
       if (status) {
-        void loadWorktrees(target)
+        void loadWorktrees(request)
       } else {
         $repoWorktrees.set([])
       }
     }
   } catch {
-    if (seq === repoStatusRefreshSeq && inflightCwd === target) {
+    const request = { generation, probe, seq, target, profile, worktreeList }
+
+    if (isRepoStatusRequestCurrent(request)) {
       $repoStatus.set(null)
       $repoWorktrees.set([])
     }
@@ -128,10 +147,21 @@ async function drainRepoStatusRefreshes(): Promise<void> {
   $repoStatusLoading.set(false)
 }
 
-export function refreshRepoStatus(cwd?: null | string): Promise<void> {
+export async function refreshRepoStatus(cwd?: null | string): Promise<void> {
   const target = normalizeCwd(cwd ?? $currentCwd.get())
-  const probe = desktopGit()?.repoStatus
+  const profile = activeProfileKey()
+  const generation = $activeGatewayProfileGeneration.get()
   const seq = (repoStatusRefreshSeq += 1)
+  const git = target ? await desktopGitForProfile(profile, generation) : undefined
+  const probe = git?.repoStatus
+
+  if (
+    seq !== repoStatusRefreshSeq ||
+    profile !== activeProfileKey() ||
+    generation !== $activeGatewayProfileGeneration.get()
+  ) {
+    return repoStatusRefreshInFlight ?? Promise.resolve()
+  }
 
   if (!target || !probe) {
     pendingRepoStatusRefresh = null
@@ -144,7 +174,7 @@ export function refreshRepoStatus(cwd?: null | string): Promise<void> {
   }
 
   inflightCwd = target
-  pendingRepoStatusRefresh = { probe, seq, target }
+  pendingRepoStatusRefresh = { generation, probe, profile, seq, target, worktreeList: git?.worktreeList }
   $repoStatusLoading.set(true)
 
   if (!repoStatusRefreshInFlight) {
@@ -171,6 +201,32 @@ function scheduleRepoStatusRefresh(cwd?: null | string): void {
 
 // The active session's cwd changed (session switch / new chat) → re-probe.
 $currentCwd.subscribe(cwd => scheduleRepoStatusRefresh(cwd))
+
+let repoStatusProfile = activeProfileKey()
+
+$activeGatewayProfile.subscribe(value => {
+  const next = normalizeProfileKey(value)
+
+  if (next === repoStatusProfile) {
+    return
+  }
+
+  repoStatusProfile = next
+  repoStatusRefreshSeq += 1
+  pendingRepoStatusRefresh = null
+  inflightCwd = null
+  $repoStatus.set(null)
+  $repoWorktrees.set([])
+  $repoStatusLoading.set(false)
+  scheduleRepoStatusRefresh()
+})
+
+// Switching sessions can land on the same cwd but a different checked-out
+// branch (the agent ran `git checkout` in another session's terminal). The cwd
+// subscription above won't fire when the path is identical, so the branch label
+// would stay stale until a window focus or turn-settle triggers a refresh.
+// Treat the stored-session id as a structural edge in its own right.
+$selectedStoredSessionId.subscribe(() => scheduleRepoStatusRefresh())
 
 // A worktree add/remove (desktop op, or the agent's out-of-band git in a settled
 // turn / a window refocus — both already bump this token) → re-probe.

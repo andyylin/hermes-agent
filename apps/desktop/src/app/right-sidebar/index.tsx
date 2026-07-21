@@ -13,6 +13,7 @@ import { cn } from '@/lib/utils'
 import { $panesFlipped } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
 import { setCurrentSessionPreviewTarget } from '@/store/preview'
+import { activeGatewayProfileContextIsCurrent, captureActiveGatewayProfileContext } from '@/store/profile'
 import { $currentCwd } from '@/store/session'
 
 import { SidebarPanelLabel } from '../shell/sidebar-label'
@@ -59,8 +60,14 @@ export function RightSidebarPane({ onActivateFile, onActivateFolder }: RightSide
   const canCollapse = Object.values(openState).some(Boolean)
 
   const previewFile = async (path: string) => {
+    const context = captureActiveGatewayProfileContext()
+
     try {
       const preview = await normalizeOrLocalPreviewTarget(path, effectiveCwd || undefined)
+
+      if (!activeGatewayProfileContextIsCurrent(context)) {
+        return
+      }
 
       if (!preview) {
         throw new Error(r.couldNotPreview(path))
@@ -68,6 +75,10 @@ export function RightSidebarPane({ onActivateFile, onActivateFolder }: RightSide
 
       setCurrentSessionPreviewTarget(preview, 'file-browser', path)
     } catch (error) {
+      if (!activeGatewayProfileContextIsCurrent(context)) {
+        return
+      }
+
       notifyError(error, r.previewUnavailable)
     }
   }

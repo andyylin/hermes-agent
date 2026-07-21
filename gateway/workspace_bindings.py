@@ -143,28 +143,3 @@ def resolve_workspace_binding(
         cwd=str(primary_path),
         allowed_folders=tuple(allowed),
     )
-
-
-def assign_session_to_workspace(
-    binding: WorkspaceBinding,
-    session_id: str,
-    *,
-    projects_db_path: Optional[Path] = None,
-    previous_cwd: Optional[str] = None,
-) -> None:
-    """Persist explicit Project membership for a gateway session."""
-
-    if not str(session_id or "").strip():
-        raise WorkspaceBindingError("cannot assign a workspace without a session ID")
-    with pdb.connect_closing(projects_db_path) as conn:
-        project = pdb.get_project(conn, binding.project_id)
-        if project is None or project.archived:
-            raise WorkspaceBindingError(
-                f"workspace binding project {binding.project_slug!r} is unavailable"
-            )
-        pdb.assign_session(
-            conn,
-            binding.project_id,
-            session_id,
-            previous_cwd=previous_cwd,
-        )

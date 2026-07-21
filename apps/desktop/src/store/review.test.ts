@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { HermesReviewFile, HermesReviewShipInfo } from '@/global'
 
+import { $activeGatewayProfile } from './profile'
 import {
   $reviewCommitDefault,
   $reviewCommitMsgBusy,
@@ -35,7 +36,7 @@ import {
   toggleReviewTreeMode,
   unstageReviewFile
 } from './review'
-import { $currentCwd } from './session'
+import { $connection, $currentCwd } from './session'
 
 // requestOneShot is the only cross-module dependency that must be faked (it
 // reaches the gateway); everything else routes through window.hermesDesktop.git,
@@ -78,6 +79,8 @@ function stubReview(over: ReviewStub = {}) {
 }
 
 beforeEach(() => {
+  $activeGatewayProfile.set('default')
+  $connection.set(null)
   requestOneShot.mockClear()
   requestOneShot.mockResolvedValue('generated message')
   // Reset stores touched across tests.
@@ -132,6 +135,63 @@ describe('refreshReview', () => {
     expect($reviewFiles.get().map(f => f.path)).toEqual(['a.ts', 'b.ts'])
     expect($reviewIsRepo.get()).toBe(true)
     expect($reviewLoading.get()).toBe(false)
+  })
+
+  it('drops a delayed same-cwd result after the active profile changes', async () => {
+    let resolveList!: (value: { files: HermesReviewFile[] }) => void
+    const list = vi.fn(() => new Promise<{ files: HermesReviewFile[] }>(resolve => (resolveList = resolve)))
+
+    stubReview({ list })
+    $activeGatewayProfile.set('alpha')
+    $connection.set({ mode: 'local', profile: 'alpha' } as never)
+    $reviewOpen.set(true)
+    const refresh = refreshReview()
+    await vi.waitFor(() => expect(list).toHaveBeenCalled())
+
+    $activeGatewayProfile.set('beta')
+    resolveList({ files: [file('alpha-only.ts')] })
+    await refresh
+
+    expect($reviewFiles.get()).toEqual([])
+  })
+
+  it('drops a delayed same-cwd result after an A to B to A profile generation swap', async () => {
+    let resolveList!: (value: { files: HermesReviewFile[] }) => void
+    const list = vi.fn(() => new Promise<{ files: HermesReviewFile[] }>(resolve => (resolveList = resolve)))
+
+    stubReview({ list })
+    $activeGatewayProfile.set('alpha')
+    $connection.set({ mode: 'local', profile: 'alpha' } as never)
+    $reviewOpen.set(true)
+    const refresh = refreshReview()
+    await vi.waitFor(() => expect(list).toHaveBeenCalled())
+
+    $activeGatewayProfile.set('beta')
+    $activeGatewayProfile.set('alpha')
+    resolveList({ files: [file('old-alpha.ts')] })
+    await refresh
+
+    expect($reviewFiles.get()).toEqual([])
+  })
+
+  it('does not publish an old Alpha diff after Beta and a new Alpha select the same path', async () => {
+    let resolveOldDiff!: (value: string) => void
+    const oldDiff = new Promise<string>(resolve => (resolveOldDiff = resolve))
+    const diff = vi.fn().mockReturnValueOnce(oldDiff).mockResolvedValueOnce('new alpha diff')
+
+    stubReview({ diff })
+    $activeGatewayProfile.set('alpha')
+    $connection.set({ mode: 'local', profile: 'alpha' } as never)
+    const staleSelection = selectReviewFile(file('same.ts'))
+    await vi.waitFor(() => expect(diff).toHaveBeenCalledTimes(1))
+
+    $activeGatewayProfile.set('beta')
+    $activeGatewayProfile.set('alpha')
+    await selectReviewFile(file('same.ts'))
+    resolveOldDiff('old alpha diff')
+    await staleSelection
+
+    expect($reviewDiff.get()).toBe('new alpha diff')
   })
 
   it('filters excluded paths (node_modules et al.) out of the list', async () => {
@@ -289,15 +349,17 @@ describe('mutations', () => {
 
 describe('revert confirm dialog', () => {
   it('requestRevert opens a target, cancelRevert closes it', () => {
+    stubReview()
     requestRevert('a.ts')
-    expect($reviewRevertTarget.get()).toEqual({ path: 'a.ts' })
+    expect($reviewRevertTarget.get()).toMatchObject({ path: 'a.ts', profile: 'default' })
     cancelRevert()
     expect($reviewRevertTarget.get()).toBeUndefined()
   })
 
   it('requestRevert(null) encodes the "revert all" target distinctly from closed', () => {
+    stubReview()
     requestRevert(null)
-    expect($reviewRevertTarget.get()).toEqual({ path: null })
+    expect($reviewRevertTarget.get()).toMatchObject({ path: null, profile: 'default' })
   })
 
   it('confirmRevert closes the dialog then performs the revert', async () => {
@@ -316,6 +378,17 @@ describe('revert confirm dialog', () => {
 
     await confirmRevert()
 
+    expect(review.revert).not.toHaveBeenCalled()
+  })
+
+  it('drops a pending destructive revert after the active profile changes', async () => {
+    const review = stubReview()
+
+    requestRevert('a.ts')
+    $activeGatewayProfile.set('other')
+    await confirmRevert()
+
+    expect($reviewRevertTarget.get()).toBeUndefined()
     expect(review.revert).not.toHaveBeenCalled()
   })
 })

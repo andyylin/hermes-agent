@@ -69,7 +69,7 @@ class _StreamConsumer:
     async def run(self):
         return None
 
-    def finish(self):
+    def finish(self, _final_text=""):
         pass
 
 

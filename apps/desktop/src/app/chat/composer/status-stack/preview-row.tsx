@@ -13,6 +13,7 @@ import { notifyError } from '@/store/notifications'
 import { $paneOpen } from '@/store/panes'
 import { $previewTarget, dismissPreviewTarget, setCurrentSessionPreviewTarget } from '@/store/preview'
 import { type PreviewArtifact } from '@/store/preview-status'
+import { activeGatewayProfileContextIsCurrent, captureActiveGatewayProfileContext } from '@/store/profile'
 
 interface PreviewStatusRowProps {
   item: PreviewArtifact
@@ -28,13 +29,18 @@ export const PreviewStatusRow = memo(function PreviewStatusRow({ item, onDismiss
   const isOpen = activePreview?.source === item.target && previewPaneOpen
 
   const resolveTarget = async () => {
+    const context = captureActiveGatewayProfileContext()
     const target = await normalizeOrLocalPreviewTarget(item.target, item.cwd || undefined)
+
+    if (!activeGatewayProfileContextIsCurrent(context)) {
+      return null
+    }
 
     if (!target) {
       throw new Error(`Could not open preview target: ${item.target}`)
     }
 
-    return target
+    return { context, target }
   }
 
   const togglePreview = async () => {
@@ -51,7 +57,11 @@ export const PreviewStatusRow = memo(function PreviewStatusRow({ item, onDismiss
     setOpening(true)
 
     try {
-      setCurrentSessionPreviewTarget(await resolveTarget(), 'tool-result', item.target)
+      const resolved = await resolveTarget()
+
+      if (resolved && activeGatewayProfileContextIsCurrent(resolved.context)) {
+        setCurrentSessionPreviewTarget(resolved.target, 'tool-result', item.target)
+      }
     } catch (error) {
       notifyError(error, t.preview.unavailable)
     } finally {
@@ -67,7 +77,11 @@ export const PreviewStatusRow = memo(function PreviewStatusRow({ item, onDismiss
         throw new Error('Desktop preview browser bridge is unavailable')
       }
 
-      await bridge((await resolveTarget()).url)
+      const resolved = await resolveTarget()
+
+      if (resolved && activeGatewayProfileContextIsCurrent(resolved.context)) {
+        await bridge(resolved.target.url)
+      }
     } catch (error) {
       notifyError(error, t.preview.unavailable)
     }

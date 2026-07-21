@@ -30,8 +30,21 @@ import { latestSessionTodos } from '@/lib/todos'
 import { setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
 import { $filePreviewTarget, $previewTarget } from '@/store/preview'
-import { $activeGatewayProfile, $freshSessionRequest, $profileScope, refreshActiveProfile } from '@/store/profile'
-import { $startWorkSessionRequest, followActiveSessionCwd, resolveNewSessionCwd } from '@/store/projects'
+import {
+  $activeGatewayProfile,
+  $freshSessionRequest,
+  $profileScope,
+  activeGatewayProfileContextIsCurrent,
+  captureActiveGatewayProfileContext,
+  normalizeProfileKey,
+  refreshActiveProfile
+} from '@/store/profile'
+import {
+  $startWorkSessionRequest,
+  followActiveSessionCwd,
+  markStartWorkSessionCommitted,
+  resolveNewSessionCwd
+} from '@/store/projects'
 import {
   $activeSessionId,
   $connection,
@@ -394,6 +407,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     creatingSessionRef,
     ensureSessionState,
     getRouteToken,
+    getRoutedStoredSessionId,
     navigate,
     onFreshDraftRouteIntent: clearRoutedSessionIntent,
     requestGateway,
@@ -409,6 +423,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // A profile switch/create drops to a fresh new-session draft so the
   // previously open session doesn't bleed across contexts. Skip initial value.
   const freshSessionRequest = useStore($freshSessionRequest)
+  const freshSessionConnection = useStore($connection)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
   const lastFreshRef = useRef(freshSessionRequest)
 
   useEffect(() => {
@@ -416,14 +432,17 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       return
     }
 
+    if (normalizeProfileKey(freshSessionConnection?.profile) !== normalizeProfileKey(activeGatewayProfile)) {
+      return
+    }
+
     lastFreshRef.current = freshSessionRequest
     startFreshSessionDraft()
-  }, [freshSessionRequest, startFreshSessionDraft])
+  }, [activeGatewayProfile, freshSessionConnection?.profile, freshSessionRequest, startFreshSessionDraft])
 
   // Swapping the live gateway to another profile must re-pull that profile's
   // global model + active-profile pill (both are nanostores — the blanket
   // invalidateQueries on swap doesn't touch them).
-  const activeGatewayProfile = useStore($activeGatewayProfile)
   const lastGatewayProfileRef = useRef(activeGatewayProfile)
 
   useEffect(() => {
@@ -432,18 +451,31 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
 
     lastGatewayProfileRef.current = activeGatewayProfile
-    // Force: the new profile has its own default, so reseed even if the
-    // composer already shows the previous profile's model.
+    // Force: the new profile has its own defaults, so reseed the selector even
+    // if the composer already shows values from the previous profile. Both
+    // refreshes carry an intent token so a picker click made in flight wins.
     void refreshCurrentModel(true)
+    void refreshHermesConfig(true)
     void refreshActiveProfile()
-  }, [activeGatewayProfile, refreshCurrentModel])
+  }, [activeGatewayProfile, refreshCurrentModel, refreshHermesConfig])
 
   // New session anchored to a workspace (sidebar "+" on a project/worktree).
   // Seeds cwd + branch from the clicked workspace; an explicit worktree path
   // also drills the sidebar into that project so the new lane is visible.
   const startSessionInWorkspace = useCallback(
-    (path: null | string) => {
-      startFreshSessionDraft()
+    async (path: null | string, expectedProfile?: string, expectedGeneration?: number): Promise<boolean> => {
+      const current = captureActiveGatewayProfileContext()
+
+      const context = {
+        generation: expectedGeneration ?? current.generation,
+        profile: normalizeProfileKey(expectedProfile ?? current.profile)
+      }
+
+      const ownsRequest = () => activeGatewayProfileContextIsCurrent(context)
+
+      if (!ownsRequest()) {
+        return false
+      }
 
       // A worktree lane carries its own path; the trunk "+" can be path-less
       // (the main checkout is implicit), so fall back to the active project's
@@ -451,23 +483,35 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       const target = path?.trim() || resolveNewSessionCwd()
 
       if (!target) {
-        return
+        return false
       }
 
-      setCurrentCwd(target)
-      void requestGateway<{ branch?: string; cwd?: string }>('config.get', { key: 'project', cwd: target })
-        .then(info => {
-          const resolved = info.cwd || target
+      let info: { branch?: string; cwd?: string } = {}
 
-          setCurrentCwd(resolved)
-          setCurrentBranch(info.branch || '')
+      try {
+        info = await requestGateway<{ branch?: string; cwd?: string }>('config.get', { key: 'project', cwd: target })
+      } catch {
+        if (!ownsRequest()) {
+          return false
+        }
+      }
 
-          if (path?.trim()) {
-            restoreWorktree(resolved)
-            void followActiveSessionCwd(resolved)
-          }
-        })
-        .catch(() => undefined)
+      if (!ownsRequest()) {
+        return false
+      }
+
+      const resolved = info.cwd || target
+
+      startFreshSessionDraft()
+      setCurrentCwd(resolved)
+      setCurrentBranch(info.branch || '')
+
+      if (path?.trim()) {
+        restoreWorktree(resolved)
+        void followActiveSessionCwd(resolved)
+      }
+
+      return true
     },
     [requestGateway, startFreshSessionDraft]
   )
@@ -483,11 +527,29 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
 
     lastStartWorkTokenRef.current = startWorkSessionRequest.token
-    startSessionInWorkspace(startWorkSessionRequest.path)
 
-    if (startWorkSessionRequest.draft) {
-      requestComposerInsert(startWorkSessionRequest.draft, { target: 'main' })
+    const request = startWorkSessionRequest
+
+    if (
+      !activeGatewayProfileContextIsCurrent({
+        generation: request.generation,
+        profile: request.profile
+      })
+    ) {
+      return
     }
+
+    void startSessionInWorkspace(request.path, request.profile, request.generation).then(committed => {
+      if (!committed || $startWorkSessionRequest.get()?.token !== request.token) {
+        return
+      }
+
+      markStartWorkSessionCommitted(request.token)
+
+      if (request.draft) {
+        requestComposerInsert(request.draft, { target: 'main' })
+      }
+    })
   }, [startSessionInWorkspace, startWorkSessionRequest])
 
   const composer = useComposerActions({ activeSessionId, currentCwd, requestGateway })
@@ -649,6 +711,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // Keep app data live while the gateway is open (on-connect reseed + the
   // cron / messaging / transcript visibility polls + fresh-draft reseed).
   useBackgroundSync({
+    activeGatewayProfile,
     activeIsMessaging,
     activeSessionId,
     freshDraftReady,
@@ -915,7 +978,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
               setCurrentProvider(provider)
               setCurrentModel(model)
               setCurrentModelSource('default')
-              updateModelOptionsCache(provider, model, true)
+              updateModelOptionsCache($activeSessionId.get(), provider, model, true)
               void refreshCurrentModel()
               void queryClient.invalidateQueries({ queryKey: ['model-options'] })
             }}

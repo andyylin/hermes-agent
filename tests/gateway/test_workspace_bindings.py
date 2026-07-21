@@ -208,33 +208,6 @@ def test_configured_room_fails_closed_when_primary_folder_disappears(tmp_path):
         resolve_workspace_binding(config, _matrix_source(), projects_db_path=db_path)
 
 
-def test_assignment_records_project_for_session(tmp_path):
-    from gateway.workspace_bindings import assign_session_to_workspace, resolve_workspace_binding
-
-    db_path, project_id, _ = _project_db(tmp_path)
-    config = {
-        "gateway": {
-            "workspace_bindings": {
-                "matrix": {"!kenya:example.com": {"project": "kenya"}}
-            }
-        }
-    }
-    binding = resolve_workspace_binding(config, _matrix_source(), projects_db_path=db_path)
-    assert binding is not None
-
-    assign_session_to_workspace(
-        binding,
-        "session-123",
-        projects_db_path=db_path,
-        previous_cwd="/home/pi",
-    )
-
-    with pdb.connect_closing(db_path) as conn:
-        assignments = pdb.list_session_assignments(conn)
-        assert assignments["session-123"] == project_id
-        assert pdb.previous_session_cwd(conn, "session-123") == "/home/pi"
-
-
 def test_bound_project_is_rendered_in_session_context(tmp_path):
     folder = tmp_path / "kenya"
     folder.mkdir()
@@ -350,17 +323,9 @@ async def test_gateway_runner_persists_and_applies_workspace_binding(tmp_path, m
         cwd=str(folder),
         allowed_folders=(str(folder),),
     )
-    assigned = []
-
     monkeypatch.setattr(
         "gateway.workspace_bindings.resolve_workspace_binding",
         lambda config, source: binding,
-    )
-    monkeypatch.setattr(
-        "gateway.workspace_bindings.assign_session_to_workspace",
-        lambda resolved, session_id, previous_cwd=None: assigned.append(
-            (resolved, session_id, previous_cwd)
-        ),
     )
     monkeypatch.setattr(
         "gateway.run._load_gateway_config", lambda **_kwargs: {"gateway": {}}
@@ -391,7 +356,6 @@ async def test_gateway_runner_persists_and_applies_workspace_binding(tmp_path, m
     assert resolved is binding
     assert context.workspace_project_id == "p_kenya"
     assert context.workspace_cwd == str(folder)
-    assert assigned == [(binding, "session-123", "/home/pi")]
     assert runner._session_db.replacements == [("session-123", str(folder))]
 
 
@@ -418,10 +382,6 @@ async def test_gateway_runner_persists_bound_cwd_with_real_async_session_db(
     monkeypatch.setattr(
         "gateway.workspace_bindings.resolve_workspace_binding",
         lambda config, source: binding,
-    )
-    monkeypatch.setattr(
-        "gateway.workspace_bindings.assign_session_to_workspace",
-        lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
         "gateway.run._load_gateway_config", lambda **_kwargs: {"gateway": {}}
@@ -496,11 +456,6 @@ async def test_multiplex_workspace_binding_loads_config_inside_profile_scope(
         "gateway.workspace_bindings.resolve_workspace_binding",
         fake_resolve,
     )
-    monkeypatch.setattr(
-        "gateway.workspace_bindings.assign_session_to_workspace",
-        lambda *args, **kwargs: None,
-    )
-
     class FakeSessionDB:
         async def get_session(self, _session_id):
             return {"cwd": "/home/pi"}

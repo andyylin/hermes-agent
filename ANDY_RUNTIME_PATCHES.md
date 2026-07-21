@@ -6,10 +6,31 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 
 ## Integrated upstream baseline
 
-- `e6327692699f05d83f80c06103bc871bc61a048c` (2026-07-18)
-- Temporary overlays below were re-audited against this cutoff; Projects PR #61335 and idle-rendering PR #66160 remain open and unmerged.
+- `31c08a9aad6e83ded5d0e55dc7d41b94a99f08a1` (2026-07-20 frozen rollout cutoff)
+- Upstream Projects is canonical. The former explicit session-assignment and Desktop move-to-Project overlay was retired against this cutoff.
+- Temporary overlays below were re-audited against this cutoff; idle-rendering PR #66160 remains external to upstream.
 
 ## Active runtime patches
+
+- `fix(discord): isolate multiplex profile policy`
+  - Keeps Discord authorization, mention, channel, thread, and reply policy adapter-local under profile multiplexing.
+  - Disables legacy YAML-to-environment policy bridges in multiplex mode so one profile cannot inherit another profile's settings.
+  - Activates multiplex isolation before the first platform YAML hook and preserves explicit environment-over-YAML precedence in legacy single-profile gateways.
+  - Ignores process-global gateway allow-all/user policy on Discord message, warning, and component authorization paths while multiplexing.
+
+- `fix(matrix): isolate multiplex profile policy`
+  - Keeps Matrix room/user authorization, mentions, reactions, threading, notices, and public-room policy adapter-local.
+  - Disables Matrix's legacy YAML-to-environment bridge while multiplexing so secondary profiles cannot contaminate process-global policy.
+  - Resolves absent-profile authorization, room, mention, reaction, threading, and approval policy from fail-closed/default values rather than poisoned process globals; legacy single-profile environment fallback remains intact.
+  - Makes shared gateway authorization fail closed on unscoped multiplex reads and routes chat, bot, allowlist, and unauthorized-DM policy through the scoped resolver.
+
+- `fix(desktop): close profile-generation handoff gaps`
+  - Revalidates project RPC continuations, review reads, filesystem routing/previews, picker listings, branch/worktree consumers, and session startup against the initiating profile generation.
+  - Publishes profile activation only after connection synchronization and delays fresh-session reset until activation settles.
+  - Binds composer commitment and draft/attachment cleanup to the owning profile generation, preventing stale or failed handoffs from eating another profile's draft.
+  - Uses request ownership for branch-loading teardown, synchronously invalidates stale remote-picker requests, and guards every local-preview continuation and consumer against A→B→A generation swaps.
+  - Carries preview ownership through nested helpers to the final pane/browser side effect and rolls gateway activation back when connection-descriptor synchronization fails.
+  - Binds every rendered project/workspace “new session” callback to its producer profile generation so stale sidebar trees cannot reinterpret an old path through a newer foreground profile.
 
 - `fix(discord): add smart auto-thread titles`
   - Adds deterministic Discord auto-thread title cleanup/summarization.
@@ -33,6 +54,9 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 - `fix(email): send HTML bodies as multipart alternative`
   - Sends HTML email content as `text/html` with a plain-text fallback instead of raw tags in plain text.
 
+- `fix(gateway): release delivery claims without process start timestamps`
+  - Uses SQLite's NULL-safe identity comparison so an unavailable process start time cannot strand a delivery obligation or consume its retry budget.
+
 - `fix(cron): format Discord cron deliveries without tables`
   - Uses Discord-friendly headings and bullets for cron reports.
   - Converts simple Markdown tables to grouped bullet rows before Discord delivery.
@@ -50,6 +74,16 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
   - Existing Matrix threads and DM policy retain precedence; add a room to `free_response_rooms` too when every message should be handled without an `@mention`.
   - Retire this overlay once upstream Matrix supports an equivalent per-room thread policy.
 
+- `feat(gateway): bind configured conversation scopes to upstream Projects`
+  - Resolves profile-local room/channel bindings through upstream `projects.db` and persists the bound folder as the session cwd.
+  - Upstream Projects remains the only membership authority: grouping is inferred from cwd and no parallel assignment table is written.
+  - Configured-but-invalid bindings fail closed rather than running from a broader fallback directory.
+
+- `fix(state): retire unstable trigram FTS writes`
+  - Removes the disabled `messages_fts_trigram` table and its synchronization triggers so it cannot continue corrupting `state.db` behind the fallback path.
+  - Keeps base FTS5 enabled and uses the existing `LIKE` fallback for CJK/substring search.
+  - Repair procedure: take a coherent SQLite online backup, copy canonical rows logically, rebuild ordinary indexes and base FTS, and do not recreate trigram.
+
 - `fix(matrix): preserve password-auth reconnect eligibility`
   - Treats `MATRIX_PASSWORD` and `matrix.password` as valid Matrix credentials when no access token is configured.
   - Prevents a temporary Synapse startup outage from permanently removing password-auth Matrix from the gateway reconnect queue.
@@ -57,10 +91,22 @@ Do not assume a fix exists live just because it exists in a PR branch. Verify th
 - `fix(desktop): preserve unsafe config integers`
   - Serializes large config identifiers without JavaScript precision loss so Discord/channel/account IDs are not silently rounded by Desktop edits.
 
-- `feat(projects): complete session move lifecycle` *(temporary pending upstream)*
-  - Source: `andyylin/hermes-agent:contrib/pr-61335-complete`, preserving JuizSpeaking's original commits from upstream PR #61335.
-  - Adds explicit project assignment, explicit `No Project`, profile-safe assign/unassign RPCs, cwd re-anchoring/restoration, and Desktop move/drag behavior.
-  - Retire this overlay once PR #61335 (or an equivalent upstream implementation) lands and the runtime has been reconciled to that upstream version.
+- `fix(desktop): discover runtime plugins from the local Desktop Hermes home`
+  - Resolves the on-disk plugin directory through Desktop-local profile IPC instead of backend-reported status.
+  - Prevents a Mac Desktop connected to the Pi from reading or opening the Pi's plugin directory.
+  - Fails closed when the Desktop bridge does not provide a non-empty local Hermes home.
+
+- `fix(desktop): isolate upstream Projects state by live profile`
+  - Captures the concrete profile generation and gateway for every asynchronous Projects RPC so stale A results and writes cannot publish through B.
+  - Binds repo discovery, folder-picker browsing, and post-create `IDEA.md` writes to the initiating profile's filesystem transport.
+  - Settles replaced/unmounted remote folder pickers and generation-binds both generic and explicit picker requests, including rapid A→B→A swaps.
+  - Carries profile plus generation ownership through worktree creation, branch switching, and new-session handoff, rejecting stale `config.get`, draft clearing, and composer routing.
+  - Binds project-drill-in worktree probes to the initiating profile generation so stale lanes cannot repaint after a swap.
+  - Binds coding-status and review results to both cwd and profile, and refuses Git operations while the active profile and foreground connection disagree.
+  - Clears filesystem-bound worktree/project order, collapse, and dismissal state on profile swap until those persisted keys are profile-namespaced.
+  - Resets profile-bound Projects caches, optimistic state, dialogs, tombstones, and loading flags on a live profile swap.
+  - Keys repo-scan completion and persisted Project view scope by profile.
+  - Retire this overlay once upstream Projects provides equivalent A→B→A isolation and regression coverage.
 
 - `fix(desktop): stop idle renderer animation loops` *(temporary pending upstream)*
   - Source: `andyylin/hermes-agent:fix/desktop-idle-rendering` / upstream PR #66160, preserving Ho Lim's original commits from PR #61084.
@@ -77,6 +123,12 @@ curl -fsSL https://raw.githubusercontent.com/andyylin/hermes-agent/andy-runtime/
 
 The bootstrap pins the checkout and in-app updater to `origin/andy-runtime`, builds the native Desktop app, and installs `hermes-custom-update`. It deliberately does not copy credentials or remote-backend authentication. Re-running it is idempotent, but it refuses to proceed over tracked source changes.
 
+## Retired runtime patches
+
+- Custom explicit Project assignments, explicit `No Project`, assign/unassign RPCs, Desktop drag/move controls, assignment-aware colors, and assignment overrides were removed on 2026-07-20.
+- Upstream Projects now owns Project persistence, discovery, grouping, session colors, Desktop navigation, tools, and Kanban integration.
+- Existing `project_session_assignments` rows are migration input only. The legacy table is preserved in database backups but is not read or written by the runtime.
+
 ## Operating rule
 
 Before restarting live Hermes gateway after upstream updates:
@@ -85,7 +137,7 @@ Before restarting live Hermes gateway after upstream updates:
 2. Confirm the Discord adapter has `skip_thread = bool(channel_keys & no_thread_channels)`.
 3. Confirm LINE group allowlist handling remains upstream in `plugins/platforms/line/adapter.py`.
 4. Run focused gateway/title/STT/cron tests.
-5. Run project/session lifecycle tests plus Desktop typecheck and focused project UI tests while the temporary Projects overlay is active.
+5. Run upstream Projects/database compatibility tests, conversation-scope workspace-binding tests, Desktop typecheck, and focused Project UI tests.
 6. Restart the gateway and inspect logs for reconnect/errors.
 
 If upstream `main` later contains any item above, trim the duplicate local patch and update this ledger.

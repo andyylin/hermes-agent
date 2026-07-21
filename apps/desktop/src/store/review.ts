@@ -2,6 +2,7 @@ import { atom, computed } from 'nanostores'
 
 import { SIDEBAR_COLLAPSE_MEDIA_QUERY } from '@/app/layout-constants'
 import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
+import { revealTreePane } from '@/components/pane-shell/tree/store'
 import type { HermesReviewFile, HermesReviewShipInfo } from '@/global'
 import { matchesQuery } from '@/hooks/use-media-query'
 import { desktopGit } from '@/lib/desktop-git'
@@ -10,6 +11,7 @@ import { requestOneShot } from '@/lib/oneshot'
 import { Codecs, persistentAtom } from '@/lib/persisted'
 
 import { refreshRepoStatus } from './coding-status'
+import { $activeGatewayProfile, $activeGatewayProfileGeneration, normalizeProfileKey } from './profile'
 import { $busy, $currentCwd } from './session'
 import { $workspaceChangeTick } from './workspace-events'
 
@@ -93,12 +95,28 @@ let shipInfoLastCheckedAt = 0
 
 // The two things every review op needs: the repo cwd + the IPC bridge. Null when
 // either is missing (no session, remote backend), so callers bail in one line.
-function reviewCtx(): { cwd: string; review: ReviewBridge } | null {
+interface ReviewContext {
+  cwd: string
+  generation: number
+  profile: string
+  review: ReviewBridge
+}
+
+const activeReviewProfile = () => normalizeProfileKey($activeGatewayProfile.get())
+
+function reviewCtx(): ReviewContext | null {
   const cwd = repoCwd()
   const review = desktopGit()?.review
 
-  return cwd && review ? { cwd, review } : null
+  return cwd && review
+    ? { cwd, generation: $activeGatewayProfileGeneration.get(), profile: activeReviewProfile(), review }
+    : null
 }
+
+const isReviewContextCurrent = (ctx: Pick<ReviewContext, 'cwd' | 'generation' | 'profile'>) =>
+  repoCwd() === ctx.cwd &&
+  activeReviewProfile() === ctx.profile &&
+  $activeGatewayProfileGeneration.get() === ctx.generation
 
 // ── Reads ────────────────────────────────────────────────────────────────────
 
@@ -129,7 +147,7 @@ export async function refreshReview(): Promise<void> {
     const result = await review.list(cwd, 'uncommitted', null)
 
     // Ignore a result that resolved after the cwd moved on.
-    if (seq !== reviewRefreshSeq || repoCwd() !== cwd) {
+    if (seq !== reviewRefreshSeq || !isReviewContextCurrent(ctx)) {
       return
     }
 
@@ -151,11 +169,11 @@ export async function refreshReview(): Promise<void> {
       void selectReviewFile(selectedFile)
     }
   } catch {
-    if (seq === reviewRefreshSeq) {
+    if (seq === reviewRefreshSeq && isReviewContextCurrent(ctx)) {
       $reviewFiles.set([])
     }
   } finally {
-    if (seq === reviewRefreshSeq) {
+    if (seq === reviewRefreshSeq && isReviewContextCurrent(ctx)) {
       $reviewLoading.set(false)
     }
   }
@@ -192,15 +210,15 @@ export async function selectReviewFile(file: HermesReviewFile): Promise<void> {
   try {
     const diff = await ctx.review.diff(ctx.cwd, file.path, 'uncommitted', null, file.staged)
 
-    if ($reviewSelectedPath.get() === file.path) {
+    if ($reviewSelectedPath.get() === file.path && isReviewContextCurrent(ctx)) {
       $reviewDiff.set(diff || '')
     }
   } catch {
-    if ($reviewSelectedPath.get() === file.path) {
+    if ($reviewSelectedPath.get() === file.path && isReviewContextCurrent(ctx)) {
       $reviewDiff.set('')
     }
   } finally {
-    if ($reviewSelectedPath.get() === file.path) {
+    if ($reviewSelectedPath.get() === file.path && isReviewContextCurrent(ctx)) {
       $reviewDiffLoading.set(false)
     }
   }
@@ -227,12 +245,12 @@ export async function refreshShipInfo(): Promise<void> {
   try {
     const info = await ctx.review.shipInfo(ctx.cwd)
 
-    if (seq === shipInfoSeq && repoCwd() === ctx.cwd) {
+    if (seq === shipInfoSeq && isReviewContextCurrent(ctx)) {
       $reviewShipInfo.set(info)
       shipInfoLastCheckedAt = Date.now()
     }
   } catch {
-    if (seq === shipInfoSeq) {
+    if (seq === shipInfoSeq && isReviewContextCurrent(ctx)) {
       $reviewShipInfo.set({ ghReady: false, pr: null })
       shipInfoLastCheckedAt = Date.now()
     }
@@ -274,6 +292,7 @@ export function toggleReview(): void {
     closeReview()
   } else {
     openReview()
+    revealTreePane(REVIEW_PANE_ID)
   }
 }
 
@@ -281,7 +300,11 @@ export function toggleReview(): void {
 
 // Run a git mutation then re-sync both the review list and the rail's +/- (the
 // working tree changed). A failure is swallowed by the caller's notify wrapper.
-async function afterMutation(): Promise<void> {
+async function afterMutation(ctx: ReviewContext): Promise<void> {
+  if (!isReviewContextCurrent(ctx)) {
+    return
+  }
+
   await refreshReview()
   void refreshRepoStatus()
 
@@ -295,29 +318,54 @@ async function afterMutation(): Promise<void> {
 }
 
 export async function stageReviewFile(path: null | string): Promise<void> {
-  await desktopGit()?.review?.stage(repoCwd() ?? '', path)
-  await afterMutation()
+  const ctx = reviewCtx()
+
+  if (ctx) {
+    await ctx.review.stage(ctx.cwd, path)
+    await afterMutation(ctx)
+  }
 }
 
 export async function unstageReviewFile(path: null | string): Promise<void> {
-  await desktopGit()?.review?.unstage(repoCwd() ?? '', path)
-  await afterMutation()
+  const ctx = reviewCtx()
+
+  if (ctx) {
+    await ctx.review.unstage(ctx.cwd, path)
+    await afterMutation(ctx)
+  }
 }
 
 export async function revertReviewFile(path: null | string): Promise<void> {
-  await desktopGit()?.review?.revert(repoCwd() ?? '', path)
-  await afterMutation()
+  const ctx = reviewCtx()
+
+  if (ctx) {
+    await ctx.review.revert(ctx.cwd, path)
+    await afterMutation(ctx)
+  }
 }
 
 // Revert is destructive (discards working-tree edits with no undo), so it always
 // routes through a confirm dialog. The target is `{ path }` where `path === null`
 // means "revert all"; `undefined` means no confirm is open. We wrap the path in
 // an object so the `null` ("all") case is distinguishable from "closed".
-export const $reviewRevertTarget = atom<{ path: null | string } | undefined>(undefined)
+interface ReviewRevertTarget {
+  cwd: string
+  generation: number
+  path: null | string
+  profile: string
+}
+
+export const $reviewRevertTarget = atom<ReviewRevertTarget | undefined>(undefined)
 
 /** Open the revert confirm for a single file, or `null` for all changes. */
 export function requestRevert(path: null | string): void {
-  $reviewRevertTarget.set({ path })
+  const ctx = reviewCtx()
+
+  if (!ctx) {
+    return
+  }
+
+  $reviewRevertTarget.set({ cwd: ctx.cwd, generation: ctx.generation, path, profile: ctx.profile })
 }
 
 export function cancelRevert(): void {
@@ -330,7 +378,7 @@ export async function confirmRevert(): Promise<void> {
 
   $reviewRevertTarget.set(undefined)
 
-  if (target) {
+  if (target && isReviewContextCurrent(target)) {
     await revertReviewFile(target.path)
   }
 }
@@ -453,6 +501,32 @@ export async function createOrOpenPr(): Promise<void> {
 }
 
 // ── Triggers (module-scope, mirror coding-status.ts) ─────────────────────────
+
+let reviewProfileGeneration = $activeGatewayProfileGeneration.get()
+
+$activeGatewayProfileGeneration.subscribe(value => {
+  if (value === reviewProfileGeneration) {
+    return
+  }
+
+  reviewProfileGeneration = value
+  reviewRefreshSeq += 1
+  shipInfoSeq += 1
+  commitGenSeq += 1
+  clearReviewSelection()
+  $reviewFiles.set([])
+  $reviewLoading.set(false)
+  $reviewIsRepo.set(true)
+  $reviewShipInfo.set({ ghReady: false, pr: null })
+  $reviewShipBusy.set(false)
+  $reviewCommitMsgBusy.set(false)
+  $reviewRevertTarget.set(undefined)
+
+  if ($reviewOpen.get()) {
+    scheduleReviewRefresh()
+    void refreshShipInfo()
+  }
+})
 
 // A file-mutating tool finished (event-driven, not polled) → refresh the open
 // pane's changed-file list. gh/PR re-check is NOT here (gh is slow); it runs on

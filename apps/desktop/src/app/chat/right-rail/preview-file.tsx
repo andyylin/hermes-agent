@@ -1,3 +1,4 @@
+import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import type {
   ComponentProps,
@@ -6,7 +7,7 @@ import type {
   MouseEvent as ReactMouseEvent,
   ReactNode
 } from 'react'
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import ShikiHighlighter from 'react-shiki'
 import { Streamdown } from 'streamdown'
 
@@ -22,17 +23,22 @@ import { PageLoader } from '@/components/page-loader'
 import { Tip } from '@/components/ui/tooltip'
 import { translateNow, useI18n } from '@/i18n'
 import {
-  desktopFileDiff,
-  desktopGitRoot,
-  readDesktopFileDataUrl,
-  readDesktopFileText,
-  writeDesktopFileText
+  desktopFileDiffForProfile,
+  desktopGitRootForProfile,
+  readDesktopFileDataUrlForProfile,
+  readDesktopFileTextForProfile,
+  writeDesktopFileTextForProfile
 } from '@/lib/desktop-fs'
 import { Check, Pencil, X } from '@/lib/icons'
 import { shikiLanguageForFilename } from '@/lib/markdown-code'
 import { cn } from '@/lib/utils'
 import type { PreviewTarget } from '@/store/preview'
 import { setPreviewDirty } from '@/store/preview-edit'
+import {
+  $activeGatewayProfile,
+  $activeGatewayProfileGeneration,
+  activeGatewayProfileContextIsCurrent
+} from '@/store/profile'
 import { $currentCwd } from '@/store/session'
 import { notifyWorkspaceChanged } from '@/store/workspace-events'
 
@@ -217,9 +223,9 @@ function looksBinaryBytes(bytes: Uint8Array) {
   return suspicious / Math.min(bytes.length, 4096) > 0.12
 }
 
-async function readTextPreview(filePath: string) {
+async function readTextPreview(filePath: string, profile: string, generation: number) {
   try {
-    return await readDesktopFileText(filePath)
+    return await readDesktopFileTextForProfile(profile, generation, filePath)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
 
@@ -230,7 +236,7 @@ async function readTextPreview(filePath: string) {
 
   // Back-compat for a running Electron process whose preload hasn't been
   // restarted since readFileText was added. readFileDataUrl already existed.
-  const dataUrl = await window.hermesDesktop.readFileDataUrl(filePath)
+  const dataUrl = await readDesktopFileDataUrlForProfile(profile, generation, filePath)
   const [, metadata = '', data = ''] = dataUrl.match(/^data:([^,]*),(.*)$/) || []
   const base64 = metadata.includes(';base64')
   const mimeType = metadata.replace(/;base64$/, '') || undefined
@@ -565,6 +571,8 @@ type PreviewViewMode = 'diff' | 'rendered' | 'source'
 
 export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; target: PreviewTarget }) {
   const { t } = useI18n()
+  const activeProfile = useStore($activeGatewayProfile)
+  const activeProfileGeneration = useStore($activeGatewayProfileGeneration)
   const [state, setState] = useState<LocalPreviewState>({ loading: true })
   const [forcePreview, setForcePreview] = useState(false)
   // User-picked view; null = auto (diff when changed, else rendered markdown,
@@ -591,7 +599,8 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
   const filePath = filePathForTarget(target)
   const isImage = target.previewKind === 'image'
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    setState({ loading: true })
     setUserMode(null)
     setEditing(false)
     setDirty(false)
@@ -600,7 +609,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
     setConflict(false)
     draftRef.current = ''
     baselineRef.current = ''
-  }, [filePath, reloadKey])
+  }, [activeProfile, activeProfileGeneration, filePath, reloadKey])
 
   // HTML files are rendered as source code, not in a webview - so they take
   // the same path as plain text files. `previewKind === 'binary'` arrives
@@ -611,8 +620,14 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
 
   useEffect(() => {
     let active = true
+    const context = { generation: activeProfileGeneration, profile: activeProfile }
+    const owned = () => active && activeGatewayProfileContextIsCurrent(context)
 
     async function load() {
+      if (!owned()) {
+        return
+      }
+
       if (blockedByTarget) {
         setState({ loading: false })
 
@@ -631,18 +646,19 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
         if (isImage) {
           // Prefer bytes the caller already handed us (a pasted/dropped
           // screenshot) over re-reading a path that may be transient/unreadable.
-          const dataUrl = target.dataUrl || (await readDesktopFileDataUrl(filePath))
+          const dataUrl =
+            target.dataUrl || (await readDesktopFileDataUrlForProfile(context.profile, context.generation, filePath))
 
-          if (active) {
+          if (owned()) {
             setState({ dataUrl, loading: false })
           }
 
           return
         }
 
-        const result = await readTextPreview(filePath)
+        const result = await readTextPreview(filePath, context.profile, context.generation)
 
-        if (active) {
+        if (owned()) {
           const shouldBlock = !forcePreview && (result.binary || (result.byteSize ?? 0) > TEXT_PREVIEW_MAX_BYTES)
 
           setState({
@@ -659,10 +675,13 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
           // Empty (clean file / not a repo / remote) just hides the option.
           if (!shouldBlock) {
             try {
-              const root = await desktopGitRoot(filePath)
-              const diff = root ? await desktopFileDiff(root, filePath) : ''
+              const root = await desktopGitRootForProfile(context.profile, context.generation, filePath)
 
-              if (active && diff.trim()) {
+              const diff = root
+                ? await desktopFileDiffForProfile(context.profile, context.generation, root, filePath)
+                : ''
+
+              if (owned() && diff.trim()) {
                 setState(prev => (prev.text === result.text ? { ...prev, diff } : prev))
               }
             } catch {
@@ -671,7 +690,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
           }
         }
       } catch (error) {
-        if (active) {
+        if (owned()) {
           setState({
             error: error instanceof Error ? error.message : String(error),
             loading: false
@@ -685,7 +704,19 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
     return () => {
       active = false
     }
-  }, [blockedByTarget, filePath, forcePreview, isImage, isText, reloadKey, selfReload, target.dataUrl, target.language])
+  }, [
+    activeProfile,
+    activeProfileGeneration,
+    blockedByTarget,
+    filePath,
+    forcePreview,
+    isImage,
+    isText,
+    reloadKey,
+    selfReload,
+    target.dataUrl,
+    target.language
+  ])
 
   // Editing is only offered for whole, readable text — never images, binaries,
   // or files we only loaded the first 512 KB of (saving would drop the tail).
@@ -777,6 +808,12 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
       return
     }
 
+    const context = { generation: activeProfileGeneration, profile: activeProfile }
+
+    if (!activeGatewayProfileContextIsCurrent(context)) {
+      return
+    }
+
     setSaving(true)
     setSaveError(null)
 
@@ -787,7 +824,11 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
       // choice. `force` is the user picking "overwrite" from that banner.
       if (!force) {
         try {
-          const current = await readTextPreview(filePath)
+          const current = await readTextPreview(filePath, context.profile, context.generation)
+
+          if (!activeGatewayProfileContextIsCurrent(context)) {
+            return
+          }
 
           if (!current.binary && (current.text ?? '') !== baselineRef.current) {
             setConflict(true)
@@ -800,7 +841,16 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
         }
       }
 
-      await writeDesktopFileText(filePath, draftRef.current)
+      if (!activeGatewayProfileContextIsCurrent(context)) {
+        return
+      }
+
+      await writeDesktopFileTextForProfile(context.profile, filePath, draftRef.current, context.generation)
+
+      if (!activeGatewayProfileContextIsCurrent(context)) {
+        return
+      }
+
       baselineRef.current = draftRef.current
       setDirty(false)
       setConflict(false)
@@ -808,9 +858,13 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
       notifyWorkspaceChanged()
       setSelfReload(n => n + 1)
     } catch (error) {
-      setSaveError(error instanceof Error ? error.message : String(error))
+      if (activeGatewayProfileContextIsCurrent(context)) {
+        setSaveError(error instanceof Error ? error.message : String(error))
+      }
     } finally {
-      setSaving(false)
+      if (activeGatewayProfileContextIsCurrent(context)) {
+        setSaving(false)
+      }
     }
   }
 

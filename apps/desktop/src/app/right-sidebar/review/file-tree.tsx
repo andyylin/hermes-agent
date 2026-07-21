@@ -23,6 +23,13 @@ import { $sidebarWorkspaceCollapsedIds, revealFileInTree, toggleWorkspaceNodeCol
 import { notifyError } from '@/store/notifications'
 import { setCurrentSessionPreviewTarget } from '@/store/preview'
 import {
+  $activeGatewayProfile,
+  $activeGatewayProfileGeneration,
+  activeGatewayProfileContextIsCurrent,
+  captureActiveGatewayProfileContext,
+  normalizeProfileKey
+} from '@/store/profile'
+import {
   $reviewFiles,
   $reviewLoading,
   $reviewOpen,
@@ -270,11 +277,13 @@ function ReviewFileRow({ node, depth }: { node: ReviewTreeNode; depth: number })
   }
 
   const openInPreview = () => {
+    const context = captureActiveGatewayProfileContext()
+
     void (async () => {
       try {
         const preview = await normalizeOrLocalPreviewTarget(dragPath)
 
-        if (preview) {
+        if (preview && activeGatewayProfileContextIsCurrent(context)) {
           setCurrentSessionPreviewTarget(preview, 'file-browser', dragPath)
         }
       } catch (error) {
@@ -401,6 +410,9 @@ function ReviewFileContextMenu({
   const c = t.statusStack.coding
   const m = t.fileMenu
   const localFs = !isDesktopFsRemoteMode()
+  const profile = normalizeProfileKey(useStore($activeGatewayProfile))
+  const generation = useStore($activeGatewayProfileGeneration)
+  const owner = useMemo(() => ({ generation, profile }), [generation, profile])
 
   return (
     <ContextMenu>
@@ -424,7 +436,7 @@ function ReviewFileContextMenu({
         <ContextMenuSeparator />
         <ContextMenuItem onSelect={() => revealFileInTree(dragPath)}>{m.revealInSidebar}</ContextMenuItem>
         {localFs && (
-          <ContextMenuItem onSelect={() => void revealFile(dragPath)}>
+          <ContextMenuItem onSelect={() => void revealFile(dragPath, owner)}>
             {pickRevealLabel(m.revealFinder, m.revealExplorer, m.revealFileManager)}
           </ContextMenuItem>
         )}

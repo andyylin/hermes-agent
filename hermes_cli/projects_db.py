@@ -93,16 +93,6 @@ CREATE TABLE IF NOT EXISTS discovered_repos (
     label         TEXT,
     last_seen     INTEGER NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS project_session_assignments (
-    session_id   TEXT PRIMARY KEY,
-    project_id   TEXT REFERENCES projects(id) ON DELETE SET NULL,
-    assigned_at  INTEGER NOT NULL,
-    previous_cwd TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_project_session_assignments_project
-    ON project_session_assignments(project_id);
 """
 
 
@@ -182,7 +172,6 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
         if resolved not in _INITIALIZED_PATHS:
             conn.executescript(SCHEMA_SQL)
             _migrate_add_optional_columns(conn)
-            _migrate_session_assignments(conn)
             _INITIALIZED_PATHS.add(resolved)
     except Exception:
         conn.close()
@@ -220,43 +209,6 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     for col in _OPTIONAL_PROJECT_COLUMNS:
         if col not in cols:
             _add_column_if_missing(conn, "projects", col, f"{col} TEXT")
-
-
-def _migrate_session_assignments(conn: sqlite3.Connection) -> None:
-    """Upgrade the early assignment schema to support explicit No Project."""
-    columns = {
-        str(row["name"]): row
-        for row in conn.execute("PRAGMA table_info(project_session_assignments)")
-    }
-    project_id = columns.get("project_id")
-    if project_id is None:
-        return
-    if not bool(project_id["notnull"]) and "previous_cwd" in columns:
-        return
-
-    with write_txn(conn):
-        conn.execute(
-            "ALTER TABLE project_session_assignments "
-            "RENAME TO project_session_assignments_legacy"
-        )
-        conn.execute(
-            "CREATE TABLE project_session_assignments ("
-            "session_id TEXT PRIMARY KEY, "
-            "project_id TEXT REFERENCES projects(id) ON DELETE SET NULL, "
-            "assigned_at INTEGER NOT NULL, previous_cwd TEXT)"
-        )
-        previous_expr = "previous_cwd" if "previous_cwd" in columns else "NULL"
-        conn.execute(
-            "INSERT INTO project_session_assignments "
-            "(session_id, project_id, assigned_at, previous_cwd) "
-            f"SELECT session_id, project_id, assigned_at, {previous_expr} "
-            "FROM project_session_assignments_legacy"
-        )
-        conn.execute("DROP TABLE project_session_assignments_legacy")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_project_session_assignments_project "
-            "ON project_session_assignments(project_id)"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -636,87 +588,6 @@ def delete_project(conn: sqlite3.Connection, project_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
     return cur.rowcount > 0
-
-
-def assign_session(
-    conn: sqlite3.Connection,
-    project_id: str,
-    session_id: str,
-    *,
-    previous_cwd: Optional[str] = None,
-) -> None:
-    """Pin an existing session to a project, overriding cwd-based grouping."""
-    sid = str(session_id or "").strip()
-    if not sid:
-        raise ValueError("session_id required")
-    if get_project(conn, project_id) is None:
-        raise ValueError(f"no such project: {project_id}")
-    with write_txn(conn):
-        conn.execute(
-            "INSERT INTO project_session_assignments "
-            "(session_id, project_id, assigned_at, previous_cwd) "
-            "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(session_id) DO UPDATE SET "
-            "project_id = excluded.project_id, assigned_at = excluded.assigned_at, "
-            "previous_cwd = CASE "
-            "WHEN project_session_assignments.project_id IS NULL "
-            "OR NOT EXISTS (SELECT 1 FROM projects p "
-            "WHERE p.id = project_session_assignments.project_id AND p.archived = 0) "
-            "THEN excluded.previous_cwd "
-            "ELSE COALESCE(project_session_assignments.previous_cwd, excluded.previous_cwd) END",
-            (sid, project_id, _now(), previous_cwd or None),
-        )
-
-
-def unassign_session(conn: sqlite3.Connection, session_id: str) -> bool:
-    """Remove an explicit project assignment so cwd inference applies again."""
-    sid = str(session_id or "").strip()
-    if not sid:
-        return False
-    with write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM project_session_assignments WHERE session_id = ?", (sid,)
-        )
-    return cur.rowcount > 0
-
-
-def previous_session_cwd(conn: sqlite3.Connection, session_id: str) -> Optional[str]:
-    row = conn.execute(
-        "SELECT previous_cwd FROM project_session_assignments WHERE session_id = ?",
-        (str(session_id or "").strip(),),
-    ).fetchone()
-    return str(row["previous_cwd"]) if row and row["previous_cwd"] else None
-
-
-def exclude_session(conn: sqlite3.Connection, session_id: str) -> Optional[str]:
-    """Explicitly detach a session while preserving its pre-project cwd."""
-    sid = str(session_id or "").strip()
-    if not sid:
-        raise ValueError("session_id required")
-    previous = previous_session_cwd(conn, sid)
-    with write_txn(conn):
-        conn.execute(
-            "INSERT INTO project_session_assignments "
-            "(session_id, project_id, assigned_at, previous_cwd) VALUES (?, NULL, ?, ?) "
-            "ON CONFLICT(session_id) DO UPDATE SET "
-            "project_id = NULL, assigned_at = excluded.assigned_at",
-            (sid, _now(), previous),
-        )
-    return previous
-
-
-def list_session_assignments(conn: sqlite3.Connection) -> dict[str, Optional[str]]:
-    """Visible explicit membership; archived projects fall back to cwd inference."""
-    rows = conn.execute(
-        "SELECT psa.session_id, psa.project_id "
-        "FROM project_session_assignments psa "
-        "LEFT JOIN projects p ON p.id = psa.project_id "
-        "WHERE psa.project_id IS NULL OR p.archived = 0"
-    ).fetchall()
-    return {
-        str(r["session_id"]): (str(r["project_id"]) if r["project_id"] else None)
-        for r in rows
-    }
 
 
 # ---------------------------------------------------------------------------

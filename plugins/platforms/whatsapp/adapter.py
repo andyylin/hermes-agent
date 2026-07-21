@@ -27,6 +27,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
 from typing import Dict, Optional, Any
 
+from agent.secret_scope import get_secret, is_multiplex_active
 from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
 from hermes_constants import (
     find_node_executable,
@@ -406,9 +407,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
         ))
         self._reply_prefix: Optional[str] = config.extra.get("reply_prefix")
-        self._dm_policy = str(config.extra.get("dm_policy") or os.getenv("WHATSAPP_DM_POLICY", "pairing")).strip().lower()
+        self._dm_policy = str(config.extra.get("dm_policy") or get_secret("WHATSAPP_DM_POLICY", "pairing")).strip().lower()
         self._allow_from = self._coerce_allow_list(config.extra.get("allow_from") or config.extra.get("allowFrom"))
-        self._group_policy = str(config.extra.get("group_policy") or os.getenv("WHATSAPP_GROUP_POLICY", "pairing")).strip().lower()
+        self._group_policy = str(config.extra.get("group_policy") or get_secret("WHATSAPP_GROUP_POLICY", "pairing")).strip().lower()
         self._group_allow_from = self._coerce_allow_list(config.extra.get("group_allow_from") or config.extra.get("groupAllowFrom"))
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
@@ -614,7 +615,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # Start the bridge process in its own process group.
             # Route output to a log file so QR codes, errors, and reconnection
             # messages are preserved for troubleshooting.
-            whatsapp_mode = os.getenv("WHATSAPP_MODE", "self-chat")
+            whatsapp_mode = get_secret("WHATSAPP_MODE", "self-chat")
             self._bridge_log = self._session_path.parent / "bridge.log"
             bridge_log_fh = open(self._bridge_log, "a", encoding="utf-8")
             self._bridge_log_fh = bridge_log_fh
@@ -1715,33 +1716,44 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
 
     Implements the apply_yaml_config_fn contract (#24849). Mirrors the legacy
     whatsapp_cfg block from gateway/config.py::load_gateway_config(). Env vars
-    take precedence over YAML. Returns None — everything flows through env.
+    take precedence over YAML in single-profile mode. Multiplex mode returns
+    profile-local extras and never mutates process-global environment state.
     """
     import json as _json
-    if "require_mention" in whatsapp_cfg and not os.getenv("WHATSAPP_REQUIRE_MENTION"):
+    legacy_env_bridge = not is_multiplex_active()
+    if legacy_env_bridge and "require_mention" in whatsapp_cfg and not os.getenv("WHATSAPP_REQUIRE_MENTION"):
         os.environ["WHATSAPP_REQUIRE_MENTION"] = str(whatsapp_cfg["require_mention"]).lower()
-    if "mention_patterns" in whatsapp_cfg and not os.getenv("WHATSAPP_MENTION_PATTERNS"):
+    if legacy_env_bridge and "mention_patterns" in whatsapp_cfg and not os.getenv("WHATSAPP_MENTION_PATTERNS"):
         os.environ["WHATSAPP_MENTION_PATTERNS"] = _json.dumps(whatsapp_cfg["mention_patterns"])
     frc = whatsapp_cfg.get("free_response_chats")
-    if frc is not None and not os.getenv("WHATSAPP_FREE_RESPONSE_CHATS"):
+    if legacy_env_bridge and frc is not None and not os.getenv("WHATSAPP_FREE_RESPONSE_CHATS"):
         if isinstance(frc, list):
             frc = ",".join(str(v) for v in frc)
         os.environ["WHATSAPP_FREE_RESPONSE_CHATS"] = str(frc)
-    if "dm_policy" in whatsapp_cfg and not os.getenv("WHATSAPP_DM_POLICY"):
+    if legacy_env_bridge and "dm_policy" in whatsapp_cfg and not os.getenv("WHATSAPP_DM_POLICY"):
         os.environ["WHATSAPP_DM_POLICY"] = str(whatsapp_cfg["dm_policy"]).lower()
     af = whatsapp_cfg.get("allow_from")
-    if af is not None and not os.getenv("WHATSAPP_ALLOWED_USERS"):
+    if legacy_env_bridge and af is not None and not os.getenv("WHATSAPP_ALLOWED_USERS"):
         if isinstance(af, list):
             af = ",".join(str(v) for v in af)
         os.environ["WHATSAPP_ALLOWED_USERS"] = str(af)
-    if "group_policy" in whatsapp_cfg and not os.getenv("WHATSAPP_GROUP_POLICY"):
+    if legacy_env_bridge and "group_policy" in whatsapp_cfg and not os.getenv("WHATSAPP_GROUP_POLICY"):
         os.environ["WHATSAPP_GROUP_POLICY"] = str(whatsapp_cfg["group_policy"]).lower()
     gaf = whatsapp_cfg.get("group_allow_from")
-    if gaf is not None and not os.getenv("WHATSAPP_GROUP_ALLOWED_USERS"):
+    if legacy_env_bridge and gaf is not None and not os.getenv("WHATSAPP_GROUP_ALLOWED_USERS"):
         if isinstance(gaf, list):
             gaf = ",".join(str(v) for v in gaf)
         os.environ["WHATSAPP_GROUP_ALLOWED_USERS"] = str(gaf)
-    return None
+    profile_local_keys = (
+        "require_mention",
+        "mention_patterns",
+        "free_response_chats",
+        "dm_policy",
+        "allow_from",
+        "group_policy",
+        "group_allow_from",
+    )
+    return {key: whatsapp_cfg[key] for key in profile_local_keys if key in whatsapp_cfg}
 
 
 def _is_connected(config) -> bool:
@@ -1763,8 +1775,12 @@ def _is_connected(config) -> bool:
     # Read via hermes_cli.gateway.get_env_value (not os.getenv) so setup-status
     # callers that patch get_env_value — and the gateway connected-platforms
     # check — observe the same value. Matches the discord/slack plugin pattern.
-    import hermes_cli.gateway as gateway_mod
-    val = (gateway_mod.get_env_value("WHATSAPP_ENABLED") or "").strip().lower()
+    if is_multiplex_active():
+        val = (get_secret("WHATSAPP_ENABLED") or "").strip().lower()
+    else:
+        import hermes_cli.gateway as gateway_mod
+
+        val = (gateway_mod.get_env_value("WHATSAPP_ENABLED") or "").strip().lower()
     return val in {"true", "1", "yes"}
 
 

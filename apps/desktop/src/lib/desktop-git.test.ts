@@ -1,12 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { $activeGatewayProfile, $activeGatewayProfileGeneration } from '@/store/profile'
 import { $connection } from '@/store/session'
 
-import { desktopGit } from './desktop-git'
+import {
+  desktopGit,
+  desktopGitForProfile,
+  scanDesktopReposForProfile,
+  StaleDesktopGitProfileError
+} from './desktop-git'
 
 const repoStatus = vi.fn(async () => ({ branch: 'main' }))
+const scanRepos = vi.fn(async () => [{ label: 'Repo', root: '/repo' }])
 const worktreeList = vi.fn(async () => [{ branch: 'main', detached: false, isMain: true, locked: false, path: '/r' }])
-const localGit = { repoStatus, review: { stage: vi.fn() }, worktreeList }
+const localGit = { repoStatus, review: { stage: vi.fn() }, scanRepos, worktreeList }
+const getConnection = vi.fn(async () => ({ mode: 'local' }))
 
 const api = vi.fn(async ({ path }: { path: string }) => {
   if (path.startsWith('/api/git/status')) {
@@ -26,7 +34,8 @@ const api = vi.fn(async ({ path }: { path: string }) => {
 
 describe('desktop git facade', () => {
   beforeEach(() => {
-    vi.stubGlobal('window', { hermesDesktop: { api, git: localGit } })
+    vi.stubGlobal('window', { hermesDesktop: { api, getConnection, git: localGit } })
+    $activeGatewayProfile.set('default')
     $connection.set(null)
   })
 
@@ -64,6 +73,7 @@ describe('desktop git facade', () => {
   })
 
   it('targets the active profile backend so a remote profile never touches the local repo', async () => {
+    $activeGatewayProfile.set('remote-docker')
     $connection.set({ mode: 'remote', profile: 'remote-docker' } as never)
 
     await desktopGit()?.repoStatus('/srv/work')
@@ -89,5 +99,59 @@ describe('desktop git facade', () => {
       path: '/api/git/review/stage'
     })
     expect(localGit.review.stage).not.toHaveBeenCalled()
+  })
+
+  it('binds repo discovery to the requested profile connection', async () => {
+    $activeGatewayProfile.set('alpha')
+    const alphaGeneration = $activeGatewayProfileGeneration.get()
+
+    getConnection.mockResolvedValueOnce({ mode: 'local', profile: 'alpha' } as never)
+
+    await expect(scanDesktopReposForProfile('alpha', alphaGeneration)).resolves.toEqual([
+      { label: 'Repo', root: '/repo' }
+    ])
+    expect(getConnection).toHaveBeenCalledWith('alpha')
+    expect(scanRepos).toHaveBeenCalledWith([])
+
+    $activeGatewayProfile.set('beta')
+    const betaGeneration = $activeGatewayProfileGeneration.get()
+
+    getConnection.mockResolvedValueOnce({ mode: 'remote', profile: 'beta' } as never)
+    await expect(scanDesktopReposForProfile('beta', betaGeneration)).resolves.toEqual([])
+    expect(scanRepos).toHaveBeenCalledTimes(1)
+  })
+
+  it('binds remote git operations to the requested profile instead of the foreground connection', async () => {
+    $activeGatewayProfile.set('remote-beta')
+    const generation = $activeGatewayProfileGeneration.get()
+
+    $connection.set({ mode: 'local', profile: 'foreground-alpha' } as never)
+    getConnection.mockResolvedValueOnce({ mode: 'remote', profile: 'remote-beta' } as never)
+
+    const git = await desktopGitForProfile('remote-beta', generation)
+    await git?.repoStatus('/srv/work')
+
+    expect(getConnection).toHaveBeenCalledWith('remote-beta')
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/git/status?path=%2Fsrv%2Fwork',
+      profile: 'remote-beta'
+    })
+    expect(repoStatus).not.toHaveBeenCalled()
+  })
+
+  it('classifies a delayed Git completion after a profile switch as stale cancellation', async () => {
+    let resolveStatus!: (value: { branch: string }) => void
+
+    repoStatus.mockImplementationOnce(() => new Promise(resolve => (resolveStatus = resolve)))
+    $activeGatewayProfile.set('alpha')
+    const generation = $activeGatewayProfileGeneration.get()
+    getConnection.mockResolvedValueOnce({ mode: 'local', profile: 'alpha' } as never)
+    const git = await desktopGitForProfile('alpha', generation)
+    const pending = git?.repoStatus('/work')
+
+    $activeGatewayProfile.set('beta')
+    resolveStatus({ branch: 'main' })
+
+    await expect(pending).rejects.toBeInstanceOf(StaleDesktopGitProfileError)
   })
 })

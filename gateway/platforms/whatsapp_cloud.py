@@ -54,6 +54,8 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from agent.secret_scope import get_secret
+
 try:
     from aiohttp import web
 
@@ -234,8 +236,6 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # two adapters can run in parallel with independent policies; the
         # shared WHATSAPP_* names remain as fallback for single-adapter
         # setups.
-        import os
-
         self._reply_prefix: Optional[str] = extra.get("reply_prefix")
         # Allowlist: honor the *documented* WHATSAPP_CLOUD_ALLOWED_USERS (the
         # var the setup wizard writes) in addition to WHATSAPP_CLOUD_ALLOW_FROM.
@@ -245,8 +245,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             self._coerce_allow_list(
                 extra.get("allow_from")
                 or extra.get("allowFrom")
-                or os.getenv("WHATSAPP_CLOUD_ALLOW_FROM")
-                or os.getenv("WHATSAPP_CLOUD_ALLOWED_USERS")
+                or get_secret("WHATSAPP_CLOUD_ALLOW_FROM")
+                or get_secret("WHATSAPP_CLOUD_ALLOWED_USERS")
             )
         )
         # DM policy: explicit config wins; otherwise choose a safe, working
@@ -254,7 +254,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # "allowlist" when an allowlist is configured (so it is actually
         # enforced instead of silently dropping), else "open".
         _allow_all_optin = str(
-            os.getenv("WHATSAPP_CLOUD_ALLOW_ALL_USERS", "")
+            get_secret("WHATSAPP_CLOUD_ALLOW_ALL_USERS", "")
         ).strip().lower() in {"true", "1", "yes"}
         _default_dm_policy = (
             "open" if _allow_all_optin
@@ -262,20 +262,20 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         )
         self._dm_policy: str = str(
             extra.get("dm_policy")
-            or os.getenv("WHATSAPP_CLOUD_DM_POLICY")
-            or os.getenv("WHATSAPP_DM_POLICY")
+            or get_secret("WHATSAPP_CLOUD_DM_POLICY")
+            or get_secret("WHATSAPP_DM_POLICY")
             or _default_dm_policy
         ).strip().lower()
         self._group_policy: str = str(
             extra.get("group_policy")
-            or os.getenv("WHATSAPP_CLOUD_GROUP_POLICY")
-            or os.getenv("WHATSAPP_GROUP_POLICY", "open")
+            or get_secret("WHATSAPP_CLOUD_GROUP_POLICY")
+            or get_secret("WHATSAPP_GROUP_POLICY", "open")
         ).strip().lower()
         self._group_allow_from: set[str] = self._normalize_allow_ids(
             self._coerce_allow_list(
                 extra.get("group_allow_from")
                 or extra.get("groupAllowFrom")
-                or os.getenv("WHATSAPP_CLOUD_GROUP_ALLOW_FROM")
+                or get_secret("WHATSAPP_CLOUD_GROUP_ALLOW_FROM")
             )
         )
         self._mention_patterns = self._compile_mention_patterns()
@@ -383,7 +383,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         WHATSAPP_ALLOW_ALL_USERS; the Cloud adapter's documented open-access
         opt-in is WHATSAPP_CLOUD_ALLOW_ALL_USERS, so honor it here too.
         """
-        if str(os.getenv("WHATSAPP_CLOUD_ALLOW_ALL_USERS", "")).strip().lower() in {"true", "1", "yes"}:
+        if str(get_secret("WHATSAPP_CLOUD_ALLOW_ALL_USERS", "")).strip().lower() in {"true", "1", "yes"}:
             return True
         return super()._open_dm_opted_in()
 

@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
 from gateway.config import Platform
 
 
@@ -107,3 +108,29 @@ def test_allow_from_still_takes_precedence(monkeypatch):
     # Legacy ALLOW_FROM wins when both are set (documented precedence).
     assert "15550000001" in adapter._allow_from
     assert "15559999999" not in adapter._allow_from
+
+
+def test_multiplex_scope_ignores_poisoned_process_allowlist(monkeypatch):
+    set_multiplex_active(True)
+    token = set_secret_scope(
+        {
+            "WHATSAPP_CLOUD_ALLOWED_USERS": "15550000001",
+            "WHATSAPP_CLOUD_DM_POLICY": "allowlist",
+        }
+    )
+
+    try:
+        adapter = _build_adapter(
+            monkeypatch,
+            {
+                "WHATSAPP_CLOUD_ALLOWED_USERS": "15559999999",
+                "WHATSAPP_CLOUD_ALLOW_ALL_USERS": "true",
+            },
+        )
+
+        assert adapter._allow_from == {"15550000001"}
+        assert adapter._open_dm_opted_in() is False
+        assert adapter._is_dm_allowed("15559999999") is False
+    finally:
+        reset_secret_scope(token)
+        set_multiplex_active(False)

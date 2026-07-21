@@ -1,7 +1,7 @@
 import { atom, computed } from 'nanostores'
 
 import { getProfiles, setApiRequestProfile, STARTUP_REQUEST_TIMEOUT_MS } from '@/hermes'
-import { queryClient } from '@/lib/query-client'
+import { invalidateProfileScopedQueries } from '@/lib/query-client'
 import {
   arraysEqual,
   persistBoolean,
@@ -150,6 +150,40 @@ export async function switchProfile(name: string): Promise<void> {
 // to the primary (window) backend's profile on boot.
 export const $activeGatewayProfile = atom<string>('default')
 
+export interface ActiveGatewayProfileContext {
+  generation: number
+  profile: string
+}
+
+export const $activeGatewayProfileGeneration = atom(0)
+
+let generationProfile = normalizeProfileKey($activeGatewayProfile.get())
+
+$activeGatewayProfile.subscribe(value => {
+  const profile = normalizeProfileKey(value)
+
+  if (profile === generationProfile) {
+    return
+  }
+
+  generationProfile = profile
+  $activeGatewayProfileGeneration.set($activeGatewayProfileGeneration.get() + 1)
+})
+
+export function captureActiveGatewayProfileContext(): ActiveGatewayProfileContext {
+  return {
+    generation: $activeGatewayProfileGeneration.get(),
+    profile: normalizeProfileKey($activeGatewayProfile.get())
+  }
+}
+
+export function activeGatewayProfileContextIsCurrent(context: ActiveGatewayProfileContext): boolean {
+  return (
+    context.generation === $activeGatewayProfileGeneration.get() &&
+    context.profile === normalizeProfileKey($activeGatewayProfile.get())
+  )
+}
+
 // Profile for the NEXT new chat (chosen via the new-chat picker). null = primary
 // / default, so single-profile users are unaffected.
 export const $newChatProfile = atom<string | null>(null)
@@ -177,7 +211,9 @@ $activeGatewayProfile.subscribe(value => {
 
   if (_lastRoutedProfile !== null && _lastRoutedProfile !== key) {
     // Profile-scoped settings + the unified session list are now stale.
-    void queryClient.invalidateQueries()
+    // Narrowed so account/marketplace/onboarding caches don't refetch on
+    // every profile switch.
+    invalidateProfileScopedQueries()
     resetStarmapGraph()
   }
 
@@ -234,8 +270,9 @@ let gatewaySwitch: Promise<void> | null = null
 // instead of `image.attach_bytes`, handing the remote gateway a client-only
 // path it can't resolve ("image not found: C:\…"), while the /api/fs/* file
 // browser and /api/media fetches targeted the wrong machine (#46651).
-// Best-effort: a failed descriptor fetch leaves the prior connection intact for
-// boot/reconnect to resync.
+// A failed descriptor fetch aborts profile activation. Publishing the target
+// profile while retaining the prior descriptor would pair routing identity B
+// with connection A.
 async function syncConnectionToActiveProfile(profile: string): Promise<void> {
   const getConnection = window.hermesDesktop?.getConnection
 
@@ -243,11 +280,7 @@ async function syncConnectionToActiveProfile(profile: string): Promise<void> {
     return
   }
 
-  try {
-    setConnection(await getConnection(profile))
-  } catch {
-    // Leave the prior connection in place; boot/reconnect resyncs it later.
-  }
+  setConnection(await getConnection(profile))
 }
 
 // Make `profile`'s backend the active gateway, lazily opening its socket if it
@@ -286,13 +319,24 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
 
   $gatewaySwapTarget.set(target)
   gatewaySwitch = (async () => {
+    const previous = normalizeProfileKey($activeGatewayProfile.get())
+
     // ensureGatewayForProfile opens (or reuses) the target's socket and points
     // the active gateway at it — without closing the profile you came from.
     await ensureGatewayForProfile(target)
-    $activeGatewayProfile.set(target)
     // The active backend just changed; resync $connection so remote-aware
     // paths (image.attach_bytes vs image.attach, /api/fs/*, /api/media) follow.
-    await syncConnectionToActiveProfile(target)
+
+    try {
+      await syncConnectionToActiveProfile(target)
+    } catch (error) {
+      // Restore gateway.ts's internal active key as well as its public atom.
+      // The previous socket remains open, so this is a bounded pointer rollback.
+      await ensureGatewayForProfile(previous)
+      throw error
+    }
+
+    $activeGatewayProfile.set(target)
   })()
 
   try {
@@ -339,11 +383,13 @@ export function selectProfile(name: string): void {
   $showAllProfiles.set(false)
   $newChatProfile.set(target)
 
-  if (switching) {
-    requestFreshSession()
-  }
-
   void ensureGatewayProfile(target)
+    .then(() => {
+      if (switching && normalizeProfileKey($activeGatewayProfile.get()) === target) {
+        requestFreshSession()
+      }
+    })
+    .catch(() => undefined)
 }
 
 // Start a fresh session in `name` WITHOUT collapsing the "All profiles" browse
@@ -355,8 +401,13 @@ export function selectProfile(name: string): void {
 export function newSessionInProfile(name: string): void {
   const target = normalizeProfileKey(name)
   $newChatProfile.set(target)
-  requestFreshSession()
   void ensureGatewayProfile(target)
+    .then(() => {
+      if (normalizeProfileKey($activeGatewayProfile.get()) === target) {
+        requestFreshSession()
+      }
+    })
+    .catch(() => undefined)
 }
 
 export function setShowAllProfiles(value: boolean): void {

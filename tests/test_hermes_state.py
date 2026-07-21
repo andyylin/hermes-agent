@@ -201,17 +201,6 @@ class TestSessionLifecycle:
         assert session["git_branch"] is None
         assert session["git_repo_root"] is None
 
-    def test_restore_session_workspace_can_restore_null_cwd(self, db):
-        db.create_session(session_id="s1", source="cli", cwd="/project")
-        db.update_session_cwd("s1", "/project", git_branch="main", git_repo_root="/project")
-
-        db.restore_session_workspace("s1", None)
-
-        session = db.get_session("s1")
-        assert session["cwd"] is None
-        assert session["git_branch"] is None
-        assert session["git_repo_root"] is None
-
     def test_distinct_session_cwds_aggregates_history(self, db):
         db.create_session("s1", "cli", cwd="/repo")
         db.create_session("s2", "cli", cwd="/repo")
@@ -832,6 +821,41 @@ class TestSessionLifecycle:
         finally:
             db.close()
 
+    def test_open_retires_legacy_trigram_table_and_triggers(self, tmp_path):
+        """Disabled trigram FTS must not keep indexing writes behind the scenes."""
+        db_path = tmp_path / "state.db"
+        seeded = SessionDB(db_path=db_path)
+        try:
+            seeded.create_session(session_id="s1", source="cli")
+            seeded.append_message("s1", role="user", content="大别山项目计划书")
+            # Simulate a legacy database that still owns the trigram table and
+            # write triggers even though the runtime has disabled trigram search.
+            seeded._conn.executescript(hermes_state.FTS_TRIGRAM_SQL)
+            seeded._conn.execute(
+                "INSERT OR REPLACE INTO messages_fts_trigram(rowid, content) "
+                "SELECT id, COALESCE(content, '') FROM messages"
+            )
+            seeded._conn.commit()
+            assert seeded._fts_table_exists("messages_fts_trigram") is True
+        finally:
+            seeded.close()
+
+        restored = SessionDB(db_path=db_path)
+        try:
+            assert restored._fts_enabled is True
+            assert restored._trigram_available is False
+            assert restored._fts_table_exists("messages_fts_trigram") is False
+            trigram_triggers = restored._conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'messages_fts_trigram_%'"
+            ).fetchone()[0]
+            assert trigram_triggers == 0
+            assert len(restored.search_messages("大别山")) == 1
+            restored.append_message("s1", role="assistant", content="后续计划")
+            assert restored._conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        finally:
+            restored.close()
+
     def test_v11_migration_backfills_base_fts_when_trigram_unavailable(
         self, tmp_path, monkeypatch
     ):
@@ -1344,6 +1368,120 @@ class TestMessageStorage:
         conv = db.get_messages_as_conversation("child", include_ancestors=True)
 
         assert [m["content"] for m in conv if m["role"] == "user"] == ["same prompt", "next prompt"]
+
+    def test_get_resume_conversations_matches_separate_reads(self, db):
+        """The one-fetch resume projections must be byte-identical to the two
+        separate get_messages_as_conversation reads they replace — the whole
+        point of the single-SELECT optimization (desktop audit P1). Includes a
+        dangling tool-call tail so repair_alternation drops rows and the model /
+        display lengths diverge (exercises session.resume's prefix computation).
+        """
+        db.create_session("root", "tui")
+        db.append_message("root", role="user", content="first prompt")
+        db.append_message("root", role="assistant", content="first answer")
+        db.create_session("child", "tui", parent_session_id="root")
+        db.append_message("child", role="user", content="second prompt")
+        db.append_message(
+            "child", role="assistant", content="second answer", finish_reason="stop"
+        )
+        # Dangling assistant(tool_calls) tail with no tool response → repair
+        # drops it, so model_history is shorter than display_history.
+        db.append_message(
+            "child",
+            role="assistant",
+            content="",
+            tool_calls=[
+                {"id": "t1", "type": "function", "function": {"name": "x", "arguments": "{}"}}
+            ],
+        )
+
+        model_expected = db.get_messages_as_conversation("child", repair_alternation=True)
+        display_expected = db.get_messages_as_conversation("child", include_ancestors=True)
+
+        model_history, display_history = db.get_resume_conversations("child")
+
+        assert model_history == model_expected
+        assert display_history == display_expected
+        # Sanity: the tail really did diverge the two projections.
+        assert len(display_history) > len(model_history)
+
+    def test_get_resume_conversations_single_session_no_ancestors(self, db):
+        db.create_session("solo", "cli")
+        db.append_message("solo", role="user", content="hi")
+        db.append_message("solo", role="assistant", content="hello")
+
+        model_expected = db.get_messages_as_conversation("solo", repair_alternation=True)
+        display_expected = db.get_messages_as_conversation("solo", include_ancestors=True)
+        model_history, display_history = db.get_resume_conversations("solo")
+
+        assert model_history == model_expected
+        assert display_history == display_expected
+
+    def test_get_resume_conversations_dedupes_replayed_ancestor_user(self, db):
+        db.create_session("root", "tui")
+        db.append_message("root", role="user", content="same prompt")
+        db.append_message("root", role="user", content="same prompt")
+        db.append_message("root", role="assistant", content="answer")
+        db.create_session("child", "tui", parent_session_id="root")
+        db.append_message("child", role="user", content="next prompt")
+
+        model_expected = db.get_messages_as_conversation("child", repair_alternation=True)
+        display_expected = db.get_messages_as_conversation("child", include_ancestors=True)
+        model_history, display_history = db.get_resume_conversations("child")
+
+        assert model_history == model_expected
+        assert display_history == display_expected
+
+    def test_get_ancestor_display_prefix_single_session_returns_empty(self, db):
+        """A session with no compression ancestors has an empty prefix."""
+        db.create_session("solo", "cli")
+        db.append_message("solo", role="user", content="hi")
+        db.append_message("solo", role="assistant", content="hello")
+
+        assert db.get_ancestor_display_prefix("solo") == []
+
+    def test_get_ancestor_display_prefix_returns_ancestor_only_messages(self, db):
+        """The prefix contains ONLY ancestor messages, not tip messages.
+
+        Previously the prefix was calculated as
+        display_history[:len(display) - len(raw)], which overcounts when
+        repair_message_sequence removes messages from the MIDDLE of the
+        tip history — the length difference includes both ancestor messages
+        AND repair-removed tip messages, but the slice captures the first N
+        display messages (tip messages when there are no ancestors),
+        causing duplication in _live_session_payload. (#65919)
+        """
+        db.create_session("root", "tui")
+        db.append_message("root", role="user", content="ancestor prompt")
+        db.append_message("root", role="assistant", content="ancestor reply")
+        db.create_session("child", "tui", parent_session_id="root")
+        db.append_message("child", role="user", content="tip prompt")
+        db.append_message("child", role="assistant", content="tip reply")
+        # A verification candidate that repair_message_sequence collapses
+        # (consecutive-assistant merge replaces it with the next assistant).
+        db.append_message(
+            "child",
+            role="assistant",
+            content="verification candidate",
+            finish_reason="verification_required",
+        )
+        db.append_message("child", role="assistant", content="post-verification reply")
+
+        prefix = db.get_ancestor_display_prefix("child")
+        # Only the ancestor messages, not any tip messages.
+        assert len(prefix) == 2
+        assert prefix[0]["role"] == "user"
+        assert prefix[0]["content"] == "ancestor prompt"
+        assert prefix[1]["role"] == "assistant"
+        assert prefix[1]["content"] == "ancestor reply"
+
+        # The old broken calculation would produce a non-empty prefix
+        # (because repair collapses the verification candidate, making
+        # len(display) > len(raw)), even though there are 2 ancestor
+        # messages — it would overcount.
+        raw, display = db.get_resume_conversations("child")
+        old_prefix_len = max(0, len(display) - len(raw))
+        assert len(prefix) <= old_prefix_len
 
     def test_finish_reason_stored(self, db):
         db.create_session(session_id="s1", source="cli")
@@ -3677,12 +3815,12 @@ class TestSchemaInit:
 
         migrated_db.close()
 
-    def test_v9_migration_skips_v10_trigram_backfill_before_v11_rebuild(self, tmp_path, monkeypatch):
-        """Direct v9→current migration should do only the v11 FTS rebuild.
+    def test_v9_migration_rebuilds_base_fts_and_retires_trigram(self, tmp_path, monkeypatch):
+        """Direct v9→current migration rebuilds base FTS without trigram work.
 
-        v10 backfilled ``messages_fts_trigram`` with content-only rows. Current
-        v11+ migration immediately drops and rebuilds both FTS tables with
-        content + tool metadata, so running the v10 insert first is wasted work.
+        Legacy trigram indexing is retired because it can corrupt the global
+        database. Base FTS still indexes content and tool metadata, while CJK
+        and substring search use the LIKE fallback.
         """
         db_path = tmp_path / "v9_fts.db"
         conn = sqlite3.connect(str(db_path))
@@ -3724,13 +3862,14 @@ class TestSchemaInit:
             assert trigram_content_only_inserts == []
             version = migrated_db._conn.execute("SELECT version FROM schema_version").fetchone()[0]
             assert version == SCHEMA_VERSION
-            normal_count = migrated_db._conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
-            trigram_count = migrated_db._conn.execute("SELECT COUNT(*) FROM messages_fts_trigram").fetchone()[0]
+            normal_count = migrated_db._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts"
+            ).fetchone()[0]
             assert normal_count == 1
-            assert trigram_count == 1
+            assert migrated_db._fts_table_exists("messages_fts_trigram") is False
             tool_hit = migrated_db._conn.execute(
-                "SELECT COUNT(*) FROM messages_fts_trigram "
-                "WHERE messages_fts_trigram MATCH 'browser_snapshot'"
+                "SELECT COUNT(*) FROM messages_fts "
+                "WHERE messages_fts MATCH 'browser_snapshot'"
             ).fetchone()[0]
             assert tool_hit == 1
         finally:
@@ -6196,3 +6335,96 @@ class TestGetMessagesPagination:
         self._seed(db, n=5)
         rows = db.get_messages("s1", offset=3)
         assert [m["content"] for m in rows] == ["msg-3", "msg-4"]
+
+
+# =========================================================================
+# Lone-surrogate persistence
+# =========================================================================
+
+class TestLoneSurrogatePersistence:
+    """sqlite3 encodes bound str params as UTF-8 and raises UnicodeEncodeError
+    on lone surrogates (U+D800..U+DFFF). Tool results scraped from the web can
+    carry them, so a single such code point aborted the whole message write —
+    and because run_agent swallows the failure with a warning, the session then
+    silently stopped persisting for the rest of its life.
+    """
+
+    DIRTY = "scraped \ud835 price"
+
+    def test_append_message_survives_lone_surrogate_content(self, db):
+        db.create_session("s1", source="cli")
+        db.append_message("s1", "assistant", "hello world")
+        db.append_message("s1", "tool", self.DIRTY, tool_name="web_search")
+
+        rows = db.get_messages("s1")
+        assert len(rows) == 2
+        # Surrogate replaced with U+FFFD; the surrounding text is intact.
+        assert rows[1]["content"] == "scraped � price"
+
+    def test_append_message_survives_lone_surrogate_reasoning(self, db):
+        db.create_session("s1", source="cli")
+        db.append_message("s1", "assistant", "fine", reasoning=self.DIRTY)
+        assert len(db.get_messages("s1")) == 1
+
+    def test_replace_messages_keeps_persisting_after_dirty_row(self, db):
+        """The regression that mattered: one poisoned row froze the session.
+
+        replace_messages re-sends the full history each turn, so once a dirty
+        tool result entered it, every later save raised and nothing after it
+        was ever written.
+        """
+        db.create_session("s1", source="cli")
+        history = [
+            {"role": "user", "content": "turn 1"},
+            {"role": "assistant", "content": "answer 1"},
+            {"role": "tool", "content": self.DIRTY, "tool_name": "web_search"},
+            {"role": "assistant", "content": "answer 2"},
+        ]
+        db.replace_messages("s1", history)
+        assert len(db.get_messages("s1")) == 4
+
+        # Later turns still persist rather than freezing at the poisoned row.
+        history += [
+            {"role": "user", "content": "turn 3"},
+            {"role": "assistant", "content": "answer 3"},
+        ]
+        db.replace_messages("s1", history)
+        rows = db.get_messages("s1")
+        assert len(rows) == 6
+        assert rows[-1]["content"] == "answer 3"
+
+    def test_well_formed_unicode_is_unchanged(self, db):
+        """Accents, CJK and emoji must round-trip byte-identically."""
+        db.create_session("s1", source="cli")
+        benign = "Ünïcödé ok — 日本語 🎉 emoji fine"
+        db.append_message("s1", "assistant", benign)
+        assert db.get_messages("s1")[0]["content"] == benign
+
+    # -- sibling raw-str bind sites (follow-up widening of the same bug class)
+
+    def test_append_message_survives_lone_surrogate_api_content(self, db):
+        db.create_session("s1", source="cli")
+        db.append_message("s1", "user", "clean", api_content=self.DIRTY)
+        assert db.get_messages("s1")[0]["api_content"] == "scraped \ufffd price"
+
+    def test_append_message_survives_lone_surrogate_tool_name(self, db):
+        db.create_session("s1", source="cli")
+        db.append_message("s1", "tool", "ok", tool_name="web\ud835search")
+        assert len(db.get_messages("s1")) == 1
+
+    def test_replace_messages_survives_lone_surrogate_api_content(self, db):
+        db.create_session("s1", source="cli")
+        db.replace_messages(
+            "s1", [{"role": "user", "content": "u1", "api_content": self.DIRTY}]
+        )
+        assert db.get_messages("s1")[0]["api_content"] == "scraped \ufffd price"
+
+    def test_set_latest_user_api_content_survives_lone_surrogate(self, db):
+        db.create_session("s1", source="cli")
+        db.append_message("s1", "user", "turn text")
+        assert db.set_latest_user_api_content("s1", "turn text", self.DIRTY) == 1
+
+    def test_session_title_survives_lone_surrogate(self, db):
+        db.create_session("s1", source="cli")
+        assert db.set_session_title("s1", "title \ud835 bad") is True
+        assert db.get_session("s1")["title"] == "title \ufffd bad"

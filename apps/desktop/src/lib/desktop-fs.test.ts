@@ -1,16 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { $activeGatewayProfile, $activeGatewayProfileGeneration } from '@/store/profile'
 import { $connection } from '@/store/session'
 
 import {
   desktopDefaultCwd,
+  desktopDefaultCwdForProfile,
   desktopFileDiff,
   desktopGitRoot,
   readDesktopDir,
+  readDesktopDirForProfile,
   readDesktopFileDataUrl,
   readDesktopFileText,
+  renameDesktopPathForProfile,
   selectDesktopPaths,
-  setDesktopFsRemotePicker
+  selectDesktopPathsForProfile,
+  setDesktopFsRemotePicker,
+  trashDesktopPathForProfile,
+  writeDesktopFileTextForProfile
 } from './desktop-fs'
 
 const readDir = vi.fn(async () => ({ entries: [{ name: 'local', path: '/local', isDirectory: true }] }))
@@ -18,6 +25,10 @@ const readFileText = vi.fn(async () => ({ path: '/local/file.txt', text: 'local'
 const readFileDataUrl = vi.fn(async () => 'data:text/plain;base64,bG9jYWw=')
 const gitRoot = vi.fn(async () => '/local')
 const selectPaths = vi.fn(async () => ['/local'])
+const writeTextFile = vi.fn(async (path: string) => ({ path }))
+const renamePath = vi.fn(async (path: string, newName: string) => ({ path: `${path}/${newName}` }))
+const trashPath = vi.fn(async () => undefined)
+const getConnection = vi.fn(async () => ({ mode: 'local' }))
 
 const api = vi.fn(async ({ path }: { path: string }) => {
   if (path.startsWith('/api/fs/list?')) {
@@ -40,6 +51,10 @@ const api = vi.fn(async ({ path }: { path: string }) => {
     return { cwd: '/backend/project', branch: 'main' }
   }
 
+  if (path === '/api/fs/write-text') {
+    return { ok: true, path: '/remote/IDEA.md' }
+  }
+
   if (path.startsWith('/api/git/file-diff?')) {
     return { diff: 'remote diff' }
   }
@@ -51,11 +66,15 @@ function stubBridge() {
   vi.stubGlobal('window', {
     hermesDesktop: {
       api,
+      getConnection,
       gitRoot,
       readDir,
       readFileDataUrl,
       readFileText,
-      selectPaths
+      renamePath,
+      selectPaths,
+      trashPath,
+      writeTextFile
     }
   })
 }
@@ -63,6 +82,7 @@ function stubBridge() {
 describe('desktop filesystem facade', () => {
   beforeEach(() => {
     stubBridge()
+    $activeGatewayProfile.set('default')
     $connection.set(null)
   })
 
@@ -113,6 +133,7 @@ describe('desktop filesystem facade', () => {
   })
 
   it('targets the active profile backend so a remote profile never reads local disk', async () => {
+    $activeGatewayProfile.set('remote-docker')
     $connection.set({ mode: 'remote', profile: 'remote-docker' } as never)
 
     await readDesktopDir('/srv/project')
@@ -120,6 +141,130 @@ describe('desktop filesystem facade', () => {
 
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/list?path=%2Fsrv%2Fproject', profile: 'remote-docker' })
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/default-cwd', profile: 'remote-docker' })
+  })
+
+  it('fails closed while the foreground connection belongs to another profile', async () => {
+    $activeGatewayProfile.set('beta')
+    $connection.set({ mode: 'local', profile: 'alpha' } as never)
+
+    await expect(readDesktopDir('/alpha/private')).rejects.toThrow('active gateway profile')
+    await expect(readDesktopFileText('/alpha/private.txt')).rejects.toThrow('active gateway profile')
+    await expect(desktopGitRoot('/alpha/private')).rejects.toThrow('active gateway profile')
+    await expect(desktopDefaultCwd()).rejects.toThrow('active gateway profile')
+    await expect(desktopFileDiff('/alpha', 'private.txt')).rejects.toThrow('active gateway profile')
+
+    expect(readDir).not.toHaveBeenCalled()
+    expect(readFileText).not.toHaveBeenCalled()
+    expect(gitRoot).not.toHaveBeenCalled()
+    expect(api).not.toHaveBeenCalled()
+  })
+
+  it('routes profile-bound picker and writes through the requested profile', async () => {
+    const remoteSelect = vi.fn(async () => ['/remote/project'])
+    $activeGatewayProfile.set('beta')
+    getConnection.mockResolvedValue({ mode: 'remote', profile: 'beta' } as never)
+    setDesktopFsRemotePicker({ selectPaths: remoteSelect })
+    const generation = $activeGatewayProfileGeneration.get()
+
+    await expect(desktopDefaultCwdForProfile('beta', generation)).resolves.toEqual({
+      branch: 'main',
+      cwd: '/backend/project'
+    })
+    await expect(
+      readDesktopDirForProfile('beta', $activeGatewayProfileGeneration.get(), '/backend/project')
+    ).resolves.toMatchObject({
+      entries: [{ name: 'remote' }]
+    })
+    await expect(
+      selectDesktopPathsForProfile('beta', { directories: true, multiple: false }, generation)
+    ).resolves.toEqual(['/remote/project'])
+    await expect(
+      writeDesktopFileTextForProfile(
+        'beta',
+        '/remote/IDEA.md',
+        '# Idea\n',
+        $activeGatewayProfileGeneration.get()
+      )
+    ).resolves.toEqual({
+      path: '/remote/IDEA.md'
+    })
+
+    expect(getConnection).toHaveBeenCalledWith('beta')
+    expect(remoteSelect).toHaveBeenCalledWith(
+      { directories: true, multiple: false },
+      'beta',
+      $activeGatewayProfileGeneration.get()
+    )
+    expect(api).toHaveBeenCalledWith({ path: '/api/fs/list?path=%2Fbackend%2Fproject', profile: 'beta' })
+    expect(api).toHaveBeenCalledWith({ path: '/api/fs/default-cwd', profile: 'beta' })
+    expect(api).toHaveBeenCalledWith({
+      body: { content: '# Idea\n', path: '/remote/IDEA.md' },
+      method: 'POST',
+      path: '/api/fs/write-text',
+      profile: 'beta'
+    })
+    expect(writeTextFile).not.toHaveBeenCalled()
+  })
+
+  it('refuses a profile-bound directory read when ownership changes while resolving the connection', async () => {
+    let resolveConnection!: (value: { mode: 'local'; profile: string }) => void
+
+    const connection = new Promise<{ mode: 'local'; profile: string }>(resolve => {
+      resolveConnection = resolve
+    })
+
+    $activeGatewayProfile.set('alpha')
+    const generation = $activeGatewayProfileGeneration.get()
+
+    getConnection.mockReturnValueOnce(connection as never)
+
+    const read = readDesktopDirForProfile('alpha', generation, '/alpha/private')
+
+    $activeGatewayProfile.set('beta')
+    resolveConnection({ mode: 'local', profile: 'alpha' })
+
+    await expect(read).rejects.toThrow('profile ownership changed')
+    expect(readDir).not.toHaveBeenCalled()
+    expect(api).not.toHaveBeenCalled()
+  })
+
+  it('refuses a stale profile-bound write before issuing the filesystem mutation', async () => {
+    let resolveConnection!: (value: { mode: 'local'; profile: string }) => void
+
+    const connection = new Promise<{ mode: 'local'; profile: string }>(resolve => {
+      resolveConnection = resolve
+    })
+
+    $activeGatewayProfile.set('alpha')
+    const generation = $activeGatewayProfileGeneration.get()
+
+    getConnection.mockReturnValueOnce(connection as never)
+
+    const write = writeDesktopFileTextForProfile('alpha', '/alpha/private.txt', 'secret', generation)
+
+    $activeGatewayProfile.set('beta')
+    $activeGatewayProfile.set('alpha')
+    resolveConnection({ mode: 'local', profile: 'alpha' })
+
+    await expect(write).rejects.toThrow('profile ownership changed')
+    expect(writeTextFile).not.toHaveBeenCalled()
+    expect(api).not.toHaveBeenCalled()
+  })
+
+  it('refuses stale rename and trash callbacks before local filesystem mutation', async () => {
+    $activeGatewayProfile.set('alpha')
+    const generation = $activeGatewayProfileGeneration.get()
+
+    $activeGatewayProfile.set('beta')
+
+    await expect(renameDesktopPathForProfile('alpha', generation, '/alpha/file.txt', 'next.txt')).rejects.toThrow(
+      'profile ownership changed'
+    )
+    await expect(trashDesktopPathForProfile('alpha', generation, '/alpha/file.txt')).rejects.toThrow(
+      'profile ownership changed'
+    )
+    expect(renamePath).not.toHaveBeenCalled()
+    expect(trashPath).not.toHaveBeenCalled()
   })
 
   it('routes file diffs through backend git in remote mode', async () => {
@@ -138,7 +283,11 @@ describe('desktop filesystem facade', () => {
       '/remote/project'
     ])
 
-    expect(remoteSelect).toHaveBeenCalledWith({ defaultPath: '/remote', directories: true, multiple: false })
+    expect(remoteSelect).toHaveBeenCalledWith(
+      { defaultPath: '/remote', directories: true, multiple: false },
+      'default',
+      $activeGatewayProfileGeneration.get()
+    )
     expect(selectPaths).not.toHaveBeenCalled()
   })
 
@@ -160,7 +309,11 @@ describe('desktop filesystem facade', () => {
 
     await expect(selectDesktopPaths({ directories: true })).resolves.toEqual(['/remote/project'])
 
-    expect(remoteSelect).toHaveBeenCalledWith({ directories: true, multiple: false })
+    expect(remoteSelect).toHaveBeenCalledWith(
+      { directories: true, multiple: false },
+      'default',
+      $activeGatewayProfileGeneration.get()
+    )
     expect(selectPaths).not.toHaveBeenCalled()
   })
 })

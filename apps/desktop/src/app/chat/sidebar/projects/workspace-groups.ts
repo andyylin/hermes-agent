@@ -361,15 +361,21 @@ function isPathUnder(folder: string, target: string): boolean {
  */
 export function liveSessionProjectId(session: SessionInfo, explicitProjects: ProjectInfo[]): null | string {
   const cwd = (session.cwd || '').trim()
+  // A session may carry only a git_repo_root and no cwd — older/imported rows,
+  // or ones captured before cwd tracking. The backend still groups those by repo
+  // root, so anchor on it here too; otherwise the sidebar files the row under a
+  // project but the color derivation drops it (the "grouped but grey" bug).
+  const repoRoot = (session.git_repo_root || '').trim() || cwd
+  const anchor = cwd || repoRoot
 
-  if (!cwd || kanbanWorktreeDir(cwd)) {
+  if (!anchor || kanbanWorktreeDir(anchor)) {
     return null
   }
 
-  // No persisted repo root yet (brand-new session) → the cwd is the root.
-  const repoRoot = (session.git_repo_root || '').trim() || cwd
-
-  if (!isPathUnder(repoRoot, cwd)) {
+  // With a cwd present it must sit under the repo root (a sibling worktree
+  // outside the root can't be placed from the row alone); a root-only session
+  // skips this — the root IS the anchor.
+  if (cwd && !isPathUnder(repoRoot, cwd)) {
     return null
   }
 
@@ -394,6 +400,26 @@ export function liveSessionProjectId(session: SessionInfo, explicitProjects: Pro
   }
 
   return projectId || repoRoot
+}
+
+/**
+ * The color a session inherits from its owning project — the explicit project
+ * whose folder is the longest prefix of the session's cwd/repo-root, when that
+ * project carries a user-set color. Auto-promoted repo projects have no color
+ * unless the user set one, so a session only tints when it belongs to a colored
+ * project (inheritance is opt-in by coloring the project). Reuses
+ * {@link liveSessionProjectId} so the color follows the SAME membership the
+ * sidebar groups by; returns null for rootless / kanban / out-of-tree rows and
+ * for sessions under an uncolored (or auto) project.
+ */
+export function sessionProjectColor(session: SessionInfo, projects: ProjectInfo[]): null | string {
+  const projectId = liveSessionProjectId(session, projects)
+
+  if (!projectId) {
+    return null
+  }
+
+  return projects.find(project => project.id === projectId)?.color ?? null
 }
 
 const upsertSession = (rows: SessionInfo[], session: SessionInfo): SessionInfo[] =>
@@ -429,7 +455,6 @@ function liveLaneForRepo(repoRoot: string, session: SessionInfo): null | Sidebar
 }
 
 const NO_REMOVED: ReadonlySet<string> = new Set()
-const NO_ASSIGNMENTS: Readonly<Record<string, null | string>> = {}
 
 /**
  * Reconcile ONE repo's lanes against the live `$sessions` cache: evict
@@ -442,24 +467,18 @@ const NO_ASSIGNMENTS: Readonly<Record<string, null | string>> = {}
 export function overlayRepoLanes(
   repo: SidebarWorkspaceTree,
   live: SessionInfo[],
-  removed: ReadonlySet<string> = NO_REMOVED,
-  projectId?: string,
-  sessionProjectAssignments: Readonly<Record<string, null | string>> = NO_ASSIGNMENTS
+  removed: ReadonlySet<string> = NO_REMOVED
 ): SidebarWorkspaceTree {
   const repoRootKey = pathKey(repo.path)
   let changed = false
 
-  // Snapshot lanes minus anything deleted/archived or optimistically moved to
-  // another project. This keeps a stale backend snapshot from duplicating a
-  // row while the authoritative write's refresh is still in flight.
+  // Snapshot lanes minus anything the user just deleted/archived.
   const lanes = repo.groups.map(g => {
-    const kept = g.sessions.filter(s => {
-      if (removed.has(s.id)) {
-        return false
-      }
-      const hasAssignment = Object.prototype.hasOwnProperty.call(sessionProjectAssignments, s.id)
-      return !hasAssignment || sessionProjectAssignments[s.id] === projectId
-    })
+    if (!removed.size) {
+      return { ...g, sessions: [...g.sessions] }
+    }
+
+    const kept = g.sessions.filter(s => !removed.has(s.id))
 
     changed ||= kept.length !== g.sessions.length
 
@@ -468,10 +487,8 @@ export function overlayRepoLanes(
 
   for (const session of live) {
     const cwd = (session.cwd || '').trim()
-    const hasAssignment = Object.prototype.hasOwnProperty.call(sessionProjectAssignments, session.id)
-    const assignedProjectId = sessionProjectAssignments[session.id]
 
-    if (removed.has(session.id) || !cwd || (hasAssignment && assignedProjectId !== projectId)) {
+    if (removed.has(session.id) || !cwd) {
       continue
     }
 
@@ -543,13 +560,12 @@ export function overlayRepoLanes(
 export function overlayLiveLanes(
   project: SidebarProjectTree,
   live: SessionInfo[],
-  removed: ReadonlySet<string> = NO_REMOVED,
-  sessionProjectAssignments: Readonly<Record<string, null | string>> = NO_ASSIGNMENTS
+  removed: ReadonlySet<string> = NO_REMOVED
 ): SidebarProjectTree {
   let changed = false
 
   const repos = project.repos.map(repo => {
-    const next = overlayRepoLanes(repo, live, removed, project.id, sessionProjectAssignments)
+    const next = overlayRepoLanes(repo, live, removed)
 
     changed ||= next !== repo
 
@@ -569,8 +585,7 @@ export function overlayLivePreviews(
   live: SessionInfo[],
   explicitProjects: ProjectInfo[],
   limit: number,
-  removed: ReadonlySet<string> = new Set(),
-  sessionProjectAssignments: Readonly<Record<string, null | string>> = NO_ASSIGNMENTS
+  removed: ReadonlySet<string> = new Set()
 ): Record<string, SessionInfo[]> {
   const byProject = new Map<string, SessionInfo[]>()
 
@@ -579,10 +594,7 @@ export function overlayLivePreviews(
       continue
     }
 
-    const hasAssignment = Object.prototype.hasOwnProperty.call(sessionProjectAssignments, session.id)
-    const projectId = hasAssignment
-      ? sessionProjectAssignments[session.id]
-      : liveSessionProjectId(session, explicitProjects)
+    const projectId = liveSessionProjectId(session, explicitProjects)
 
     if (!projectId) {
       continue
@@ -601,13 +613,7 @@ export function overlayLivePreviews(
     }
 
     const liveRows = byProject.get(node.id) ?? []
-    const base = (node.previewSessions ?? []).filter(session => {
-      if (removed.has(session.id)) {
-        return false
-      }
-      const hasAssignment = Object.prototype.hasOwnProperty.call(sessionProjectAssignments, session.id)
-      return !hasAssignment || sessionProjectAssignments[session.id] === node.id
-    })
+    const base = (node.previewSessions ?? []).filter(session => !removed.has(session.id))
 
     if (!liveRows.length && !base.length) {
       continue

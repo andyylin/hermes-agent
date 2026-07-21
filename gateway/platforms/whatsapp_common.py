@@ -34,6 +34,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+
+from agent.secret_scope import get_secret
 import re
 from typing import Any, Dict, Optional
 
@@ -87,12 +89,12 @@ class WhatsAppBehaviorMixin:
         adapter) can override this to always return ``""`` or apply a
         different policy.
         """
-        whatsapp_mode = os.getenv("WHATSAPP_MODE", "self-chat")
+        whatsapp_mode = get_secret("WHATSAPP_MODE", "self-chat")
         if whatsapp_mode != "self-chat":
             return ""
         if self._reply_prefix is not None:
             return self._reply_prefix.replace("\\n", "\n")
-        env_prefix = os.getenv("WHATSAPP_REPLY_PREFIX")
+        env_prefix = get_secret("WHATSAPP_REPLY_PREFIX")
         if env_prefix is not None:
             return env_prefix.replace("\\n", "\n")
         return self.DEFAULT_REPLY_PREFIX
@@ -110,7 +112,7 @@ class WhatsAppBehaviorMixin:
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("WHATSAPP_REQUIRE_MENTION", "false").lower() in {
+        return str(get_secret("WHATSAPP_REQUIRE_MENTION", "false")).lower() in {
             "true",
             "1",
             "yes",
@@ -120,7 +122,7 @@ class WhatsAppBehaviorMixin:
     def _whatsapp_free_response_chats(self) -> set[str]:
         raw = self.config.extra.get("free_response_chats")
         if raw is None:
-            raw = os.getenv("WHATSAPP_FREE_RESPONSE_CHATS", "")
+            raw = get_secret("WHATSAPP_FREE_RESPONSE_CHATS", "")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
@@ -166,9 +168,9 @@ class WhatsAppBehaviorMixin:
 
     # ------------------------------------------------------------------ gating
     def _open_dm_opted_in(self) -> bool:
-        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+        if str(get_secret("GATEWAY_ALLOW_ALL_USERS", "")).lower() in {"true", "1", "yes"}:
             return True
-        return os.getenv("WHATSAPP_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+        return str(get_secret("WHATSAPP_ALLOW_ALL_USERS", "")).lower() in {"true", "1", "yes"}
 
     @staticmethod
     def _matches_whatsapp_allowlist(candidate: str, allow_from) -> bool:
@@ -249,7 +251,7 @@ class WhatsAppBehaviorMixin:
     def _compile_mention_patterns(self):
         patterns = self.config.extra.get("mention_patterns")
         if patterns is None:
-            raw = os.getenv("WHATSAPP_MENTION_PATTERNS", "").strip()
+            raw = str(get_secret("WHATSAPP_MENTION_PATTERNS", "")).strip()
             if raw:
                 try:
                     patterns = json.loads(raw)

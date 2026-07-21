@@ -10,6 +10,7 @@ import {
 } from '@/components/pane-shell/tree/store'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
+import { ColorSwatches } from '@/components/ui/color-swatches'
 import {
   ContextMenu,
   ContextMenuContent,
@@ -43,18 +44,19 @@ import { Input } from '@/components/ui/input'
 import { renameSession } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
+import { PROFILE_SWATCHES } from '@/lib/profile-color'
 import { exportSession } from '@/lib/session-export'
 import { activeGateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
-import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
-  $projects,
-  $projectSessionAssignmentsAvailable,
-  $sessionProjectAssignments,
-  assignSessionToProject,
-  unassignSessionFromProject
-} from '@/store/projects'
-import { $activeSessionId, $selectedStoredSessionId, setSessions } from '@/store/session'
+  $activeSessionId,
+  $selectedStoredSessionId,
+  $sessions,
+  sessionMatchesStoredId,
+  sessionPinId,
+  setSessions
+} from '@/store/session'
+import { $sessionColorOverrides, setSessionColorOverride } from '@/store/session-color'
 import { $sessionTiles, openSessionTile } from '@/store/session-states'
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
@@ -129,17 +131,14 @@ interface SessionActions {
 }
 
 type MenuItem = typeof DropdownMenuItem | typeof ContextMenuItem
-type MenuSub = typeof DropdownMenuSub | typeof ContextMenuSub
-type MenuSubTrigger = typeof DropdownMenuSubTrigger | typeof ContextMenuSubTrigger
-type MenuSubContent = typeof DropdownMenuSubContent | typeof ContextMenuSubContent
 
-/** A menu flavour (dropdown / context) — item + separator components. */
+/** A menu flavour (dropdown / context) — item + separator + submenu components. */
 interface MenuKit {
   Item: MenuItem
   Separator: typeof DropdownMenuSeparator | typeof ContextMenuSeparator
-  Sub: MenuSub
-  SubContent: MenuSubContent
-  SubTrigger: MenuSubTrigger
+  Sub: typeof DropdownMenuSub | typeof ContextMenuSub
+  SubTrigger: typeof DropdownMenuSubTrigger | typeof ContextMenuSubTrigger
+  SubContent: typeof DropdownMenuSubContent | typeof ContextMenuSubContent
 }
 
 const DROPDOWN_KIT: MenuKit = {
@@ -149,6 +148,7 @@ const DROPDOWN_KIT: MenuKit = {
   SubContent: DropdownMenuSubContent,
   SubTrigger: DropdownMenuSubTrigger
 }
+
 const CONTEXT_KIT: MenuKit = {
   Item: ContextMenuItem,
   Separator: ContextMenuSeparator,
@@ -164,6 +164,27 @@ interface ItemSpec {
   label: string
   onSelect: (event: Event) => void
   variant?: 'destructive'
+}
+
+// The color picker inside the session menu's Appearance submenu. Its own
+// component so only an OPEN submenu subscribes to the stores (not every row's
+// menu). Reads/writes the override keyed by the DURABLE id so a color survives
+// compression; clearing falls back to the inherited project color.
+function SessionColorSwatches({ sessionId }: { sessionId: string }) {
+  const { t } = useI18n()
+  const overrides = useStore($sessionColorOverrides)
+  const session = useStore($sessions).find(s => sessionMatchesStoredId(s, sessionId))
+  const durableId = session ? sessionPinId(session) : sessionId
+
+  return (
+    <ColorSwatches
+      clearIcon="circle-slash"
+      clearLabel={t.sidebar.projects.noColor}
+      onChange={color => setSessionColorOverride(durableId, color)}
+      swatches={PROFILE_SWATCHES}
+      value={overrides[durableId] ?? null}
+    />
+  )
 }
 
 function useSessionActions({
@@ -182,34 +203,7 @@ function useSessionActions({
 }: SessionActions) {
   const { t } = useI18n()
   const r = t.sidebar.row
-  const projects = useStore($projects)
-  const assignmentsAvailable = useStore($projectSessionAssignmentsAvailable)
-  const assignments = useStore($sessionProjectAssignments)
-  const activeProfile = useStore($activeGatewayProfile)
   const [renameOpen, setRenameOpen] = useState(false)
-  const isActiveProfile = normalizeProfileKey(profile) === normalizeProfileKey(activeProfile)
-  const assignableProjects = isActiveProfile ? projects.filter(project => !project.archived) : []
-  const assignedProjectId = assignments[sessionId]
-
-  const moveToProject = async (projectId: string, label: string) => {
-    try {
-      triggerHaptic('selection')
-      await assignSessionToProject(sessionId, projectId)
-      notify({ durationMs: 2_000, kind: 'success', message: r.movedToProject(label) })
-    } catch (err) {
-      notifyError(err, r.moveToProjectFailed)
-    }
-  }
-
-  const moveToNoProject = async () => {
-    try {
-      triggerHaptic('selection')
-      await unassignSessionFromProject(sessionId)
-      notify({ durationMs: 2_000, kind: 'success', message: r.movedToProject(r.noProject) })
-    } catch (err) {
-      notifyError(err, r.moveToProjectFailed)
-    }
-  }
   const tiles = useStore($sessionTiles)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
 
@@ -380,44 +374,20 @@ function useSessionActions({
     </Item>
   )
 
-  const renderMoveToProject = (kit: MenuKit) =>
-    isActiveProfile && assignmentsAvailable === true ? (
-      <kit.Sub key={r.moveToProject}>
-        <kit.SubTrigger disabled={!sessionId}>
-          <Codicon name="folder-opened" size="0.875rem" />
-          <span>{r.moveToProject}</span>
-        </kit.SubTrigger>
-        <kit.SubContent className="w-48">
-          <kit.Item disabled={assignedProjectId === null} onSelect={() => void moveToNoProject()}>
-            <Codicon name="root-folder" size="0.875rem" />
-            <span className="truncate">{r.noProject}</span>
-          </kit.Item>
-          {assignableProjects.map(project => (
-            <kit.Item
-              disabled={assignedProjectId === project.id}
-              key={project.id}
-              onSelect={() => void moveToProject(project.id, project.name)}
-            >
-              <Codicon name={project.icon || 'folder-library'} size="0.875rem" />
-              <span className="truncate">{project.name}</span>
-            </kit.Item>
-          ))}
-        </kit.SubContent>
-      </kit.Sub>
-    ) : (
-      renderMenuItem(kit.Item, {
-        disabled: true,
-        icon: 'folder-opened',
-        label: r.moveToProject,
-        onSelect: () => undefined
-      })
-    )
-
   const renderItems = (kit: MenuKit) => (
     <>
       {openItems.map(item => renderMenuItem(kit.Item, item))}
       {openItems.length > 0 && <kit.Separator />}
       {identityItems.map(item => renderMenuItem(kit.Item, item))}
+      <kit.Sub>
+        <kit.SubTrigger disabled={!sessionId}>
+          <Codicon name="symbol-color" size="0.875rem" />
+          <span>{t.sidebar.projects.menuAppearance}</span>
+        </kit.SubTrigger>
+        <kit.SubContent className="p-2">
+          <SessionColorSwatches sessionId={sessionId} />
+        </kit.SubContent>
+      </kit.Sub>
       <CopyButton
         appearance={kit.Item === DropdownMenuItem ? 'menu-item' : 'context-menu-item'}
         disabled={!sessionId}
@@ -428,7 +398,6 @@ function useSessionActions({
         onCopyError={err => notifyError(err, r.copyIdFailed)}
         text={sessionId}
       />
-      {renderMoveToProject(kit)}
       <kit.Separator />
       {workItems.map(item => renderMenuItem(kit.Item, item))}
       {tabCloseItems.length > 0 && (

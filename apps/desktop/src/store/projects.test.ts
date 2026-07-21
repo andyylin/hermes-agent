@@ -1,26 +1,55 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $sidebarAgentsGrouped } from '@/store/layout'
+import type { SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
+import {
+  $dismissedAutoProjectIds,
+  $dismissedWorktreeIds,
+  $sidebarAgentsGrouped,
+  $sidebarProjectOrderIds,
+  $sidebarWorkspaceCollapsedIds,
+  $sidebarWorkspaceOrderIds,
+  $sidebarWorkspaceParentOrderIds
+} from '@/store/layout'
+import { $activeGatewayProfile, $activeGatewayProfileGeneration } from '@/store/profile'
+import type { ProjectInfo } from '@/types/hermes'
 
 import {
   $activeProjectId,
+  $projectDialog,
+  $projects,
   $projectScope,
-  $projectSessionAssignmentsAvailable,
   $projectsRpcAvailable,
-  $sessionProjectAssignments,
+  $projectTree,
+  $projectTreeLoading,
+  $removedSessionIds,
+  $startWorkSessionCommitted,
+  $startWorkSessionRequest,
   $worktreeRefreshToken,
   ALL_PROJECTS,
-  assignSessionToProject,
   createProject,
   enterProject,
   exitProjectScope,
+  followActiveSessionCwd,
+  listRepoBranches,
+  markStartWorkSessionCommitted,
   openProjectCreate,
   pickProjectFolder,
+  projectNameForCwd,
   refreshProjects,
   refreshProjectTree,
   refreshWorktrees,
-  unassignSessionFromProject
+  requestStartWorkSession,
+  scanAndRecordRepos,
+  startWorkInRepo,
+  switchBranchInRepo,
+  tombstoneSessions,
+  updateProject
 } from './projects'
+
+const { desktopGitForProfile, scanRepos } = vi.hoisted(() => ({
+  desktopGitForProfile: vi.fn(),
+  scanRepos: vi.fn()
+}))
 
 vi.mock('@/i18n', () => ({
   translateNow: (key: string) => key
@@ -31,10 +60,19 @@ vi.mock('@/store/notifications', () => ({
 }))
 
 vi.mock('@/lib/desktop-fs', () => ({
-  desktopDefaultCwd: vi.fn(),
-  isDesktopFsRemoteMode: vi.fn(),
-  selectDesktopPaths: vi.fn(),
-  writeDesktopFileText: vi.fn()
+  desktopDefaultCwdForProfile: vi.fn(),
+  selectDesktopPathsForProfile: vi.fn(),
+  writeDesktopFileTextForProfile: vi.fn()
+}))
+
+vi.mock('@/lib/desktop-git', () => ({
+  desktopGitForProfile,
+  scanDesktopReposForProfile: scanRepos,
+  StaleDesktopGitProfileError: class extends Error {
+    constructor() {
+      super('Desktop Git operation belongs to a stale profile context')
+    }
+  }
 }))
 
 vi.mock('@/store/gateway', () => ({
@@ -43,18 +81,337 @@ vi.mock('@/store/gateway', () => ({
 }))
 
 const fs = await import('@/lib/desktop-fs')
-const desktopDefaultCwd = vi.mocked(fs.desktopDefaultCwd)
-const isDesktopFsRemoteMode = vi.mocked(fs.isDesktopFsRemoteMode)
-const selectDesktopPaths = vi.mocked(fs.selectDesktopPaths)
+const desktopDefaultCwdForProfile = vi.mocked(fs.desktopDefaultCwdForProfile)
+const selectDesktopPathsForProfile = vi.mocked(fs.selectDesktopPathsForProfile)
+const writeDesktopFileTextForProfile = vi.mocked(fs.writeDesktopFileTextForProfile)
 
 const gw = await import('@/store/gateway')
 const activeGateway = vi.mocked(gw.activeGateway)
 const notifications = await import('@/store/notifications')
 const notify = vi.mocked(notifications.notify)
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+
+  return { promise, reject, resolve }
+}
+
+const project = (id: string, name: string): ProjectInfo => ({
+  archived: false,
+  board_slug: null,
+  color: null,
+  created_at: 0,
+  description: null,
+  folders: [],
+  icon: null,
+  id,
+  name,
+  primary_path: null,
+  slug: id
+})
+
+describe('profile isolation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    desktopGitForProfile.mockResolvedValue({ scanRepos })
+    window.localStorage.clear()
+    $activeGatewayProfile.set('default')
+    $projects.set([])
+    $projectScope.set(ALL_PROJECTS)
+  })
+
+  it('drops a stale projects.list response after switching profiles', async () => {
+    const responseA = deferred<{ active_id: null; projects: ProjectInfo[] }>()
+    const gatewayA = { connectionState: 'open', request: vi.fn(() => responseA.promise) }
+    const gatewayB = { connectionState: 'open', request: vi.fn() }
+
+    $activeGatewayProfile.set('alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    const refresh = refreshProjects()
+
+    $activeGatewayProfile.set('beta')
+    activeGateway.mockReturnValue(gatewayB as never)
+    responseA.resolve({ active_id: null, projects: [project('p_alpha', 'Alpha')] })
+    await refresh
+
+    expect($projects.get()).toEqual([])
+  })
+
+  it('clears filesystem-bound project layout when switching profiles', () => {
+    $sidebarWorkspaceOrderIds.set(['/alpha/worktree'])
+    $sidebarWorkspaceParentOrderIds.set(['/alpha/repo'])
+    $sidebarProjectOrderIds.set(['alpha-project'])
+    $sidebarWorkspaceCollapsedIds.set(['/alpha/worktree'])
+    $dismissedAutoProjectIds.set(['/alpha/repo'])
+    $dismissedWorktreeIds.set(['/alpha/removed'])
+
+    $activeGatewayProfile.set('layout-beta')
+
+    expect($sidebarWorkspaceOrderIds.get()).toEqual([])
+    expect($sidebarWorkspaceParentOrderIds.get()).toEqual([])
+    expect($sidebarProjectOrderIds.get()).toEqual([])
+    expect($sidebarWorkspaceCollapsedIds.get()).toEqual([])
+    expect($dismissedAutoProjectIds.get()).toEqual([])
+    expect($dismissedWorktreeIds.get()).toEqual([])
+  })
+
+  it('refuses a work-session handoff owned by a stale profile', () => {
+    $activeGatewayProfile.set('handoff-alpha')
+    requestStartWorkSession('/alpha/worktree', 'draft', 'handoff-alpha')
+    const alpha = $startWorkSessionRequest.get()
+
+    expect(alpha).toMatchObject({ path: '/alpha/worktree', profile: 'handoff-alpha' })
+
+    $activeGatewayProfile.set('handoff-beta')
+    requestStartWorkSession('/alpha/late', 'stale', 'handoff-alpha')
+
+    expect($startWorkSessionRequest.get()).toBeNull()
+  })
+
+  it('rejects an old handoff generation after an alpha to beta to alpha swap', () => {
+    $activeGatewayProfile.set('handoff-rapid-alpha')
+    const generation = $activeGatewayProfileGeneration.get()
+
+    $activeGatewayProfile.set('handoff-rapid-beta')
+    $activeGatewayProfile.set('handoff-rapid-alpha')
+    requestStartWorkSession('/alpha/stale', 'stale', 'handoff-rapid-alpha', generation)
+
+    expect($startWorkSessionRequest.get()).toBeNull()
+  })
+
+  it('acknowledges only the currently accepted work-session handoff token', () => {
+    $activeGatewayProfile.set('handoff-commit')
+    requestStartWorkSession('/repo/worktree', 'draft')
+    const request = $startWorkSessionRequest.get()
+
+    expect(request).not.toBeNull()
+    markStartWorkSessionCommitted((request?.token ?? 0) + 1)
+    expect($startWorkSessionCommitted.get()).toBeNull()
+
+    markStartWorkSessionCommitted(request?.token ?? 0)
+    expect($startWorkSessionCommitted.get()).toMatchObject({
+      generation: request?.generation,
+      profile: request?.profile,
+      token: request?.token
+    })
+  })
+
+  it('drops an old alpha response after a rapid alpha to beta to alpha swap', async () => {
+    const oldAlpha = deferred<{ active_id: null; projects: ProjectInfo[] }>()
+    const gatewayA = { connectionState: 'open', request: vi.fn(() => oldAlpha.promise) }
+    const gatewayB = { connectionState: 'open', request: vi.fn() }
+
+    $activeGatewayProfile.set('rapid-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    const refresh = refreshProjects()
+
+    $activeGatewayProfile.set('rapid-beta')
+    activeGateway.mockReturnValue(gatewayB as never)
+    $activeGatewayProfile.set('rapid-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    $projects.set([project('p_fresh', 'Fresh alpha')])
+
+    oldAlpha.resolve({ active_id: null, projects: [project('p_stale', 'Stale alpha')] })
+    await refresh
+
+    expect($projects.get().map(item => item.id)).toEqual(['p_fresh'])
+  })
+
+  it('never submits alpha repo scan results through beta gateway', async () => {
+    const scanned = deferred<Array<{ path: string }>>()
+    const gatewayA = { connectionState: 'open', request: vi.fn().mockResolvedValue({}) }
+    const gatewayB = { connectionState: 'open', request: vi.fn().mockResolvedValue({}) }
+    scanRepos.mockReturnValue(scanned.promise)
+
+    $activeGatewayProfile.set('scan-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    const scan = scanAndRecordRepos(true)
+
+    $activeGatewayProfile.set('scan-beta')
+    activeGateway.mockReturnValue(gatewayB as never)
+    scanned.resolve([{ path: '/repos/alpha' }])
+    await scan
+
+    expect(gatewayB.request).not.toHaveBeenCalledWith('projects.record_repos', expect.anything())
+  })
+
+  it('scans once for each profile instead of suppressing beta after alpha', async () => {
+    const gatewayA = { connectionState: 'open', request: vi.fn().mockResolvedValue({}) }
+    const gatewayB = { connectionState: 'open', request: vi.fn().mockResolvedValue({}) }
+    scanRepos.mockResolvedValue([{ path: '/repos/shared' }])
+
+    $activeGatewayProfile.set('once-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    await scanAndRecordRepos()
+
+    $activeGatewayProfile.set('once-beta')
+    activeGateway.mockReturnValue(gatewayB as never)
+    await scanAndRecordRepos()
+
+    expect(gatewayA.request).toHaveBeenCalledWith('projects.record_repos', expect.anything())
+    expect(gatewayB.request).toHaveBeenCalledWith('projects.record_repos', expect.anything())
+  })
+
+  it('selects the repo scanner for the captured profile', async () => {
+    const gateway = { connectionState: 'open', request: vi.fn().mockResolvedValue({}) }
+    scanRepos.mockResolvedValue([{ path: '/repos/beta' }])
+
+    $activeGatewayProfile.set('scanner-beta')
+    activeGateway.mockReturnValue(gateway as never)
+    await scanAndRecordRepos(true)
+
+    expect(scanRepos).toHaveBeenCalledWith('scanner-beta', expect.any(Number))
+  })
+
+  it('does not roll an alpha optimistic snapshot into beta after a failed write', async () => {
+    const writeA = deferred<never>()
+    const gatewayA = { connectionState: 'open', request: vi.fn(() => writeA.promise) }
+
+    $activeGatewayProfile.set('write-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    $projects.set([project('p_alpha', 'Alpha')])
+    const update = updateProject('p_alpha', { name: 'Alpha renamed' })
+    await Promise.resolve()
+
+    $activeGatewayProfile.set('write-beta')
+    $projects.set([project('p_beta', 'Beta')])
+    writeA.reject(new Error('alpha write failed'))
+    await expect(update).rejects.toThrow()
+
+    expect($projects.get().map(project => project.id)).toEqual(['p_beta'])
+  })
+
+  it('does not mutate beta after switching during the context-capture microtask', async () => {
+    const gatewayA = { connectionState: 'open', request: vi.fn().mockResolvedValue({}) }
+
+    $activeGatewayProfile.set('microtask-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    $projects.set([project('p_shared', 'Alpha')])
+    const update = updateProject('p_shared', { name: 'Alpha renamed' })
+
+    $activeGatewayProfile.set('microtask-beta')
+    $projects.set([project('p_shared', 'Beta')])
+    await expect(update).rejects.toThrow()
+
+    expect($projects.get()[0]?.name).toBe('Beta')
+  })
+
+  it('does not leave beta loading when switching during tree context capture', async () => {
+    const gatewayA = { connectionState: 'open', request: vi.fn().mockResolvedValue({}) }
+
+    $activeGatewayProfile.set('loading-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    const refresh = refreshProjectTree()
+
+    $activeGatewayProfile.set('loading-beta')
+    $projectTreeLoading.set(false)
+    await refresh
+
+    expect($projectTreeLoading.get()).toBe(false)
+  })
+
+  it('does not enter a beta project using an alpha cwd after refresh', async () => {
+    const listA = deferred<{ active_id: null; projects: ProjectInfo[] }>()
+    const treeA = deferred<{ active_id: null; projects: SidebarProjectTree[]; scoped_session_ids: string[] }>()
+
+    const gatewayA = {
+      connectionState: 'open',
+      request: vi.fn((method: string) => (method === 'projects.list' ? listA.promise : treeA.promise))
+    }
+
+    const gatewayB = { connectionState: 'open', request: vi.fn() }
+
+    $activeGatewayProfile.set('follow-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    const follow = followActiveSessionCwd('/shared')
+
+    await vi.waitFor(() => expect(gatewayA.request).toHaveBeenCalledTimes(2))
+
+    $activeGatewayProfile.set('follow-beta')
+    activeGateway.mockReturnValue(gatewayB as never)
+    $projectTree.set([
+      {
+        id: 'p_beta',
+        isAuto: false,
+        label: 'Beta',
+        path: '/shared',
+        repos: [],
+        sessionCount: 0
+      }
+    ])
+    listA.resolve({ active_id: null, projects: [] })
+    treeA.resolve({ active_id: null, projects: [], scoped_session_ids: [] })
+    await follow
+
+    expect($projectScope.get()).toBe(ALL_PROJECTS)
+  })
+
+  it('writes IDEA.md through the captured project profile', async () => {
+    const created = { ...project('p_idea', 'Idea'), primary_path: '/idea' }
+
+    const gateway = {
+      connectionState: 'open',
+      request: vi.fn().mockResolvedValue({ project: created })
+    }
+
+    writeDesktopFileTextForProfile.mockResolvedValue({ path: '/idea/IDEA.md' })
+
+    $activeGatewayProfile.set('idea-beta')
+    const generation = $activeGatewayProfileGeneration.get()
+
+    activeGateway.mockReturnValue(gateway as never)
+    await createProject({ folders: ['/idea'], idea: '# Beta idea', name: 'Idea' })
+
+    expect(writeDesktopFileTextForProfile).toHaveBeenCalledWith(
+      'idea-beta',
+      '/idea/IDEA.md',
+      '# Beta idea\n',
+      generation
+    )
+  })
+
+  it('persists project scope independently per profile', () => {
+    $activeGatewayProfile.set('scope-alpha')
+    enterProject('p_alpha')
+
+    $activeGatewayProfile.set('scope-beta')
+    expect($projectScope.get()).toBe(ALL_PROJECTS)
+    enterProject('p_beta')
+
+    $activeGatewayProfile.set('scope-alpha')
+    expect($projectScope.get()).toBe('p_alpha')
+  })
+
+  it('clears every profile-bound project view atom during a switch', () => {
+    $activeGatewayProfile.set('reset-alpha')
+    $projects.set([project('p_alpha', 'Alpha')])
+    $activeProjectId.set('p_alpha')
+    $projectTreeLoading.set(true)
+    openProjectCreate()
+    $projectsRpcAvailable.set(false)
+    tombstoneSessions(['s_alpha'])
+
+    $activeGatewayProfile.set('reset-beta')
+
+    expect($projects.get()).toEqual([])
+    expect($activeProjectId.get()).toBeNull()
+    expect($projectTreeLoading.get()).toBe(false)
+    expect($projectsRpcAvailable.get()).toBeNull()
+    expect($removedSessionIds.get().size).toBe(0)
+    expect($projectDialog.get()).toBeNull()
+  })
+})
+
 describe('project scope', () => {
   beforeEach(() => {
     window.localStorage.clear()
+    $activeGatewayProfile.set('default')
     $projectScope.set(ALL_PROJECTS)
   })
 
@@ -82,7 +439,69 @@ describe('project scope', () => {
 
   it('persists the scope to localStorage', () => {
     enterProject('p_abc')
-    expect(window.localStorage.getItem('hermes.desktop.projectScope')).toBe('p_abc')
+    expect(window.localStorage.getItem('hermes.desktop.projectScope.default')).toBe('p_abc')
+  })
+})
+
+describe('projectNameForCwd', () => {
+  const treeNode = (
+    over: Partial<SidebarProjectTree> & Pick<SidebarProjectTree, 'id' | 'label'>
+  ): SidebarProjectTree => ({
+    path: null,
+    repos: [],
+    sessionCount: 0,
+    ...over
+  })
+
+  beforeEach(() => {
+    $projectTree.set([])
+  })
+
+  it('names the explicit project owning the cwd (longest path match)', () => {
+    $projectTree.set([
+      treeNode({ id: 'p_web', label: 'Website', path: '/repos/website' }),
+      treeNode({ id: 'p_api', label: 'API', path: '/repos/api' })
+    ])
+
+    expect(projectNameForCwd('/repos/website/src/app')).toBe('Website')
+  })
+
+  it('matches nested repo and worktree paths, not just the project root', () => {
+    $projectTree.set([
+      treeNode({
+        id: 'p_mono',
+        label: 'Monorepo',
+        path: '/repos/mono',
+        repos: [
+          {
+            id: 'r1',
+            label: 'mono',
+            path: '/repos/mono',
+            sessionCount: 0,
+            groups: [{ id: 'g1', label: 'feature', path: '/elsewhere/mono-feature', sessions: [] }]
+          }
+        ]
+      })
+    ])
+
+    // A linked worktree lives OUTSIDE the project root but still belongs to it.
+    expect(projectNameForCwd('/elsewhere/mono-feature/src')).toBe('Monorepo')
+  })
+
+  it('ignores auto-projects and the No-project bucket (no named identity)', () => {
+    $projectTree.set([
+      treeNode({ id: '/repos/loose', label: 'loose', path: '/repos/loose', isAuto: true }),
+      treeNode({ id: '__no_project__', label: 'No project', path: null, isNoProject: true })
+    ])
+
+    expect(projectNameForCwd('/repos/loose/src')).toBeNull()
+  })
+
+  it('returns null for a cwd in no project and for a blank cwd', () => {
+    $projectTree.set([treeNode({ id: 'p_web', label: 'Website', path: '/repos/website' })])
+
+    expect(projectNameForCwd('/somewhere/else')).toBeNull()
+    expect(projectNameForCwd('')).toBeNull()
   })
 })
 
@@ -92,39 +511,146 @@ describe('worktree refresh', () => {
     refreshWorktrees()
     expect($worktreeRefreshToken.get()).toBe(before + 1)
   })
+
+  it('drops a completed worktree result after the initiating profile becomes stale', async () => {
+    const added = deferred<{ branch: string; path: string }>()
+    const git = { worktreeAdd: vi.fn(() => added.promise) }
+    const gatewayA = { connectionState: 'open', request: vi.fn() }
+    const gatewayB = { connectionState: 'open', request: vi.fn() }
+
+    desktopGitForProfile.mockResolvedValue(git)
+    $activeGatewayProfile.set('git-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    const before = $worktreeRefreshToken.get()
+    const result = startWorkInRepo('/repo', { branch: 'feature' })
+    await vi.waitFor(() => expect(git.worktreeAdd).toHaveBeenCalled())
+
+    $activeGatewayProfile.set('git-beta')
+    activeGateway.mockReturnValue(gatewayB as never)
+    added.resolve({ branch: 'feature', path: '/repo/.worktrees/feature' })
+
+    await expect(result).resolves.toBeNull()
+    expect(desktopGitForProfile).toHaveBeenCalledWith('git-alpha', expect.any(Number))
+    expect($worktreeRefreshToken.get()).toBe(before)
+  })
+
+  it('refuses stale producer ownership before starting a git mutation', async () => {
+    vi.clearAllMocks()
+    $activeGatewayProfile.set('producer-alpha')
+
+    const owner = {
+      generation: $activeGatewayProfileGeneration.get(),
+      profile: 'producer-alpha'
+    }
+
+    $activeGatewayProfile.set('producer-beta')
+
+    await expect(
+      startWorkInRepo('/alpha/repo', {
+        branch: 'feature',
+        generation: owner.generation,
+        profile: owner.profile
+      })
+    ).resolves.toBeNull()
+    await expect(switchBranchInRepo('/alpha/repo', 'main', owner)).resolves.toBeNull()
+    expect(desktopGitForProfile).not.toHaveBeenCalled()
+  })
+
+  it('returns no committed handoff when a branch switch becomes profile-stale', async () => {
+    const switched = deferred<void>()
+    const git = { branchSwitch: vi.fn(() => switched.promise) }
+
+    desktopGitForProfile.mockResolvedValue(git)
+    $activeGatewayProfile.set('switch-alpha')
+    activeGateway.mockReturnValue({ connectionState: 'open', request: vi.fn() } as never)
+    const result = switchBranchInRepo('/repo', 'main')
+    await vi.waitFor(() => expect(git.branchSwitch).toHaveBeenCalled())
+
+    $activeGatewayProfile.set('switch-beta')
+    switched.resolve()
+
+    await expect(result).resolves.toBeNull()
+  })
+
+  it('rejects a stale branch list instead of disguising it as a valid empty result', async () => {
+    const listed = deferred<Array<{ current: boolean; name: string }>>()
+    const git = { branchList: vi.fn(() => listed.promise) }
+    const gatewayA = { connectionState: 'open', request: vi.fn() }
+    const gatewayB = { connectionState: 'open', request: vi.fn() }
+
+    desktopGitForProfile.mockResolvedValue(git)
+    $activeGatewayProfile.set('branches-alpha')
+    activeGateway.mockReturnValue(gatewayA as never)
+    const result = listRepoBranches('/repo')
+    await vi.waitFor(() => expect(git.branchList).toHaveBeenCalled())
+
+    $activeGatewayProfile.set('branches-beta')
+    activeGateway.mockReturnValue(gatewayB as never)
+    listed.resolve([{ current: true, name: 'alpha-only' }])
+
+    await expect(result).rejects.toThrow('stale profile context')
+    expect(desktopGitForProfile).toHaveBeenLastCalledWith('branches-alpha', expect.any(Number))
+  })
 })
 
 describe('pickProjectFolder', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    $activeGatewayProfile.set('default')
+    activeGateway.mockReturnValue({ connectionState: 'open', request: vi.fn() } as never)
   })
 
   it('uses the remote-aware directory picker locally', async () => {
-    isDesktopFsRemoteMode.mockReturnValue(false)
-    selectDesktopPaths.mockResolvedValue(['/local/repo'])
+    desktopDefaultCwdForProfile.mockResolvedValue(null)
+    selectDesktopPathsForProfile.mockResolvedValue(['/local/repo'])
 
     await expect(pickProjectFolder()).resolves.toBe('/local/repo')
-    expect(selectDesktopPaths).toHaveBeenCalledWith({ defaultPath: undefined, directories: true, multiple: false })
+    expect(selectDesktopPathsForProfile).toHaveBeenCalledWith(
+      'default',
+      {
+        defaultPath: undefined,
+        directories: true,
+        multiple: false
+      },
+      expect.any(Number)
+    )
   })
 
   it('seeds the picker with the backend cwd on a remote gateway', async () => {
-    isDesktopFsRemoteMode.mockReturnValue(true)
-    desktopDefaultCwd.mockResolvedValue({ branch: 'main', cwd: '/backend/work' })
-    selectDesktopPaths.mockResolvedValue(['/backend/work/repo'])
+    desktopDefaultCwdForProfile.mockResolvedValue({ branch: 'main', cwd: '/backend/work' })
+    selectDesktopPathsForProfile.mockResolvedValue(['/backend/work/repo'])
 
     await expect(pickProjectFolder()).resolves.toBe('/backend/work/repo')
-    expect(selectDesktopPaths).toHaveBeenCalledWith({
-      defaultPath: '/backend/work',
-      directories: true,
-      multiple: false
-    })
+    expect(selectDesktopPathsForProfile).toHaveBeenCalledWith(
+      'default',
+      {
+        defaultPath: '/backend/work',
+        directories: true,
+        multiple: false
+      },
+      expect.any(Number)
+    )
   })
 
   it('returns null when the picker is cancelled (empty selection)', async () => {
-    isDesktopFsRemoteMode.mockReturnValue(false)
-    selectDesktopPaths.mockResolvedValue([])
+    desktopDefaultCwdForProfile.mockResolvedValue(null)
+    selectDesktopPathsForProfile.mockResolvedValue([])
 
     await expect(pickProjectFolder()).resolves.toBeNull()
+  })
+
+  it('drops a picker result after the active profile changes', async () => {
+    const selected = deferred<string[]>()
+
+    $activeGatewayProfile.set('picker-alpha')
+    desktopDefaultCwdForProfile.mockResolvedValue(null)
+    selectDesktopPathsForProfile.mockReturnValue(selected.promise)
+    const picked = pickProjectFolder()
+
+    $activeGatewayProfile.set('picker-beta')
+    selected.resolve(['/alpha/repo'])
+
+    await expect(picked).resolves.toBeNull()
   })
 })
 
@@ -170,6 +696,45 @@ describe('createProject', () => {
     )
     expect($projectsRpcAvailable.get()).toBe(false)
   })
+
+  it('does not publish a resolved create across an A to B to A generation swap', async () => {
+    const created = { ...project('alpha-created', 'Alpha'), primary_path: '/alpha' }
+    const pending = deferred<{ project: ProjectInfo | null }>()
+
+    const gateway = {
+      connectionState: 'open',
+      request: vi.fn((method: string) =>
+        method === 'projects.create'
+          ? pending.promise
+          : Promise.resolve({ active_id: null, projects: [], scoped_session_ids: [] })
+      )
+    }
+
+    let armGenerationSwap = false
+    let generationSwapQueued = false
+
+    $activeGatewayProfile.set('create-alpha')
+    activeGateway.mockImplementation(() => {
+      if (armGenerationSwap && !generationSwapQueued) {
+        generationSwapQueued = true
+        queueMicrotask(() => {
+          $activeGatewayProfile.set('create-beta')
+          $activeGatewayProfile.set('create-alpha')
+        })
+      }
+
+      return gateway as never
+    })
+    const create = createProject({ folders: ['/alpha'], name: 'Alpha', use: true })
+
+    await vi.waitFor(() => expect(gateway.request).toHaveBeenCalledWith('projects.create', expect.any(Object)))
+    armGenerationSwap = true
+    pending.resolve({ project: created })
+
+    await expect(create).resolves.toBeNull()
+    expect($projects.get()).not.toContainEqual(created)
+    expect($activeProjectId.get()).not.toBe(created.id)
+  })
 })
 
 describe('projects RPC capability', () => {
@@ -199,161 +764,35 @@ describe('projects RPC capability', () => {
     )
   })
 
-  it('detects an older project backend without session assignments', async () => {
-    activeGateway.mockReturnValue({
-      connectionState: 'open',
-      request: vi.fn().mockResolvedValue({ active_id: null, projects: [], scoped_session_ids: [] })
-    } as never)
-    $projectSessionAssignmentsAvailable.set(null)
+  it('does not publish a resolved list across an A to B to A generation swap', async () => {
+    const pending = deferred<{ active_id: null | string; projects: ProjectInfo[] }>()
+    const gateway = { connectionState: 'open', request: vi.fn(() => pending.promise) }
+    const staleProject = project('alpha-only', 'Alpha only')
 
-    await refreshProjectTree()
+    let armGenerationSwap = false
+    let generationSwapQueued = false
 
-    expect($projectSessionAssignmentsAvailable.get()).toBe(false)
-  })
-})
-
-describe('project session assignment cache', () => {
-  beforeEach(() => {
-    vi.clearAllMocks()
-    $sessionProjectAssignments.set({ existing: 'p_old' })
-    $projectSessionAssignmentsAvailable.set(true)
-  })
-
-  it('rolls back the optimistic assignment when the write fails', async () => {
-    activeGateway.mockReturnValue({
-      connectionState: 'open',
-      request: vi.fn().mockRejectedValue(new Error('write failed'))
-    } as never)
-
-    const write = assignSessionToProject('s1', 'p_new')
-    expect($sessionProjectAssignments.get()).toEqual({ existing: 'p_old', s1: 'p_new' })
-    await expect(write).rejects.toThrow('write failed')
-    expect($sessionProjectAssignments.get()).toEqual({ existing: 'p_old' })
-  })
-
-  it('rolls back one failed session without clobbering a newer session move', async () => {
-    let rejectFirst: ((error: Error) => void) | undefined
-    const request = vi.fn((method: string, params?: { session_id?: string }) => {
-      if (method !== 'projects.assign_session') {
-        return Promise.resolve({
-          active_id: null,
-          projects: [],
-          scoped_session_ids: [],
-          session_project_assignments: { s2: 'p_two' }
+    $projects.set([])
+    $activeGatewayProfile.set('list-alpha')
+    activeGateway.mockImplementation(() => {
+      if (armGenerationSwap && !generationSwapQueued) {
+        generationSwapQueued = true
+        queueMicrotask(() => {
+          $activeGatewayProfile.set('list-beta')
+          $activeGatewayProfile.set('list-alpha')
         })
       }
-      if (params?.session_id === 's1') {
-        return new Promise((_resolve, reject) => {
-          rejectFirst = reject
-        })
-      }
-      return Promise.resolve({})
+
+      return gateway as never
     })
-    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+    const refresh = refreshProjects()
 
-    const first = assignSessionToProject('s1', 'p_one')
-    const second = assignSessionToProject('s2', 'p_two')
-    await vi.waitFor(() => expect(rejectFirst).toBeTypeOf('function'))
-    rejectFirst?.(new Error('first failed'))
+    await vi.waitFor(() => expect(gateway.request).toHaveBeenCalledWith('projects.list', {}))
+    armGenerationSwap = true
+    pending.resolve({ active_id: staleProject.id, projects: [staleProject] })
+    await refresh
 
-    await expect(first).rejects.toThrow('first failed')
-    await second
-    expect($sessionProjectAssignments.get()).toEqual({ s2: 'p_two' })
-  })
-
-  it('returns to the confirmed value when two overlapping moves both fail', async () => {
-    activeGateway.mockReturnValue({
-      connectionState: 'open',
-      request: vi.fn().mockRejectedValue(new Error('write failed'))
-    } as never)
-
-    const first = assignSessionToProject('same', 'p_one')
-    const second = assignSessionToProject('same', 'p_two')
-
-    await Promise.allSettled([first, second])
-    expect($sessionProjectAssignments.get()).toEqual({ existing: 'p_old' })
-  })
-
-  it('rejects a stale tree that finishes after the latest queued move', async () => {
-    let resolveFirst: ((value: unknown) => void) | undefined
-    let resolveSecond: ((value: unknown) => void) | undefined
-    let resolveStaleTree: ((value: unknown) => void) | undefined
-    let assignmentCalls = 0
-    let treeCalls = 0
-    const request = vi.fn((method: string) => {
-      if (method === 'projects.assign_session') {
-        assignmentCalls += 1
-        return new Promise(resolve => {
-          if (assignmentCalls === 1) {
-            resolveFirst = resolve
-          } else {
-            resolveSecond = resolve
-          }
-        })
-      }
-      if (method === 'projects.tree') {
-        treeCalls += 1
-
-        if (treeCalls === 1) {
-          return new Promise(resolve => {
-            resolveStaleTree = resolve
-          })
-        }
-
-        return Promise.resolve({
-          active_id: null,
-          projects: [],
-          scoped_session_ids: ['same'],
-          session_project_assignments: { same: 'p_two' }
-        })
-      }
-      return Promise.resolve({ projects: [] })
-    })
-    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
-
-    const first = assignSessionToProject('same', 'p_one')
-    const second = assignSessionToProject('same', 'p_two')
-    expect($sessionProjectAssignments.get().same).toBe('p_two')
-
-    const staleRefresh = refreshProjectTree()
-    await vi.waitFor(() => expect(resolveStaleTree).toBeTypeOf('function'))
-    await vi.waitFor(() => expect(resolveFirst).toBeTypeOf('function'))
-    resolveFirst?.({})
-    await first
-    await vi.waitFor(() => expect(resolveSecond).toBeTypeOf('function'))
-
-    resolveSecond?.({})
-    await second
-
-    resolveStaleTree?.({
-      active_id: null,
-      projects: [],
-      scoped_session_ids: ['same'],
-      session_project_assignments: { same: 'p_one' }
-    })
-    await staleRefresh
-    expect($sessionProjectAssignments.get().same).toBe('p_two')
-
-    activeGateway.mockReturnValue({
-      connectionState: 'open',
-      request: vi.fn().mockRejectedValue(new Error('later write failed'))
-    } as never)
-    await expect(assignSessionToProject('same', 'p_three')).rejects.toThrow('later write failed')
-    expect($sessionProjectAssignments.get().same).toBe('p_two')
-  })
-
-  it('keeps the optimistic result when reconciliation transiently fails', async () => {
-    const request = vi.fn(async (method: string) => {
-      if (method === 'projects.unassign_session') {
-        return {}
-      }
-      throw new Error('refresh unavailable')
-    })
-    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
-
-    await unassignSessionFromProject('s1')
-
-    expect($sessionProjectAssignments.get()).toEqual({ existing: 'p_old', s1: null })
-    expect($projectSessionAssignmentsAvailable.get()).toBe(true)
+    expect($projects.get()).toEqual([])
+    expect($activeProjectId.get()).toBeNull()
   })
 })

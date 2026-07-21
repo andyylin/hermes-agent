@@ -16,14 +16,21 @@ vi.mock('@/hermes', () => ({
   getProfiles: vi.fn(async () => ({ profiles: [] })),
   setApiRequestProfile: vi.fn()
 }))
-vi.mock('@/lib/query-client', () => ({ queryClient: { invalidateQueries: vi.fn() } }))
+vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
 vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
 
-const { $activeGatewayProfile, $profiles, ensureGatewayProfile, prewarmProfileBackend, refreshProfiles } =
-  await import('./profile')
+const {
+  $activeGatewayProfile,
+  $freshSessionRequest,
+  $profiles,
+  ensureGatewayProfile,
+  prewarmProfileBackend,
+  refreshProfiles,
+  selectProfile
+} = await import('./profile')
 
 const { $connection } = await import('./session')
-const { queryClient } = await import('@/lib/query-client')
+const { invalidateProfileScopedQueries } = await import('@/lib/query-client')
 const { getProfiles } = await import('@/hermes')
 
 const profile = (name: string, isDefault = false): ProfileInfo => ({
@@ -44,6 +51,16 @@ const localConn = (over: Partial<HermesConnection> = {}): HermesConnection =>
 
 const getConnection = vi.fn<(profile?: string | null) => Promise<HermesConnection>>()
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+
+  const promise = new Promise<T>(res => {
+    resolve = res
+  })
+
+  return { promise, resolve }
+}
+
 beforeEach(() => {
   getConnection.mockReset()
   ensureGatewayForProfile.mockClear()
@@ -53,7 +70,7 @@ beforeEach(() => {
   $connection.set(localConn())
   $profiles.set([])
   vi.stubGlobal('window', { hermesDesktop: { getConnection } })
-  vi.mocked(queryClient.invalidateQueries).mockClear()
+  vi.mocked(invalidateProfileScopedQueries).mockClear()
   resetStarmapGraph.mockClear()
 })
 
@@ -78,6 +95,35 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
     expect($connection.get()?.profile).toBe('vps-remote')
   })
 
+  it('publishes the active profile only after its connection descriptor is current', async () => {
+    getConnection.mockResolvedValue(remoteConn())
+    const seen: Array<null | string> = []
+
+    const unsubscribe = $activeGatewayProfile.subscribe(value => {
+      if (value === 'vps-remote') {
+        seen.push($connection.get()?.profile ?? null)
+      }
+    })
+
+    await ensureGatewayProfile('vps-remote')
+    unsubscribe()
+
+    expect(seen).toEqual(['vps-remote'])
+  })
+
+  it('defers a profile fresh-session request until connection activation finishes', async () => {
+    const connection = deferred<HermesConnection>()
+    getConnection.mockReturnValue(connection.promise)
+    const before = $freshSessionRequest.get()
+
+    selectProfile('vps-remote')
+    await Promise.resolve()
+
+    expect($freshSessionRequest.get()).toBe(before)
+    connection.resolve(remoteConn())
+    await vi.waitFor(() => expect($freshSessionRequest.get()).toBe(before + 1))
+  })
+
   it('resyncs $connection back to local when returning to the default profile', async () => {
     $activeGatewayProfile.set('vps-remote')
     $connection.set(remoteConn())
@@ -89,12 +135,14 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
     expect($connection.get()?.mode).toBe('local')
   })
 
-  it('leaves the prior connection intact when the descriptor fetch fails', async () => {
+  it('rolls back gateway activation and leaves the prior profile active when descriptor fetch fails', async () => {
     getConnection.mockRejectedValue(new Error('backend unreachable'))
 
-    await ensureGatewayProfile('vps-remote')
+    await expect(ensureGatewayProfile('vps-remote')).rejects.toThrow('backend unreachable')
 
-    // Best-effort: boot/reconnect resyncs later; we must not null it out here.
+    expect(ensureGatewayForProfile).toHaveBeenNthCalledWith(1, 'vps-remote')
+    expect(ensureGatewayForProfile).toHaveBeenNthCalledWith(2, 'default')
+    expect($activeGatewayProfile.get()).toBe('default')
     expect($connection.get()?.mode).toBe('local')
   })
 
@@ -114,7 +162,7 @@ describe('profile-scoped cache invalidation', () => {
   it('drops the memory graph cache when the active gateway profile changes', () => {
     $activeGatewayProfile.set('coder')
 
-    expect(queryClient.invalidateQueries).toHaveBeenCalled()
+    expect(invalidateProfileScopedQueries).toHaveBeenCalled()
     expect(resetStarmapGraph).toHaveBeenCalledTimes(1)
   })
 })

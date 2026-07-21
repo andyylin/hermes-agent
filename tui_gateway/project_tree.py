@@ -475,7 +475,6 @@ def build_tree(
     hydrate: bool = False,
     is_junk_root: Optional[Callable[[str], bool]] = None,
     is_junk_cwd: Optional[Callable[[str], bool]] = None,
-    session_project_overrides: Optional[dict[str, Optional[str]]] = None,
 ) -> dict:
     """Build the authoritative project tree.
 
@@ -489,8 +488,7 @@ def build_tree(
     workspaces even when their parent tree contains Hermes state. User-created
     projects are honored regardless.
 
-    Returns ``{"projects": [...], "scoped_session_ids": [...],
-    "session_project_assignments": {...}}``. When
+    Returns ``{"projects": [...], "scoped_session_ids": [...]}``. When
     ``hydrate`` is False (overview), lane ``sessions`` arrays are emptied but
     every count is preserved and each project carries up to ``preview_limit``
     ``previewSessions``. When True (drill-in), lanes carry full session rows.
@@ -499,20 +497,14 @@ def build_tree(
     _junk = is_junk_root or (lambda _root: False)
     _junk_cwd = is_junk_cwd or (lambda _cwd: False)
     folder_index = _FolderIndex(active_projects)
-    project_by_id = {p["id"]: p for p in active_projects}
-    overrides = session_project_overrides or {}
 
     by_project: dict[str, list[dict]] = {}
     unowned: list[dict] = []
     for session in sessions:
-        sid = str(session.get("id") or "")
-        has_override = bool(sid) and sid in overrides
-        owner = project_by_id.get(overrides.get(sid) or "") if has_override else None
-        if not has_override:
-            owner = _project_for_session(session, folder_index, resolve)
+        owner = _project_for_session(session, folder_index, resolve)
         if owner:
             by_project.setdefault(owner["id"], []).append(session)
-        elif not has_override:
+        else:
             unowned.append(session)
 
     scoped_ids: list[str] = []
@@ -645,11 +637,4 @@ def build_tree(
     # Explicit projects keep their user-chosen names untouched.
     _disambiguate_labels([p for p in result if p.get("isAuto")])
 
-    return {
-        "projects": result,
-        "scoped_session_ids": scoped_ids,
-        "session_project_assignments": {
-            sid: pid if pid in project_by_id else None
-            for sid, pid in overrides.items()
-        },
-    }
+    return {"projects": result, "scoped_session_ids": scoped_ids}

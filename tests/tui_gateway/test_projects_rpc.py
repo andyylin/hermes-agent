@@ -10,22 +10,6 @@ import pytest
 import tui_gateway.server as server
 
 
-@pytest.fixture(autouse=True)
-def _isolate_server_runtime_state():
-    """Keep the gateway's module caches bound to each test's HERMES_HOME."""
-    if server._db is not None:
-        server._db.close()
-    server._db = None
-    server._db_error = None
-    server._sessions.clear()
-    yield
-    if server._db is not None:
-        server._db.close()
-    server._db = None
-    server._db_error = None
-    server._sessions.clear()
-
-
 def _call(method, params=None):
     handler = server._methods[method]
     resp = handler(1, params or {})
@@ -44,8 +28,6 @@ def test_methods_registered():
         "projects.set_primary",
         "projects.archive",
         "projects.set_active",
-        "projects.assign_session",
-        "projects.unassign_session",
         "projects.for_cwd",
     ):
         assert m in server._methods
@@ -190,218 +172,53 @@ def test_add_folder_and_for_cwd(tmp_path):
     assert "branch" in resolved
 
 
-def test_assign_session_rpc_moves_session_between_projects(tmp_path):
-    target_dir = tmp_path / "target"
-    natural_dir = tmp_path / "natural"
-    target_dir.mkdir()
-    natural_dir.mkdir()
+def test_project_info_for_cwd_returns_status_payload(tmp_path):
+    # The status-surface resolver returns the owning project's identity for a
+    # nested cwd — the shape the TUI status label + /status read.
+    folder = tmp_path / "repo"
+    folder.mkdir()
+    created = _call("projects.create", {"name": "Repo", "folders": [str(folder)]})["project"]
 
-    target = _call("projects.create", {"name": "Target", "folders": [str(target_dir)]})["project"]
-    natural = _call("projects.create", {"name": "Natural", "folders": [str(natural_dir)]})["project"]
+    nested = folder / "src"
+    nested.mkdir()
 
-    db = server._get_db()
-    assert db is not None
-    db.create_session("assigned-session", "cli", cwd=str(natural_dir))
-    db.append_message("assigned-session", role="user", content="move me")
-
-    payload = _call("projects.assign_session", {"id": target["id"], "session_id": "assigned-session"})
-    assert payload == {
-        "cwd": str(target_dir),
-        "project_id": target["id"],
-        "session_id": "assigned-session",
+    assert server._project_info_for_cwd(str(nested)) == {
+        "id": created["id"],
+        "slug": "repo",
+        "name": "Repo",
+        "primary_path": str(folder),
     }
-    assert db.get_session("assigned-session")["cwd"] == str(target_dir)
 
-    tree = _call("projects.project_sessions", {"project_id": target["id"]})["project"]
-    assert tree["id"] == target["id"]
-    assert tree["sessionCount"] == 1
-    assert tree["repos"][0]["groups"][0]["sessions"][0]["id"] == "assigned-session"
 
-    natural_tree = _call("projects.project_sessions", {"project_id": natural["id"]})["project"]
-    assert natural_tree["sessionCount"] == 0
+def test_project_info_for_cwd_unowned_and_blank_are_none(tmp_path):
+    # A cwd outside every project — and an empty cwd — carry no project, so the
+    # status label falls back to the cwd leaf on every surface.
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    _call("projects.create", {"name": "Owned", "folders": [str(owned)]})
 
-    overview = _call("projects.tree", {"preview_limit": 3})
-    assert overview["session_project_assignments"] == {"assigned-session": target["id"]}
+    outside = tmp_path / "outside"
+    outside.mkdir()
 
-    detached = _call("projects.unassign_session", {"session_id": "assigned-session"})
-    assert detached == {"cwd": str(natural_dir), "project_id": None, "session_id": "assigned-session"}
-    assert db.get_session("assigned-session")["cwd"] == str(natural_dir)
-    assert _call("projects.tree", {"preview_limit": 3})["session_project_assignments"] == {
-        "assigned-session": None
+    assert server._project_info_for_cwd(str(outside)) is None
+    assert server._project_info_for_cwd("") is None
+
+
+def test_session_info_carries_project_for_owned_cwd(tmp_path):
+    # session.info threads the resolved project through so the desktop/TUI can
+    # name the workspace without a second round-trip.
+    folder = tmp_path / "proj"
+    folder.mkdir()
+    _call("projects.create", {"name": "Proj", "folders": [str(folder)]})
+
+    info = server._session_info(None, {"cwd": str(folder), "session_key": "s1"})
+    assert info["project"] == {
+        "id": info["project"]["id"],
+        "slug": "proj",
+        "name": "Proj",
+        "primary_path": str(folder),
     }
-    assert _call("projects.project_sessions", {"project_id": target["id"]})["project"]["sessionCount"] == 0
-    assert _call("projects.project_sessions", {"project_id": natural["id"]})["project"]["sessionCount"] == 0
-
-
-def test_assign_session_rpc_rejects_session_missing_from_active_profile(tmp_path):
-    target_dir = tmp_path / "target"
-    target_dir.mkdir()
-    target = _call("projects.create", {"name": "Target", "folders": [str(target_dir)]})["project"]
-
-    resp = server._methods["projects.assign_session"](1, {"id": target["id"], "session_id": "other-profile-session"})
-
-    assert resp["error"]["code"] == 5063
-    assert "active profile" in resp["error"]["message"]
-    assert _call("projects.tree", {"preview_limit": 3})["session_project_assignments"] == {}
-
-
-def test_assign_rolls_back_workspace_if_assignment_write_fails(tmp_path, monkeypatch):
-    from hermes_cli import projects_db as pdb
-
-    target_dir = tmp_path / "target"
-    old_dir = tmp_path / "old"
-    target_dir.mkdir()
-    old_dir.mkdir()
-    target = _call("projects.create", {"name": "Target", "folders": [str(target_dir)]})["project"]
-    db = server._get_db()
-    db.create_session("s-fail-assign", "cli", cwd=str(old_dir))
-    db.append_message("s-fail-assign", role="user", content="move me")
-
-    def fail_assign(*_args, **_kwargs):
-        raise OSError("boom")
-
-    monkeypatch.setattr(pdb, "assign_session", fail_assign)
-    response = server._methods["projects.assign_session"](
-        1, {"id": target["id"], "session_id": "s-fail-assign"}
-    )
-
-    assert response["error"]["message"] == "boom"
-    assert db.get_session("s-fail-assign")["cwd"] == str(old_dir)
-    assert _call("projects.tree")["session_project_assignments"] == {}
-
-
-def test_assign_failure_restores_a_null_workspace(tmp_path, monkeypatch):
-    from hermes_cli import projects_db as pdb
-
-    target_dir = tmp_path / "target"
-    target_dir.mkdir()
-    target = _call("projects.create", {"name": "Target", "folders": [str(target_dir)]})["project"]
-    db = server._get_db()
-    db.create_session("s-null-cwd", "cli")
-    db.append_message("s-null-cwd", role="user", content="move me")
-
-    def fail_assign(*_args, **_kwargs):
-        raise OSError("boom")
-
-    monkeypatch.setattr(pdb, "assign_session", fail_assign)
-    response = server._methods["projects.assign_session"](
-        1, {"id": target["id"], "session_id": "s-null-cwd"}
-    )
-
-    assert response["error"]["message"] == "boom"
-    assert db.get_session("s-null-cwd")["cwd"] is None
-    assert _call("projects.tree")["session_project_assignments"] == {}
-
-
-def test_live_emit_failure_does_not_undo_a_durable_assignment(tmp_path, monkeypatch):
-    target_dir = tmp_path / "target"
-    old_dir = tmp_path / "old"
-    target_dir.mkdir()
-    old_dir.mkdir()
-    target = _call("projects.create", {"name": "Target", "folders": [str(target_dir)]})["project"]
-    db = server._get_db()
-    db.create_session("s-live", "cli", cwd=str(old_dir))
-    db.append_message("s-live", role="user", content="move me")
-    server._sessions["runtime-live"] = {"agent": None, "session_key": "s-live", "cwd": str(old_dir)}
-
-    def fail_emit(*_args, **_kwargs):
-        raise OSError("emit boom")
-
-    monkeypatch.setattr(server, "_emit", fail_emit)
-    assigned = _call("projects.assign_session", {"id": target["id"], "session_id": "s-live"})
-
-    assert assigned["cwd"] == str(target_dir)
-    assert db.get_session("s-live")["cwd"] == str(target_dir)
-    assert server._sessions["runtime-live"]["cwd"] == str(target_dir)
-    assert _call("projects.tree")["session_project_assignments"] == {"s-live": target["id"]}
-
-
-def test_assign_does_not_write_assignment_if_state_move_fails(tmp_path, monkeypatch):
-    target_dir = tmp_path / "target"
-    old_dir = tmp_path / "old"
-    target_dir.mkdir()
-    old_dir.mkdir()
-    target = _call("projects.create", {"name": "Target", "folders": [str(target_dir)]})["project"]
-    db = server._get_db()
-    db.create_session("s-state-fail", "cli", cwd=str(old_dir))
-    db.append_message("s-state-fail", role="user", content="move me")
-
-    def fail_state(*_args, **_kwargs):
-        raise OSError("state boom")
-
-    monkeypatch.setattr(db, "replace_session_cwd", fail_state)
-    response = server._methods["projects.assign_session"](
-        1, {"id": target["id"], "session_id": "s-state-fail"}
-    )
-
-    assert response["error"]["message"] == "state boom"
-    assert db.get_session("s-state-fail")["cwd"] == str(old_dir)
-    assert _call("projects.tree")["session_project_assignments"] == {}
-
-
-def test_unassign_rolls_back_workspace_if_detach_write_fails(tmp_path, monkeypatch):
-    from hermes_cli import projects_db as pdb
-
-    target_dir = tmp_path / "target"
-    old_dir = tmp_path / "old"
-    target_dir.mkdir()
-    old_dir.mkdir()
-    target = _call("projects.create", {"name": "Target", "folders": [str(target_dir)]})["project"]
-    db = server._get_db()
-    db.create_session("s-fail-detach", "cli", cwd=str(old_dir))
-    db.append_message("s-fail-detach", role="user", content="move me")
-    _call("projects.assign_session", {"id": target["id"], "session_id": "s-fail-detach"})
-
-    def fail_exclude(*_args, **_kwargs):
-        raise OSError("boom")
-
-    monkeypatch.setattr(pdb, "exclude_session", fail_exclude)
-    response = server._methods["projects.unassign_session"](1, {"session_id": "s-fail-detach"})
-
-    assert response["error"]["message"] == "boom"
-    assert db.get_session("s-fail-detach")["cwd"] == str(target_dir)
-    assert _call("projects.tree")["session_project_assignments"] == {"s-fail-detach": target["id"]}
-
-
-def test_unassign_keeps_assignment_if_state_restore_fails(tmp_path, monkeypatch):
-    target_dir = tmp_path / "target"
-    old_dir = tmp_path / "old"
-    target_dir.mkdir()
-    old_dir.mkdir()
-    target = _call("projects.create", {"name": "Target", "folders": [str(target_dir)]})["project"]
-    db = server._get_db()
-    db.create_session("s-state-detach", "cli", cwd=str(old_dir))
-    db.append_message("s-state-detach", role="user", content="move me")
-    _call("projects.assign_session", {"id": target["id"], "session_id": "s-state-detach"})
-
-    def fail_state(*_args, **_kwargs):
-        raise OSError("state boom")
-
-    monkeypatch.setattr(db, "replace_session_cwd", fail_state)
-    response = server._methods["projects.unassign_session"](1, {"session_id": "s-state-detach"})
-
-    assert response["error"]["message"] == "state boom"
-    assert db.get_session("s-state-detach")["cwd"] == str(target_dir)
-    assert _call("projects.tree")["session_project_assignments"] == {"s-state-detach": target["id"]}
-
-
-def test_unassign_uses_home_when_saved_and_default_cwds_are_missing(tmp_path, monkeypatch):
-    target_dir = tmp_path / "target"
-    old_dir = tmp_path / "old"
-    target_dir.mkdir()
-    old_dir.mkdir()
-    target = _call("projects.create", {"name": "Target", "folders": [str(target_dir)]})["project"]
-    db = server._get_db()
-    db.create_session("s-fallback", "cli", cwd=str(old_dir))
-    db.append_message("s-fallback", role="user", content="move me")
-    _call("projects.assign_session", {"id": target["id"], "session_id": "s-fallback"})
-    old_dir.rmdir()
-    monkeypatch.setattr(server, "_default_session_cwd", lambda: str(tmp_path / "also-missing"))
-
-    detached = _call("projects.unassign_session", {"session_id": "s-fallback"})
-
-    assert detached["cwd"] == os.path.expanduser("~")
-    assert db.get_session("s-fallback")["cwd"] == os.path.expanduser("~")
+    assert info["project"]["name"] == "Proj"
 
 
 def test_update_and_archive(tmp_path):
