@@ -13,19 +13,13 @@ Upstream is the product. This branch carries only a small, explicit behavioral o
 
 ### Discord auto-threading in free-response channels
 
-- Reconstruction commits: `1c9fd9434`, `6ead40403`
+- Reconstruction commits: `1c9fd9434`, `6ead40403`, `91f11a279`
 - Historical sources: `494db21ec690d765e60828554a9fa8f9a18518f1`, `fdd9d09a7111cbb55a6817b80bcedde49bb903b8`
 - Contract: free-response controls mention gating; it does not disable automatic thread creation. `DISCORD_NO_THREAD_CHANNELS` remains the explicit inline-response override.
 
-### Codex OAuth speech-to-text
-
-- Reconstruction commit: `cb313c43c`
-- Historical source: `c857b505cf04edf7d6b4aba23957ac7ea4ecb5dc`
-- Contract: audio can use the existing OpenAI Codex OAuth identity without a separate OpenAI API key.
-
 ### LINE private collection gates
 
-- Reconstruction commit: `47d38e49c`
+- Reconstruction commits: `47d38e49c`, `86b106688`
 - Historical sources: `b067c99151b3038b3a5516ec553204fa62562257`, `0444a8c2f72be8a9d4b1d16737cdc7081dfe9ad3`
 - Contract: read-only groups archive without agent dispatch; archive groups retain collection while dispatching eligible messages; prefix-required groups dispatch only after stripping an approved prefix; group authorization uses the chat allowlist.
 
@@ -37,9 +31,15 @@ Upstream is the product. This branch carries only a small, explicit behavioral o
 
 ### Discord-friendly cron formatting
 
-- Reconstruction commit: `019524ab5`
+- Reconstruction commits: `019524ab5`, `24435d77a`
 - Historical source: `0e7c69634fff5cbbf3d0b1e0688231f3847e6179`
-- Contract: Discord cron reports use headings and bullets; simple Markdown tables are converted to grouped bullet rows. Non-Discord delivery keeps upstream formatting.
+- Contract: Discord cron reports use headings and bullets; simple Markdown tables are converted to grouped bullet rows. Formatting is selected independently per delivery target, so mixed Discord/email fan-out preserves each platform's native rendering.
+
+## Rejected after exact-SHA review
+
+### Codex OAuth speech-to-text
+
+Historical source `c857b505cf04edf7d6b4aba23957ac7ea4ecb5dc` was replayed and then reverted by `08347b85f`. The implementation forwarded a ChatGPT/Codex OAuth bearer to the public OpenAI audio endpoint and allowed a configurable base URL. That credential path was neither proven compatible nor acceptably constrained, so STT remains on supported local, Groq, direct OpenAI, Mistral, xAI, or ElevenLabs backends.
 
 ## Skipped because pinned upstream already provides the behavior
 
