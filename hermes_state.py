@@ -1006,16 +1006,12 @@ class SessionDB:
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
     _CHECKPOINT_EVERY_N_WRITES = 50
-    # Merge fragmented FTS5 segments every N successful writes. The message
-    # triggers append one segment per insert; left unmaintained these grow
-    # into tens of thousands of segments, so every MATCH must scan them all
-    # and every insert pays a growing automerge cost — which lengthens the
-    # write-lock hold time and starves competing writers (gateway + cron
-    # processes share one state.db), surfacing as "database is locked".
-    # 'optimize' is a no-op once the index is already merged, so an idle DB
-    # pays almost nothing; the cadence is deliberately coarse so the one-off
-    # merge cost is amortised far below the checkpoint cadence.
-    _OPTIMIZE_EVERY_N_WRITES = 1000
+    # Automatic FTS5 'optimize' on the write path is intentionally disabled
+    # (sentinel 0). Concurrent multi-connection workloads on large corpora
+    # made derived-index maintenance a corruption risk; segment merge is now
+    # explicit-only via :meth:`optimize_fts` / :meth:`vacuum`. Live message
+    # triggers still keep the base index current for MATCH queries.
+    _OPTIMIZE_EVERY_N_WRITES = 0
     # Session imports intentionally use a lower cap than exports: import holds
     # one BEGIN IMMEDIATE transaction, so bounded batches avoid starving live
     # gateway/CLI writers. The dashboard accepts one exported JSON/JSONL file
@@ -1326,11 +1322,15 @@ class SessionDB:
                         except Exception:
                             pass
                         raise
-                # Success — periodic best-effort checkpoint + FTS merge.
+                # Success — periodic best-effort checkpoint. Automatic FTS
+                # optimize is disabled (_OPTIMIZE_EVERY_N_WRITES == 0).
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
-                if self._write_count % self._OPTIMIZE_EVERY_N_WRITES == 0:
+                if (
+                    self._OPTIMIZE_EVERY_N_WRITES > 0
+                    and self._write_count % self._OPTIMIZE_EVERY_N_WRITES == 0
+                ):
                     self._try_optimize_fts()
                 return result
             except sqlite3.OperationalError as exc:
@@ -1438,9 +1438,10 @@ class SessionDB:
         cannot corrupt B-tree pages under I/O pressure.
 
         PASSIVE does not truncate the WAL file — it stays at its
-        high-water mark.  WAL truncation happens in :meth:`close`
-        (TRUNCATE) and pre-VACUUM checkpoints, which run infrequently
-        under controlled conditions.
+        high-water mark.  WAL truncation is reserved for pre-VACUUM
+        checkpoints under controlled single-owner conditions.  ``close()``
+        also uses PASSIVE: short-lived multi-connection SessionDB lifetimes
+        must never request exclusive TRUNCATE (residual of issue #45383).
 
         Previous TRUNCATE strategy caused B-tree corruption on large
         databases (65K+ pages) due to the exclusive-lock I/O pressure
@@ -1478,15 +1479,19 @@ class SessionDB:
     def close(self):
         """Close the database connection.
 
-        Attempts a TRUNCATE WAL checkpoint first so that exiting processes
-        help shrink the WAL file.
+        Uses a PASSIVE WAL checkpoint only. Concurrent multi-connection
+        ``TRUNCATE`` checkpoints on large state DBs are a known B-tree
+        corruption class (issue #45383); ``close()`` is on the hot path for
+        every short-lived SessionDB (gateway request handlers, CLI, concurrent
+        threads) so it must never request exclusive TRUNCATE. WAL truncation
+        is reserved for :meth:`vacuum` under controlled single-owner conditions.
         """
         with self._lock:
             if self._conn:
                 try:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                 except Exception as exc:
-                    logger.debug("WAL checkpoint (TRUNCATE) at close failed: %s", exc)
+                    logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
                 self._conn.close()
                 self._conn = None
 
@@ -5449,6 +5454,75 @@ class SessionDB:
         """Count CJK characters in text."""
         return sum(1 for ch in text if cls._is_cjk_codepoint(ord(ch)))
 
+    def _search_messages_like(
+        self,
+        raw_query: str,
+        *,
+        source_filter: List[str] = None,
+        exclude_sources: List[str] = None,
+        role_filter: List[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+        include_inactive: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Canonical-table substring search (LIKE) — never touches FTS.
+
+        Used for CJK (unicode61 tokenization is useless for ideographs), as the
+        fallback when base FTS MATCH fails with a derived-index fault, and for
+        multi-token OR queries. Operates only on ``messages`` / ``sessions`` so
+        a corrupt FTS shadow tree cannot fail or further stress the search path.
+        """
+        non_op_tokens = [
+            t for t in raw_query.split()
+            if t.upper() not in {"AND", "OR", "NOT"}
+        ] or [raw_query]
+        token_clauses = []
+        like_params: list = []
+        for tok in non_op_tokens:
+            esc = tok.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            token_clauses.append(
+                "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' "
+                "OR m.tool_calls LIKE ? ESCAPE '\\')"
+            )
+            like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
+        like_where = [f"({' OR '.join(token_clauses)})"]
+        if not include_inactive:
+            like_where.append("(m.active = 1 OR m.compacted = 1)")
+        if source_filter is not None:
+            like_where.append(
+                f"s.source IN ({','.join('?' for _ in source_filter)})"
+            )
+            like_params.extend(source_filter)
+        if exclude_sources is not None:
+            like_where.append(
+                f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})"
+            )
+            like_params.extend(exclude_sources)
+        if role_filter:
+            like_where.append(
+                f"m.role IN ({','.join('?' for _ in role_filter)})"
+            )
+            like_params.extend(role_filter)
+        like_sql = f"""
+            SELECT m.id, m.session_id, m.role,
+                   substr(m.content,
+                          max(1, instr(m.content, ?) - 40),
+                          120) AS snippet,
+                   m.content, m.timestamp, m.tool_name,
+                   s.source, s.model, s.started_at AS session_started
+            FROM messages m
+            JOIN sessions s ON s.id = m.session_id
+            WHERE {' AND '.join(like_where)}
+            ORDER BY m.timestamp DESC
+            LIMIT ? OFFSET ?
+        """
+        like_params.extend([limit, offset])
+        # instr() for snippet uses first search token
+        like_params = [non_op_tokens[0]] + like_params
+        with self._lock:
+            like_cursor = self._conn.execute(like_sql, like_params)
+            return [dict(row) for row in like_cursor.fetchall()]
+
     def search_messages(
         self,
         query: str,
@@ -5477,9 +5551,9 @@ class SessionDB:
           - ``"newest"``: order by message timestamp DESC, then by rank.
           - ``"oldest"``: order by message timestamp ASC, then by rank.
 
-        The short-CJK LIKE fallback already orders by timestamp DESC and
-        ignores ``sort``. The trigram CJK path honours ``sort`` like the main
-        FTS5 path.
+        CJK queries always use the canonical LIKE path (ordered by timestamp
+        DESC) and ignore ``sort``. ASCII queries use base FTS5 ranking unless
+        MATCH fails, in which case they fall back to the same LIKE path.
 
         Rewound (``active=0``, ``compacted=0``) rows are excluded by default —
         the user took those back. Compaction-archived rows (``active=0``,
@@ -5508,8 +5582,8 @@ class SessionDB:
         else:
             sort_norm = None
 
-        # ORDER BY shared across the main FTS5 path and trigram CJK path.
-        # With sort set, timestamp is primary and rank is the tiebreaker.
+        # ORDER BY for the main FTS5 (ASCII) path. With sort set, timestamp is
+        # primary and rank is the tiebreaker.
         if sort_norm == "newest":
             order_by_sql = "ORDER BY m.timestamp DESC, rank"
         elif sort_norm == "oldest":
@@ -5564,134 +5638,25 @@ class SessionDB:
             LIMIT ? OFFSET ?
         """
 
-        # CJK queries bypass the unicode61 FTS5 table.  The default tokenizer
-        # splits CJK characters into individual tokens, so "大别山项目" becomes
-        # "大 AND 别 AND 山 AND 项 AND 目" — producing false positives and
-        # missing exact phrase matches.
-        #
-        # For queries with 3+ CJK characters, we use the trigram FTS5 table
-        # (indexed substring matching with ranking and snippets).  For shorter
-        # CJK queries (1-2 chars), trigram can't match (it needs ≥9 UTF-8
-        # bytes = 3 CJK chars), so we fall back to LIKE.
+        # CJK queries never use unicode61 FTS5 MATCH: the default tokenizer
+        # splits ideographs into single-char tokens. Trigram FTS is retired
+        # after repeated production-scale malformation, so CJK always searches
+        # the canonical messages table via LIKE.
         is_cjk = self._contains_cjk(query)
         if is_cjk:
+            # CJK: unicode61 FTS splits ideographs into single-char tokens, so
+            # substring search always uses the canonical LIKE path (trigram FTS
+            # is retired). Derived-index MATCH is never required for correctness.
             raw_query = query.strip('"').strip()
-            cjk_count = self._count_cjk(raw_query)
-
-            # Per-token CJK length check (#20494): trigram needs >=3 CJK chars
-            # per token. A query like "广西 OR 桂林 OR 漓江" has cjk_count=6
-            # (>=3) but each individual token is only 2 chars — trigram returns 0.
-            # Route to LIKE when any non-operator CJK token is <3 CJK chars.
-            _tokens_for_check = [
-                t for t in raw_query.split()
-                if t.upper() not in {"AND", "OR", "NOT"} and self._contains_cjk(t)
-            ]
-            _any_short_cjk = any(
-                self._count_cjk(t) < 3 for t in _tokens_for_check
+            matches = self._search_messages_like(
+                raw_query,
+                source_filter=source_filter,
+                exclude_sources=exclude_sources,
+                role_filter=role_filter,
+                limit=limit,
+                offset=offset,
+                include_inactive=include_inactive,
             )
-
-            _trigram_succeeded = False
-            if cjk_count >= 3 and not _any_short_cjk and self._trigram_available:
-                # Trigram FTS5 path — quote each non-operator token to handle
-                # FTS5 special chars (%, *, etc.) while preserving boolean
-                # operators (AND, OR, NOT) for multi-term queries.
-                tokens = raw_query.split()
-                parts = []
-                for tok in tokens:
-                    if tok.upper() in {"AND", "OR", "NOT"}:
-                        parts.append(tok)
-                    else:
-                        parts.append('"' + tok.replace('"', '""') + '"')
-                trigram_query = " ".join(parts)
-                tri_where = ["messages_fts_trigram MATCH ?"]
-                tri_params: list = [trigram_query]
-                if not include_inactive:
-                    tri_where.append("(m.active = 1 OR m.compacted = 1)")
-                if source_filter is not None:
-                    tri_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
-                    tri_params.extend(source_filter)
-                if exclude_sources is not None:
-                    tri_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
-                    tri_params.extend(exclude_sources)
-                if role_filter:
-                    tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
-                    tri_params.extend(role_filter)
-                tri_sql = f"""
-                    SELECT
-                        m.id,
-                        m.session_id,
-                        m.role,
-                        snippet(messages_fts_trigram, 0, '>>>', '<<<', '...', 40) AS snippet,
-                        m.content,
-                        m.timestamp,
-                        m.tool_name,
-                        s.source,
-                        s.model,
-                        s.started_at AS session_started
-                    FROM messages_fts_trigram
-                    JOIN messages m ON m.id = messages_fts_trigram.rowid
-                    JOIN sessions s ON s.id = m.session_id
-                    WHERE {' AND '.join(tri_where)}
-                    {order_by_sql}
-                    LIMIT ? OFFSET ?
-                """
-                tri_params.extend([limit, offset])
-                with self._lock:
-                    try:
-                        tri_cursor = self._conn.execute(tri_sql, tri_params)
-                    except sqlite3.OperationalError:
-                        # Trigram query failed at runtime — fall through to LIKE.
-                        pass
-                    else:
-                        matches = [dict(row) for row in tri_cursor.fetchall()]
-                        _trigram_succeeded = True
-            if not _trigram_succeeded:
-                # Short / mixed CJK query, trigram unavailable, or trigram
-                # <3 CJK chars. Fall back to LIKE substring search.
-                # For multi-token OR queries (e.g. "广西 OR 桂林 OR 漓江"),
-                # build one LIKE condition per non-operator token so each term
-                # is matched independently (#20494).
-                non_op_tokens = [
-                    t for t in raw_query.split()
-                    if t.upper() not in {"AND", "OR", "NOT"}
-                ] or [raw_query]
-                token_clauses = []
-                like_params: list = []
-                for tok in non_op_tokens:
-                    esc = tok.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                    token_clauses.append(
-                        "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')"
-                    )
-                    like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
-                like_where = [f"({' OR '.join(token_clauses)})"]
-                if source_filter is not None:
-                    like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
-                    like_params.extend(source_filter)
-                if exclude_sources is not None:
-                    like_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
-                    like_params.extend(exclude_sources)
-                if role_filter:
-                    like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
-                    like_params.extend(role_filter)
-                like_sql = f"""
-                    SELECT m.id, m.session_id, m.role,
-                           substr(m.content,
-                                  max(1, instr(m.content, ?) - 40),
-                                  120) AS snippet,
-                           m.content, m.timestamp, m.tool_name,
-                           s.source, s.model, s.started_at AS session_started
-                    FROM messages m
-                    JOIN sessions s ON s.id = m.session_id
-                    WHERE {' AND '.join(like_where)}
-                    ORDER BY m.timestamp DESC
-                    LIMIT ? OFFSET ?
-                """
-                like_params.extend([limit, offset])
-                # instr() for snippet uses first search token
-                like_params = [non_op_tokens[0]] + like_params
-                with self._lock:
-                    like_cursor = self._conn.execute(like_sql, like_params)
-                    matches = [dict(row) for row in like_cursor.fetchall()]
         else:
             with self._lock:
                 try:
@@ -5699,8 +5664,30 @@ class SessionDB:
                 except sqlite3.OperationalError:
                     # FTS5 query syntax error despite sanitization — return empty
                     return []
+                except sqlite3.DatabaseError as exc:
+                    # Never fail the user-facing search path on a derived-index
+                    # fault. Canonical messages remain authoritative; fall back
+                    # to LIKE. Corruption is still visible via PRAGMA checks /
+                    # write-path rebuild — we do not swallow it into silence.
+                    logger.warning(
+                        "messages_fts MATCH failed (%s); falling back to "
+                        "canonical LIKE search for %r",
+                        exc,
+                        query[:80],
+                    )
+                    matches = None
                 else:
                     matches = [dict(row) for row in cursor.fetchall()]
+            if matches is None:
+                matches = self._search_messages_like(
+                    query,
+                    source_filter=source_filter,
+                    exclude_sources=exclude_sources,
+                    role_filter=role_filter,
+                    limit=limit,
+                    offset=offset,
+                    include_inactive=include_inactive,
+                )
 
         # Add surrounding context (1 message before + after each match).
         # Done outside the lock so we don't hold it across N sequential queries.

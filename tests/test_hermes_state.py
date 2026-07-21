@@ -5015,10 +5015,26 @@ class TestOptimizeFts:
         # Search still works after repeated optimization.
         assert len(db.search_messages("repeat")) == 1
 
-    def test_write_path_optimizes_fts_on_cadence(self, db, monkeypatch):
-        """Writes periodically merge FTS segments so they never accumulate
-        into the tens-of-thousands that lengthen the write-lock hold and
-        starve competing writers ("database is locked")."""
+    def test_write_path_auto_optimize_disabled_by_default(self, db, monkeypatch):
+        """Automatic FTS optimize on the write path is retired (explicit only)."""
+        assert db._OPTIMIZE_EVERY_N_WRITES == 0
+        calls = {"n": 0}
+
+        def _counting_optimize():
+            calls["n"] += 1
+            return 0
+
+        monkeypatch.setattr(db, "optimize_fts", _counting_optimize)
+        db.create_session(session_id="s1", source="cli")
+        for i in range(20):
+            db.append_message(session_id="s1", role="user", content=f"needle {i}")
+        assert calls["n"] == 0
+        assert len(db.search_messages("needle")) == 20
+
+    def test_write_path_optimizes_fts_when_cadence_explicitly_enabled(
+        self, db, monkeypatch
+    ):
+        """Opt-in cadence still merges FTS segments without breaking search."""
         db._OPTIMIZE_EVERY_N_WRITES = 5
         calls = {"n": 0}
         real_optimize = db.optimize_fts
@@ -5033,7 +5049,6 @@ class TestOptimizeFts:
         for i in range(9):
             db.append_message(session_id="s1", role="user", content=f"needle {i}")
         assert calls["n"] == 2
-        # The auto-merge is layout-only: search is unaffected.
         assert len(db.search_messages("needle")) == 9
 
     def test_write_path_optimize_failure_never_breaks_write(self, db, monkeypatch):
