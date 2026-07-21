@@ -453,6 +453,30 @@ async def test_discord_auto_thread_enabled_by_default(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_discord_free_response_channel_still_auto_threads(adapter, monkeypatch):
+    """Free-response controls mention gating, not thread creation."""
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "123")
+
+    fake_thread = FakeThread(channel_id=999, name="auto-thread")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=123),
+        content="allowed without mention",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "999"
+
+
+@pytest.mark.asyncio
 async def test_discord_reply_message_skips_auto_thread(adapter, monkeypatch):
     """Quote-replies should stay in-channel instead of trying to create a thread."""
     monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
