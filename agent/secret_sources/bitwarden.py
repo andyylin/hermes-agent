@@ -62,6 +62,40 @@ from agent.secret_sources.base import ErrorKind, SecretSource
 logger = logging.getLogger(__name__)
 
 
+def _source_environ():
+    """Return the registry's isolated fetch environment when provided."""
+    try:
+        from agent.secret_sources.registry import current_source_environ
+        scoped = current_source_environ()
+    except ImportError:
+        scoped = None
+    return scoped if scoped is not None else os.environ
+
+
+_BWS_ENV_ALLOWLIST = (
+    "PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "SystemRoot",
+    "TMPDIR", "TMP", "TEMP", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+)
+
+
+def _bws_child_env(access_token: str, server_url: str = "") -> Dict[str, str]:
+    """Build a least-privilege environment for the Bitwarden CLI child."""
+    source = _source_environ()
+    env = {
+        key: source[key]
+        for key in _BWS_ENV_ALLOWLIST
+        if source.get(key) is not None
+    }
+    env["BWS_ACCESS_TOKEN"] = access_token
+    if server_url:
+        env["BWS_SERVER_URL"] = server_url
+    env["NO_COLOR"] = "1"
+    return env
+
+
 # ---------------------------------------------------------------------------
 # Configuration constants
 # ---------------------------------------------------------------------------
@@ -663,17 +697,7 @@ def _run_bws_list(
     bws: Path, access_token: str, project_id: str, server_url: str = ""
 ) -> Tuple[Dict[str, str], List[str]]:
     cmd = [str(bws), "secret", "list", project_id, "--output", "json"]
-    env = os.environ.copy()
-    env["BWS_ACCESS_TOKEN"] = access_token
-    # Make sure we're not echoing telemetry / colour codes into json.
-    env.setdefault("NO_COLOR", "1")
-    # Region / self-hosted support.  bws defaults to https://vault.bitwarden.com
-    # (US Cloud); EU Cloud users need https://vault.bitwarden.eu, and
-    # self-hosted users need their own URL.  When unset, fall back to whatever
-    # BWS_SERVER_URL the caller already had in their shell env (preserved by
-    # the copy above) so manual overrides keep working too.
-    if server_url:
-        env["BWS_SERVER_URL"] = server_url
+    env = _bws_child_env(access_token, server_url)
 
     try:
         proc = subprocess.run(  # noqa: S603 — bws path is trusted
