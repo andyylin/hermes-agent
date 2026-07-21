@@ -158,9 +158,10 @@ def _set_matrix_env_default(name: str, value: object) -> None:
     except ImportError:
         scope = None
     if isinstance(scope, dict):
-        scope.setdefault(name, str(value))
-    else:
-        os.environ.setdefault(name, str(value))
+        if not scope.get(name):
+            scope[name] = str(value)
+    elif not os.getenv(name):
+        os.environ[name] = str(value)
 
 _MATRIX_BANG_COMMAND_RE = re.compile(
     r"^!([A-Za-z][A-Za-z0-9_-]*)(?=$|\s)(.*)$",

@@ -55,9 +55,10 @@ def _set_discord_env_default(name: str, value: object) -> None:
     except ImportError:
         scope = None
     if isinstance(scope, dict):
-        scope.setdefault(name, str(value))
-    else:
-        os.environ.setdefault(name, str(value))
+        if not scope.get(name):
+            scope[name] = str(value)
+    elif not os.getenv(name):
+        os.environ[name] = str(value)
 
 
 def _discord_config_env(config, key: str, env_name: str, default: str = "") -> str:
@@ -4418,9 +4419,9 @@ class DiscordAdapter(BasePlatformAdapter):
         allowed_roles = getattr(self, "_allowed_role_ids", set()) or set()
         if allowed_users or allowed_roles:
             return
-        if _discord_config_env(self.config, "allowed_channels", "DISCORD_ALLOWED_CHANNELS", "").strip():
+        if _discord_config_env(getattr(self, "config", None), "allowed_channels", "DISCORD_ALLOWED_CHANNELS", "").strip():
             return
-        if _discord_config_env(self.config, "allow_all_users", "DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+        if _discord_config_env(getattr(self, "config", None), "allow_all_users", "DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
             return
         if _discord_env("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
             return
@@ -4502,7 +4503,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
             allowed_raw = _discord_config_env(
-                self.config, "allowed_channels", "DISCORD_ALLOWED_CHANNELS", ""
+                getattr(self, "config", None), "allowed_channels", "DISCORD_ALLOWED_CHANNELS", ""
             )
             if allowed_raw:
                 allowed = {c.strip() for c in allowed_raw.split(",") if c.strip()}
@@ -4521,7 +4522,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # is on the allowlist, an explicit DISCORD_IGNORED_CHANNELS
             # entry on the thread or its parent rejects the interaction.
             ignored_raw = _discord_config_env(
-                self.config, "ignored_channels", "DISCORD_IGNORED_CHANNELS", ""
+                getattr(self, "config", None), "ignored_channels", "DISCORD_IGNORED_CHANNELS", ""
             )
             if ignored_raw and channel_ids:
                 ignored = {c.strip() for c in ignored_raw.split(",") if c.strip()}
@@ -7310,7 +7311,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Check allowed channels - if set, only respond in these channels
             allowed_channels_raw = _discord_config_env(
-                self.config, "allowed_channels", "DISCORD_ALLOWED_CHANNELS", ""
+                getattr(self, "config", None), "allowed_channels", "DISCORD_ALLOWED_CHANNELS", ""
             )
             if allowed_channels_raw:
                 allowed_channels = {ch.strip() for ch in allowed_channels_raw.split(",") if ch.strip()}
@@ -7320,7 +7321,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Check ignored channels - never respond even when mentioned
             ignored_channels_raw = _discord_config_env(
-                self.config, "ignored_channels", "DISCORD_IGNORED_CHANNELS", ""
+                getattr(self, "config", None), "ignored_channels", "DISCORD_IGNORED_CHANNELS", ""
             )
             ignored_channels = {ch.strip() for ch in ignored_channels_raw.split(",") if ch.strip()}
             if "*" in ignored_channels or (channel_keys & ignored_channels):
@@ -7363,12 +7364,12 @@ class DiscordAdapter(BasePlatformAdapter):
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = _discord_config_env(
-                self.config, "no_thread_channels", "DISCORD_NO_THREAD_CHANNELS", ""
+                getattr(self, "config", None), "no_thread_channels", "DISCORD_NO_THREAD_CHANNELS", ""
             )
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
             skip_thread = bool(channel_keys & no_thread_channels)
             auto_thread = _discord_config_env(
-                self.config, "auto_thread", "DISCORD_AUTO_THREAD", "true"
+                getattr(self, "config", None), "auto_thread", "DISCORD_AUTO_THREAD", "true"
             ).lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
