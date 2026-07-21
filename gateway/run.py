@@ -9556,10 +9556,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         from gateway.pairing import PairingStore
 
-        store = self.pairing_stores.get(profile_name)
+        stores = getattr(self, "pairing_stores", None)
+        if stores is None:
+            stores = {}
+            self.pairing_stores = stores
+        store = stores.get(profile_name)
         if store is None:
             store = PairingStore(profile=profile_name)
-            self.pairing_stores[profile_name] = store
+            stores[profile_name] = store
         adapter._pairing_store = store
         adapter._busy_text_mode = self._busy_text_mode
 
