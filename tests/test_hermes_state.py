@@ -4821,10 +4821,14 @@ class TestVacuum:
 
 class TestOptimizeFts:
     def test_optimize_returns_index_count(self, db):
-        """A fresh DB has both FTS indexes; optimize merges both."""
+        """Optimize reports the number of enabled FTS indexes it merges."""
         db.create_session(session_id="s1", source="cli")
         db.append_message(session_id="s1", role="user", content="hello world")
-        assert db.optimize_fts() == 2
+        expected = sum(
+            db._fts_table_exists(table) is True
+            for table in ("messages_fts", "messages_fts_trigram")
+        )
+        assert db.optimize_fts() == expected
 
     def test_optimize_preserves_search_and_snippet(self, db):
         """Optimize is layout-only: MATCH results + snippets are unchanged."""
@@ -4837,7 +4841,11 @@ class TestOptimizeFts:
             )
         before = db.search_messages("needle")
         n = db.optimize_fts()
-        assert n == 2
+        expected = sum(
+            db._fts_table_exists(table) is True
+            for table in ("messages_fts", "messages_fts_trigram")
+        )
+        assert n == expected
         after = db.search_messages("needle")
         assert len(after) == len(before)
         assert len(after) > 0
@@ -4871,8 +4879,12 @@ class TestOptimizeFts:
         """Running optimize twice is safe (second pass is a no-op merge)."""
         db.create_session(session_id="s1", source="cli")
         db.append_message(session_id="s1", role="user", content="repeat me")
-        assert db.optimize_fts() == 2
-        assert db.optimize_fts() == 2
+        expected = sum(
+            db._fts_table_exists(table) is True
+            for table in ("messages_fts", "messages_fts_trigram")
+        )
+        assert db.optimize_fts() == expected
+        assert db.optimize_fts() == expected
         # Search still works after repeated optimization.
         assert len(db.search_messages("repeat")) == 1
 
