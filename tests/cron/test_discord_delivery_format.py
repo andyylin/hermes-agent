@@ -70,5 +70,6 @@ def test_mixed_target_fanout_formats_each_platform_independently():
     }
     assert sent_by_platform["discord"].startswith("# Cron Alert: Weekly report")
     assert "| Item | Status |" not in sent_by_platform["discord"]
-    assert sent_by_platform["email"].startswith("Cronjob Response: Weekly report")
+    assert sent_by_platform["email"].startswith("## Cron Alert: Weekly report")
     assert "| Item | Status |" in sent_by_platform["email"]
+    assert "HERMES-NOTIFY:cron:weekly-report" in sent_by_platform["email"]

@@ -184,6 +184,20 @@ def get_cron_definitions_file() -> Path:
     return definitions_path_for_jobs_file(_current_cron_store().jobs_file)
 
 
+def export_definitions_file(
+    jobs: Optional[List[Dict[str, Any]]] = None,
+    output_path: Optional[Path] = None,
+) -> bool:
+    """Export deterministic cron definitions and return True if file changed."""
+    from cron.definitions_export import export_cron_definitions
+
+    ensure_dirs()
+    if jobs is None:
+        jobs = load_jobs()
+    path = output_path or get_cron_definitions_file()
+    return export_cron_definitions(jobs, path)
+
+
 def _current_ticker_file(path: Path, import_path: Path, filename: str) -> Path:
     """Resolve a ticker marker without breaking patched compatibility constants."""
     if path != import_path:

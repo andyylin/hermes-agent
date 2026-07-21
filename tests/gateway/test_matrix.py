@@ -13,6 +13,15 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageType
 
 
+@pytest.fixture(autouse=True)
+def _isolate_matrix_environment(monkeypatch, tmp_path):
+    """Keep host Matrix credentials and policy out of adapter unit tests."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    for key in list(os.environ):
+        if key.startswith("MATRIX_") or key.startswith("HERMES_MATRIX_"):
+            monkeypatch.delenv(key, raising=False)
+
+
 def _make_fake_mautrix():
     """Create a lightweight set of fake ``mautrix`` modules.
 
