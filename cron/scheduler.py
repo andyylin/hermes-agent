@@ -4041,6 +4041,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    _scope_token = None
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
@@ -4105,8 +4106,6 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
             raise
-        finally:
-            reset_secret_scope(_scope_token)
 
         # Everything from here through delivery runs with the agent still live
         # (deferred teardown). Wrap it ALL in a try/finally so that if any step
@@ -4183,6 +4182,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             mark_job_run(job["id"], False, str(e))
         finish_execution(execution_id, success=False, error=str(e))
         return False
+    finally:
+        if _scope_token is not None:
+            reset_secret_scope(_scope_token)
 
 
 def _notify_provider_jobs_changed() -> None:

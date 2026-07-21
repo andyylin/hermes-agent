@@ -532,6 +532,12 @@ def fetch_bitwarden_secrets(
     if not project_id:
         raise RuntimeError("Bitwarden project_id is empty")
 
+    # Encrypted mode is exclusive even when the network fetch fails. Remove a
+    # legacy plaintext cache before any read/fetch path so an auth or outage
+    # cannot leave raw credentials parked on disk indefinitely.
+    if encrypted_cache_enabled:
+        _DISK_CACHE.clear(home_path)
+
     cache_key = (_token_fingerprint(access_token), project_id, server_url or "")
     if use_cache and cache_ttl_seconds > 0:
         cached = _CACHE.get(cache_key)

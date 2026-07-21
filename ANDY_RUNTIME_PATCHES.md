@@ -206,6 +206,13 @@ cross-port seams. The candidate now includes explicit regression coverage for:
 The same review identified untrusted raw HTML as an unproved email boundary;
 the final candidate sanitizes that path and includes adversarial coverage.
 
+A second exact-SHA review then exercised sibling production paths rather than
+only the new helpers. The final candidate also routes group/bot/pairing auth
+through the profile resolver, keeps the cron profile scope active through
+standalone delivery, scopes live EmailAdapter configuration and dispatch
+policy, and removes legacy plaintext Bitwarden cache before a fetch attempt so
+network/auth failures cannot leave raw credentials behind.
+
 Before promotion, the exact final SHA must satisfy all of the following:
 
 1. Candidate worktree clean; no active merge/cherry-pick and no conflict markers.

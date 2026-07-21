@@ -44,7 +44,6 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
 )
 from gateway.config import Platform, PlatformConfig
-from utils import env_int, env_bool
 
 logger = logging.getLogger(__name__)
 # Automated sender patterns — emails from these are silently ignored
@@ -159,16 +158,39 @@ def _is_automated_sender(address: str, headers: dict) -> bool:
             return True
     return False
     
+def _email_env(name: str, default: str = "") -> str:
+    """Read EMAIL/GATEWAY settings from the active profile secret scope."""
+    try:
+        from agent.secret_scope import get_secret
+    except ImportError:
+        return (os.getenv(name) or default).strip()
+
+    value = get_secret(name, default)
+    return (str(value) if value is not None else default).strip()
+
+
+def _email_env_int(name: str, default: int) -> int:
+    try:
+        return int(_email_env(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _email_env_bool(name: str, default: bool = False) -> bool:
+    raw = _email_env(name, "true" if default else "false").lower()
+    return raw in {"true", "1", "yes", "on"}
+
+
 def check_email_requirements() -> bool:
     """Check if email platform settings are available and non-blank.
 
     Treats blank/whitespace-only values as missing so an abandoned setup that
     left empty ``EMAIL_*`` keys in ``.env`` does not enable the platform (#40715).
     """
-    addr = os.getenv("EMAIL_ADDRESS", "").strip()
-    pwd = os.getenv("EMAIL_PASSWORD", "").strip()
-    imap = os.getenv("EMAIL_IMAP_HOST", "").strip()
-    smtp = os.getenv("EMAIL_SMTP_HOST", "").strip()
+    addr = _email_env("EMAIL_ADDRESS")
+    pwd = _email_env("EMAIL_PASSWORD")
+    imap = _email_env("EMAIL_IMAP_HOST")
+    smtp = _email_env("EMAIL_SMTP_HOST")
     return all([addr, pwd, imap, smtp])
 
 
@@ -474,8 +496,9 @@ class EmailAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.EMAIL)
 
-        # Resolve connection settings from the env vars first, then fall back to
-        # PlatformConfig.extra (address/imap_host/smtp_host) — the canonical dict
+        # Resolve connection settings from profile-owned PlatformConfig first,
+        # then the active profile secret scope — never process-global env under
+        # multiplex. PlatformConfig.extra is the canonical dict
         # gateway.config populates and that the "connected" check, the
         # send-helper, and `hermes config show` already read. Without the
         # fallback a config.yaml-only setup left these empty. Host/address values
@@ -483,13 +506,13 @@ class EmailAdapter(BasePlatformAdapter):
         # misleading ``[Errno 8] nodename nor servname`` (an unresolvable name)
         # instead of an obvious "host not set" error.
         extra = config.extra or {}
-        self._address = (os.getenv("EMAIL_ADDRESS", "") or extra.get("address", "")).strip()
-        self._password = os.getenv("EMAIL_PASSWORD", "")
-        self._imap_host = (os.getenv("EMAIL_IMAP_HOST", "") or extra.get("imap_host", "")).strip()
-        self._imap_port = env_int("EMAIL_IMAP_PORT", 993)
-        self._smtp_host = (os.getenv("EMAIL_SMTP_HOST", "") or extra.get("smtp_host", "")).strip()
-        self._smtp_port = env_int("EMAIL_SMTP_PORT", 587)
-        self._poll_interval = env_int("EMAIL_POLL_INTERVAL", 15)
+        self._address = (extra.get("address", "") or _email_env("EMAIL_ADDRESS")).strip()
+        self._password = _email_env("EMAIL_PASSWORD")
+        self._imap_host = (extra.get("imap_host", "") or _email_env("EMAIL_IMAP_HOST")).strip()
+        self._imap_port = int(extra.get("imap_port") or _email_env_int("EMAIL_IMAP_PORT", 993))
+        self._smtp_host = (extra.get("smtp_host", "") or _email_env("EMAIL_SMTP_HOST")).strip()
+        self._smtp_port = int(extra.get("smtp_port") or _email_env_int("EMAIL_SMTP_PORT", 587))
+        self._poll_interval = int(extra.get("poll_interval") or _email_env_int("EMAIL_POLL_INTERVAL", 15))
 
         # Skip attachments — configured via config.yaml:
         #   platforms:
@@ -513,7 +536,7 @@ class EmailAdapter(BasePlatformAdapter):
         # gate below is skipped.
         if "require_authenticated_sender" in extra:
             self._require_authenticated_sender = bool(extra["require_authenticated_sender"])
-        elif env_bool("EMAIL_TRUST_FROM_HEADER", False):
+        elif _email_env_bool("EMAIL_TRUST_FROM_HEADER", False):
             self._require_authenticated_sender = False
         else:
             self._require_authenticated_sender = True
@@ -522,7 +545,7 @@ class EmailAdapter(BasePlatformAdapter):
         # own receiving server (defends against an injected header that sorts
         # first). Defaults to the From-domain of the agent's own address.
         self._authserv_id = (
-            extra.get("authserv_id", "") or os.getenv("EMAIL_AUTHSERV_ID", "")
+            extra.get("authserv_id", "") or _email_env("EMAIL_AUTHSERV_ID")
         ).strip().lower()
 
         # Track message IDs we've already processed to avoid duplicates
@@ -805,8 +828,8 @@ class EmailAdapter(BasePlatformAdapter):
         """
         truthy = {"true", "1", "yes"}
         return (
-            os.getenv("EMAIL_ALLOW_ALL_USERS", "").strip().lower() in truthy
-            or os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in truthy
+            _email_env("EMAIL_ALLOW_ALL_USERS").lower() in truthy
+            or _email_env("GATEWAY_ALLOW_ALL_USERS").lower() in truthy
         )
 
     @staticmethod
@@ -820,8 +843,8 @@ class EmailAdapter(BasePlatformAdapter):
         and the authentication gate is unnecessary.
         """
         return bool(
-            os.getenv("EMAIL_ALLOWED_USERS", "").strip()
-            or os.getenv("GATEWAY_ALLOWED_USERS", "").strip()
+            _email_env("EMAIL_ALLOWED_USERS")
+            or _email_env("GATEWAY_ALLOWED_USERS")
         )
 
     async def _dispatch_message(self, msg_data: Dict[str, Any]) -> None:
@@ -842,10 +865,10 @@ class EmailAdapter(BasePlatformAdapter):
         # that the gateway will never authorize.  Without this early guard,
         # a race between dispatch and authorization can result in the adapter
         # sending a reply even though the handler returned None.
-        allowed_raw = os.getenv("EMAIL_ALLOWED_USERS", "").strip()
+        allowed_raw = _email_env("EMAIL_ALLOWED_USERS")
         if not allowed_raw:
-            if os.getenv("EMAIL_ALLOW_ALL_USERS", "").strip().lower() not in {"true", "1", "yes"} and (
-                os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() not in {"true", "1", "yes"}
+            if _email_env("EMAIL_ALLOW_ALL_USERS").lower() not in {"true", "1", "yes"} and (
+                _email_env("GATEWAY_ALLOW_ALL_USERS").lower() not in {"true", "1", "yes"}
             ):
                 logger.debug(
                     "[Email] Dropping sender at dispatch — EMAIL_ALLOWED_USERS is unset "

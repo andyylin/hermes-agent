@@ -364,7 +364,7 @@ class GatewayAuthorizationMixin:
                 if source.platform and source.platform.value == "line":
                     raw_chat_allowlist = _line_auth_env(chat_allowlist_env)
                 else:
-                    raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
+                    raw_chat_allowlist = _auth_env(chat_allowlist_env)
                 if raw_chat_allowlist:
                     allowed_group_ids = {
                         cid.strip()
@@ -388,7 +388,7 @@ class GatewayAuthorizationMixin:
         }
         if getattr(source, "is_bot", False):
             allow_bots_var = platform_allow_bots_map.get(source.platform)
-            if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
+            if allow_bots_var and _auth_env(allow_bots_var, "none").lower() in {"mentions", "all"}:
                 return True
 
         if not user_id:
@@ -735,17 +735,17 @@ class GatewayAuthorizationMixin:
             }
             if platform and platform.value == "line":
                 platform_group_env_map[platform] = ("LINE_ALLOWED_GROUPS",)
-            if os.getenv(platform_env_map.get(platform, ""), "").strip():
+            if _auth_env(platform_env_map.get(platform, "")):
                 return "ignore"
             for env_key in platform_group_env_map.get(platform, ()):
                 if platform and platform.value == "line":
                     configured = _line_auth_env(env_key)
                 else:
-                    configured = os.getenv(env_key, "").strip()
+                    configured = _auth_env(env_key)
                 if configured:
                     return "ignore"
 
-        if os.getenv("GATEWAY_ALLOWED_USERS", "").strip():
+        if _auth_env("GATEWAY_ALLOWED_USERS"):
             return "ignore"
 
         return "pair"
