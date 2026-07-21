@@ -2270,17 +2270,26 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
+                        # ContextVars do not propagate into fresh executor
+                        # threads automatically. Preserve the profile secret
+                        # scope used by this cron delivery.
+                        from contextvars import copy_context
+
+                        def _run_standalone_send():
+                            return asyncio.run(
+                                _send_to_platform(
+                                    platform,
+                                    pconfig,
+                                    chat_id,
+                                    target_content,
+                                    thread_id=thread_id,
+                                    media_files=media_files,
+                                    subject=send_subject,
+                                )
+                            )
+
                         future = pool.submit(
-                            asyncio.run,
-                            _send_to_platform(
-                                platform,
-                                pconfig,
-                                chat_id,
-                                target_content,
-                                thread_id=thread_id,
-                                media_files=media_files,
-                                subject=send_subject,
-                            ),
+                            copy_context().run, _run_standalone_send
                         )
                         result = future.result(timeout=30)
                     finally:
@@ -4083,7 +4092,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         )
 
         _scope_token = set_secret_scope(
-            build_profile_secret_scope(_get_hermes_home())
+            build_profile_secret_scope(
+                _get_hermes_home(), include_external=True
+            )
         )
         # Defer the cron agent's async-resource teardown until AFTER delivery.
         # run_job normally closes the agent (and reaps stale async clients) in

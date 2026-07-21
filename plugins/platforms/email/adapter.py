@@ -1424,8 +1424,7 @@ def _is_connected(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
     if extra.get("address"):
         return True
-    import hermes_cli.gateway as gateway_mod
-    return bool((gateway_mod.get_env_value("EMAIL_ADDRESS") or "").strip())
+    return bool(_email_env("EMAIL_ADDRESS"))
 
 
 def _build_adapter(config):

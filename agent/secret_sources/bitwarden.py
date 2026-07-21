@@ -122,6 +122,25 @@ def _disk_cache_path(home_path: Optional[Path] = None) -> Path:
     return _DISK_CACHE.path(home_path)
 
 
+def _purge_plaintext_disk_cache(home_path: Optional[Path] = None) -> None:
+    """Remove the legacy plaintext cache or fail closed.
+
+    ``DiskCache.clear`` is deliberately best-effort for ordinary cache
+    housekeeping, but encrypted mode is a security boundary: continuing after
+    an unlink failure would leave raw secrets on disk while claiming encrypted
+    caching is active.
+    """
+    path = _disk_cache_path(home_path)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise RuntimeError(
+            f"Encrypted Bitwarden cache could not remove legacy plaintext cache: {path}"
+        ) from exc
+
+
 def _encrypted_disk_cache_path(home_path: Optional[Path] = None) -> Path:
     """Return the encrypted disk cache path under hermes_home/cache/."""
     from agent.secret_sources._cache import resolve_cache_home
@@ -536,7 +555,7 @@ def fetch_bitwarden_secrets(
     # legacy plaintext cache before any read/fetch path so an auth or outage
     # cannot leave raw credentials parked on disk indefinitely.
     if encrypted_cache_enabled:
-        _DISK_CACHE.clear(home_path)
+        _purge_plaintext_disk_cache(home_path)
 
     cache_key = (_token_fingerprint(access_token), project_id, server_url or "")
     if use_cache and cache_ttl_seconds > 0:
@@ -749,6 +768,13 @@ def apply_bitwarden_secrets(
     if not enabled:
         return result
 
+    if encrypted_cache_enabled:
+        try:
+            _purge_plaintext_disk_cache(home_path)
+        except RuntimeError as exc:
+            result.error = str(exc)
+            return result
+
     access_token = os.environ.get(access_token_env, "").strip()
     if not access_token:
         result.error = (
@@ -881,7 +907,12 @@ class BitwardenSource(SecretSource):
         result = FetchResult()
 
         access_token_env = str(cfg.get("access_token_env") or "BWS_ACCESS_TOKEN")
-        access_token = os.environ.get(access_token_env, "").strip()
+        from agent.secret_sources.registry import current_source_environ
+
+        source_env = current_source_environ()
+        access_token = (source_env if source_env is not None else os.environ).get(
+            access_token_env, ""
+        ).strip()
         if not access_token:
             result.error = (
                 f"secrets.bitwarden.enabled is true but {access_token_env} is "

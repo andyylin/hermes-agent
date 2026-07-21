@@ -60,6 +60,16 @@ from agent.secret_sources.base import ErrorKind, SecretSource
 logger = logging.getLogger(__name__)
 
 
+def _source_environ():
+    """Return the registry's isolated fetch environment when provided."""
+    try:
+        from agent.secret_sources.registry import current_source_environ
+        scoped = current_source_environ()
+    except ImportError:
+        scoped = None
+    return scoped if scoped is not None else os.environ
+
+
 # ---------------------------------------------------------------------------
 # Configuration constants
 # ---------------------------------------------------------------------------
@@ -180,12 +190,12 @@ def _auth_fingerprint(token_env: str) -> str:
     displayed; the raw token never leaves this hash.
     """
     parts: List[str] = [
-        f"token={os.environ.get(token_env, '')}",
-        f"account={os.environ.get('OP_ACCOUNT', '')}",
+        f"token={_source_environ().get(token_env, '')}",
+        f"account={_source_environ().get('OP_ACCOUNT', '')}",
     ]
-    for key in sorted(os.environ):
+    for key in sorted(_source_environ()):
         if key.startswith("OP_SESSION_"):
-            parts.append(f"{key}={os.environ[key]}")
+            parts.append(f"{key}={_source_environ()[key]}")
     material = "\n".join(parts)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
@@ -232,7 +242,7 @@ def _op_child_env(token_value: str) -> Dict[str, str]:
     """Build a minimal allowlisted environment for the ``op`` child process."""
     env: Dict[str, str] = {}
     for key in _OP_ENV_ALLOWLIST:
-        val = os.environ.get(key)
+        val = _source_environ().get(key)
         if val is not None:
             env[key] = val
     # Desktop / interactive session credentials.
@@ -332,7 +342,7 @@ def fetch_onepassword_secrets(
     if not valid:
         return {}, warnings
 
-    token_value = os.environ.get(token_env, "").strip()
+    token_value = _source_environ().get(token_env, "").strip()
     cache_key: _CacheKey = (
         _auth_fingerprint(token_env),
         account or "",

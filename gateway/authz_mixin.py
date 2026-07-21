@@ -274,18 +274,19 @@ class GatewayAuthorizationMixin:
         return False
 
     def _pairing_store_for(self, source: "SessionSource"):
-        """Pick the per-profile PairingStore for a source, falling back to global.
+        """Pick the per-profile PairingStore for a source.
 
-        In a multiplexing gateway, each profile owns its own pairing whitelist
-        so isolation is preserved. When the source has no profile (single-
-        profile gateway, or a path that hasn't stamped profile yet) or the
-        profile isn't registered, fall back to ``self.pairing_store`` (the
-        global default) so existing behavior is preserved.
+        In a multiplexing gateway, each profile owns its own pairing whitelist.
+        A stamped profile missing from the registry fails closed rather than
+        inheriting the default profile's pairing grants.
         """
         per_profile = getattr(self, "pairing_stores", None) or {}
         profile = getattr(source, "profile", None)
         if profile and profile in per_profile:
             return per_profile[profile]
+        config = getattr(self, "config", None)
+        if profile and getattr(config, "multiplex_profiles", False):
+            return None
         return getattr(self, "pairing_store", None)
 
     def _is_user_authorized(self, source: SessionSource) -> bool:

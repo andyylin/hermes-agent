@@ -518,6 +518,28 @@ def test_apply_missing_project_id(monkeypatch):
     assert "project_id" in result.error
 
 
+def test_encrypted_apply_purges_plaintext_before_binary_discovery_failure(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.t")
+    plaintext = bw._disk_cache_path(tmp_path)
+    plaintext.parent.mkdir(parents=True, exist_ok=True)
+    plaintext.write_text("legacy-plaintext")
+    monkeypatch.setattr(bw, "find_bws", lambda **_kwargs: None)
+
+    result = bw.apply_bitwarden_secrets(
+        enabled=True,
+        project_id="p",
+        auto_install=False,
+        encrypted_cache_enabled=True,
+        home_path=tmp_path,
+    )
+
+    assert not result.ok
+    assert "binary not available" in result.error
+    assert not plaintext.exists()
+
+
 def test_apply_does_not_override_existing(monkeypatch, tmp_path):
     monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.t")
     monkeypatch.setenv("OPENAI_API_KEY", "existing-value")

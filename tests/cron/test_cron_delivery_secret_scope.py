@@ -10,7 +10,7 @@ def test_run_one_job_keeps_profile_scope_through_delivery(monkeypatch, tmp_path)
     set_multiplex_active(True)
     monkeypatch.setattr(
         "agent.secret_scope.build_profile_secret_scope",
-        lambda _home: {"EMAIL_PASSWORD": "scoped-password"},
+        lambda _home, **_kwargs: {"EMAIL_PASSWORD": "scoped-password"},
     )
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)

@@ -137,6 +137,16 @@ from gateway.platforms.helpers import ThreadParticipationTracker
 
 logger = logging.getLogger(__name__)
 
+
+def _matrix_env(name: str, default: str = "") -> str:
+    """Read authority-bearing Matrix policy from the active profile scope."""
+    try:
+        from agent.secret_scope import get_secret
+    except ImportError:
+        return os.getenv(name, default)
+    value = get_secret(name, default)
+    return str(value or default).strip()
+
 _MATRIX_BANG_COMMAND_RE = re.compile(
     r"^!([A-Za-z][A-Za-z0-9_-]*)(?=$|\s)(.*)$",
     re.DOTALL,
@@ -3246,7 +3256,7 @@ class MatrixAdapter(BasePlatformAdapter):
         # federated Matrix user could invite the bot into arbitrary rooms,
         # exposing its presence and metadata. Mirrors the allow-list gate
         # used on the message/reaction paths.
-        allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {
+        allow_all = _matrix_env("GATEWAY_ALLOW_ALL_USERS").lower() in {
             "true",
             "1",
             "yes",
@@ -3617,7 +3627,7 @@ class MatrixAdapter(BasePlatformAdapter):
         prompt: Any,
         prompt_label: str,
     ) -> bool:
-        allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {
+        allow_all = _matrix_env("GATEWAY_ALLOW_ALL_USERS").lower() in {
             "true",
             "1",
             "yes",

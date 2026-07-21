@@ -35,6 +35,16 @@ from agent.async_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _discord_env(name: str, default: str = "") -> str:
+    """Read authority-bearing Discord policy from the active profile scope."""
+    try:
+        from agent.secret_scope import get_secret
+    except ImportError:
+        return os.getenv(name, default)
+    value = get_secret(name, default)
+    return str(value or default).strip()
+
+
 class _Snowflake:
     """Minimal object exposing ``.id`` — satisfies discord.py's Snowflake
     protocol for ``channel.history(before=...)`` without constructing a
@@ -1099,7 +1109,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 return False
 
             # Parse allowed user entries (may contain usernames or IDs)
-            allowed_env = os.getenv("DISCORD_ALLOWED_USERS", "")
+            allowed_env = _discord_env("DISCORD_ALLOWED_USERS")
             if allowed_env:
                 self._allowed_user_ids = {
                     _clean_discord_id(uid) for uid in allowed_env.split(",")
@@ -1108,7 +1118,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Parse DISCORD_ALLOWED_ROLES — comma-separated role IDs.
             # Users with ANY of these roles can interact with the bot.
-            roles_env = os.getenv("DISCORD_ALLOWED_ROLES", "")
+            roles_env = _discord_env("DISCORD_ALLOWED_ROLES")
             if roles_env:
                 self._allowed_role_ids = {
                     int(rid.strip()) for rid in roles_env.split(",")
@@ -1169,6 +1179,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 allowed_mentions=_build_allowed_mentions(),
                 **proxy_kwargs_for_bot(proxy_url),
             )
+            self._client._hermes_pairing_store = getattr(self, "_pairing_store", None)
             adapter_self = self  # capture for closure
 
             # Register event handlers
@@ -1285,7 +1296,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         role_authorized = False
         if getattr(message.author, "bot", False):
-            allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
+            allow_bots = _discord_env("DISCORD_ALLOW_BOTS", "none").lower()
             if allow_bots == "none":
                 return False, False
             if allow_bots == "mentions" and not self._self_is_explicitly_mentioned(message):
@@ -4222,7 +4233,7 @@ class DiscordAdapter(BasePlatformAdapter):
         """True when *channel_ids* intersect ``DISCORD_ALLOWED_CHANNELS``."""
         if not channel_ids:
             return False
-        allowed_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "").strip()
+        allowed_raw = _discord_env("DISCORD_ALLOWED_CHANNELS")
         if not allowed_raw:
             return False
         allowed = {c.strip() for c in allowed_raw.split(",") if c.strip()}
@@ -4235,10 +4246,19 @@ class DiscordAdapter(BasePlatformAdapter):
         user_id = str(user_id or "").strip()
         if not user_id:
             return False
+        store = getattr(self, "_pairing_store", None)
+        if store is None:
+            try:
+                from agent.secret_scope import is_multiplex_active
+                if not is_multiplex_active():
+                    from gateway.pairing import PairingStore
+                    store = PairingStore()
+            except ImportError:
+                store = None
+        if store is None:
+            return False
         try:
-            from gateway.pairing import PairingStore
-
-            return bool(PairingStore().is_approved("discord", user_id))
+            return bool(store.is_approved("discord", user_id))
         except Exception:
             return False
 
@@ -4291,9 +4311,9 @@ class DiscordAdapter(BasePlatformAdapter):
             return True
 
         if not has_users and not has_roles:
-            if os.getenv("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+            if _discord_env("DISCORD_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
                 return True
-            if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+            if _discord_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
                 return True
             # Channel-scoped guild access requires validated channel context.
             # Do not treat DISCORD_ALLOWED_CHANNELS alone as a user-wide bypass
@@ -7813,15 +7833,15 @@ def _component_check_auth(
     if user is None or getattr(user, "id", None) is None:
         return False
 
-    if os.getenv("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+    if _discord_env("DISCORD_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
         return True
-    if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+    if _discord_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
         return True
 
     user_set = {str(uid).strip() for uid in (allowed_user_ids or set()) if str(uid).strip()}
     global_allowed = {
         uid.strip()
-        for uid in os.getenv("GATEWAY_ALLOWED_USERS", "").split(",")
+        for uid in _discord_env("GATEWAY_ALLOWED_USERS").split(",")
         if uid.strip()
     }
     user_set.update(global_allowed)
@@ -7859,11 +7879,16 @@ def _component_check_auth(
     # component buttons even without DISCORD_ALLOWED_USERS set.
     if uid:
         try:
-            from gateway.pairing import PairingStore
-            store = PairingStore()
-            if store.is_approved("discord", uid):
+            client = getattr(interaction, "client", None)
+            store = getattr(client, "_hermes_pairing_store", None)
+            if store is None:
+                from agent.secret_scope import is_multiplex_active
+                if not is_multiplex_active():
+                    from gateway.pairing import PairingStore
+                    store = PairingStore()
+            if store is not None and store.is_approved("discord", uid):
                 return True
-        except Exception:
+        except (AttributeError, TypeError):
             pass
 
     return False

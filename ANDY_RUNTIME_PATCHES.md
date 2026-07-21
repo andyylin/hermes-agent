@@ -205,13 +205,17 @@ cross-port seams. The candidate now includes explicit regression coverage for:
 
 The same review identified untrusted raw HTML as an unproved email boundary;
 the final candidate sanitizes that path and includes adversarial coverage.
-
 A second exact-SHA review then exercised sibling production paths rather than
-only the new helpers. The final candidate also routes group/bot/pairing auth
-through the profile resolver, keeps the cron profile scope active through
-standalone delivery, scopes live EmailAdapter configuration and dispatch
-policy, and removes legacy plaintext Bitwarden cache before a fetch attempt so
-network/auth failures cannot leave raw credentials behind.
+only the new helpers. The final candidate routes LINE credentials, Discord
+group/bot/pairing/component authorization, and Matrix interactive admission
+through profile-scoped policy; fails closed for a missing profile pairing store;
+scopes live email probes; carries cron scope through fresh-thread fallback
+delivery; and resolves external secret sources directly into an isolated cron
+scope rather than process-global environment. Encrypted Bitwarden mode also
+purges legacy plaintext before binary discovery and fails closed if that purge
+cannot complete. Explicit production-path tests cover poisoned process
+environments, cron delivery scope lifetime, isolated external-source bootstrap,
+and encrypted-cache cleanup failure.
 
 Before promotion, the exact final SHA must satisfy all of the following:
 

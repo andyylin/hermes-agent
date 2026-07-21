@@ -39,6 +39,16 @@ from utils import atomic_replace
 logger = logging.getLogger(__name__)
 
 
+def _pairing_env(name: str, default: str = "") -> str:
+    """Read pairing policy from the active profile scope."""
+    try:
+        from agent.secret_scope import get_secret
+    except ImportError:
+        return os.getenv(name, default)
+    value = get_secret(name, default)
+    return str(value or default).strip()
+
+
 # Unambiguous alphabet -- excludes 0/O, 1/I to prevent confusion
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 CODE_LENGTH = 8
@@ -121,7 +131,7 @@ def _sync_allowlist_add(platform: str, user_id: str) -> None:
     env_var = _allowlist_env_for_platform(platform)
     if not env_var:
         return
-    current = os.getenv(env_var, "").strip()
+    current = _pairing_env(env_var)
     if not current:
         return  # No allowlist configured — leave the gateway open (option i).
     ids = _split_allowlist(current)
@@ -143,7 +153,7 @@ def _sync_allowlist_remove(platform: str, user_id: str) -> None:
     env_var = _allowlist_env_for_platform(platform)
     if not env_var:
         return
-    current = os.getenv(env_var, "").strip()
+    current = _pairing_env(env_var)
     if not current:
         return
     ids = _split_allowlist(current)

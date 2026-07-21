@@ -1,5 +1,6 @@
 """End-to-end profile-scope regression tests for shared gateway authorization."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -72,3 +73,31 @@ def test_pairing_behavior_ignores_poisoned_process_env(monkeypatch, scoped_multi
         Platform.DISCORD,
         profile="coder",
     ) == "pair"
+
+
+def test_missing_profile_pairing_store_fails_closed(scoped_multiplex):
+    runner = _runner()
+    runner.pairing_store.is_approved.return_value = True
+    runner.pairing_stores = {}
+    source = SessionSource(
+        platform=Platform.DISCORD, user_id="paired-on-default", chat_id="dm",
+        user_name="user", chat_type="dm", profile="coder",
+    )
+    assert runner._pairing_store_for(source) is None
+    assert runner._is_user_authorized(source) is False
+
+
+def test_authority_helpers_ignore_poisoned_process_env(monkeypatch, scoped_multiplex):
+    from gateway import pairing
+    from plugins.platforms.discord.adapter import _component_check_auth
+    from plugins.platforms.matrix.adapter import _matrix_env
+
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "foreign")
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id="foreign", roles=[]),
+        client=SimpleNamespace(_hermes_pairing_store=None),
+    )
+    assert pairing._pairing_env("DISCORD_ALLOWED_USERS") == ""
+    assert _component_check_auth(interaction, set(), set()) is False
+    assert _matrix_env("GATEWAY_ALLOW_ALL_USERS") == ""

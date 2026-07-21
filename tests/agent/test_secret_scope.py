@@ -128,3 +128,28 @@ class TestEnvFileParsing:
         assert ss.build_profile_secret_scope(tmp_path) == {
             "ANTHROPIC_API_KEY": "sk-profile"
         }
+
+    def test_build_scope_includes_external_without_mutating_process_env(
+        self, tmp_path, monkeypatch
+    ):
+        import os
+        from agent.secret_sources import registry
+        from hermes_cli import env_loader
+
+        (tmp_path / ".env").write_text("BWS_ACCESS_TOKEN=scoped-bootstrap\n")
+        monkeypatch.setenv("EXTERNAL_KEY", "wrong-global")
+        monkeypatch.setattr(
+            env_loader,
+            "_load_secrets_config",
+            lambda _home: {"dummy": {}},
+        )
+
+        def fake_apply(_config, _home, environ):
+            assert environ["BWS_ACCESS_TOKEN"] == "scoped-bootstrap"
+            environ["EXTERNAL_KEY"] = "scoped-external"
+
+        monkeypatch.setattr(registry, "apply_all", fake_apply)
+        scope = ss.build_profile_secret_scope(tmp_path, include_external=True)
+
+        assert scope["EXTERNAL_KEY"] == "scoped-external"
+        assert os.environ["EXTERNAL_KEY"] == "wrong-global"

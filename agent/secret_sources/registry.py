@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -47,6 +48,14 @@ logger = logging.getLogger(__name__)
 # insertion order, which doubles as the default apply order.
 _SOURCES: Dict[str, SecretSource] = {}
 _BUILTINS_LOADED = False
+_SOURCE_ENVIRON: ContextVar[Optional[Dict[str, str]]] = ContextVar(
+    "_SOURCE_ENVIRON", default=None
+)
+
+
+def current_source_environ() -> Optional[Dict[str, str]]:
+    """Return the isolated environment supplied to the active fetch pass."""
+    return _SOURCE_ENVIRON.get()
 
 
 @dataclass
@@ -188,7 +197,10 @@ def _reset_registry_for_tests() -> None:
 
 
 def _fetch_with_timeout(
-    source: SecretSource, cfg: dict, home_path: Path
+    source: SecretSource,
+    cfg: dict,
+    home_path: Path,
+    environ: Dict[str, str],
 ) -> FetchResult:
     """Run source.fetch() under a wall-clock budget; never raises.
 
@@ -203,7 +215,14 @@ def _fetch_with_timeout(
         max_workers=1, thread_name_prefix=f"secret-src-{source.name}"
     )
     try:
-        future = executor.submit(source.fetch, cfg, home_path)
+        def _fetch_in_scope():
+            token = _SOURCE_ENVIRON.set(environ)
+            try:
+                return source.fetch(cfg, home_path)
+            finally:
+                _SOURCE_ENVIRON.reset(token)
+
+        future = executor.submit(_fetch_in_scope)
         try:
             result = future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
@@ -307,13 +326,18 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     ordered = ([s for s in enabled if s.shape == "mapped"]
                + [s for s in enabled if s.shape == "bulk"])
 
-    # Fetch phase.
+    # Fetch phase. Source processes need a few non-secret runtime variables,
+    # but must not inherit the whole process environment in multiplex mode.
+    source_env = dict(env)
+    for name in ("PATH", "HOME", "USER", "TMPDIR", "SSL_CERT_FILE"):
+        if name in _os.environ:
+            source_env.setdefault(name, _os.environ[name])
     fetches: List[tuple[SecretSource, dict, FetchResult]] = []
     protected: Dict[str, str] = {}  # var → source that protects it
     for source in ordered:
         cfg = secrets_cfg.get(source.name)
         cfg = cfg if isinstance(cfg, dict) else {}
-        result = _fetch_with_timeout(source, cfg, home_path)
+        result = _fetch_with_timeout(source, cfg, home_path, source_env)
         fetches.append((source, cfg, result))
         try:
             for var in source.protected_env_vars(cfg):
