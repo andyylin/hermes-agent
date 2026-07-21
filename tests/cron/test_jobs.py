@@ -1,5 +1,6 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import json
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
@@ -2200,6 +2201,7 @@ class TestCronDefinitionsExport:
                 "schedule": {"kind": "interval", "minutes": 30},
                 "prompt": "Brief",
                 "email_subject_template": "Joi Morning Briefing - {date}",
+                "email_thread_key": "joi-morning-briefing",
                 "next_run_at": "2026-01-01T00:30:00+00:00",
             }
         ])

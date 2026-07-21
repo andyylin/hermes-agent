@@ -1064,6 +1064,13 @@ class EmailAdapter(BasePlatformAdapter):
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 
+    @staticmethod
+    def _plain_text_to_html(body: str) -> str:
+        """Render Markdown-ish notification text as safe email HTML."""
+        from tools.email_rendering import plain_text_to_html
+
+        return plain_text_to_html(body)
+
     def _attach_body(self, msg: MIMEMultipart, body: str) -> None:
         """Attach email body as HTML when content is HTML, with a plain fallback."""
         if self._looks_like_html(body):
@@ -1072,7 +1079,10 @@ class EmailAdapter(BasePlatformAdapter):
             alt.attach(MIMEText(body, "html", "utf-8"))
             msg.attach(alt)
         else:
-            msg.attach(MIMEText(body, "plain", "utf-8"))
+            alt = MIMEMultipart("alternative")
+            alt.attach(MIMEText(body, "plain", "utf-8"))
+            alt.attach(MIMEText(self._plain_text_to_html(body), "html", "utf-8"))
+            msg.attach(alt)
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Email has no typing indicator — no-op."""
@@ -1345,6 +1355,15 @@ async def _standalone_send(
             msg["References"] = thread_anchor_msg_id
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{domain or 'localhost'}>"
         msg["Message-ID"] = msg_id
+
+        if subject:
+            from tools.email_rendering import append_notification_reference_footer
+
+            message = append_notification_reference_footer(
+                message or "",
+                subject=str(subject),
+                ask="investigate this REF",
+            )
 
         if _standalone_looks_like_html(message or ""):
             plain_body = _standalone_html_to_plain_text(message or "")
