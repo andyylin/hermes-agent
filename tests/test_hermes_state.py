@@ -2201,6 +2201,72 @@ class TestCJKSearchFallback:
         # FTS5-style snippet with highlight markers when the term is short.
         # At minimum: english queries must still match.
 
+    def test_fts_database_error_falls_back_to_like_without_logging_query(
+        self, db, caplog
+    ):
+        """FTS DatabaseError uses canonical LIKE and never logs private query text."""
+        import logging
+
+        if not db._fts_enabled:
+            pytest.skip("FTS5 unavailable in this build")
+
+        # Unique alphanumeric sentinel (no FTS special chars) that must never
+        # appear in log output.
+        sentinel = "PRIVSENTINELQ9XZ7MK2WL4NP6RTDONOTLOG"
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(
+            "s1",
+            role="user",
+            content=f"public payload contains {sentinel} for recovery",
+        )
+
+        real_conn = db._conn
+        call_count = {"n": 0}
+
+        def _fail_fts_match(sql, parameters=(), *args, **kwargs):
+            text = sql if isinstance(sql, str) else str(sql)
+            # Only poison the base FTS MATCH path; LIKE / other SQL must pass.
+            if "messages_fts MATCH" in text and "FROM messages_fts" in text:
+                call_count["n"] += 1
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return real_conn.execute(sql, parameters, *args, **kwargs)
+
+        class _ConnProxy:
+            def execute(self, sql, parameters=(), *args, **kwargs):
+                return _fail_fts_match(sql, parameters, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(real_conn, name)
+
+        db._conn = _ConnProxy()  # type: ignore[assignment]
+
+        with caplog.at_level(logging.WARNING, logger="hermes_state"):
+            results = db.search_messages(sentinel)
+
+        assert call_count["n"] >= 1, "expected FTS MATCH path to be attempted"
+        assert len(results) == 1
+        # search_messages strips full content; snippet/context must still show
+        # the match so callers can verify LIKE recovery.
+        blob = " ".join(
+            str(results[0].get(k) or "")
+            for k in ("snippet", "content", "context")
+        )
+        assert sentinel in blob
+
+        joined = "\n".join(r.getMessage() for r in caplog.records)
+        assert any(
+            "messages_fts MATCH raised DatabaseError" in r.getMessage()
+            and "canonical LIKE" in r.getMessage()
+            and "query text not logged" in r.getMessage()
+            for r in caplog.records
+        ), f"expected derived-index fallback warning, got: {joined!r}"
+        assert sentinel not in joined
+        for record in caplog.records:
+            assert sentinel not in record.getMessage()
+            # getMessage() already interpolates args; also check raw args.
+            assert sentinel not in str(getattr(record, "args", ()))
+            assert sentinel not in (record.msg if isinstance(record.msg, str) else "")
+
     def test_cjk_query_with_no_matches_returns_empty(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="unrelated English content")

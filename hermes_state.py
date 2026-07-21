@@ -5669,11 +5669,13 @@ class SessionDB:
                     # fault. Canonical messages remain authoritative; fall back
                     # to LIKE. Corruption is still visible via PRAGMA checks /
                     # write-path rebuild — we do not swallow it into silence.
+                    # Privacy: never log raw query text, snippets, hashes, or
+                    # other user content — only the exception class.
                     logger.warning(
-                        "messages_fts MATCH failed (%s); falling back to "
-                        "canonical LIKE search for %r",
-                        exc,
-                        query[:80],
+                        "messages_fts MATCH raised %s; falling back to "
+                        "canonical LIKE search (derived-index fault; "
+                        "query text not logged)",
+                        type(exc).__name__,
                     )
                     matches = None
                 else:
