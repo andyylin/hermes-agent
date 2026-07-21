@@ -1571,21 +1571,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception:
         pass
 
-    if wrap_response:
-        delivery_content = _format_cron_delivery_content(
-            job,
-            content,
-            for_discord=any(str(target.get("platform", "")).lower() == "discord" for target in targets),
-        )
-    else:
-        delivery_content = _markdown_tables_to_bullets(content) if any(
-            str(target.get("platform", "")).lower() == "discord" for target in targets
-        ) else content
-
-    # Extract MEDIA: tags so attachments are forwarded as files, not raw text
+    # Extracting and platform-specific formatting happen per target below.
+    # A fan-out may include Discord plus email/Telegram, and one shared payload
+    # would leak Discord's table-to-bullet rendering into every sibling target.
     from gateway.platforms.base import BasePlatformAdapter
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
@@ -1613,6 +1602,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+
+        for_discord = str(platform_name).lower() == "discord"
+        if wrap_response:
+            delivery_content = _format_cron_delivery_content(
+                job,
+                content,
+                for_discord=for_discord,
+            )
+        else:
+            delivery_content = _markdown_tables_to_bullets(content) if for_discord else content
+        media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
