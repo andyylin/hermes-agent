@@ -1237,6 +1237,55 @@ class TestSendEmailStandalone(unittest.TestCase):
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
         "EMAIL_SMTP_HOST": "smtp.test.com",
+        "EMAIL_SMTP_PORT": "587",
+    })
+    def test_send_email_tool_sends_html_as_multipart_alternative(self):
+        """Standalone cron email must not expose HTML tags as plain text."""
+        import asyncio
+        from types import SimpleNamespace
+        from plugins.platforms.email.adapter import _standalone_send
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            result = asyncio.run(
+                _standalone_send(
+                    SimpleNamespace(
+                        token=None,
+                        api_key=None,
+                        extra={
+                            "address": "hermes@test.com",
+                            "smtp_host": "smtp.test.com",
+                        },
+                    ),
+                    "user@test.com",
+                    "<h2>Bottom line</h2><p><strong>Done</strong></p>",
+                )
+            )
+
+        self.assertTrue(result["success"])
+        msg = mock_server.send_message.call_args.args[0]
+        content_types = [part.get_content_type() for part in msg.walk()]
+        self.assertIn("multipart/alternative", content_types)
+        self.assertIn("text/plain", content_types)
+        self.assertIn("text/html", content_types)
+        plain_part = next(
+            part for part in msg.walk() if part.get_content_type() == "text/plain"
+        )
+        html_part = next(
+            part for part in msg.walk() if part.get_content_type() == "text/html"
+        )
+        plain = plain_part.get_payload(decode=True).decode("utf-8")
+        html = html_part.get_payload(decode=True).decode("utf-8")
+        self.assertIn("Bottom line", plain)
+        self.assertNotIn("<h2>", plain)
+        self.assertIn("<h2>Bottom line</h2>", html)
+
+    @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "hermes@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_SMTP_HOST": "smtp.test.com",
     })
     def test_send_email_tool_failure(self):
         """SMTP failure should return error dict."""
