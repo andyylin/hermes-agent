@@ -138,3 +138,21 @@ def test_platform_policy_helpers_ignore_poisoned_global_env(monkeypatch, scoped_
 
     assert _discord_env("DISCORD_ALLOWED_CHANNELS") == "profile-channel"
     assert _matrix_env("MATRIX_ALLOWED_USERS") == "@profile:example.org"
+
+
+def test_discord_allowed_mentions_uses_profile_scope(monkeypatch, scoped_multiplex):
+    from plugins.platforms.discord import adapter as discord_adapter
+
+    monkeypatch.setenv("DISCORD_ALLOW_MENTION_EVERYONE", "true")
+    scoped_multiplex["DISCORD_ALLOW_MENTION_EVERYONE"] = "false"
+    fake_discord = SimpleNamespace(AllowedMentions=MagicMock(return_value="mentions"))
+    monkeypatch.setattr(discord_adapter, "DISCORD_AVAILABLE", True)
+    monkeypatch.setattr(discord_adapter, "discord", fake_discord)
+
+    assert discord_adapter._build_allowed_mentions() == "mentions"
+    fake_discord.AllowedMentions.assert_called_once_with(
+        everyone=False,
+        roles=False,
+        users=True,
+        replied_user=True,
+    )

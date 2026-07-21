@@ -122,6 +122,21 @@ class TestPlatformHasBotCredential:
             Platform.MATRIX, PlatformConfig(enabled=True, token="")
         ) is False
 
+    def test_matrix_password_ignores_poisoned_global_in_profile_scope(self, monkeypatch):
+        from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+        from gateway.run import _platform_has_bot_credential
+
+        monkeypatch.setenv("MATRIX_PASSWORD", "foreign-profile-password")
+        set_multiplex_active(True)
+        token = set_secret_scope({})
+        try:
+            assert _platform_has_bot_credential(
+                Platform.MATRIX, PlatformConfig(enabled=True, token="")
+            ) is False
+        finally:
+            reset_secret_scope(token)
+            set_multiplex_active(False)
+
     def test_non_token_platform_always_true(self):
         from gateway.run import _platform_has_bot_credential
 

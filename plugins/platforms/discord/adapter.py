@@ -406,7 +406,7 @@ def _build_allowed_mentions():
         return None
 
     def _b(name: str, default: bool) -> bool:
-        raw = os.getenv(name, "").strip().lower()
+        raw = _discord_env(name, "").strip().lower()
         if not raw:
             return default
         return raw in {"true", "1", "yes", "on"}
