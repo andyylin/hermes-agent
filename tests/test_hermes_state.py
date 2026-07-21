@@ -1,4 +1,4 @@
-"""Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
+"""Tests for hermes_state.py — SessionDB SQLite CRUD, session search, export."""
 
 import sqlite3
 import time
@@ -6,6 +6,7 @@ import json
 import pytest
 
 import hermes_state
+from tests.state.legacy_fts_ddl import LEGACY_FTS_SQL, LEGACY_FTS_TRIGRAM_SQL
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
 
 
@@ -694,27 +695,22 @@ class TestSessionLifecycle:
         finally:
             restored.close()
 
-    def test_is_fts5_unavailable_error_catches_trigram_tokenizer(self):
-        """Unit test: _is_fts5_unavailable_error matches 'no such tokenizer: trigram'."""
-        fts5_err = sqlite3.OperationalError("no such module: fts5")
-        trigram_err = sqlite3.OperationalError("no such tokenizer: trigram")
-        generic_tokenizer_err = sqlite3.OperationalError("no such tokenizer: foo")
-        unrelated_err = sqlite3.OperationalError("no such table: foo")
+    def test_canonical_database_error_propagates_without_retry(self, db):
+        """Write-path DatabaseError is never scrubbed/retried (no live FTS)."""
+        db.create_session(session_id="s1", source="cli")
+        calls = {"n": 0}
 
-        assert SessionDB._is_fts5_unavailable_error(fts5_err) is True
-        assert SessionDB._is_fts5_unavailable_error(trigram_err) is True
-        assert SessionDB._is_fts5_unavailable_error(generic_tokenizer_err) is False
-        assert SessionDB._is_fts5_unavailable_error(unrelated_err) is False
+        def _bad(conn):
+            calls["n"] += 1
+            raise sqlite3.DatabaseError("database disk image is malformed")
 
-    def test_is_trigram_unavailable_error(self):
-        """Unit test: _is_trigram_unavailable_error is scoped to trigram."""
-        trigram_err = sqlite3.OperationalError("no such tokenizer: trigram")
-        generic_err = sqlite3.OperationalError("no such tokenizer: foo")
-        fts5_err = sqlite3.OperationalError("no such module: fts5")
-
-        assert SessionDB._is_trigram_unavailable_error(trigram_err) is True
-        assert SessionDB._is_trigram_unavailable_error(generic_err) is False
-        assert SessionDB._is_trigram_unavailable_error(fts5_err) is False
+        with pytest.raises(sqlite3.DatabaseError, match="malformed"):
+            db._execute_write(_bad)
+        # Must fail once — no rebuild/retry loop.
+        assert calls["n"] == 1
+        # Canonical write path still works after a failed write.
+        db.append_message("s1", role="user", content="after fault")
+        assert len(db.get_messages("s1")) == 1
 
     def test_db_never_creates_fts_tables(self, tmp_path):
         """Fresh SessionDB must not create base or trigram FTS objects."""
@@ -741,8 +737,8 @@ class TestSessionLifecycle:
         try:
             seeded.create_session(session_id="s1", source="cli")
             seeded.append_message("s1", role="user", content="大别山项目计划书")
-            seeded._conn.executescript(hermes_state.FTS_SQL)
-            seeded._conn.executescript(hermes_state.FTS_TRIGRAM_SQL)
+            seeded._conn.executescript(LEGACY_FTS_SQL)
+            seeded._conn.executescript(LEGACY_FTS_TRIGRAM_SQL)
             seeded._conn.execute(
                 "INSERT OR REPLACE INTO messages_fts(rowid, content) "
                 "SELECT id, COALESCE(content, '') FROM messages"
@@ -773,8 +769,8 @@ class TestSessionLifecycle:
         finally:
             restored.close()
 
-    def test_reopen_does_not_create_or_rebuild_fts(self, tmp_path, monkeypatch):
-        """Healthy no-FTS DBs must not recreate FTS on open."""
+    def test_repeated_healthy_opens_stay_free_of_fts_objects(self, tmp_path):
+        """Repeated open/close on a healthy DB never creates FTS objects."""
         db_path = tmp_path / "state.db"
         seeded = SessionDB(db_path=db_path)
         try:
@@ -784,24 +780,20 @@ class TestSessionLifecycle:
         finally:
             seeded.close()
 
-        ensure_calls = {"n": 0}
-        real_ensure = SessionDB._ensure_fts_schema
-
-        def _spy_ensure(self, cursor, table_name, ddl):
-            ensure_calls["n"] += 1
-            return real_ensure(self, cursor, table_name, ddl)
-
-        monkeypatch.setattr(SessionDB, "_ensure_fts_schema", _spy_ensure)
-
-        restored = SessionDB(db_path=db_path)
-        try:
-            assert ensure_calls["n"] == 0
-            assert restored._fts_table_exists("messages_fts") is False
-            assert len(restored.search_messages("stable")) == 1
-            assert len(restored.search_messages("中文")) == 1
-            assert restored._conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
-        finally:
-            restored.close()
+        for _ in range(5):
+            restored = SessionDB(db_path=db_path)
+            try:
+                n = restored._conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master "
+                    "WHERE name LIKE 'messages_fts%'"
+                ).fetchone()[0]
+                assert n == 0
+                assert restored._fts_table_exists("messages_fts") is False
+                assert len(restored.search_messages("stable")) == 1
+                assert len(restored.search_messages("中文")) == 1
+                assert restored._conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+            finally:
+                restored.close()
 
     def test_optimize_and_rebuild_are_noop_and_scrub_leftovers(self, tmp_path):
         """optimize_fts/rebuild_fts return 0 and scrub leftover FTS objects."""
@@ -810,8 +802,8 @@ class TestSessionLifecycle:
         try:
             db.create_session(session_id="s1", source="cli")
             db.append_message("s1", role="user", content="optimize base only")
-            db._conn.executescript(hermes_state.FTS_TRIGRAM_SQL)
-            db._conn.executescript(hermes_state.FTS_SQL)
+            db._conn.executescript(LEGACY_FTS_TRIGRAM_SQL)
+            db._conn.executescript(LEGACY_FTS_SQL)
             db._conn.commit()
             assert db._fts_table_exists("messages_fts") is True
 
@@ -1815,10 +1807,10 @@ class TestFTS5Search:
         # the assistant message depending on FTS5 phrase matching
         assert len(results) >= 1
 
-    def test_sanitize_fts5_query_strips_dangerous_chars(self):
-        """Unit test for _sanitize_fts5_query static method."""
+    def test_sanitize_search_query_strips_dangerous_chars(self):
+        """Unit test for _sanitize_search_query static method."""
         from hermes_state import SessionDB
-        s = SessionDB._sanitize_fts5_query
+        s = SessionDB._sanitize_search_query
         assert s('hello world') == 'hello world'
         assert '+' not in s('C++')
         assert '"' not in s('"unterminated')
@@ -1836,10 +1828,10 @@ class TestFTS5Search:
         assert s('TODO: fix').split() == ['TODO', 'fix']
         assert ':' not in s('error:timeout')
 
-    def test_sanitize_fts5_preserves_quoted_phrases(self):
+    def test_sanitize_search_preserves_quoted_phrases(self):
         """Properly paired double-quoted phrases should be preserved."""
         from hermes_state import SessionDB
-        s = SessionDB._sanitize_fts5_query
+        s = SessionDB._sanitize_search_query
         # Simple quoted phrase
         assert s('"exact phrase"') == '"exact phrase"'
         # Quoted phrase alongside unquoted terms
@@ -1851,10 +1843,10 @@ class TestFTS5Search:
         # Unmatched quote still stripped
         assert '"' not in s('"unterminated')
 
-    def test_sanitize_fts5_quotes_hyphenated_terms(self):
+    def test_sanitize_search_quotes_hyphenated_terms(self):
         """Hyphenated terms should be wrapped in quotes for exact matching."""
         from hermes_state import SessionDB
-        s = SessionDB._sanitize_fts5_query
+        s = SessionDB._sanitize_search_query
         # Simple hyphenated term
         assert s('chat-send') == '"chat-send"'
         # Multiple hyphens
@@ -1873,10 +1865,10 @@ class TestFTS5Search:
         # Hyphenated inside a quoted phrase stays as-is
         assert s('"my chat-send thing"') == '"my chat-send thing"'
 
-    def test_sanitize_fts5_quotes_dotted_terms(self):
+    def test_sanitize_search_quotes_dotted_terms(self):
         """Dotted terms should be wrapped in quotes to avoid FTS5 query parse edge cases."""
         from hermes_state import SessionDB
-        s = SessionDB._sanitize_fts5_query
+        s = SessionDB._sanitize_search_query
 
         assert s('P2.2') == '"P2.2"'
         assert s('simulate.p2') == '"simulate.p2"'
@@ -1894,7 +1886,7 @@ class TestFTS5Search:
         assert s('my-app.config') == '"my-app.config"'
         assert s('my-app.config.ts') == '"my-app.config.ts"'
 
-    def test_sanitize_fts5_quotes_underscored_terms(self):
+    def test_sanitize_search_quotes_underscored_terms(self):
         """Underscored terms should be wrapped in quotes for exact matching.
 
         FTS5 default tokenizer splits 'sp_new1' into tokens 'sp' and 'new1'.
@@ -1902,7 +1894,7 @@ class TestFTS5Search:
         ('sp AND new') that fails to match rows indexed as 'sp_new1'.
         """
         from hermes_state import SessionDB
-        s = SessionDB._sanitize_fts5_query
+        s = SessionDB._sanitize_search_query
         # Simple underscored term
         assert s('sp_new') == '"sp_new"'
         # Multiple underscores
@@ -1918,11 +1910,11 @@ class TestFTS5Search:
         assert '"sp_new"' in result
         assert '血管瘤' in result
 
-    def test_sanitize_fts5_query_runtime_is_bounded(self):
+    def test_sanitize_search_query_runtime_is_bounded(self):
         """Adversarial quote/special-char runs should sanitize quickly."""
-        from hermes_state import MAX_FTS5_QUERY_CHARS, SessionDB
+        from hermes_state import MAX_SEARCH_QUERY_CHARS, SessionDB
 
-        s = SessionDB._sanitize_fts5_query
+        s = SessionDB._sanitize_search_query
         query = ('"' * 100_000) + ("a." * 100_000) + ("*" * 100_000)
 
         start = time.perf_counter()
@@ -1930,7 +1922,7 @@ class TestFTS5Search:
         elapsed = time.perf_counter() - start
 
         assert isinstance(result, str)
-        assert len(result) <= MAX_FTS5_QUERY_CHARS * 2
+        assert len(result) <= MAX_SEARCH_QUERY_CHARS * 2
         assert elapsed < 0.5
 
     def test_long_search_query_is_capped_and_does_not_crash(self, db):
@@ -4858,7 +4850,7 @@ class TestOptimizeFts:
         db.create_session(session_id="s1", source="cli")
         db.append_message(session_id="s1", role="user", content="hello")
         with db._lock:
-            db._conn.executescript(hermes_state.FTS_SQL)
+            db._conn.executescript(LEGACY_FTS_SQL)
         assert db._fts_table_exists("messages_fts") is True
         assert db.optimize_fts() == 0
         assert db._fts_table_exists("messages_fts") is False

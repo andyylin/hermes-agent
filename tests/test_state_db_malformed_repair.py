@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 import hermes_state
+from tests.state.legacy_fts_ddl import LEGACY_FTS_SQL
 from hermes_state import (
     SessionDB,
     is_malformed_db_error,
@@ -39,7 +40,7 @@ def _build_healthy_db(db_path: Path) -> str:
 def _inject_legacy_fts(db_path: Path) -> None:
     """Install pre-retirement FTS objects on a no-FTS healthy DB."""
     conn = sqlite3.connect(str(db_path))
-    conn.executescript(hermes_state.FTS_SQL)
+    conn.executescript(LEGACY_FTS_SQL)
     try:
         conn.execute(
             "INSERT INTO messages_fts(rowid, content) "

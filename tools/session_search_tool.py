@@ -5,21 +5,22 @@ Session Search Tool - Long-Term Conversation Recall
 Single-shape tool with three calling modes (inferred from args, no explicit
 mode parameter):
 
-  1. DISCOVERY — pass ``query``. Runs FTS5, dedupes hits by session lineage,
-     returns top N sessions each with: snippet, ±5 message window around the
-     match, plus bookend_start (first 3 user+assistant msgs of session) and
-     bookend_end (last 3). Zero LLM cost.
+  1. DISCOVERY — pass ``query``. Canonical-table search (LIKE over
+     messages/sessions), dedupes hits by session lineage, returns top N
+     sessions each with: snippet, ±5 message window around the match, plus
+     bookend_start (first 3 user+assistant msgs of session) and bookend_end
+     (last 3). Zero LLM cost.
 
   2. SCROLL — pass ``session_id`` + ``around_message_id``. Returns a window
-     of ±window messages centered on the anchor, no FTS5, no bookends. To
-     scroll forward / backward, re-anchor on the last / first message id of
-     the returned window.
+     of ±window messages centered on the anchor, no full-session search, no
+     bookends. To scroll forward / backward, re-anchor on the last / first
+     message id of the returned window.
 
   3. BROWSE — no args. Returns recent sessions chronologically (titles,
      previews, timestamps).
 
-All three modes operate on the SQLite session DB via the FTS5 index and
-the get_anchored_view / get_messages_around primitives in hermes_state.
+All three modes operate on the SQLite session DB (canonical tables) via
+search_messages / get_anchored_view / get_messages_around in hermes_state.
 No LLM calls anywhere — every shape returns actual messages from the DB.
 
 History: PR #20238 (JabberELF) seeded a fast/summary dual-mode split; the
@@ -42,11 +43,11 @@ _HIDDEN_SESSION_SOURCES = ("subagent", "tool")
 # Automation sources that are kept searchable but DEMOTED below interactive
 # sessions in discover ranking. Cron jobs run on a schedule and accumulate
 # large volumes of repetitive vocabulary (recurring project names, dates,
-# "session", summaries); under bare BM25 they dominate the top-N FTS rows and
-# starve out the user's own interactive sessions, producing "recall blindness"
-# where only cron sessions surface (#19434). Demoting — not excluding — keeps
-# cron content reachable when it's the only match, while interactive sessions
-# always win when both match.
+# "session", summaries); under unranked recall they dominate the top-N
+# search rows and starve out the user's own interactive sessions, producing
+# "recall blindness" where only cron sessions surface (#19434). Demoting —
+# not excluding — keeps cron content reachable when it's the only match,
+# while interactive sessions always win when both match.
 _DEMOTED_SESSION_SOURCES = ("cron",)
 
 # How many FTS rows discover scans before dedup-by-lineage. The interactive
@@ -104,15 +105,14 @@ def _resolve_to_parent(db, session_id: str) -> str:
 
 
 def _order_for_recall(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Stable-sort FTS rows so interactive sessions rank above automation.
+    """Stable-sort search hits so interactive sessions rank above automation.
 
-    Within each class (interactive vs demoted) the original BM25 ``rank``
-    order is preserved — Python's sort is stable, and rows arrive already
-    ranked by relevance. This only changes cross-class ordering: a cron hit
-    never displaces an interactive hit during lineage dedup, so the user's
-    own conversations surface first even when cron rows out-rank them under
-    bare BM25 (#19434). Demoted rows still appear when they're the only
-    matches.
+    Within each class (interactive vs demoted) the original result order
+    is preserved — Python's sort is stable. This only changes cross-class
+    ordering: a cron hit never displaces an interactive hit during lineage
+    dedup, so the user's own conversations surface first even when cron
+    rows would otherwise dominate under unranked recall (#19434). Demoted
+    rows still appear when they're the only matches.
     """
     return sorted(
         raw_results,
@@ -258,7 +258,7 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
 
 
 def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
-    """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
+    """Return metadata for the most recent sessions (no LLM calls)."""
     try:
         sessions = db.list_sessions_rich(
             limit=limit + 5,
@@ -309,7 +309,7 @@ def _scroll(
 ) -> str:
     """Scroll shape: return a window of messages centered on an anchor.
 
-    No FTS5, no bookends — just the slice. The discovery shape's lineage
+    No full-session search, no bookends — just the slice. The discovery shape's lineage
     fixup is preserved: if the anchor doesn't live in the named session
     but does live in a child session in the same lineage, rebind silently.
     """
@@ -504,7 +504,7 @@ def _discover(
     sort: Optional[str],
     current_session_id: str = None,
 ) -> str:
-    """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
+    """Discovery shape: search + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
     current_lineage_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
     title_result = _title_match_result(db, query, current_lineage_root)
@@ -521,12 +521,12 @@ def _discover(
             sort=sort,
         )
     except Exception as e:
-        logging.error("FTS5 search failed: %s", e, exc_info=True)
+        logging.error("Session search failed: %s", e, exc_info=True)
         return tool_error(f"Search failed: {e}", success=False)
 
     # Demote automation (cron) rows below interactive ones before dedup, so a
     # high-volume cron corpus can't starve the user's own sessions out of the
-    # top `limit` results (#19434). Stable — preserves BM25/recency order
+    # top `limit` results (#19434). Stable — preserves relative order
     # within each class.
     raw_results = _order_for_recall(raw_results)
 
@@ -541,7 +541,7 @@ def _discover(
         }, ensure_ascii=False)
 
     # Dedupe by lineage. Keep the raw owning session_id on the surviving
-    # row — only that pairs validly with the FTS5 match id for the anchored
+    # row — only that pairs validly with the match id for the anchored
     # window. parent_session_id is exposed separately when different.
     seen_sessions = {}
     results = []
@@ -753,8 +753,8 @@ SESSION_SEARCH_SCHEMA = {
     "name": "session_search",
     "description": (
         "Search past sessions stored in the local session DB, or scroll inside one. "
-        "FTS5-backed retrieval over the SQLite message store. No LLM calls — every "
-        "shape returns actual messages from the DB.\n\n"
+        "Canonical-table retrieval over the SQLite message store (substring LIKE). "
+        "No LLM calls — every shape returns actual messages from the DB.\n\n"
         "SOURCE-FIRST LIMIT\n\n"
         "  This tool searches Hermes conversation history only. It is not evidence "
         "about the current contents of external sources. If the user provided a "
@@ -769,13 +769,13 @@ SESSION_SEARCH_SCHEMA = {
         "FOUR CALLING SHAPES\n\n"
         "  1) DISCOVERY — pass `query`:\n"
         "     session_search(query=\"auth refactor\", limit=3)\n"
-        "     Runs FTS5, dedupes hits by session lineage, returns the top N sessions. "
-        "Each result carries:\n"
+        "     Searches message content, dedupes hits by session lineage, returns the "
+        "top N sessions. Each result carries:\n"
         "       - session_id, title, when, source\n"
-        "       - snippet: FTS5-highlighted match excerpt\n"
+        "       - snippet: match excerpt\n"
         "       - bookend_start: first 3 user+assistant messages of the session "
         "(the goal / kickoff)\n"
-        "       - messages: ±5 messages around the FTS5 match, with the anchor message "
+        "       - messages: ±5 messages around the match, with the anchor message "
         "flagged (the hit in context)\n"
         "       - bookend_end: last 3 user+assistant messages of the session "
         "(the resolution / decisions)\n"
@@ -784,9 +784,9 @@ SESSION_SEARCH_SCHEMA = {
         "without paying for the whole transcript.\n\n"
         "  2) SCROLL — pass `session_id` + `around_message_id`:\n"
         "     session_search(session_id=\"...\", around_message_id=12345, window=10)\n"
-        "     Returns a window of ±`window` messages centered on the anchor. No FTS5, "
-        "no bookends — just the slice. Use after a discovery call when you need more "
-        "context than the ±5 default window.\n"
+        "     Returns a window of ±`window` messages centered on the anchor. No "
+        "full-session search, no bookends — just the slice. Use after a discovery "
+        "call when you need more context than the ±5 default window.\n"
         "       - To scroll FORWARD: pass messages[-1].id back as around_message_id.\n"
         "       - To scroll BACKWARD: pass messages[0].id back as around_message_id.\n"
         "       - The boundary message appears in both windows — orientation marker.\n"
@@ -802,11 +802,10 @@ SESSION_SEARCH_SCHEMA = {
         "     session_search()\n"
         "     Returns recent sessions chronologically: titles, previews, timestamps. "
         "Use when the user asks \"what was I working on\" without naming a topic.\n\n"
-        "FTS5 SYNTAX\n\n"
-        "  AND is the default — multi-word queries require all terms. Use OR explicitly "
-        "for broader recall (`alpha OR beta OR gamma`), quoted phrases for exact match "
-        "(`\"docker networking\"`), boolean (`python NOT java`), or prefix wildcards "
-        "(`deploy*`).\n\n"
+        "QUERY TIPS\n\n"
+        "  Multi-word queries match messages containing any of the terms (OR). "
+        "Use a distinctive keyword or short phrase for precision. Prefix wildcards "
+        "and FTS boolean operators are not used — plain substrings only.\n\n"
         "WHEN TO USE\n\n"
         "  Reach for this on questions about Hermes conversation history itself, such "
         "as \"what did we do about X\", \"where did we leave Y\", or \"find the "
@@ -840,7 +839,7 @@ SESSION_SEARCH_SCHEMA = {
                 "type": "string",
                 "enum": ["newest", "oldest"],
                 "description": (
-                    "Discovery shape only. Temporal bias on top of FTS5 ranking. Omit "
+                    "Discovery shape only. Temporal ordering (newest/oldest). Omit "
                     "to keep relevance-only ordering (suitable for exploratory recall — "
                     "\"what do we know about X\"). Set 'newest' for recency-shaped "
                     "questions (\"where did we leave X\"). Set 'oldest' for "

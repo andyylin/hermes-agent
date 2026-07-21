@@ -144,21 +144,15 @@ class TestConcurrentSessionDbSafety:
             db.close()
 
     def test_concurrent_writers_and_searcher_no_fts_clean_pragmas(
-        self, corpus_db, monkeypatch
+        self, corpus_db
     ):
         """Multi-connection stress: no FTS objects; quick/integrity stay ok."""
         path, baseline_msgs = corpus_db
 
-        def _no_rebuild(*_a, **_k):
-            raise RuntimeError("rebuild forbidden in concurrent safety test")
-
-        monkeypatch.setattr(
-            SessionDB, "_rebuild_fts_indexes", staticmethod(_no_rebuild)
-        )
-
         for _ in range(5):
             db = SessionDB(db_path=path)
             assert db._fts_enabled is False
+            assert _fts_object_count(path) == 0
             db.close()
         assert _fts_object_count(path) == 0
 
