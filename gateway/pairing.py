@@ -258,16 +258,23 @@ class PairingStore:
     directory (backward-compat for the ``hermes pairing`` CLI).
     """
 
-    def __init__(self, profile: Optional[str] = None):
-        # Resolve storage directory lazily — tests use a temp HERMES_HOME
-        # and PairingStore may be constructed before the env is set.
-        if profile:
+    def __init__(
+        self,
+        profile: Optional[str] = None,
+        *,
+        pairing_dir: Optional[Path] = None,
+    ):
+        # Explicit directories avoid resolving a profile twice when this is
+        # constructed inside an already profile-scoped HERMES_HOME.
+        if pairing_dir is not None:
+            self._dir = Path(pairing_dir)
+        elif profile:
             from hermes_constants import get_hermes_home
             self._dir = get_hermes_home() / "profiles" / profile / "pairing"
         else:
             self._dir = PAIRING_DIR
         self._dir.mkdir(parents=True, exist_ok=True)
-        if not profile:
+        if not profile and pairing_dir is None:
             # Heal installs whose global pairing data ended up split across
             # the legacy and new directories (per-profile stores never had
             # the legacy/new split).

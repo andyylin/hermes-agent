@@ -129,6 +129,10 @@ The final candidate SHA is recorded externally in the exact-SHA release evidence
   - Discord receives heading/bullet formatting while email retains rich HTML/Markdown rendering during mixed fan-out.
   - Preserved from minimal live ancestry and reconciled in `583022e94`.
 
+- **Operator-invoked deterministic cron-definition export**
+  - `cron definitions export` writes a stable, diffable representation on explicit request; it is not an automatic scheduler write path.
+  - Implemented by `cron/definitions_export.py`, `cron/jobs.py:export_definitions_file`, and `hermes_cli/cron.py`.
+
 - **Email HTML and notification rendering**
   - Multipart alternative output with readable plain fallback.
   - Safe Markdown-ish HTML rendering.

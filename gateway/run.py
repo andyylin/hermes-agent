@@ -9520,7 +9520,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
                 claimed[(platform, fp)] = profile_name
 
-            self._configure_profile_adapter(adapter, profile_name, platform)
+            self._configure_profile_adapter(
+                adapter, profile_name, platform, profile_home=profile_home
+            )
 
             try:
                 with _profile_runtime_scope(profile_home):
@@ -9542,6 +9544,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter: BasePlatformAdapter,
         profile_name: str,
         platform: Platform,
+        *,
+        profile_home: "Path",
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
@@ -9558,12 +9562,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         stores = getattr(self, "pairing_stores", None)
         if stores is None:
+            # Partial/test runners may omit the registry. Keep authorization
+            # fail-closed instead of creating storage in an unknown home.
             stores = {}
             self.pairing_stores = stores
-        store = stores.get(profile_name)
-        if store is None:
-            store = PairingStore(profile=profile_name)
-            stores[profile_name] = store
+            store = None
+        else:
+            store = stores.get(profile_name)
+            if store is None:
+                store = PairingStore(
+                    profile=profile_name,
+                    pairing_dir=Path(profile_home) / "pairing",
+                )
+                stores[profile_name] = store
         adapter._pairing_store = store
         adapter._busy_text_mode = self._busy_text_mode
 
@@ -9594,7 +9605,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                             return
                         self._configure_profile_adapter(
-                            adapter, profile_name, platform
+                            adapter, profile_name, platform, profile_home=profile_home
                         )
                         success = await self._connect_adapter_with_timeout(
                             adapter, platform, is_reconnect=True

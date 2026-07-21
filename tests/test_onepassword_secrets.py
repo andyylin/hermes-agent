@@ -214,6 +214,20 @@ def test_fetch_child_env_is_allowlisted(monkeypatch, tmp_path):
     assert env.get("NO_COLOR") == "1"
 
 
+def test_child_env_uses_scoped_session_not_process_session(monkeypatch):
+    monkeypatch.setenv("OP_SESSION_poisoned", "wrong-profile")
+    monkeypatch.setattr(
+        op,
+        "_source_environ",
+        lambda: {"OP_SESSION_scoped": "right-profile", "PATH": "/bin"},
+    )
+
+    env = op._op_child_env("")
+
+    assert env["OP_SESSION_scoped"] == "right-profile"
+    assert "OP_SESSION_poisoned" not in env
+
+
 # ---------------------------------------------------------------------------
 # Caching
 # ---------------------------------------------------------------------------

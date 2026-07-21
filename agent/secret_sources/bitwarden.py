@@ -448,17 +448,18 @@ def _write_encrypted_disk_cache(
                 json.dump(payload, f)
             os.chmod(tmp, 0o600)
             os.replace(tmp, path)
-            # Encrypted mode is exclusive. Remove any plaintext cache left by
-            # an earlier configuration only after the encrypted replacement
-            # has landed successfully.
-            _DISK_CACHE.clear(home_path)
+            # Encrypted mode is exclusive. Plaintext removal is a security
+            # boundary, not best-effort cleanup: abort if it cannot be removed.
+            _purge_plaintext_disk_cache(home_path)
         except BaseException:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
             raise
-    except Exception:  # noqa: BLE001 — best-effort cache only
+    except RuntimeError:
+        raise
+    except Exception:  # noqa: BLE001 — encryption write remains best-effort
         return
 
 
@@ -906,6 +907,21 @@ class BitwardenSource(SecretSource):
         cfg = cfg if isinstance(cfg, dict) else {}
         result = FetchResult()
 
+        encrypted_cfg = cfg.get("encrypted_cache")
+        encrypted_cfg = encrypted_cfg if isinstance(encrypted_cfg, dict) else {}
+        encrypted_enabled = bool(encrypted_cfg.get("enabled", False))
+        try:
+            encrypted_max_stale = float(encrypted_cfg.get("max_stale_seconds", 0))
+        except (TypeError, ValueError):
+            encrypted_max_stale = 0.0
+        if encrypted_enabled:
+            try:
+                _purge_plaintext_disk_cache(home_path)
+            except RuntimeError as exc:
+                result.error = str(exc)
+                result.error_kind = ErrorKind.UNKNOWN
+                return result
+
         access_token_env = str(cfg.get("access_token_env") or "BWS_ACCESS_TOKEN")
         from agent.secret_sources.registry import current_source_environ
 
@@ -945,14 +961,6 @@ class BitwardenSource(SecretSource):
             ttl = float(cfg.get("cache_ttl_seconds", 300))
         except (TypeError, ValueError):
             ttl = 300.0
-
-        encrypted_cfg = cfg.get("encrypted_cache")
-        encrypted_cfg = encrypted_cfg if isinstance(encrypted_cfg, dict) else {}
-        encrypted_enabled = bool(encrypted_cfg.get("enabled", False))
-        try:
-            encrypted_max_stale = float(encrypted_cfg.get("max_stale_seconds", 0))
-        except (TypeError, ValueError):
-            encrypted_max_stale = 0.0
 
         try:
             secrets, warnings = fetch_bitwarden_secrets(

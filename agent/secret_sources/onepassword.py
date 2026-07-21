@@ -246,7 +246,7 @@ def _op_child_env(token_value: str) -> Dict[str, str]:
         if val is not None:
             env[key] = val
     # Desktop / interactive session credentials.
-    for key, val in os.environ.items():
+    for key, val in _source_environ().items():
         if key.startswith("OP_SESSION_"):
             env[key] = val
     # `op` reads OP_SERVICE_ACCOUNT_TOKEN regardless of which env var the user

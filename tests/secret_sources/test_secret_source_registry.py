@@ -391,6 +391,30 @@ class TestBitwardenSource:
         assert result.error_kind is ErrorKind.NOT_CONFIGURED
         assert "project_id" in result.error
 
+    def test_encrypted_fetch_purges_plaintext_before_missing_binary(
+        self, tmp_path, monkeypatch
+    ):
+        import agent.secret_sources.bitwarden as bw
+
+        monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.token")
+        plaintext = bw._disk_cache_path(tmp_path)
+        plaintext.parent.mkdir(parents=True, exist_ok=True)
+        plaintext.write_text('{"legacy": true}')
+        monkeypatch.setattr(bw, "find_bws", lambda **_kwargs: None)
+
+        result = BitwardenSource().fetch(
+            {
+                "enabled": True,
+                "project_id": "proj",
+                "auto_install": False,
+                "encrypted_cache": {"enabled": True},
+            },
+            tmp_path,
+        )
+
+        assert result.error_kind is ErrorKind.BINARY_MISSING
+        assert not plaintext.exists()
+
     def test_fetch_delegates_to_fetch_bitwarden_secrets(self, tmp_path, monkeypatch):
         monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.token")
         import agent.secret_sources.bitwarden as bw

@@ -3358,12 +3358,19 @@ def run_job(
         # is set (mirrors startup), and the Bitwarden value-cache keeps the
         # forced re-pull off the network. load_hermes_dotenv also handles the
         # utf-8/latin-1 encoding fallback internally.
-        from hermes_cli.env_loader import (
-            load_hermes_dotenv,
-            reset_secret_source_cache,
-        )
-        reset_secret_source_cache()
-        load_hermes_dotenv(hermes_home=_get_hermes_home())
+        from agent.secret_scope import current_secret_scope
+        if current_secret_scope() is None:
+            from hermes_cli.env_loader import (
+                load_hermes_dotenv,
+                reset_secret_source_cache,
+            )
+            reset_secret_source_cache()
+            load_hermes_dotenv(hermes_home=_get_hermes_home())
+        else:
+            logger.debug(
+                "Job '%s': isolated profile scope already refreshed; skipping global dotenv reload",
+                job_id,
+            )
 
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:

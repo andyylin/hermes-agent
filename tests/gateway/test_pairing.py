@@ -27,6 +27,15 @@ def _make_store(tmp_path):
         return PairingStore()
 
 
+def test_explicit_pairing_directory_does_not_double_nest_profile(tmp_path):
+    profile_home = tmp_path / "profiles" / "reviewer"
+    store = PairingStore(
+        profile="reviewer", pairing_dir=profile_home / "pairing"
+    )
+    assert store._dir == profile_home / "pairing"
+    assert "profiles/reviewer/profiles/reviewer" not in str(store._dir)
+
+
 class TestSplitPairingDirMigration:
     def test_merges_new_approved_into_active_legacy_dir(self, tmp_path):
         home = tmp_path / "home"
