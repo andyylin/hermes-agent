@@ -9620,7 +9620,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
                 claimed[(platform, fp)] = profile_name
 
-            self._configure_profile_adapter(adapter, profile_name, platform)
+            self._configure_profile_adapter(
+                adapter, profile_name, platform, profile_home=profile_home
+            )
 
             try:
                 with _profile_runtime_scope(profile_home):
@@ -9642,6 +9644,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter: BasePlatformAdapter,
         profile_name: str,
         platform: Platform,
+        *,
+        profile_home: Optional[Path] = None,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
         adapter._multiplex_profile_name = profile_name
@@ -9649,7 +9653,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         pairing_store = self.pairing_stores.get(profile_name)
         if pairing_store is None:
-            pairing_store = PairingStore(profile=profile_name)
+            pairing_store = PairingStore(profile=profile_name, home=profile_home)
             self.pairing_stores[profile_name] = pairing_store
         adapter._profile_pairing_store = pairing_store
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
@@ -9691,7 +9695,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                             return
                         self._configure_profile_adapter(
-                            adapter, profile_name, platform
+                            adapter,
+                            profile_name,
+                            platform,
+                            profile_home=profile_home,
                         )
                         success = await self._connect_adapter_with_timeout(
                             adapter, platform, is_reconnect=True

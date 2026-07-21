@@ -104,8 +104,15 @@ def test_secondary_adapter_receives_its_profile_pairing_store(tmp_path, monkeypa
     runner._recover_telegram_topic_thread_id = MagicMock()
     adapter = MagicMock()
 
-    runner._configure_profile_adapter(adapter, "ops", Platform.YUANBAO)
+    profile_home = tmp_path / ".hermes" / "profiles" / "ops"
+    runner._configure_profile_adapter(
+        adapter,
+        "ops",
+        Platform.YUANBAO,
+        profile_home=profile_home,
+    )
 
     assert adapter._multiplex_profile_name == "ops"
     assert adapter._profile_pairing_store is runner.pairing_stores["ops"]
     assert adapter._profile_pairing_store.profile == "ops"
+    assert adapter._profile_pairing_store._dir == profile_home / "pairing"
