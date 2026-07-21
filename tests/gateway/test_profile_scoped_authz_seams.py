@@ -21,9 +21,10 @@ def scoped_multiplex(monkeypatch):
     ):
         monkeypatch.delenv(key, raising=False)
     set_multiplex_active(True)
-    token = set_secret_scope({})
+    scope = {}
+    token = set_secret_scope(scope)
     try:
-        yield
+        yield scope
     finally:
         reset_secret_scope(token)
         set_multiplex_active(False)
@@ -101,3 +102,39 @@ def test_authority_helpers_ignore_poisoned_process_env(monkeypatch, scoped_multi
     assert pairing._pairing_env("DISCORD_ALLOWED_USERS") == ""
     assert _component_check_auth(interaction, set(), set()) is False
     assert _matrix_env("GATEWAY_ALLOW_ALL_USERS") == ""
+
+
+def test_platform_yaml_policy_stays_in_profile_scope(monkeypatch, scoped_multiplex):
+    from plugins.platforms.discord.adapter import _apply_yaml_config as apply_discord
+    from plugins.platforms.matrix.adapter import _apply_yaml_config as apply_matrix
+
+    monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
+    monkeypatch.delenv("MATRIX_ALLOWED_USERS", raising=False)
+    discord_seeded = apply_discord(
+        {"discord": {"allowed_channels": ["profile-channel"]}},
+        {"allowed_channels": ["profile-channel"]},
+    )
+    matrix_seeded = apply_matrix(
+        {"matrix": {"allowed_users": ["@profile:example.org"]}},
+        {"allowed_users": ["@profile:example.org"]},
+    )
+
+    assert "DISCORD_ALLOWED_CHANNELS" not in __import__("os").environ
+    assert "MATRIX_ALLOWED_USERS" not in __import__("os").environ
+    assert scoped_multiplex["DISCORD_ALLOWED_CHANNELS"] == "profile-channel"
+    assert scoped_multiplex["MATRIX_ALLOWED_USERS"] == "@profile:example.org"
+    assert discord_seeded["allowed_channels"] == ["profile-channel"]
+    assert matrix_seeded["allowed_users"] == ["@profile:example.org"]
+
+
+def test_platform_policy_helpers_ignore_poisoned_global_env(monkeypatch, scoped_multiplex):
+    from plugins.platforms.discord.adapter import _discord_env
+    from plugins.platforms.matrix.adapter import _matrix_env
+
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "foreign-channel")
+    monkeypatch.setenv("MATRIX_ALLOWED_USERS", "@foreign:example.org")
+    scoped_multiplex["DISCORD_ALLOWED_CHANNELS"] = "profile-channel"
+    scoped_multiplex["MATRIX_ALLOWED_USERS"] = "@profile:example.org"
+
+    assert _discord_env("DISCORD_ALLOWED_CHANNELS") == "profile-channel"
+    assert _matrix_env("MATRIX_ALLOWED_USERS") == "@profile:example.org"
