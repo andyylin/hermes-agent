@@ -29,18 +29,16 @@ from gateway.whatsapp_identity import (
 
 
 def _auth_env(name: str, default: str = "") -> str:
-    """Read allowlist/auth env; prefer profile secret_scope under multiplex."""
+    """Read allowlist/auth env; profile scope is authoritative under multiplex."""
     if not name:
         return default
     try:
         from agent.secret_scope import get_secret
+    except ImportError:
+        return (os.getenv(name) or default).strip()
 
-        val = get_secret(name)
-        if val is not None and str(val).strip():
-            return str(val).strip()
-    except Exception:
-        pass
-    return (os.getenv(name) or default).strip()
+    value = get_secret(name)
+    return (str(value) if value is not None else default).strip()
 
 
 class GatewayAuthorizationMixin:
@@ -349,7 +347,7 @@ class GatewayAuthorizationMixin:
             if not chat_allowlist_env and source.platform and source.platform.value == "line":
                 chat_allowlist_env = "LINE_ALLOWED_GROUPS"
             if chat_allowlist_env:
-                raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
+                raw_chat_allowlist = _auth_env(chat_allowlist_env)
                 if raw_chat_allowlist:
                     allowed_group_ids = {
                         cid.strip()
@@ -722,7 +720,7 @@ class GatewayAuthorizationMixin:
             if os.getenv(platform_env_map.get(platform, ""), "").strip():
                 return "ignore"
             for env_key in platform_group_env_map.get(platform, ()):
-                if os.getenv(env_key, "").strip():
+                if _auth_env(env_key):
                     return "ignore"
 
         if os.getenv("GATEWAY_ALLOWED_USERS", "").strip():
