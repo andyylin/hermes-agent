@@ -264,14 +264,20 @@ describe('ToolsetConfigPanel', () => {
   })
 
   it('saves an API key for a provider env var', async () => {
+    const keyedConfig = config()
+    keyedConfig.active_provider = 'ElevenLabs'
+    keyedConfig.providers = keyedConfig.providers.map(provider => ({
+      ...provider,
+      is_active: provider.name === 'ElevenLabs'
+    }))
+    getToolsetConfig.mockResolvedValue(keyedConfig)
+
     const { ToolsetConfigPanel } = await import('./toolset-config-panel')
     render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
 
-    // Select the keyed provider so its env vars render.
-    const elevenlabs = await screen.findByRole('button', { name: /ElevenLabs/ })
-    fireEvent.click(elevenlabs)
-
-    // Open the credential actions menu (Radix opens on pointerdown), then "Set".
+    // Provider-selection behavior is covered separately. Start this credential
+    // test with ElevenLabs active so a mocked post-selection refetch cannot race
+    // the env-var row closed on slower CI runners.
     const trigger = await screen.findByRole('button', { name: /Actions for ELEVENLABS_API_KEY/ })
     fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false, pointerType: 'mouse' })
     fireEvent.click(await screen.findByRole('menuitem', { name: 'Set' }))
