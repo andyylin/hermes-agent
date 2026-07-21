@@ -972,6 +972,43 @@ class TestStandaloneEmailSend(unittest.TestCase):
             self.assertIn("<h3>Reference</h3>", html_part.get_payload(decode=True).decode("utf-8"))
             self.assertIn("Message-ID", msg)
 
+    def test_standalone_email_uses_profile_scoped_smtp_credentials(self):
+        """Multiplex standalone delivery must not consume another profile's env."""
+        import asyncio
+        from types import SimpleNamespace
+
+        from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+        from plugins.platforms.email.adapter import _standalone_send
+
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "wrong@example.com",
+            "EMAIL_PASSWORD": "wrong-password",
+            "EMAIL_SMTP_HOST": "wrong.smtp.example.com",
+            "EMAIL_SMTP_PORT": "2525",
+        }, clear=False), patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+            set_multiplex_active(True)
+            token = set_secret_scope({
+                "EMAIL_ADDRESS": "scoped@example.com",
+                "EMAIL_PASSWORD": "scoped-password",
+                "EMAIL_SMTP_HOST": "scoped.smtp.example.com",
+                "EMAIL_SMTP_PORT": "587",
+            })
+            try:
+                result = asyncio.run(_standalone_send(
+                    SimpleNamespace(extra={}),
+                    "user@example.com",
+                    "Scoped body",
+                ))
+            finally:
+                reset_secret_scope(token)
+                set_multiplex_active(False)
+
+        self.assertTrue(result["success"])
+        mock_smtp.assert_called_once_with("scoped.smtp.example.com", 587)
+        mock_server.login.assert_called_once_with("scoped@example.com", "scoped-password")
+
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",

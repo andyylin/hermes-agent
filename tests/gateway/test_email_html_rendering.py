@@ -1,5 +1,9 @@
 from plugins.platforms.email.adapter import EmailAdapter
-from tools.email_rendering import append_notification_reference_footer, plain_text_to_html
+from tools.email_rendering import (
+    append_notification_reference_footer,
+    plain_text_to_html,
+    sanitize_email_html,
+)
 
 
 BODY = (
@@ -28,6 +32,26 @@ def test_email_adapter_plain_text_to_html_renders_rich_markdown_safely():
 
 def test_shared_email_plain_text_to_html_renders_rich_markdown_safely():
     assert_rich_safe_html(plain_text_to_html(BODY))
+
+
+def test_raw_html_is_sanitized_before_email_delivery():
+    raw = (
+        '<h2 onclick="steal()" style="background:url(https://evil.example)">Safe</h2>'
+        '<script>alert("owned")</script>'
+        '<a href="javascript:alert(1)">bad link</a>'
+        '<a href="https://example.com/path?a=1&b=2">good link</a>'
+    )
+
+    safe = sanitize_email_html(raw)
+
+    assert "<h2>Safe</h2>" in safe
+    assert "onclick" not in safe
+    assert "style=" not in safe
+    assert "<script" not in safe
+    assert "owned" not in safe
+    assert "javascript:" not in safe
+    assert '<a>bad link</a>' in safe
+    assert '<a href="https://example.com/path?a=1&amp;b=2">good link</a>' in safe
 
 
 def test_notification_reference_footer_is_copyable_in_plain_and_html():

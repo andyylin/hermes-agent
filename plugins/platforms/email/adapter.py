@@ -1074,6 +1074,9 @@ class EmailAdapter(BasePlatformAdapter):
     def _attach_body(self, msg: MIMEMultipart, body: str) -> None:
         """Attach email body as HTML when content is HTML, with a plain fallback."""
         if self._looks_like_html(body):
+            from tools.email_rendering import sanitize_email_html
+
+            body = sanitize_email_html(body)
             alt = MIMEMultipart("alternative")
             alt.attach(MIMEText(self._html_to_plain_text(body), "plain", "utf-8"))
             alt.attach(MIMEText(body, "html", "utf-8"))
@@ -1324,13 +1327,14 @@ async def _standalone_send(
     standalone_sender_fn contract; replaces the legacy _send_email helper."""
     import smtplib
     import ssl as _ssl
+    from agent.secret_scope import get_secret
 
     extra = getattr(pconfig, "extra", {}) or {}
-    address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
-    password = os.getenv("EMAIL_PASSWORD", "")
-    smtp_host = extra.get("smtp_host") or os.getenv("EMAIL_SMTP_HOST", "")
+    address = extra.get("address") or get_secret("EMAIL_ADDRESS", "") or ""
+    password = get_secret("EMAIL_PASSWORD", "") or ""
+    smtp_host = extra.get("smtp_host") or get_secret("EMAIL_SMTP_HOST", "") or ""
     try:
-        smtp_port = int(os.getenv("EMAIL_SMTP_PORT", "587"))
+        smtp_port = int(extra.get("smtp_port") or get_secret("EMAIL_SMTP_PORT", "587") or "587")
     except (ValueError, TypeError):
         smtp_port = 587
 
@@ -1366,8 +1370,10 @@ async def _standalone_send(
             )
 
         if _standalone_looks_like_html(message or ""):
-            plain_body = _standalone_html_to_plain_text(message or "")
-            html_body = message or ""
+            from tools.email_rendering import sanitize_email_html
+
+            html_body = sanitize_email_html(message or "")
+            plain_body = _standalone_html_to_plain_text(html_body)
         else:
             plain_body = message or ""
             html_body = _standalone_plain_text_to_html(plain_body)

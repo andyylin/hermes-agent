@@ -907,6 +907,44 @@ def test_encrypted_cache_writes_without_plaintext(monkeypatch, tmp_path):
     }
 
 
+def test_encrypted_cache_never_falls_back_to_plaintext_when_stale_disabled(
+    monkeypatch, tmp_path
+):
+    """Encrypted mode stays encrypted and removes a legacy plaintext cache."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([{"key": "K1", "value": "secret-value"}])
+
+    monkeypatch.setattr(
+        bw.subprocess,
+        "run",
+        lambda *a, **kw: mock.Mock(returncode=0, stdout=payload, stderr=""),
+    )
+    bw._reset_cache_for_tests(home)
+    plaintext_path = bw._disk_cache_path(home)
+    plaintext_path.parent.mkdir(parents=True, exist_ok=True)
+    plaintext_path.write_text('{"secrets":{"OLD":"plaintext-secret"}}')
+
+    secrets, warnings = bw.fetch_bitwarden_secrets(
+        access_token="0.t",
+        project_id="proj-1",
+        binary=fake_binary,
+        cache_ttl_seconds=300,
+        encrypted_cache_enabled=True,
+        encrypted_cache_max_stale_seconds=0,
+        home_path=home,
+    )
+
+    assert secrets == {"K1": "secret-value"}
+    assert warnings == []
+    assert not plaintext_path.exists()
+    encrypted_path = bw._encrypted_disk_cache_path(home)
+    assert encrypted_path.exists()
+    assert "secret-value" not in encrypted_path.read_text()
+
+
 def test_encrypted_cache_falls_back_on_network_error(monkeypatch, tmp_path):
     """A fresh-enough encrypted cache is used when BWS is unreachable."""
     home = tmp_path / ".hermes"

@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from html import escape, unescape
+from html.parser import HTMLParser
+from urllib.parse import urlsplit
 
 _HTML_TAG_RE = re.compile(
     r"</?(?:html|body|h[1-6]|p|ul|ol|li|br|strong|em|table|thead|tbody|tr|th|td|div|span|blockquote|pre|code)\b",
@@ -99,6 +101,86 @@ def append_notification_reference_footer(
 def message_looks_like_html(body: str) -> bool:
     """Return True when an outgoing body contains renderable HTML."""
     return bool(_HTML_TAG_RE.search(body or ""))
+
+
+_SAFE_EMAIL_TAGS = frozenset({
+    "html", "body", "h1", "h2", "h3", "h4", "h5", "h6", "p", "ul",
+    "ol", "li", "br", "strong", "em", "table", "thead", "tbody", "tr",
+    "th", "td", "div", "span", "blockquote", "pre", "code", "a", "hr",
+})
+_VOID_EMAIL_TAGS = frozenset({"br", "hr"})
+_DROP_EMAIL_TAGS = frozenset({
+    "script", "style", "iframe", "object", "embed", "form", "input",
+    "button", "meta", "link", "svg", "math",
+})
+
+
+class _EmailHTMLSanitizer(HTMLParser):
+    """Small allowlist sanitizer for model- or automation-supplied HTML."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.output: list[str] = []
+        self.blocked_depth = 0
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        tag = tag.lower()
+        if self.blocked_depth:
+            if tag in _DROP_EMAIL_TAGS:
+                self.blocked_depth += 1
+            return
+        if tag in _DROP_EMAIL_TAGS:
+            self.blocked_depth = 1
+            return
+        if tag not in _SAFE_EMAIL_TAGS:
+            return
+
+        safe_attrs: list[tuple[str, str]] = []
+        for raw_name, raw_value in attrs:
+            name = (raw_name or "").lower()
+            value = raw_value or ""
+            if name == "class":
+                safe_attrs.append((name, value))
+            elif name in {"colspan", "rowspan"} and value.isdigit():
+                safe_attrs.append((name, value))
+            elif tag == "a" and name == "href":
+                scheme = urlsplit(value.strip()).scheme.lower()
+                if scheme in {"http", "https", "mailto"}:
+                    safe_attrs.append((name, value.strip()))
+            elif name == "title":
+                safe_attrs.append((name, value))
+
+        rendered_attrs = "".join(
+            f' {name}="{escape(value, quote=True)}"'
+            for name, value in safe_attrs
+        )
+        self.output.append(f"<{tag}{rendered_attrs}>")
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        self.handle_starttag(tag, attrs)
+        if not self.blocked_depth and tag.lower() in _SAFE_EMAIL_TAGS - _VOID_EMAIL_TAGS:
+            self.output.append(f"</{tag.lower()}>")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if self.blocked_depth:
+            if tag in _DROP_EMAIL_TAGS:
+                self.blocked_depth -= 1
+            return
+        if tag in _SAFE_EMAIL_TAGS and tag not in _VOID_EMAIL_TAGS:
+            self.output.append(f"</{tag}>")
+
+    def handle_data(self, data: str) -> None:
+        if not self.blocked_depth:
+            self.output.append(escape(data))
+
+
+def sanitize_email_html(html: str) -> str:
+    """Strip executable/remote-loading HTML while preserving safe structure."""
+    sanitizer = _EmailHTMLSanitizer()
+    sanitizer.feed(html or "")
+    sanitizer.close()
+    return "".join(sanitizer.output)
 
 
 def html_to_plain_text(html: str) -> str:

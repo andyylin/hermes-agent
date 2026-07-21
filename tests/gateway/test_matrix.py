@@ -1531,6 +1531,7 @@ class TestMatrixAccessTokenAuth:
         mock_client.device_id = None
         mock_client.state_store = MagicMock()
         mock_client.sync_store = MagicMock()
+        mock_client.sync_store.get_next_batch = AsyncMock(return_value=None)
         mock_client.sync_store.put_next_batch = AsyncMock()
         mock_client.crypto = None
         mock_client.whoami = AsyncMock(
@@ -1689,6 +1690,11 @@ class TestMatrixE2EEHardFail:
 
         assert result is True
         assert adapter._encryption is False
+        mock_client.sync.assert_awaited_once_with(
+            since=None,
+            timeout=10000,
+            full_state=True,
+        )
         await adapter.disconnect()
 
     @pytest.mark.asyncio
@@ -1915,6 +1921,21 @@ class TestMatrixDeviceIdConfig:
 
         mc = config.platforms[Platform.MATRIX]
         assert "device_id" not in mc.extra
+
+
+class TestMatrixInitialSync:
+    @pytest.mark.asyncio
+    async def test_initial_sync_resumes_from_durable_next_batch(self):
+        from plugins.platforms.matrix.adapter import _matrix_initial_sync_kwargs
+
+        sync_store = MagicMock()
+        sync_store.get_next_batch = AsyncMock(return_value="persisted-since-token")
+
+        assert await _matrix_initial_sync_kwargs(sync_store) == {
+            "since": "persisted-since-token",
+            "timeout": 10000,
+            "full_state": True,
+        }
 
 
 class TestMatrixSyncLoop:

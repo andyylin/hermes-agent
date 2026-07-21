@@ -1652,7 +1652,8 @@ class MatrixAdapter(BasePlatformAdapter):
         self._closing = False
 
         try:
-            sync_data = await client.sync(timeout=10000, full_state=True)
+            initial_sync_kwargs = await _matrix_initial_sync_kwargs(client.sync_store)
+            sync_data = await client.sync(**initial_sync_kwargs)
             if isinstance(sync_data, dict):
                 self._last_sync_ts = time.time()
                 rooms_join = sync_data.get("rooms", {}).get("join", {})

@@ -34,13 +34,14 @@ def _auth_env(name: str, default: str = "") -> str:
         return default
     try:
         from agent.secret_scope import get_secret
+    except ImportError:
+        return (os.getenv(name) or default).strip()
 
-        val = get_secret(name)
-        if val is not None and str(val).strip():
-            return str(val).strip()
-    except Exception:
-        pass
-    return (os.getenv(name) or default).strip()
+    # The profile scope is authoritative. In multiplex mode get_secret()
+    # deliberately raises when no scope is installed; do not swallow that
+    # signal and leak a process-global allowlist from another profile.
+    val = get_secret(name)
+    return (str(val) if val is not None else default).strip()
 
 
 def _line_auth_env(name: str, default: str = "") -> str:

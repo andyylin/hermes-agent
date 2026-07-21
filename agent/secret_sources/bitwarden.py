@@ -429,6 +429,10 @@ def _write_encrypted_disk_cache(
                 json.dump(payload, f)
             os.chmod(tmp, 0o600)
             os.replace(tmp, path)
+            # Encrypted mode is exclusive. Remove any plaintext cache left by
+            # an earlier configuration only after the encrypted replacement
+            # has landed successfully.
+            _DISK_CACHE.clear(home_path)
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -584,7 +588,7 @@ def fetch_bitwarden_secrets(
     if use_cache:
         if cache_ttl_seconds > 0:
             _CACHE[cache_key] = entry
-        if encrypted_cache_enabled and encrypted_cache_max_stale_seconds > 0:
+        if encrypted_cache_enabled:
             _write_encrypted_disk_cache(
                 cache_key=cache_key,
                 access_token=access_token,

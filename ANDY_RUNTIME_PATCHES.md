@@ -132,6 +132,8 @@ The final candidate SHA is recorded externally in the exact-SHA release evidence
 - **Email HTML and notification rendering**
   - Multipart alternative output with readable plain fallback.
   - Safe Markdown-ish HTML rendering.
+  - Allowlist sanitization for raw HTML fragments; executable tags, event
+    handlers, unsafe URL schemes, and remote-loading style attributes are removed.
   - Dated subject templates and explicit `hermes send` subjects.
   - Stable recurring-email thread anchors.
   - Copyable `HERMES-NOTIFY` references for notification diagnosis.
@@ -189,6 +191,20 @@ Generic workspace metadata is retained because it does not assign, move, or own 
   - Merge-resolution commits, stale ledgers, fixture-only repairs with no surviving behavior, dead helper scaffolding, malformed snapshots, and duplicated predecessor implementations.
 
 ## Verification contract
+
+The first independent exact-SHA review found and blocked promotion on five
+cross-port seams. The candidate now includes explicit regression coverage for:
+
+- fail-closed profile-scoped authorization without process-global fallback;
+- profile-scoped standalone SMTP credentials and connection settings;
+- Matrix initial sync resuming from the durable `next_batch` token;
+- the Electron profile bridge returning the Desktop-local `hermes_home` used by
+  plugin discovery;
+- encrypted Bitwarden mode never writing or retaining a plaintext cache when
+  stale fallback is disabled.
+
+The same review identified untrusted raw HTML as an unproved email boundary;
+the final candidate sanitizes that path and includes adversarial coverage.
 
 Before promotion, the exact final SHA must satisfy all of the following:
 

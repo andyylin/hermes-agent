@@ -207,3 +207,32 @@ def test_secondary_open_policy_fails_startup_guard(monkeypatch):
     assert violation is not None
     assert "wecom" in violation
     assert "open policy" in violation
+
+
+def test_auth_env_fails_closed_without_profile_scope(monkeypatch):
+    """Multiplex auth must never fall back to another profile's global env."""
+    from agent.secret_scope import UnscopedSecretError, set_multiplex_active
+    from gateway.authz_mixin import _auth_env
+
+    monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "wrong-profile-user")
+    set_multiplex_active(True)
+    try:
+        with pytest.raises(UnscopedSecretError):
+            _auth_env("GATEWAY_ALLOWED_USERS")
+    finally:
+        set_multiplex_active(False)
+
+
+def test_auth_env_treats_profile_scope_as_authoritative(monkeypatch):
+    """A missing scoped allowlist must not fall through to process-global env."""
+    from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+    from gateway.authz_mixin import _auth_env
+
+    monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "wrong-profile-user")
+    set_multiplex_active(True)
+    token = set_secret_scope({})
+    try:
+        assert _auth_env("GATEWAY_ALLOWED_USERS", "") == ""
+    finally:
+        reset_secret_scope(token)
+        set_multiplex_active(False)
