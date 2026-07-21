@@ -1211,11 +1211,18 @@ class SessionDB:
 
     @staticmethod
     def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
-        placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
+        """Count installed *base* FTS write triggers only.
+
+        Trigram triggers are retired and deliberately absent on a healthy DB.
+        Repair decisions must compare against ``_BASE_FTS_TRIGGERS`` — counting
+        the full ``_FTS_TRIGGERS`` tuple permanently under-reports health after
+        retirement and forces a full FTS rebuild on every open.
+        """
+        placeholders = ",".join("?" for _ in _BASE_FTS_TRIGGERS)
         row = cursor.execute(
             f"SELECT COUNT(*) FROM sqlite_master "
             f"WHERE type = 'trigger' AND name IN ({placeholders})",
-            _FTS_TRIGGERS,
+            _BASE_FTS_TRIGGERS,
         ).fetchone()
         return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
 
@@ -1912,7 +1919,15 @@ class SessionDB:
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
             # an earlier no-FTS5 runtime.
-            triggers_need_repair = self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+            # Only the base FTS triggers are required post-retirement. Counting
+            # retired trigram triggers here permanently treats a healthy DB as
+            # broken and rebuilds the entire index on every SessionDB open —
+            # catastrophic on large corpora (100k+ messages) and a race source
+            # for transient "database disk image is malformed" under concurrent
+            # readers/writers.
+            triggers_need_repair = (
+                self._fts_trigger_count(cursor) < len(_BASE_FTS_TRIGGERS)
+            )
             self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
 
             # Trigram FTS5 is deliberately retired on this SQLite/runtime path.
@@ -7504,17 +7519,21 @@ class SessionDB:
 
     # ── Space reclamation ──
 
-    # FTS5 virtual tables whose b-tree segments we merge on optimize. The
-    # trigram table is created lazily / may be disabled, so we probe before
-    # touching it (see optimize_fts).
-    _FTS_TABLES = ("messages_fts", "messages_fts_trigram")
+    # FTS5 virtual tables whose b-tree segments we merge on optimize / rebuild.
+    # Trigram FTS is retired: never create, optimize, or rebuild it from these
+    # paths. Leftover tables are detached by ``_retire_trigram_fts``; touching a
+    # half-dropped corrupt trigram tree was a historical poison source.
+    _FTS_TABLES = ("messages_fts",)
 
     def _fts_table_exists(self, name: str) -> bool:
         """True if an FTS5 virtual table is queryable in this DB."""
         try:
             self._conn.execute(f"SELECT 1 FROM {name} LIMIT 0")
             return True
-        except sqlite3.OperationalError:
+        except sqlite3.DatabaseError:
+            # OperationalError ("no such table") or the broader DatabaseError
+            # class ("vtable constructor failed", "disk image is malformed") —
+            # in every case the table is not queryable for maintenance.
             return False
 
     def optimize_fts(self) -> int:
@@ -7532,9 +7551,8 @@ class SessionDB:
         speed. It is complementary to VACUUM: ``optimize`` compacts the FTS
         index internally, then VACUUM returns the freed pages to the OS.
 
-        Skips any FTS table that does not exist (e.g. the trigram index when
-        disabled via ``HERMES_DISABLE_FTS_TRIGRAM`` or not yet created), so
-        it is safe to call unconditionally.
+        Only the active base FTS index is optimized (trigram is retired).
+        Missing tables are skipped, so this is safe to call unconditionally.
 
         Returns the number of FTS indexes that were optimized.
         """
@@ -7566,6 +7584,7 @@ class SessionDB:
         merges existing segments), ``rebuild`` discards and recreates the
         index data entirely.
 
+        Only the active base FTS index is rebuilt (trigram is retired).
         Safe to call when FTS tables don't exist (skips them).
         Returns the number of FTS indexes that were rebuilt.
         """

@@ -824,6 +824,133 @@ class TestSessionLifecycle:
         finally:
             restored.close()
 
+    def test_reopen_does_not_full_rebuild_healthy_base_fts(self, tmp_path, monkeypatch):
+        """Healthy post-retirement DBs must not DELETE+reinsert FTS on every open.
+
+        After trigram retirement only three base triggers exist. Counting the
+        six pre-retirement names treated every healthy open as broken and
+        rebuilt the full index — catastrophic on 100k+ message corpora and a
+        race source for transient malformed-image errors under concurrent use.
+        """
+        db_path = tmp_path / "state.db"
+        seeded = SessionDB(db_path=db_path)
+        try:
+            if not seeded._fts_enabled:
+                pytest.skip("FTS5 unavailable in this build")
+            seeded.create_session(session_id="s1", source="cli")
+            seeded.append_message("s1", role="user", content="stable ascii needle")
+            seeded.append_message("s1", role="user", content="稳定中文检索词")
+            fts_before = seeded._conn.execute(
+                "SELECT rowid, content FROM messages_fts ORDER BY rowid"
+            ).fetchall()
+            assert len(fts_before) == 2
+        finally:
+            seeded.close()
+
+        rebuild_calls: list = []
+        real_rebuild = SessionDB._rebuild_fts_indexes
+
+        def _spy_rebuild(cursor, *, include_trigram=True):
+            rebuild_calls.append(include_trigram)
+            return real_rebuild(cursor, include_trigram=include_trigram)
+
+        monkeypatch.setattr(SessionDB, "_rebuild_fts_indexes", staticmethod(_spy_rebuild))
+
+        restored = SessionDB(db_path=db_path)
+        try:
+            assert rebuild_calls == []
+            fts_after = restored._conn.execute(
+                "SELECT rowid, content FROM messages_fts ORDER BY rowid"
+            ).fetchall()
+            assert fts_after == fts_before
+            assert len(restored.search_messages("stable")) == 1
+            assert len(restored.search_messages("中文")) == 1
+            assert restored._conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        finally:
+            restored.close()
+
+    def test_missing_base_triggers_still_force_fts_rebuild(self, tmp_path, monkeypatch):
+        """Dropped base FTS triggers must still trigger a one-shot repair rebuild."""
+        db_path = tmp_path / "state.db"
+        seeded = SessionDB(db_path=db_path)
+        try:
+            if not seeded._fts_enabled:
+                pytest.skip("FTS5 unavailable in this build")
+            seeded.create_session(session_id="s1", source="cli")
+            seeded.append_message("s1", role="user", content="pre-repair content")
+            for trigger in (
+                "messages_fts_insert",
+                "messages_fts_delete",
+                "messages_fts_update",
+            ):
+                seeded._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            # Write while triggers are gone so the row is missing from FTS.
+            seeded._conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) "
+                "VALUES (?, 'user', ?, ?)",
+                ("s1", "unindexedrepairneedle", time.time()),
+            )
+            seeded._conn.commit()
+            missing = seeded._conn.execute(
+                "SELECT COUNT(*) FROM messages_fts "
+                "WHERE messages_fts MATCH 'unindexedrepairneedle'"
+            ).fetchone()[0]
+            assert missing == 0
+        finally:
+            seeded.close()
+
+        rebuild_calls: list = []
+        real_rebuild = SessionDB._rebuild_fts_indexes
+
+        def _spy_rebuild(cursor, *, include_trigram=True):
+            rebuild_calls.append(include_trigram)
+            return real_rebuild(cursor, include_trigram=include_trigram)
+
+        monkeypatch.setattr(SessionDB, "_rebuild_fts_indexes", staticmethod(_spy_rebuild))
+
+        restored = SessionDB(db_path=db_path)
+        try:
+            assert rebuild_calls == [False]
+            assert restored._fts_enabled is True
+            assert len(restored.search_messages("unindexedrepairneedle")) == 1
+            # Triggers restored so subsequent writes index normally.
+            restored.append_message("s1", role="assistant", content="postrepair indexed")
+            assert len(restored.search_messages("postrepair")) == 1
+        finally:
+            restored.close()
+
+    def test_optimize_and_rebuild_skip_retired_trigram_table(self, tmp_path):
+        """Maintenance must not touch a leftover trigram table after retirement."""
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            if not db._fts_enabled:
+                pytest.skip("FTS5 unavailable in this build")
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="optimize base only")
+            # Recreate a detached leftover trigram tree (no write triggers).
+            db._conn.executescript(hermes_state.FTS_TRIGRAM_SQL)
+            for trig in (
+                "messages_fts_trigram_insert",
+                "messages_fts_trigram_delete",
+                "messages_fts_trigram_update",
+            ):
+                db._conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
+            db._conn.execute(
+                "INSERT INTO messages_fts_trigram(rowid, content) "
+                "SELECT id, COALESCE(content, '') FROM messages"
+            )
+            db._conn.commit()
+            assert db._fts_table_exists("messages_fts_trigram") is True
+
+            assert db.optimize_fts() == 1
+            assert db.rebuild_fts() == 1
+            # Leftover table may still exist; maintenance must not require it.
+            assert len(db.search_messages("optimize")) == 1
+            assert db._conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        finally:
+            db.close()
+
     def test_v11_migration_backfills_base_fts_when_trigram_unavailable(
         self, tmp_path, monkeypatch
     ):
