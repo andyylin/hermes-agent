@@ -29,9 +29,22 @@ from gateway.whatsapp_identity import (
 
 
 def _auth_env(name: str, default: str = "") -> str:
-    """Read allowlist/auth env; profile scope is authoritative under multiplex."""
+    """Read allowlist/auth env; prefer profile secret_scope under multiplex."""
     if not name:
         return default
+    try:
+        from agent.secret_scope import get_secret
+
+        val = get_secret(name)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    except Exception:
+        pass
+    return (os.getenv(name) or default).strip()
+
+
+def _line_auth_env(name: str, default: str = "") -> str:
+    """Read added LINE policy with the active profile scope as authority."""
     try:
         from agent.secret_scope import get_secret
     except ImportError:
@@ -347,7 +360,10 @@ class GatewayAuthorizationMixin:
             if not chat_allowlist_env and source.platform and source.platform.value == "line":
                 chat_allowlist_env = "LINE_ALLOWED_GROUPS"
             if chat_allowlist_env:
-                raw_chat_allowlist = _auth_env(chat_allowlist_env)
+                if source.platform and source.platform.value == "line":
+                    raw_chat_allowlist = _line_auth_env(chat_allowlist_env)
+                else:
+                    raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
                 if raw_chat_allowlist:
                     allowed_group_ids = {
                         cid.strip()
@@ -404,8 +420,6 @@ class GatewayAuthorizationMixin:
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
             Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
         }
-        if source.platform and source.platform.value == "line":
-            platform_group_chat_env_map[source.platform] = "LINE_ALLOWED_GROUPS"
         platform_allow_all_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
             Platform.DISCORD: "DISCORD_ALLOW_ALL_USERS",
@@ -478,7 +492,10 @@ class GatewayAuthorizationMixin:
         group_chat_allowlist = ""
         if source.chat_type in {"group", "forum"}:
             group_user_allowlist = _auth_env(platform_group_user_env_map.get(source.platform, ""))
-            group_chat_allowlist = _auth_env(platform_group_chat_env_map.get(source.platform, ""))
+            if source.platform and source.platform.value == "line":
+                group_chat_allowlist = _line_auth_env("LINE_ALLOWED_GROUPS")
+            else:
+                group_chat_allowlist = _auth_env(platform_group_chat_env_map.get(source.platform, ""))
         global_allowlist = _auth_env("GATEWAY_ALLOWED_USERS")
 
         if not platform_allowlist and not group_user_allowlist and not group_chat_allowlist and not global_allowlist:
@@ -720,7 +737,11 @@ class GatewayAuthorizationMixin:
             if os.getenv(platform_env_map.get(platform, ""), "").strip():
                 return "ignore"
             for env_key in platform_group_env_map.get(platform, ()):
-                if _auth_env(env_key):
+                if platform and platform.value == "line":
+                    configured = _line_auth_env(env_key)
+                else:
+                    configured = os.getenv(env_key, "").strip()
+                if configured:
                     return "ignore"
 
         if os.getenv("GATEWAY_ALLOWED_USERS", "").strip():
