@@ -19,7 +19,7 @@ Upstream is the product. This branch carries only a small, explicit behavioral o
 
 ### LINE private collection gates
 
-- Reconstruction commits: `47d38e49c`, `86b106688`
+- Reconstruction commits: `47d38e49c`, `86b106688`, `07cb41c2b`
 - Historical sources: `b067c99151b3038b3a5516ec553204fa62562257`, `0444a8c2f72be8a9d4b1d16737cdc7081dfe9ad3`
 - Contract: read-only groups archive without agent dispatch; archive groups retain collection while dispatching eligible messages; prefix-required groups dispatch only after stripping an approved prefix; group authorization uses the chat allowlist.
 
@@ -62,7 +62,7 @@ Historical sources retained only as evidence:
 
 - All custom Projects assignment, movement, metadata, conversation-binding, database, and UI behavior.
 - All Desktop Projects profile-generation, preview ownership, worktree, review, picker, and multi-window isolation overlays.
-- Shared-process profile multiplex hardening, adapter registries, profile pairing stores, global-environment isolation refactors, and sibling-platform authority audits.
+- Custom shared-process profile multiplex architecture, adapter registries, profile pairing stores, and broad global-environment refactors. Retained platform behavior must still honor upstream's existing profile-isolation primitives when reading per-profile policy; compatibility with upstream isolation is not a second profile authority.
 - Matrix room auto-threading and password reconnect patches added after the Projects boundary.
 - Desktop config-integer, local-plugin-home, idle-rendering, clarify-timeout, and custom bootstrap patches added after the Projects boundary.
 - Session workspace metadata RPC additions.
