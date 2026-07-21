@@ -582,12 +582,10 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
             return "; ".join(problems[:3])
         conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
 
-        # FTS write probe: drive a row through the messages_fts* triggers in a
-        # transaction that is always rolled back, so a corrupt FTS index that
-        # rejects writes is caught even though reads look healthy. The probe is
-        # best-effort — if the messages/sessions tables don't exist yet (brand
-        # new file mid-init) the OperationalError is treated as "not yet a
-        # populated DB", not corruption.
+        # Canonical write probe: insert a rolled-back session+message so a DB
+        # that rejects writes is reported unhealthy even when reads and
+        # integrity_check look fine. (Live FTS triggers are retired; this
+        # probes the base tables only.)
         probe_session_id = f"_hermes_fts_health_probe_{time.time_ns()}"
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -602,7 +600,6 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
             )
             conn.execute("ROLLBACK")
         except sqlite3.OperationalError as exc:
-            # Missing tables / FTS disabled — not the corruption class we probe.
             try:
                 conn.execute("ROLLBACK")
             except sqlite3.Error:
@@ -610,6 +607,13 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
             msg = str(exc).lower()
             if "no such table" in msg or "no such column" in msg:
                 return None
+            return str(exc)
+        except sqlite3.DatabaseError as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            # Preserve explicit integrity/disk-image errors; never conceal.
             return str(exc)
         return None
     except sqlite3.DatabaseError as exc:
@@ -619,28 +623,19 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
 
 
 def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
-    """Repair a state.db whose ``sqlite_master`` schema is malformed or whose
-    FTS indexes reject writes.
+    """Repair a state.db whose ``sqlite_master`` schema is malformed.
 
-    Handles two corruption classes: the "duplicate object definition" /
-    malformed-schema class where even ``PRAGMA`` statements fail, and the FTS
-    write-corruption class (#50502) where base tables read fine and
-    ``integrity_check`` passes but writes fail through the ``messages_fts*``
-    triggers. Tries least-destructive recovery first and escalates:
+    Live FTS is fully retired. Recovery never recreates FTS indexes. Handles:
 
-      1. **Rebuild FTS indexes in place** via the FTS5 ``'rebuild'`` command,
-         which rewrites the internal b-tree segments from the canonical
-         ``messages`` rows without dropping or recreating anything. Fixes the
-         FTS write-corruption class while preserving the schema intact.
+      1. **Drop every ``messages_fts*`` object** (triggers + virtual tables /
+         shadows) so leftover derived-index corruption cannot poison writes.
       2. **De-duplicate** ``sqlite_master`` (keep the lowest rowid per
-         ``type``/``name``). Fixes the canonical "table X already exists"
-         case and PRESERVES the existing FTS index intact.
-      3. **Drop the FTS schema** (every ``messages_fts*`` object) + ``VACUUM``.
-         The next ``SessionDB()`` open rebuilds the FTS indexes from the
-         canonical ``messages`` table.
+         ``type``/``name``). Fixes "table X already exists" schema parse fails.
+      3. **VACUUM** after FTS scrub when needed.
 
-    Canonical ``sessions`` / ``messages`` rows are never modified. A
-    timestamped raw backup is taken first unless ``backup=False``.
+    Canonical ``sessions`` / ``messages`` rows are never modified. Explicit
+    integrity / disk-image errors on those tables are reported, not concealed.
+    A timestamped raw backup is taken first unless ``backup=False``.
 
     Returns a report dict: ``{repaired: bool, strategy: str|None,
     backup_path: str|None, error: str|None}``.
@@ -666,35 +661,48 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         bpath = _backup_db_file(db_path)
         report["backup_path"] = str(bpath) if bpath else None
 
-    # ── Strategy 0: rebuild FTS indexes in place (FTS write-corruption) ──
-    # The FTS5 'rebuild' command rewrites the internal index from the canonical
-    # content table. This is the recommended, least-destructive recovery for a
-    # corrupt FTS index that rejects message writes while reads still succeed.
+    # ── Strategy 0: drop all FTS schema (live FTS is retired — never rebuild)
+    # When sqlite_master has duplicate FTS definitions, ordinary DROP TABLE
+    # fails with "malformed database schema". Prefer writable_schema surgery
+    # first; only attempt DROP after the schema parse is clean again.
     try:
         conn = sqlite3.connect(str(db_path), isolation_level=None)
         try:
+            conn.execute("PRAGMA writable_schema=ON")
+            conn.execute(
+                "DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'"
+            )
+            conn.execute("PRAGMA writable_schema=OFF")
+            conn.commit()
+            # Best-effort DROP for any residual non-master objects.
+            for trigger in _FTS_TRIGGERS:
+                try:
+                    conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                except sqlite3.DatabaseError:
+                    pass
             for table_name in ("messages_fts", "messages_fts_trigram"):
                 try:
-                    conn.execute(
-                        f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')"
-                    )
-                except sqlite3.OperationalError:
-                    # Table absent (FTS disabled / trigram off) — skip it.
-                    continue
+                    conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+                except sqlite3.DatabaseError:
+                    pass
+            try:
+                conn.execute("VACUUM")
+            except sqlite3.DatabaseError:
+                pass
         finally:
             conn.close()
         if _db_opens_cleanly(db_path) is None:
             report["repaired"] = True
-            report["strategy"] = "rebuild_fts"
+            report["strategy"] = "drop_fts"
             logger.warning(
-                "state.db FTS indexes rebuilt in place (schema preserved): %s",
+                "state.db repaired by dropping retired FTS schema objects: %s",
                 db_path,
             )
             return report
     except sqlite3.DatabaseError as exc:
-        logger.warning("state.db FTS in-place rebuild pass failed: %s", exc)
+        logger.warning("state.db FTS drop repair pass failed: %s", exc)
 
-    # ── Strategy 1: de-duplicate sqlite_master (keeps FTS index) ──
+    # ── Strategy 1: de-duplicate sqlite_master ──
     try:
         conn = sqlite3.connect(str(db_path), isolation_level=None)
         try:
@@ -709,6 +717,10 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
                     "WHERE type IS ? AND name IS ? AND rowid <> ?",
                     (type_, name, keep),
                 )
+            # Also scrub any remaining FTS objects after dedup.
+            conn.execute(
+                "DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'"
+            )
             conn.execute("PRAGMA writable_schema=OFF")
             conn.commit()
         finally:
@@ -717,34 +729,11 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             report["repaired"] = True
             report["strategy"] = "dedup_schema"
             logger.warning(
-                "state.db schema repaired by de-duplicating sqlite_master "
-                "(FTS index preserved): %s", db_path
+                "state.db schema repaired by de-duplicating sqlite_master: %s",
+                db_path,
             )
             return report
-    except sqlite3.DatabaseError as exc:
-        logger.warning("state.db dedup repair pass failed: %s", exc)
-
-    # ── Strategy 2: drop all FTS schema, VACUUM, rebuild on next open ──
-    try:
-        conn = sqlite3.connect(str(db_path), isolation_level=None)
-        try:
-            conn.execute("PRAGMA writable_schema=ON")
-            conn.execute("DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'")
-            conn.execute("PRAGMA writable_schema=OFF")
-            conn.commit()
-            conn.execute("VACUUM")
-        finally:
-            conn.close()
-        reason = _db_opens_cleanly(db_path)
-        if reason is None:
-            report["repaired"] = True
-            report["strategy"] = "drop_fts_rebuild"
-            logger.warning(
-                "state.db schema repaired by dropping FTS schema; indexes "
-                "will rebuild from messages on next open: %s", db_path
-            )
-            return report
-        report["error"] = reason
+        report["error"] = _db_opens_cleanly(db_path)
     except sqlite3.DatabaseError as exc:
         report["error"] = str(exc)
 
@@ -1194,31 +1183,73 @@ class SessionDB:
         remain safe and CJK/substring search uses the existing LIKE fallback.
         """
         for trigger in _TRIGRAM_FTS_TRIGGERS:
-            cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            try:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            except sqlite3.OperationalError:
+                pass
         try:
             cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
         except sqlite3.DatabaseError as exc:
             logger.warning(
                 "Detached legacy trigram FTS triggers for %s but could not drop "
-                "the table; LIKE fallback remains active: %s",
+                "the table; LIKE search remains active: %s",
                 self.db_path,
                 exc,
             )
 
+    def _retire_all_live_fts(self, cursor: sqlite3.Cursor) -> None:
+        """Fully retire live FTS: no triggers, no virtual tables, no writes.
+
+        Production multi-connection stress on large corpora repeatedly corrupted
+        derived FTS indexes while canonical ``sessions``/``messages`` stayed
+        healthy. Search now uses only those canonical tables (LIKE). Fresh DBs
+        never create FTS objects; existing DBs drop them best-effort on open.
+
+        Drop order: triggers first (mandatory for write safety), then virtual
+        tables. If ``DROP TABLE`` fails on a corrupt shadow tree, escalate to
+        ``writable_schema`` deletion of every ``messages_fts%`` object so a
+        recovered open ends with no FTS objects when SQLite allows it.
+        """
+        # Prefer DROP when the schema is parseable; always follow with a
+        # writable_schema scrub so residual/corrupt objects are removed.
+        self._drop_fts_triggers(cursor)
+        for table_name in ("messages_fts", "messages_fts_trigram"):
+            try:
+                cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+            except sqlite3.DatabaseError as exc:
+                logger.warning(
+                    "Could not DROP %s on %s (%s); attempting schema scrub",
+                    table_name,
+                    self.db_path,
+                    type(exc).__name__,
+                )
+        try:
+            cursor.execute("PRAGMA writable_schema=ON")
+            cursor.execute(
+                "DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'"
+            )
+            cursor.execute("PRAGMA writable_schema=OFF")
+        except sqlite3.DatabaseError as exc:
+            logger.warning(
+                "Could not scrub leftover FTS schema objects on %s: %s",
+                self.db_path,
+                type(exc).__name__,
+            )
+            try:
+                cursor.execute("PRAGMA writable_schema=OFF")
+            except sqlite3.DatabaseError:
+                pass
+        self._fts_enabled = False
+        self._trigram_available = False
+
     @staticmethod
     def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
-        """Count installed *base* FTS write triggers only.
-
-        Trigram triggers are retired and deliberately absent on a healthy DB.
-        Repair decisions must compare against ``_BASE_FTS_TRIGGERS`` — counting
-        the full ``_FTS_TRIGGERS`` tuple permanently under-reports health after
-        retirement and forces a full FTS rebuild on every open.
-        """
-        placeholders = ",".join("?" for _ in _BASE_FTS_TRIGGERS)
+        """Count any remaining FTS write triggers (should be 0 after retirement)."""
+        placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
         row = cursor.execute(
             f"SELECT COUNT(*) FROM sqlite_master "
             f"WHERE type = 'trigger' AND name IN ({placeholders})",
-            _BASE_FTS_TRIGGERS,
+            _FTS_TRIGGERS,
         ).fetchone()
         return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
 
@@ -1228,26 +1259,8 @@ class SessionDB:
         *,
         include_trigram: bool = True,
     ) -> None:
-        cursor.execute("DELETE FROM messages_fts")
-        cursor.execute(
-            "INSERT INTO messages_fts(rowid, content) "
-            "SELECT id, "
-            "COALESCE(content, '') || ' ' || "
-            "COALESCE(tool_name, '') || ' ' || "
-            "COALESCE(tool_calls, '') "
-            "FROM messages"
-        )
-        if not include_trigram:
-            return
-        cursor.execute("DELETE FROM messages_fts_trigram")
-        cursor.execute(
-            "INSERT INTO messages_fts_trigram(rowid, content) "
-            "SELECT id, "
-            "COALESCE(content, '') || ' ' || "
-            "COALESCE(tool_name, '') || ' ' || "
-            "COALESCE(tool_calls, '') "
-            "FROM messages"
-        )
+        """No-op: live FTS indexes are retired; never re-populate them."""
+        return
 
     def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
         try:
@@ -1381,52 +1394,34 @@ class SessionDB:
         return "fts5" in msg and "corrupt" in msg
 
     def _try_runtime_fts_rebuild(self, exc: sqlite3.DatabaseError) -> bool:
-        """One-shot in-place FTS rebuild after a corrupt-index write failure.
+        """One-shot scrub of retired FTS leftovers after a write-path fault.
 
-        Returns True when a rebuild was performed and the failed write should
-        be retried; False when the error isn't the FTS-corruption class, FTS
-        is disabled, or a rebuild was already attempted for this instance.
-
-        Delegates to :meth:`rebuild_fts` (the FTS5 ``'rebuild'`` command —
-        index rewritten from the canonical messages table, zero message-row
-        mutation). Safe to call from ``_execute_write``'s except path: the
-        failed transaction was rolled back and ``self._lock`` released before
-        the exception propagated, and ``rebuild_fts`` re-acquires it.
-        E2E-verified: a corrupted ``messages_fts_data`` shadow table rejects
-        every append; after the in-place rebuild the same append succeeds and
-        search works again.
+        Live FTS is fully retired, so there is no index to rebuild. If a
+        pre-retirement DB still has corrupt FTS objects/triggers that reject
+        writes, scrub them once and retry. Returns True when a scrub was
+        attempted and the write should retry; False when the error is not the
+        derived-index class or a scrub was already attempted for this instance.
         """
         if self._fts_runtime_rebuild_attempted:
-            return False
-        if not self._fts_enabled:
             return False
         if not self._is_fts_write_corruption_error(exc):
             return False
         self._fts_runtime_rebuild_attempted = True
         logger.warning(
-            "state.db write failed with an FTS-corruption error (%s) — "
-            "attempting one-shot in-place FTS rebuild; canonical message "
-            "rows are preserved.", exc,
+            "state.db write failed with a derived-index / disk-image error "
+            "(%s) — scrubbing retired FTS objects and retrying; canonical "
+            "message rows are preserved.",
+            type(exc).__name__,
         )
         try:
-            rebuilt = self.rebuild_fts()
+            self.rebuild_fts()  # retires leftovers; returns 0
         except Exception as rebuild_exc:
             logger.error(
-                "In-place FTS rebuild failed (%s); the database needs the "
-                "full offline repair path (repair_state_db_schema).",
-                rebuild_exc,
+                "FTS scrub after write fault failed (%s); the database may "
+                "need the offline repair path (repair_state_db_schema).",
+                type(rebuild_exc).__name__,
             )
             return False
-        if not rebuilt:
-            logger.error(
-                "In-place FTS rebuild made no progress; the database needs "
-                "the full offline repair path (repair_state_db_schema)."
-            )
-            return False
-        logger.warning(
-            "state.db FTS indexes rebuilt in place (%d); retrying the failed write.",
-            rebuilt,
-        )
         return True
 
     def _try_wal_checkpoint(self) -> None:
@@ -1640,15 +1635,11 @@ class SessionDB:
         except sqlite3.OperationalError:
             pass
 
-        fts5_available = self._sqlite_supports_fts5(cursor)
+        # Live FTS is fully retired: never create FTS virtual tables or
+        # write triggers. Drop any legacy objects so message writes cannot
+        # touch a derived index. Search uses canonical LIKE only.
         fts_migrations_complete = True
-        if not fts5_available:
-            # Existing FTS triggers can still fire on messages INSERT/UPDATE
-            # even though the current sqlite runtime cannot read the virtual
-            # tables they target. Drop only the triggers so core persistence
-            # continues; if a future runtime has FTS5, _ensure_fts_schema()
-            # recreates them.
-            self._drop_fts_triggers(cursor)
+        self._retire_all_live_fts(cursor)
 
         # ── Schema version bookkeeping ─────────────────────────────────
         # Bump to current so future data migrations (if any) can gate on
@@ -1666,69 +1657,9 @@ class SessionDB:
             # backfills, index changes tied to a specific version step) stay
             # in a version-gated chain. Column additions are handled by
             # _reconcile_columns() above and no longer need entries here.
-            if current_version < 10 and SCHEMA_VERSION == 10:
-                # v10: trigram FTS5 table for CJK/substring search. The
-                # virtual table + triggers are created unconditionally via
-                # FTS_TRIGRAM_SQL below, but existing rows need a one-time
-                # backfill into the FTS index.
-                #
-                # Only run this when v10 itself is the target schema. Current
-                # v11+ code drops and rebuilds both FTS tables below, so doing
-                # the v10-only trigram backfill first only burns startup time
-                # and WAL space before v11 throws the work away.
-                if fts5_available:
-                    _fts_trigram_exists = self._fts_table_probe(
-                        cursor, "messages_fts_trigram"
-                    )
-                    if _fts_trigram_exists is False:
-                        if self._ensure_fts_schema(
-                            cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                        ):
-                            cursor.execute(
-                                "INSERT INTO messages_fts_trigram(rowid, content) "
-                                "SELECT id, content FROM messages WHERE content IS NOT NULL"
-                            )
-                        else:
-                            fts_migrations_complete = False
-                    elif _fts_trigram_exists is None:
-                        fts_migrations_complete = False
-                else:
-                    fts_migrations_complete = False
-            if current_version < 11:
-                # v11: re-index base FTS to cover tool_name + tool_calls and
-                # switch to the current external-content schema. Existing DBs
-                # may still have obsolete base/trigram tables and triggers, so
-                # retire trigram, recreate base FTS, and backfill canonical rows.
-                if fts5_available:
-                    self._drop_fts_triggers(cursor)
-                    self._retire_trigram_fts(cursor)
-                    try:
-                        cursor.execute("DROP TABLE IF EXISTS messages_fts")
-                    except sqlite3.OperationalError as exc:
-                        if not self._is_fts5_unavailable_error(exc):
-                            raise
-                        self._warn_fts5_unavailable(exc)
-                        fts5_available = False
-                        fts_migrations_complete = False
-
-                    if fts5_available:
-                        # Recreate and backfill only the supported base index.
-                        # Trigram is retired on this runtime; CJK/substring
-                        # search deliberately uses the LIKE fallback.
-                        base_fts_ok = self._ensure_fts_schema(
-                            cursor, "messages_fts", FTS_SQL
-                        )
-                        if base_fts_ok:
-                            self._rebuild_fts_indexes(
-                                cursor, include_trigram=False
-                            )
-                        else:
-                            fts_migrations_complete = False
-                        self._trigram_available = False
-                    else:
-                        fts_migrations_complete = False
-                else:
-                    fts_migrations_complete = False
+            # v10/v11 historically created/backfilled FTS indexes; those steps
+            # are intentionally no-ops under full live-FTS retirement (objects
+            # already dropped above).
             if current_version < 16:
                 # v16: tag delegate subagent rows so pickers stay clean after
                 # parent deletes that used to orphan them (parent_session_id → NULL).
@@ -1920,30 +1851,10 @@ class SessionDB:
         except sqlite3.OperationalError:
             pass  # Index already exists
 
-        if fts5_available:
-            # FTS5 setup. Run the DDL even when the virtual table exists so
-            # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
-            # an earlier no-FTS5 runtime.
-            # Only the base FTS triggers are required post-retirement. Counting
-            # retired trigram triggers here permanently treats a healthy DB as
-            # broken and rebuilds the entire index on every SessionDB open —
-            # catastrophic on large corpora (100k+ messages) and a race source
-            # for transient "database disk image is malformed" under concurrent
-            # readers/writers.
-            triggers_need_repair = (
-                self._fts_trigger_count(cursor) < len(_BASE_FTS_TRIGGERS)
-            )
-            self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
-
-            # Trigram FTS5 is deliberately retired on this SQLite/runtime path.
-            # The real corpus repeatedly produced globally malformed trigram
-            # indexes. Remove its write triggers and table so a disabled index
-            # cannot continue poisoning message writes; CJK/substring search
-            # falls back to LIKE.
-            self._retire_trigram_fts(cursor)
-            self._trigram_available = False
-            if self._fts_enabled and triggers_need_repair:
-                self._rebuild_fts_indexes(cursor, include_trigram=False)
+        # Final FTS retirement pass (idempotent). Never recreate indexes.
+        self._retire_all_live_fts(cursor)
+        self._fts_enabled = False
+        self._trigram_available = False
 
         self._conn.commit()
 
@@ -5464,13 +5375,14 @@ class SessionDB:
         limit: int = 20,
         offset: int = 0,
         include_inactive: bool = False,
+        sort: str = None,
     ) -> List[Dict[str, Any]]:
         """Canonical-table substring search (LIKE) — never touches FTS.
 
-        Used for CJK (unicode61 tokenization is useless for ideographs), as the
-        fallback when base FTS MATCH fails with a derived-index fault, and for
-        multi-token OR queries. Operates only on ``messages`` / ``sessions`` so
-        a corrupt FTS shadow tree cannot fail or further stress the search path.
+        Sole search implementation after live FTS retirement. Operates only on
+        ``messages`` / ``sessions`` so a derived index cannot fail or corrupt
+        the search path. Token OR matching preserves the previous CJK multi-
+        token behaviour; boolean operators are ignored as bare tokens.
         """
         non_op_tokens = [
             t for t in raw_query.split()
@@ -5503,6 +5415,11 @@ class SessionDB:
                 f"m.role IN ({','.join('?' for _ in role_filter)})"
             )
             like_params.extend(role_filter)
+        if sort == "oldest":
+            order_sql = "ORDER BY m.timestamp ASC"
+        else:
+            # Default and "newest": most recent first.
+            order_sql = "ORDER BY m.timestamp DESC"
         like_sql = f"""
             SELECT m.id, m.session_id, m.role,
                    substr(m.content,
@@ -5513,7 +5430,7 @@ class SessionDB:
             FROM messages m
             JOIN sessions s ON s.id = m.session_id
             WHERE {' AND '.join(like_where)}
-            ORDER BY m.timestamp DESC
+            {order_sql}
             LIMIT ? OFFSET ?
         """
         like_params.extend([limit, offset])
@@ -5535,25 +5452,16 @@ class SessionDB:
         include_inactive: bool = False,
     ) -> List[Dict[str, Any]]:
         """
-        Full-text search across session messages using FTS5.
+        Search session messages on canonical ``messages`` / ``sessions`` tables.
 
-        Supports FTS5 query syntax:
-          - Simple keywords: "docker deployment"
-          - Phrases: '"exact phrase"'
-          - Boolean: "docker OR kubernetes", "python NOT java"
-          - Prefix: "deploy*"
-
-        Returns matching messages with session metadata, content snippet,
-        and surrounding context (1 message before and after the match).
+        Live FTS indexes are retired: search never creates, writes, or MATCH-
+        queries a derived FTS virtual table. Keywords (ASCII and CJK) use
+        substring LIKE with the existing source/role/active filters, limit/
+        offset pagination, and surrounding context.
 
         ``sort`` controls temporal ordering:
-          - ``None`` (default): FTS5 BM25 relevance only. Time-neutral.
-          - ``"newest"``: order by message timestamp DESC, then by rank.
-          - ``"oldest"``: order by message timestamp ASC, then by rank.
-
-        CJK queries always use the canonical LIKE path (ordered by timestamp
-        DESC) and ignore ``sort``. ASCII queries use base FTS5 ranking unless
-        MATCH fails, in which case they fall back to the same LIKE path.
+          - ``None`` / ``"newest"``: message timestamp DESC (default).
+          - ``"oldest"``: message timestamp ASC.
 
         Rewound (``active=0``, ``compacted=0``) rows are excluded by default —
         the user took those back. Compaction-archived rows (``active=0``,
@@ -5562,19 +5470,19 @@ class SessionDB:
         pre-compaction transcript stays discoverable after in-place compaction
         (#38763). Pass ``include_inactive=True`` to search every row regardless.
         """
-        if not self._fts_enabled:
-            return []
-
         if not query or not query.strip():
             return []
 
+        # Cap / strip FTS-oriented special chars, then flatten to plain tokens
+        # for LIKE (drop quotes and prefix wildcards).
         query = self._sanitize_fts5_query(query)
         if not query:
             return []
+        raw_query = query.replace('"', " ").replace("*", " ")
+        raw_query = re.sub(r"\s+", " ", raw_query).strip()
+        if not raw_query:
+            return []
 
-        # Normalise sort. Anything not in the allowed set falls back to None
-        # (FTS5 rank-only) so callers can pass through user input without
-        # validation.
         if isinstance(sort, str):
             sort_norm = sort.strip().lower()
             if sort_norm not in ("newest", "oldest"):
@@ -5582,114 +5490,16 @@ class SessionDB:
         else:
             sort_norm = None
 
-        # ORDER BY for the main FTS5 (ASCII) path. With sort set, timestamp is
-        # primary and rank is the tiebreaker.
-        if sort_norm == "newest":
-            order_by_sql = "ORDER BY m.timestamp DESC, rank"
-        elif sort_norm == "oldest":
-            order_by_sql = "ORDER BY m.timestamp ASC, rank"
-        else:
-            order_by_sql = "ORDER BY rank"
-
-        # Build WHERE clauses dynamically
-        where_clauses = ["messages_fts MATCH ?"]
-        params: list = [query]
-        if not include_inactive:
-            # Live rows (active=1) AND compaction-archived rows (compacted=1)
-            # are discoverable; only rewind/undo rows (active=0, compacted=0)
-            # are hidden. See archive_and_compact() / #38763.
-            where_clauses.append("(m.active = 1 OR m.compacted = 1)")
-
-        if source_filter is not None:
-            source_placeholders = ",".join("?" for _ in source_filter)
-            where_clauses.append(f"s.source IN ({source_placeholders})")
-            params.extend(source_filter)
-
-        if exclude_sources is not None:
-            exclude_placeholders = ",".join("?" for _ in exclude_sources)
-            where_clauses.append(f"s.source NOT IN ({exclude_placeholders})")
-            params.extend(exclude_sources)
-
-        if role_filter:
-            role_placeholders = ",".join("?" for _ in role_filter)
-            where_clauses.append(f"m.role IN ({role_placeholders})")
-            params.extend(role_filter)
-
-        where_sql = " AND ".join(where_clauses)
-        params.extend([limit, offset])
-
-        sql = f"""
-            SELECT
-                m.id,
-                m.session_id,
-                m.role,
-                snippet(messages_fts, 0, '>>>', '<<<', '...', 40) AS snippet,
-                m.content,
-                m.timestamp,
-                m.tool_name,
-                s.source,
-                s.model,
-                s.started_at AS session_started
-            FROM messages_fts
-            JOIN messages m ON m.id = messages_fts.rowid
-            JOIN sessions s ON s.id = m.session_id
-            WHERE {where_sql}
-            {order_by_sql}
-            LIMIT ? OFFSET ?
-        """
-
-        # CJK queries never use unicode61 FTS5 MATCH: the default tokenizer
-        # splits ideographs into single-char tokens. Trigram FTS is retired
-        # after repeated production-scale malformation, so CJK always searches
-        # the canonical messages table via LIKE.
-        is_cjk = self._contains_cjk(query)
-        if is_cjk:
-            # CJK: unicode61 FTS splits ideographs into single-char tokens, so
-            # substring search always uses the canonical LIKE path (trigram FTS
-            # is retired). Derived-index MATCH is never required for correctness.
-            raw_query = query.strip('"').strip()
-            matches = self._search_messages_like(
-                raw_query,
-                source_filter=source_filter,
-                exclude_sources=exclude_sources,
-                role_filter=role_filter,
-                limit=limit,
-                offset=offset,
-                include_inactive=include_inactive,
-            )
-        else:
-            with self._lock:
-                try:
-                    cursor = self._conn.execute(sql, params)
-                except sqlite3.OperationalError:
-                    # FTS5 query syntax error despite sanitization — return empty
-                    return []
-                except sqlite3.DatabaseError as exc:
-                    # Never fail the user-facing search path on a derived-index
-                    # fault. Canonical messages remain authoritative; fall back
-                    # to LIKE. Corruption is still visible via PRAGMA checks /
-                    # write-path rebuild — we do not swallow it into silence.
-                    # Privacy: never log raw query text, snippets, hashes, or
-                    # other user content — only the exception class.
-                    logger.warning(
-                        "messages_fts MATCH raised %s; falling back to "
-                        "canonical LIKE search (derived-index fault; "
-                        "query text not logged)",
-                        type(exc).__name__,
-                    )
-                    matches = None
-                else:
-                    matches = [dict(row) for row in cursor.fetchall()]
-            if matches is None:
-                matches = self._search_messages_like(
-                    query,
-                    source_filter=source_filter,
-                    exclude_sources=exclude_sources,
-                    role_filter=role_filter,
-                    limit=limit,
-                    offset=offset,
-                    include_inactive=include_inactive,
-                )
+        matches = self._search_messages_like(
+            raw_query,
+            source_filter=source_filter,
+            exclude_sources=exclude_sources,
+            role_filter=role_filter,
+            limit=limit,
+            offset=offset,
+            include_inactive=include_inactive,
+            sort=sort_norm,
+        )
 
         # Add surrounding context (1 message before + after each match).
         # Done outside the lock so we don't hold it across N sequential queries.
@@ -7508,92 +7318,51 @@ class SessionDB:
 
     # ── Space reclamation ──
 
-    # FTS5 virtual tables whose b-tree segments we merge on optimize / rebuild.
-    # Trigram FTS is retired: never create, optimize, or rebuild it from these
-    # paths. Leftover tables are detached by ``_retire_trigram_fts``; touching a
-    # half-dropped corrupt trigram tree was a historical poison source.
-    _FTS_TABLES = ("messages_fts",)
+    # Live FTS is fully retired — never create/optimize/rebuild virtual tables.
+    _FTS_TABLES: tuple = ()
 
     def _fts_table_exists(self, name: str) -> bool:
-        """True if an FTS5 virtual table is queryable in this DB."""
+        """True if an FTS5 virtual table is still queryable (should be False)."""
         try:
             self._conn.execute(f"SELECT 1 FROM {name} LIMIT 0")
             return True
         except sqlite3.DatabaseError:
-            # OperationalError ("no such table") or the broader DatabaseError
-            # class ("vtable constructor failed", "disk image is malformed") —
-            # in every case the table is not queryable for maintenance.
+            # OperationalError ("no such table") or broader DatabaseError —
+            # table is not queryable.
             return False
 
     def optimize_fts(self) -> int:
-        """Merge fragmented FTS5 b-tree segments into one per index.
+        """No-op under live FTS retirement.
 
-        FTS5 indexes grow as a series of incremental segments — one per
-        ``INSERT`` batch driven by the message triggers. Over tens of
-        thousands of messages these segments accumulate, which both bloats
-        the ``*_data`` shadow tables and slows ``MATCH`` queries that must
-        scan every segment. The special ``'optimize'`` command rewrites each
-        index as a single merged segment.
-
-        This is purely a maintenance operation — it changes neither search
-        results nor ``snippet()`` output, only on-disk layout and query
-        speed. It is complementary to VACUUM: ``optimize`` compacts the FTS
-        index internally, then VACUUM returns the freed pages to the OS.
-
-        Only the active base FTS index is optimized (trigram is retired).
-        Missing tables are skipped, so this is safe to call unconditionally.
-
-        Returns the number of FTS indexes that were optimized.
+        Previously merged FTS5 segments. Live indexes are gone; this never
+        touches residual virtual tables (touching a corrupt leftover is a
+        known poison path). Returns 0.
         """
-        optimized = 0
         with self._lock:
-            for tbl in self._FTS_TABLES:
-                if not self._fts_table_exists(tbl):
-                    continue
-                try:
-                    # The column name in the INSERT must match the table name
-                    # for FTS5 special commands.
-                    self._conn.execute(
-                        f"INSERT INTO {tbl}({tbl}) VALUES('optimize')"
-                    )
-                    optimized += 1
-                except sqlite3.OperationalError as exc:
-                    logger.warning(
-                        "FTS optimize failed for %s: %s", tbl, exc
-                    )
-        return optimized
+            try:
+                self._retire_all_live_fts(self._conn.cursor())
+            except Exception as exc:
+                logger.debug("FTS retire during optimize_fts: %s", type(exc).__name__)
+        return 0
 
     def rebuild_fts(self) -> int:
-        """Rebuild FTS5 indexes from the canonical ``messages`` table.
+        """No-op under live FTS retirement.
 
-        Uses the FTS5 ``'rebuild'`` command, which rewrites the internal
-        b-tree segments from the content rows. This is the documented
-        recovery for a corrupt FTS index that rejects message writes while
-        reads still succeed (issue #50502). Unlike ``optimize_fts`` (which
-        merges existing segments), ``rebuild`` discards and recreates the
-        index data entirely.
-
-        Only the active base FTS index is rebuilt (trigram is retired).
-        Safe to call when FTS tables don't exist (skips them).
-        Returns the number of FTS indexes that were rebuilt.
+        Previously rebuilt FTS5 indexes from ``messages``. Search no longer
+        depends on a derived index; this retires leftovers and returns 0
+        without recreating tables or triggers.
         """
-        rebuilt = 0
         with self._lock:
-            for tbl in self._FTS_TABLES:
-                if not self._fts_table_exists(tbl):
-                    continue
+            try:
+                self._retire_all_live_fts(self._conn.cursor())
+                self._conn.commit()
+            except Exception as exc:
+                logger.debug("FTS retire during rebuild_fts: %s", type(exc).__name__)
                 try:
-                    self._conn.execute(
-                        f"INSERT INTO {tbl}({tbl}) VALUES('rebuild')"
-                    )
-                    self._conn.commit()
-                    rebuilt += 1
-                except sqlite3.OperationalError as exc:
                     self._conn.rollback()
-                    logger.warning(
-                        "FTS rebuild failed for %s: %s", tbl, exc
-                    )
-        return rebuilt
+                except Exception:
+                    pass
+        return 0
 
     def vacuum(self) -> int:
         """Run VACUUM to reclaim disk space after large deletes.
@@ -7609,20 +7378,8 @@ class SessionDB:
         active. Safe to call at startup before the gateway/CLI starts
         serving traffic.
 
-        FTS5 segments are merged first via :meth:`optimize_fts` so the
-        subsequent VACUUM reclaims the pages freed by the merge. This is a
-        layout-only optimization — search results are unchanged.
-
-        Returns the number of FTS indexes that were optimized (0 if the
-        merge step failed or no FTS tables exist).
+        Returns 0 (live FTS optimize is retired; no indexes to merge).
         """
-        # Merge FTS5 segments before VACUUM so the freed pages are returned
-        # to the OS in the same pass. optimize_fts() manages its own lock.
-        optimized = 0
-        try:
-            optimized = self.optimize_fts()
-        except Exception as exc:
-            logger.warning("FTS optimize before VACUUM failed: %s", exc)
         # VACUUM cannot be executed inside a transaction.
         with self._lock:
             # Best-effort WAL checkpoint first, then VACUUM.
@@ -7631,7 +7388,7 @@ class SessionDB:
             except Exception as exc:
                 logger.debug("WAL checkpoint (TRUNCATE) before VACUUM failed: %s", exc)
             self._conn.execute("VACUUM")
-        return optimized
+        return 0
 
     def maybe_auto_prune_and_vacuum(
         self,

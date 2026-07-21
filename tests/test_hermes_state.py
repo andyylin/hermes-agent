@@ -571,6 +571,7 @@ class TestSessionLifecycle:
         assert child["parent_session_id"] == "parent"
 
     def test_db_initializes_without_fts5_module(self, tmp_path, monkeypatch):
+        """No FTS5 module: persistence + canonical LIKE search still work."""
         real_connect = sqlite3.connect
 
         def connect_without_fts(*args, **kwargs):
@@ -582,8 +583,6 @@ class TestSessionLifecycle:
         db = SessionDB(db_path=tmp_path / "state.db")
         try:
             assert db._fts_enabled is False
-            # Neither FTS5 virtual table should have been created on a build
-            # that lacks the fts5 module — both init paths must degrade.
             assert db._fts_table_exists("messages_fts") is False
             assert db._fts_table_exists("messages_fts_trigram") is False
 
@@ -593,7 +592,8 @@ class TestSessionLifecycle:
             messages = db.get_messages("s1")
             assert len(messages) == 1
             assert messages[0]["content"] == "hello from sqlite without fts"
-            assert db.search_messages("hello") == []
+            # Search no longer depends on FTS5 — canonical LIKE works.
+            assert len(db.search_messages("hello")) == 1
         finally:
             db.close()
 
@@ -621,9 +621,6 @@ class TestSessionLifecycle:
             assert db._fts_enabled is False
             assert db.get_session("s1") is not None
             assert len(db.get_messages("s1")) == 1
-
-            # Existing FTS triggers must be disabled too; otherwise this write
-            # would try to insert into an unusable FTS virtual table.
             db.append_message("s1", role="assistant", content="after runtime change")
             messages = db.get_messages("s1")
             assert len(messages) == 2
@@ -654,18 +651,17 @@ class TestSessionLifecycle:
             db.create_session(session_id="s1", source="cli")
             db.append_message("s1", role="user", content="legacy no fts")
             assert db.get_messages("s1")[0]["content"] == "legacy no fts"
-            assert db.search_messages("legacy") == []
-
-            # Leave the FTS migration version in place so a future FTS-capable
-            # runtime can still rebuild and backfill the indexes.
+            assert len(db.search_messages("legacy")) == 1
             row = db._conn.execute("SELECT version FROM schema_version").fetchone()
-            assert row["version"] == 9
+            # Schema version advances when migrations complete (FTS steps no-op).
+            assert row["version"] == SCHEMA_VERSION
         finally:
             db.close()
 
-    def test_fts_runtime_restores_triggers_after_no_fts_open(
+    def test_reopen_keeps_canonical_search_without_restoring_fts(
         self, tmp_path, monkeypatch
     ):
+        """Live FTS is never restored; search stays on canonical LIKE."""
         db_path = tmp_path / "state.db"
         seeded = SessionDB(db_path=db_path)
         try:
@@ -690,49 +686,11 @@ class TestSessionLifecycle:
         monkeypatch.setattr("hermes_state.sqlite3.connect", real_connect)
         restored = SessionDB(db_path=db_path)
         try:
-            assert restored._fts_enabled is True
+            assert restored._fts_enabled is False
+            assert restored._fts_table_exists("messages_fts") is False
             restored.append_message("s1", role="assistant", content="indexed again")
-            assert len(restored.search_messages("not indexed yet")) == 1
-            assert len(restored.search_messages("indexed")) == 2
-        finally:
-            restored.close()
-
-    def test_base_fts_rebuilds_after_trigger_repair_without_trigram(
-        self, tmp_path, monkeypatch
-    ):
-        """Trigger repair must rebuild base FTS even when trigram is unavailable."""
-        db_path = tmp_path / "state.db"
-        seeded = SessionDB(db_path=db_path)
-        try:
-            seeded.create_session(session_id="s1", source="cli")
-            seeded.append_message("s1", role="user", content="already indexed")
-            for trigger in (
-                "messages_fts_insert",
-                "messages_fts_delete",
-                "messages_fts_update",
-                "messages_fts_trigram_insert",
-                "messages_fts_trigram_delete",
-                "messages_fts_trigram_update",
-            ):
-                seeded._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-            seeded._conn.commit()
-            seeded.append_message("s1", role="assistant", content="repair only base needle")
-        finally:
-            seeded.close()
-
-        real_connect = sqlite3.connect
-
-        def connect_without_trigram(*args, **kwargs):
-            kwargs["factory"] = _NoTrigramConnection
-            return real_connect(*args, **kwargs)
-
-        monkeypatch.setattr("hermes_state.sqlite3.connect", connect_without_trigram)
-        restored = SessionDB(db_path=db_path)
-        try:
-            assert restored._fts_enabled is True
-            assert restored._trigram_available is False
-            assert restored._fts_table_exists("messages_fts") is True
-            assert len(restored.search_messages("needle")) == 1
+            assert len(restored.search_messages("first")) >= 1
+            assert len(restored.search_messages("again")) == 1
         finally:
             restored.close()
 
@@ -745,7 +703,6 @@ class TestSessionLifecycle:
 
         assert SessionDB._is_fts5_unavailable_error(fts5_err) is True
         assert SessionDB._is_fts5_unavailable_error(trigram_err) is True
-        # Generic tokenizer errors should NOT match — only trigram.
         assert SessionDB._is_fts5_unavailable_error(generic_tokenizer_err) is False
         assert SessionDB._is_fts5_unavailable_error(unrelated_err) is False
 
@@ -759,219 +716,131 @@ class TestSessionLifecycle:
         assert SessionDB._is_trigram_unavailable_error(generic_err) is False
         assert SessionDB._is_trigram_unavailable_error(fts5_err) is False
 
-    def test_db_initializes_without_trigram_tokenizer(self, tmp_path, monkeypatch):
-        """SessionDB must not crash when FTS5 exists but trigram tokenizer is missing."""
-        real_connect = sqlite3.connect
-
-        def connect_without_trigram(*args, **kwargs):
-            kwargs["factory"] = _NoTrigramConnection
-            return real_connect(*args, **kwargs)
-
-        monkeypatch.setattr("hermes_state.sqlite3.connect", connect_without_trigram)
-
+    def test_db_never_creates_fts_tables(self, tmp_path):
+        """Fresh SessionDB must not create base or trigram FTS objects."""
         db = SessionDB(db_path=tmp_path / "state.db")
         try:
-            # Base FTS5 should still work (trigram is optional).
-            assert db._fts_enabled is True
-            assert db._fts_table_exists("messages_fts") is True
-            # Trigram table should NOT have been created.
+            assert db._fts_enabled is False
+            assert db._trigram_available is False
+            assert db._fts_table_exists("messages_fts") is False
             assert db._fts_table_exists("messages_fts_trigram") is False
-
+            n = db._conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'messages_fts%'"
+            ).fetchone()[0]
+            assert n == 0
             db.create_session(session_id="s1", source="cli")
-            db.append_message("s1", role="user", content="hello without trigram")
-
-            messages = db.get_messages("s1")
-            assert len(messages) == 1
-            assert messages[0]["content"] == "hello without trigram"
-
-            # FTS5 keyword search should still work.
+            db.append_message("s1", role="user", content="hello without fts index")
             assert len(db.search_messages("hello")) == 1
         finally:
             db.close()
 
-    def test_open_retires_legacy_trigram_table_and_triggers(self, tmp_path):
-        """Disabled trigram FTS must not keep indexing writes behind the scenes."""
+    def test_open_retires_all_legacy_fts_objects(self, tmp_path):
+        """Open drops base+trigram FTS tables/triggers; search uses LIKE."""
         db_path = tmp_path / "state.db"
         seeded = SessionDB(db_path=db_path)
         try:
             seeded.create_session(session_id="s1", source="cli")
             seeded.append_message("s1", role="user", content="大别山项目计划书")
-            # Simulate a legacy database that still owns the trigram table and
-            # write triggers even though the runtime has disabled trigram search.
+            seeded._conn.executescript(hermes_state.FTS_SQL)
             seeded._conn.executescript(hermes_state.FTS_TRIGRAM_SQL)
+            seeded._conn.execute(
+                "INSERT OR REPLACE INTO messages_fts(rowid, content) "
+                "SELECT id, COALESCE(content, '') FROM messages"
+            )
             seeded._conn.execute(
                 "INSERT OR REPLACE INTO messages_fts_trigram(rowid, content) "
                 "SELECT id, COALESCE(content, '') FROM messages"
             )
             seeded._conn.commit()
+            assert seeded._fts_table_exists("messages_fts") is True
             assert seeded._fts_table_exists("messages_fts_trigram") is True
         finally:
             seeded.close()
 
         restored = SessionDB(db_path=db_path)
         try:
-            assert restored._fts_enabled is True
+            assert restored._fts_enabled is False
             assert restored._trigram_available is False
+            assert restored._fts_table_exists("messages_fts") is False
             assert restored._fts_table_exists("messages_fts_trigram") is False
-            trigram_triggers = restored._conn.execute(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
-                "AND name LIKE 'messages_fts_trigram_%'"
+            n = restored._conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'messages_fts%'"
             ).fetchone()[0]
-            assert trigram_triggers == 0
+            assert n == 0
             assert len(restored.search_messages("大别山")) == 1
             restored.append_message("s1", role="assistant", content="后续计划")
             assert restored._conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
         finally:
             restored.close()
 
-    def test_reopen_does_not_full_rebuild_healthy_base_fts(self, tmp_path, monkeypatch):
-        """Healthy post-retirement DBs must not DELETE+reinsert FTS on every open.
-
-        After trigram retirement only three base triggers exist. Counting the
-        six pre-retirement names treated every healthy open as broken and
-        rebuilt the full index — catastrophic on 100k+ message corpora and a
-        race source for transient malformed-image errors under concurrent use.
-        """
+    def test_reopen_does_not_create_or_rebuild_fts(self, tmp_path, monkeypatch):
+        """Healthy no-FTS DBs must not recreate FTS on open."""
         db_path = tmp_path / "state.db"
         seeded = SessionDB(db_path=db_path)
         try:
-            if not seeded._fts_enabled:
-                pytest.skip("FTS5 unavailable in this build")
             seeded.create_session(session_id="s1", source="cli")
             seeded.append_message("s1", role="user", content="stable ascii needle")
             seeded.append_message("s1", role="user", content="稳定中文检索词")
-            fts_before = seeded._conn.execute(
-                "SELECT rowid, content FROM messages_fts ORDER BY rowid"
-            ).fetchall()
-            assert len(fts_before) == 2
         finally:
             seeded.close()
 
-        rebuild_calls: list = []
-        real_rebuild = SessionDB._rebuild_fts_indexes
+        ensure_calls = {"n": 0}
+        real_ensure = SessionDB._ensure_fts_schema
 
-        def _spy_rebuild(cursor, *, include_trigram=True):
-            rebuild_calls.append(include_trigram)
-            return real_rebuild(cursor, include_trigram=include_trigram)
+        def _spy_ensure(self, cursor, table_name, ddl):
+            ensure_calls["n"] += 1
+            return real_ensure(self, cursor, table_name, ddl)
 
-        monkeypatch.setattr(SessionDB, "_rebuild_fts_indexes", staticmethod(_spy_rebuild))
+        monkeypatch.setattr(SessionDB, "_ensure_fts_schema", _spy_ensure)
 
         restored = SessionDB(db_path=db_path)
         try:
-            assert rebuild_calls == []
-            fts_after = restored._conn.execute(
-                "SELECT rowid, content FROM messages_fts ORDER BY rowid"
-            ).fetchall()
-            assert fts_after == fts_before
+            assert ensure_calls["n"] == 0
+            assert restored._fts_table_exists("messages_fts") is False
             assert len(restored.search_messages("stable")) == 1
             assert len(restored.search_messages("中文")) == 1
             assert restored._conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
         finally:
             restored.close()
 
-    def test_missing_base_triggers_still_force_fts_rebuild(self, tmp_path, monkeypatch):
-        """Dropped base FTS triggers must still trigger a one-shot repair rebuild."""
-        db_path = tmp_path / "state.db"
-        seeded = SessionDB(db_path=db_path)
-        try:
-            if not seeded._fts_enabled:
-                pytest.skip("FTS5 unavailable in this build")
-            seeded.create_session(session_id="s1", source="cli")
-            seeded.append_message("s1", role="user", content="pre-repair content")
-            for trigger in (
-                "messages_fts_insert",
-                "messages_fts_delete",
-                "messages_fts_update",
-            ):
-                seeded._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-            # Write while triggers are gone so the row is missing from FTS.
-            seeded._conn.execute(
-                "INSERT INTO messages (session_id, role, content, timestamp) "
-                "VALUES (?, 'user', ?, ?)",
-                ("s1", "unindexedrepairneedle", time.time()),
-            )
-            seeded._conn.commit()
-            missing = seeded._conn.execute(
-                "SELECT COUNT(*) FROM messages_fts "
-                "WHERE messages_fts MATCH 'unindexedrepairneedle'"
-            ).fetchone()[0]
-            assert missing == 0
-        finally:
-            seeded.close()
-
-        rebuild_calls: list = []
-        real_rebuild = SessionDB._rebuild_fts_indexes
-
-        def _spy_rebuild(cursor, *, include_trigram=True):
-            rebuild_calls.append(include_trigram)
-            return real_rebuild(cursor, include_trigram=include_trigram)
-
-        monkeypatch.setattr(SessionDB, "_rebuild_fts_indexes", staticmethod(_spy_rebuild))
-
-        restored = SessionDB(db_path=db_path)
-        try:
-            assert rebuild_calls == [False]
-            assert restored._fts_enabled is True
-            assert len(restored.search_messages("unindexedrepairneedle")) == 1
-            # Triggers restored so subsequent writes index normally.
-            restored.append_message("s1", role="assistant", content="postrepair indexed")
-            assert len(restored.search_messages("postrepair")) == 1
-        finally:
-            restored.close()
-
-    def test_optimize_and_rebuild_skip_retired_trigram_table(self, tmp_path):
-        """Maintenance must not touch a leftover trigram table after retirement."""
+    def test_optimize_and_rebuild_are_noop_and_scrub_leftovers(self, tmp_path):
+        """optimize_fts/rebuild_fts return 0 and scrub leftover FTS objects."""
         db_path = tmp_path / "state.db"
         db = SessionDB(db_path=db_path)
         try:
-            if not db._fts_enabled:
-                pytest.skip("FTS5 unavailable in this build")
             db.create_session(session_id="s1", source="cli")
             db.append_message("s1", role="user", content="optimize base only")
-            # Recreate a detached leftover trigram tree (no write triggers).
             db._conn.executescript(hermes_state.FTS_TRIGRAM_SQL)
-            for trig in (
-                "messages_fts_trigram_insert",
-                "messages_fts_trigram_delete",
-                "messages_fts_trigram_update",
-            ):
-                db._conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
-            db._conn.execute(
-                "INSERT INTO messages_fts_trigram(rowid, content) "
-                "SELECT id, COALESCE(content, '') FROM messages"
-            )
+            db._conn.executescript(hermes_state.FTS_SQL)
             db._conn.commit()
-            assert db._fts_table_exists("messages_fts_trigram") is True
+            assert db._fts_table_exists("messages_fts") is True
 
-            assert db.optimize_fts() == 1
-            assert db.rebuild_fts() == 1
-            # Leftover table may still exist; maintenance must not require it.
+            assert db.optimize_fts() == 0
+            assert db.rebuild_fts() == 0
+            assert db._fts_table_exists("messages_fts") is False
+            assert db._fts_table_exists("messages_fts_trigram") is False
             assert len(db.search_messages("optimize")) == 1
             assert db._conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
         finally:
             db.close()
 
-    def test_v11_migration_backfills_base_fts_when_trigram_unavailable(
+    def test_v11_migration_retires_fts_without_recreating(
         self, tmp_path, monkeypatch
     ):
-        """Regression: v11 migration must backfill base FTS even when trigram is unavailable."""
+        """v11 migration path no longer recreates base FTS."""
         real_connect = sqlite3.connect
         db_path = tmp_path / "state.db"
 
-        # Phase 1: create a DB at schema v10 with messages.
         db = SessionDB(db_path=db_path)
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="legacy message alpha")
         db.append_message("s1", role="assistant", content="legacy reply beta")
-        # Force schema version to v10 so migration runs on next open.
         db._conn.execute(
             "UPDATE schema_version SET version = 10"
         )
         db._conn.commit()
         db.close()
 
-        # Phase 2: reopen with trigram disabled — migration should still
-        # backfill base FTS and make existing messages searchable.
         def connect_without_trigram(*args, **kwargs):
             kwargs["factory"] = _NoTrigramConnection
             return real_connect(*args, **kwargs)
@@ -979,24 +848,21 @@ class TestSessionLifecycle:
         monkeypatch.setattr("hermes_state.sqlite3.connect", connect_without_trigram)
         migrated_db = SessionDB(db_path=db_path)
         try:
-            assert migrated_db._fts_enabled is True
+            assert migrated_db._fts_enabled is False
             assert migrated_db._trigram_available is False
-            assert migrated_db._fts_table_exists("messages_fts") is True
+            assert migrated_db._fts_table_exists("messages_fts") is False
             assert migrated_db._fts_table_exists("messages_fts_trigram") is False
 
-            # Existing messages must be searchable via base FTS.
-            results = migrated_db.search_messages("legacy message")
+            # Unique token to avoid OR multi-token over-matching.
+            results = migrated_db.search_messages("alpha")
             assert len(results) == 1
-            # snippet has FTS5 highlight markers (>>>...<<<); check raw content via get_messages
             msgs = migrated_db.get_messages("s1")
             assert any("legacy message" in m["content"] for m in msgs)
         finally:
             migrated_db.close()
 
-    def test_cjk_search_falls_back_to_like_when_trigram_unavailable(
-        self, tmp_path, monkeypatch
-    ):
-        """Regression: long CJK queries must fall back to LIKE when trigram is missing."""
+    def test_cjk_search_uses_canonical_like(self, tmp_path, monkeypatch):
+        """CJK search uses canonical LIKE (no trigram/base FTS)."""
         real_connect = sqlite3.connect
         db_path = tmp_path / "state.db"
 
@@ -1011,11 +877,8 @@ class TestSessionLifecycle:
             db.append_message("s1", role="user", content="大别山项目计划书")
             db.append_message("s1", role="user", content="长江大桥设计方案")
 
-            # 3+ CJK chars would normally use trigram, but it's unavailable.
-            # Must fall back to LIKE and still return results.
             results = db.search_messages("大别山")
             assert len(results) == 1
-            # Note: search_messages strips 'content' from results; use 'snippet'.
             assert "大别山" in results[0]["snippet"]
         finally:
             db.close()
@@ -2190,28 +2053,18 @@ class TestCJKSearchFallback:
         # The centered substr() snippet must include the matched term.
         assert "记忆断裂" in results[0]["snippet"]
 
-    def test_english_query_still_uses_fts5_fast_path(self, db):
-        """English queries must not trigger the LIKE fallback (fast path regression)."""
+    def test_english_query_uses_canonical_like(self, db):
+        """ASCII search works via canonical LIKE after FTS retirement."""
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="Deploy docker containers")
         results = db.search_messages("docker")
         assert len(results) == 1
-        # No CJK in query → LIKE fallback must not run. We don't assert this
-        # directly (no instrumentation), but the FTS5 path produces an
-        # FTS5-style snippet with highlight markers when the term is short.
-        # At minimum: english queries must still match.
+        assert "docker" in (results[0].get("snippet") or "").lower()
 
-    def test_fts_database_error_falls_back_to_like_without_logging_query(
-        self, db, caplog
-    ):
-        """FTS DatabaseError uses canonical LIKE and never logs private query text."""
+    def test_canonical_search_does_not_log_private_query(self, db, caplog):
+        """Search never logs raw query text (privacy)."""
         import logging
 
-        if not db._fts_enabled:
-            pytest.skip("FTS5 unavailable in this build")
-
-        # Unique alphanumeric sentinel (no FTS special chars) that must never
-        # appear in log output.
         sentinel = "PRIVSENTINELQ9XZ7MK2WL4NP6RTDONOTLOG"
         db.create_session(session_id="s1", source="cli")
         db.append_message(
@@ -2220,33 +2073,10 @@ class TestCJKSearchFallback:
             content=f"public payload contains {sentinel} for recovery",
         )
 
-        real_conn = db._conn
-        call_count = {"n": 0}
-
-        def _fail_fts_match(sql, parameters=(), *args, **kwargs):
-            text = sql if isinstance(sql, str) else str(sql)
-            # Only poison the base FTS MATCH path; LIKE / other SQL must pass.
-            if "messages_fts MATCH" in text and "FROM messages_fts" in text:
-                call_count["n"] += 1
-                raise sqlite3.DatabaseError("database disk image is malformed")
-            return real_conn.execute(sql, parameters, *args, **kwargs)
-
-        class _ConnProxy:
-            def execute(self, sql, parameters=(), *args, **kwargs):
-                return _fail_fts_match(sql, parameters, *args, **kwargs)
-
-            def __getattr__(self, name):
-                return getattr(real_conn, name)
-
-        db._conn = _ConnProxy()  # type: ignore[assignment]
-
         with caplog.at_level(logging.WARNING, logger="hermes_state"):
             results = db.search_messages(sentinel)
 
-        assert call_count["n"] >= 1, "expected FTS MATCH path to be attempted"
         assert len(results) == 1
-        # search_messages strips full content; snippet/context must still show
-        # the match so callers can verify LIKE recovery.
         blob = " ".join(
             str(results[0].get(k) or "")
             for k in ("snippet", "content", "context")
@@ -2254,16 +2084,9 @@ class TestCJKSearchFallback:
         assert sentinel in blob
 
         joined = "\n".join(r.getMessage() for r in caplog.records)
-        assert any(
-            "messages_fts MATCH raised DatabaseError" in r.getMessage()
-            and "canonical LIKE" in r.getMessage()
-            and "query text not logged" in r.getMessage()
-            for r in caplog.records
-        ), f"expected derived-index fallback warning, got: {joined!r}"
         assert sentinel not in joined
         for record in caplog.records:
             assert sentinel not in record.getMessage()
-            # getMessage() already interpolates args; also check raw args.
             assert sentinel not in str(getattr(record, "args", ()))
             assert sentinel not in (record.msg if isinstance(record.msg, str) else "")
 
@@ -4023,16 +3846,10 @@ class TestSchemaInit:
             assert trigram_content_only_inserts == []
             version = migrated_db._conn.execute("SELECT version FROM schema_version").fetchone()[0]
             assert version == SCHEMA_VERSION
-            normal_count = migrated_db._conn.execute(
-                "SELECT COUNT(*) FROM messages_fts"
-            ).fetchone()[0]
-            assert normal_count == 1
+            assert migrated_db._fts_table_exists("messages_fts") is False
             assert migrated_db._fts_table_exists("messages_fts_trigram") is False
-            tool_hit = migrated_db._conn.execute(
-                "SELECT COUNT(*) FROM messages_fts "
-                "WHERE messages_fts MATCH 'browser_snapshot'"
-            ).fetchone()[0]
-            assert tool_hit == 1
+            # Canonical LIKE finds tool_name / content without FTS.
+            assert len(migrated_db.search_messages("browser_snapshot")) == 1
         finally:
             migrated_db.close()
 
@@ -5013,18 +4830,15 @@ class TestVacuum:
 
 
 class TestOptimizeFts:
-    def test_optimize_returns_index_count(self, db):
-        """Optimize reports the number of enabled FTS indexes it merges."""
+    def test_optimize_returns_zero_under_retirement(self, db):
+        """Live FTS is retired — optimize never merges indexes."""
         db.create_session(session_id="s1", source="cli")
         db.append_message(session_id="s1", role="user", content="hello world")
-        expected = sum(
-            db._fts_table_exists(table) is True
-            for table in ("messages_fts", "messages_fts_trigram")
-        )
-        assert db.optimize_fts() == expected
+        assert db.optimize_fts() == 0
+        assert db._fts_table_exists("messages_fts") is False
 
-    def test_optimize_preserves_search_and_snippet(self, db):
-        """Optimize is layout-only: MATCH results + snippets are unchanged."""
+    def test_optimize_preserves_canonical_search(self, db):
+        """Optimize is a no-op scrub; search results stay stable."""
         db.create_session(session_id="s1", source="cli")
         for i in range(50):
             db.append_message(
@@ -5033,56 +4847,33 @@ class TestOptimizeFts:
                 content=f"needle alpha bravo charlie message {i}",
             )
         before = db.search_messages("needle")
-        n = db.optimize_fts()
-        expected = sum(
-            db._fts_table_exists(table) is True
-            for table in ("messages_fts", "messages_fts_trigram")
-        )
-        assert n == expected
+        assert db.optimize_fts() == 0
         after = db.search_messages("needle")
         assert len(after) == len(before)
         assert len(after) > 0
-        # Snippet must still be populated (would be empty/None if the FTS
-        # content shadow were lost during optimize).
-        assert all(row.get("snippet") for row in after)
-        # IDs and snippets are identical before/after — pure layout change.
         assert [r["id"] for r in after] == [r["id"] for r in before]
-        assert [r["snippet"] for r in after] == [r["snippet"] for r in before]
 
-    def test_optimize_skips_missing_trigram_table(self, db):
-        """When the trigram index is absent, optimize handles only the porter
-        index and does not raise."""
+    def test_optimize_scrubs_leftover_fts_tables(self, db):
+        """Leftover FTS objects are dropped; optimize does not recreate them."""
         db.create_session(session_id="s1", source="cli")
         db.append_message(session_id="s1", role="user", content="hello")
-        # Drop the trigram table + triggers to simulate a disabled/absent index.
         with db._lock:
-            for trig in (
-                "messages_fts_trigram_insert",
-                "messages_fts_trigram_delete",
-                "messages_fts_trigram_update",
-            ):
-                db._conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
-            db._conn.execute("DROP TABLE IF EXISTS messages_fts_trigram")
-        assert db._fts_table_exists("messages_fts_trigram") is False
+            db._conn.executescript(hermes_state.FTS_SQL)
         assert db._fts_table_exists("messages_fts") is True
-        # Only the porter index remains -> 1 optimized, no error.
-        assert db.optimize_fts() == 1
+        assert db.optimize_fts() == 0
+        assert db._fts_table_exists("messages_fts") is False
+        assert db._fts_table_exists("messages_fts_trigram") is False
 
     def test_optimize_idempotent(self, db):
-        """Running optimize twice is safe (second pass is a no-op merge)."""
+        """Running optimize twice is safe."""
         db.create_session(session_id="s1", source="cli")
         db.append_message(session_id="s1", role="user", content="repeat me")
-        expected = sum(
-            db._fts_table_exists(table) is True
-            for table in ("messages_fts", "messages_fts_trigram")
-        )
-        assert db.optimize_fts() == expected
-        assert db.optimize_fts() == expected
-        # Search still works after repeated optimization.
+        assert db.optimize_fts() == 0
+        assert db.optimize_fts() == 0
         assert len(db.search_messages("repeat")) == 1
 
     def test_write_path_auto_optimize_disabled_by_default(self, db, monkeypatch):
-        """Automatic FTS optimize on the write path is retired (explicit only)."""
+        """Automatic FTS optimize on the write path is retired."""
         assert db._OPTIMIZE_EVERY_N_WRITES == 0
         calls = {"n": 0}
 
@@ -5097,38 +4888,18 @@ class TestOptimizeFts:
         assert calls["n"] == 0
         assert len(db.search_messages("needle")) == 20
 
-    def test_write_path_optimizes_fts_when_cadence_explicitly_enabled(
-        self, db, monkeypatch
-    ):
-        """Opt-in cadence still merges FTS segments without breaking search."""
-        db._OPTIMIZE_EVERY_N_WRITES = 5
-        calls = {"n": 0}
-        real_optimize = db.optimize_fts
-
-        def _counting_optimize():
-            calls["n"] += 1
-            return real_optimize()
-
-        monkeypatch.setattr(db, "optimize_fts", _counting_optimize)
-        # create_session is write #1; appends are #2.. -> #5 and #10 trigger.
-        db.create_session(session_id="s1", source="cli")
-        for i in range(9):
-            db.append_message(session_id="s1", role="user", content=f"needle {i}")
-        assert calls["n"] == 2
-        assert len(db.search_messages("needle")) == 9
-
     def test_write_path_optimize_failure_never_breaks_write(self, db, monkeypatch):
-        """A failing periodic optimize must not fail the surrounding write."""
+        """Even if opt-in cadence fires, optimize failure must not fail writes."""
         db._OPTIMIZE_EVERY_N_WRITES = 2
 
         def _boom():
             raise sqlite3.OperationalError("simulated optimize failure")
 
         monkeypatch.setattr(db, "optimize_fts", _boom)
-        db.create_session(session_id="s1", source="cli")  # write #1
-        # write #2 trips the cadence; the swallowed failure must not propagate.
+        db.create_session(session_id="s1", source="cli")
         db.append_message(session_id="s1", role="user", content="still persists")
         assert len(db.get_messages("s1")) == 1
+
 
 
 class TestAutoMaintenance:
