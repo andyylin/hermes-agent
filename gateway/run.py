@@ -9651,10 +9651,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter._multiplex_profile_name = profile_name
         from gateway.pairing import PairingStore
 
-        pairing_store = self.pairing_stores.get(profile_name)
+        pairing_stores = getattr(self, "pairing_stores", None)
+        if pairing_stores is None:
+            pairing_stores = {}
+            self.pairing_stores = pairing_stores
+        pairing_store = pairing_stores.get(profile_name)
         if pairing_store is None:
             pairing_store = PairingStore(profile=profile_name, home=profile_home)
-            self.pairing_stores[profile_name] = pairing_store
+            pairing_stores[profile_name] = pairing_store
         adapter._profile_pairing_store = pairing_store
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
