@@ -93,9 +93,8 @@ Add to `~/.hermes/.env`:
 ```bash
 # Speech-to-Text — local provider needs NO key at all
 # pip install faster-whisper          # Free, runs locally, recommended
-GROQ_API_KEY=***                 # Groq Whisper — fast, free tier (cloud)
+GROQ_API_KEY=your-key                 # Groq Whisper — fast, free tier (cloud)
 VOICE_TOOLS_OPENAI_KEY=your-key       # OpenAI Whisper — paid (cloud)
-# Or run: hermes auth openai-codex     # OpenAI transcription via Codex OAuth
 
 # Text-to-Speech (optional — Edge TTS and NeuTTS work without any key)
 ELEVENLABS_API_KEY=***           # ElevenLabs — premium quality
@@ -401,11 +400,9 @@ stt:
                                     # passes its path to the agent as part of the
                                     # inbound message, useful for custom pipelines
                                     # (diarization, alignment, archival, etc.)
-  provider: "local"                  # "local" (free) | "groq" | "openai" | "openai-codex" | "mistral" | "xai"
+  provider: "local"                  # "local" (free) | "groq" | "openai" | "mistral" | "xai"
   local:
     model: "base"                    # tiny, base, small, medium, large-v3
-  openai_codex:
-    model: "gpt-4o-transcribe"       # Uses `hermes auth openai-codex` OAuth
   # model: "whisper-1"              # Legacy: used when provider is not set
 
 # Text-to-Speech
@@ -438,10 +435,8 @@ VOICE_TOOLS_OPENAI_KEY=...         # OpenAI Whisper (paid)
 # STT advanced overrides (optional)
 STT_GROQ_MODEL=whisper-large-v3-turbo    # Override default Groq STT model
 STT_OPENAI_MODEL=whisper-1               # Override default OpenAI STT model
-STT_OPENAI_CODEX_MODEL=gpt-4o-transcribe # Override Codex OAuth STT model
 GROQ_BASE_URL=https://api.groq.com/openai/v1     # Custom Groq endpoint
 STT_OPENAI_BASE_URL=https://api.openai.com/v1    # Custom OpenAI STT endpoint
-STT_OPENAI_CODEX_BASE_URL=https://api.openai.com/v1 # Custom Codex OAuth STT endpoint
 
 # Text-to-Speech providers (Edge TTS and NeuTTS need no key)
 ELEVENLABS_API_KEY=***             # ElevenLabs (premium quality)
@@ -463,11 +458,10 @@ DISCORD_ALLOWED_USERS=...
 | **Groq** | `whisper-large-v3` | Fast (~1s) | Better | Free tier | Yes |
 | **OpenAI** | `whisper-1` | Fast (~1s) | Good | Paid | Yes |
 | **OpenAI** | `gpt-4o-transcribe` | Medium (~2s) | Best | Paid | Yes |
-| **OpenAI Codex OAuth** | `gpt-4o-transcribe` | Medium (~2s) | Best | Included with Codex OAuth access | No API key; run `hermes auth openai-codex` |
 | **Mistral** | `voxtral-mini-latest` | Fast | Good | Paid | Yes |
 | **xAI** | `grok-stt` | Fast | Good | Paid | Yes |
 
-Provider priority (automatic fallback): **local** > **groq** > **openai** > **openai-codex** > **mistral** > **xAI**
+Provider priority (automatic fallback): **local** > **groq** > **openai**
 
 ### TTS Provider Comparison
 

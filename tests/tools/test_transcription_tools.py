@@ -369,50 +369,6 @@ class TestTranscribeOpenAIExtended:
         mock_client.close.assert_called_once()
 
 
-class TestTranscribeOpenAICodex:
-    def test_explicit_provider_selects_codex_oauth(self):
-        with patch("tools.transcription_tools._HAS_OPENAI", True), \
-             patch("tools.transcription_tools._has_codex_audio_backend", return_value=True):
-            from tools.transcription_tools import _get_provider
-            assert _get_provider({"provider": "openai-codex"}) == "openai-codex"
-            assert _get_provider({"provider": "codex"}) == "openai-codex"
-
-    def test_explicit_provider_without_oauth_returns_none(self):
-        with patch("tools.transcription_tools._HAS_OPENAI", True), \
-             patch("tools.transcription_tools._has_codex_audio_backend", return_value=False):
-            from tools.transcription_tools import _get_provider
-            assert _get_provider({"provider": "openai-codex"}) == "none"
-
-    def test_auto_detect_uses_codex_after_direct_openai(self):
-        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
-             patch("tools.transcription_tools._has_local_command", return_value=False), \
-             patch("tools.transcription_tools._HAS_OPENAI", True), \
-             patch("tools.transcription_tools._has_openai_audio_backend", return_value=False), \
-             patch("tools.transcription_tools._has_codex_audio_backend", return_value=True):
-            from tools.transcription_tools import _get_provider
-            assert _get_provider({}) == "openai-codex"
-
-    def test_codex_transcription_uses_public_openai_audio_endpoint(self, monkeypatch, sample_wav):
-        mock_client = MagicMock()
-        mock_client.audio.transcriptions.create.return_value = {"text": "hello from codex"}
-
-        with patch("tools.transcription_tools._HAS_OPENAI", True), \
-             patch("tools.transcription_tools._resolve_codex_audio_client_config", return_value=("oauth-token", "https://api.openai.com/v1")), \
-             patch("openai.OpenAI", return_value=mock_client) as mock_openai_cls:
-            from tools.transcription_tools import _transcribe_openai_codex, DEFAULT_CODEX_STT_MODEL
-            result = _transcribe_openai_codex(sample_wav, "gpt-5.5")
-
-        assert result["success"] is True
-        assert result["transcript"] == "hello from codex"
-        assert result["provider"] == "openai-codex"
-        assert mock_openai_cls.call_args.kwargs["api_key"] == "oauth-token"
-        assert mock_openai_cls.call_args.kwargs["base_url"] == "https://api.openai.com/v1"
-        call_kwargs = mock_client.audio.transcriptions.create.call_args.kwargs
-        assert call_kwargs["model"] == DEFAULT_CODEX_STT_MODEL
-        assert call_kwargs["response_format"] == "json"
-        mock_client.close.assert_called_once()
-
-
 class TestTranscribeLocalCommand:
     def test_auto_detects_local_whisper_binary(self, monkeypatch):
         monkeypatch.delenv("HERMES_LOCAL_STT_COMMAND", raising=False)
