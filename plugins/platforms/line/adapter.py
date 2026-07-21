@@ -392,6 +392,10 @@ class _MessageDeduplicator:
             self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
         self._seen[event_id] = time.time()
         return False
+    def forget(self, event_id: str) -> None:
+        """Allow a failed webhook event to be retried."""
+        if event_id:
+            self._seen.pop(event_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -634,11 +638,22 @@ def _csv_list(value: str) -> List[str]:
     return [x.strip() for x in value.split(",") if x.strip()]
 
 
+def _profile_env(name: str, default: str = "") -> str:
+    """Read a LINE setting without crossing profile scopes in multiplex mode."""
+    try:
+        from agent.secret_scope import get_secret
+    except ImportError:
+        return os.getenv(name, default)
+
+    value = get_secret(name)
+    return str(value) if value is not None else default
+
+
 def _truthy_env(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
+    value = _profile_env(name)
+    if not value:
         return default
-    return v.strip().lower() in {"1", "true", "yes", "on"}
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ---------------------------------------------------------------------------
@@ -690,25 +705,25 @@ class LineAdapter(BasePlatformAdapter):
             "LINE_ALLOW_ALL_USERS", bool(extra.get("allow_all_users", False))
         )
         self.allowed_users = _csv_set(
-            os.getenv("LINE_ALLOWED_USERS", "")
+            _profile_env("LINE_ALLOWED_USERS")
         ) | set(extra.get("allowed_users", []))
         self.allowed_groups = _csv_set(
-            os.getenv("LINE_ALLOWED_GROUPS", "")
+            _profile_env("LINE_ALLOWED_GROUPS")
         ) | set(extra.get("allowed_groups", []))
         self.read_only_groups = _csv_set(
-            os.getenv("LINE_READ_ONLY_GROUPS", "")
+            _profile_env("LINE_READ_ONLY_GROUPS")
         ) | set(extra.get("read_only_groups", []))
         self.archive_groups = _csv_set(
-            os.getenv("LINE_ARCHIVE_GROUPS", "")
+            _profile_env("LINE_ARCHIVE_GROUPS")
         ) | set(extra.get("archive_groups", []))
         self.require_prefix_groups = _csv_set(
-            os.getenv("LINE_REQUIRE_PREFIX_GROUPS", "")
+            _profile_env("LINE_REQUIRE_PREFIX_GROUPS")
         ) | set(extra.get("require_prefix_groups", []))
         self.group_prefixes = _csv_list(
-            os.getenv("LINE_GROUP_PREFIXES", "")
+            _profile_env("LINE_GROUP_PREFIXES")
         ) or list(extra.get("group_prefixes", [])) or ["Hermes:"]
         self.allowed_rooms = _csv_set(
-            os.getenv("LINE_ALLOWED_ROOMS", "")
+            _profile_env("LINE_ALLOWED_ROOMS")
         ) | set(extra.get("allowed_rooms", []))
 
         # Slow-LLM postback button threshold
@@ -908,12 +923,17 @@ class LineAdapter(BasePlatformAdapter):
             return web.Response(status=400, text="bad json")
 
         events = payload.get("events", []) or []
+        had_dispatch_error = False
         for event in events:
             try:
                 await self._dispatch_event(event)
             except Exception:
+                self._dedup.forget(event.get("webhookEventId", "") or "")
+                had_dispatch_error = True
                 logger.exception("LINE: dispatch_event failed")
 
+        if had_dispatch_error:
+            return web.Response(status=500, text="event processing failed")
         return web.Response(status=200, text="ok")
 
     async def _dispatch_event(self, event: Dict[str, Any]) -> None:
@@ -978,23 +998,65 @@ class LineAdapter(BasePlatformAdapter):
             hermes_home = Path.home().joinpath(".hermes").resolve()
 
         archive_dir = hermes_home / "data" / "line-read-only"
-        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        archive_dir.chmod(0o700)
         safe_chat_id = re.sub(r"[^A-Za-z0-9_.-]", "_", chat_id or "unknown")
+        message = event.get("message") or {}
+        webhook_event_id = event.get("webhookEventId", "") or ""
+        message_id = message.get("id", "") or ""
+        if webhook_event_id:
+            event_key = f"webhook:{webhook_event_id}"
+        elif message_id:
+            event_key = f"message:{chat_id}:{message_id}"
+        else:
+            identity = json.dumps(
+                {
+                    "timestamp": event.get("timestamp"),
+                    "source": source,
+                    "message": message,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            event_key = f"sha256:{hashlib.sha256(identity.encode()).hexdigest()}"
         record = {
             "received_at": time.time(),
+            "event_key": event_key,
             "event_timestamp": event.get("timestamp"),
-            "webhook_event_id": event.get("webhookEventId", ""),
+            "webhook_event_id": webhook_event_id,
             "chat_id": chat_id,
             "chat_type": chat_type,
             "user_id": source.get("userId", ""),
-            "message_id": (event.get("message") or {}).get("id", ""),
+            "message_id": message_id,
             "message_type": msg_type,
             "text": text,
             "media_urls": media_urls,
             "media_types": media_types,
         }
-        with (archive_dir / f"{safe_chat_id}.jsonl").open("a", encoding="utf-8") as fh:
+        archive_path = archive_dir / f"{safe_chat_id}.jsonl"
+        fd = os.open(archive_path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+        os.chmod(archive_path, 0o600)
+        with os.fdopen(fd, "a+", encoding="utf-8") as fh:
+            fh.seek(0)
+            for line in fh:
+                try:
+                    existing = json.loads(line)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if existing.get("event_key") == event_key:
+                    return
+                if webhook_event_id and existing.get("webhook_event_id") == webhook_event_id:
+                    return
+                if (
+                    message_id
+                    and existing.get("chat_id") == chat_id
+                    and existing.get("message_id") == message_id
+                ):
+                    return
             fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
 
     async def _handle_message_event(self, event: Dict[str, Any]) -> None:
         msg = event.get("message") or {}

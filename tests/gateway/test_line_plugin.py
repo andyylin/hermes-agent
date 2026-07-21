@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import base64
 import json
+import stat
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -724,6 +725,26 @@ class TestAdapterInit:
         assert ad.require_prefix_groups == {"C3"}
         assert ad.group_prefixes == ["Hermes:", "Joi:"]
 
+    def test_profile_scope_does_not_union_process_global_group_policy(self, monkeypatch):
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+        from gateway.config import PlatformConfig
+
+        monkeypatch.setenv("LINE_ALLOWED_GROUPS", "Cglobal")
+        monkeypatch.setenv("LINE_READ_ONLY_GROUPS", "Cglobal-read")
+        token = set_secret_scope(
+            {
+                "LINE_ALLOWED_GROUPS": "Cprofile",
+                "LINE_READ_ONLY_GROUPS": "Cprofile-read",
+            }
+        )
+        try:
+            ad = LineAdapter(PlatformConfig(enabled=True))
+        finally:
+            reset_secret_scope(token)
+
+        assert ad.allowed_groups == {"Cprofile"}
+        assert ad.read_only_groups == {"Cprofile-read"}
+
     def test_read_only_group_message_is_archived_without_agent_dispatch(
         self, monkeypatch, tmp_path
     ):
@@ -760,6 +781,54 @@ class TestAdapterInit:
         assert rows[-1]["text"] == "大家好"
         assert rows[-1]["media_urls"] == []
         assert rows[-1]["media_types"] == []
+        assert stat.S_IMODE(archive.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(archive.stat().st_mode) == 0o600
+
+    def test_archive_deduplicates_message_id_across_adapter_restart(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
+        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
+        monkeypatch.setenv("LINE_READ_ONLY_GROUPS", "Cread")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        from gateway.config import PlatformConfig
+
+        event = {
+            "type": "message",
+            "timestamp": 1234567890,
+            "source": {"type": "group", "groupId": "Cread", "userId": "U123"},
+            "message": {"type": "text", "id": "stable-message-id", "text": "once"},
+        }
+        asyncio.run(LineAdapter(PlatformConfig(enabled=True))._dispatch_event(event))
+        asyncio.run(LineAdapter(PlatformConfig(enabled=True))._dispatch_event(event))
+
+        archive = tmp_path / ".hermes" / "data" / "line-read-only" / "Cread.jsonl"
+        assert len(archive.read_text().splitlines()) == 1
+
+    def test_archive_write_failure_returns_retryable_webhook_error(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
+        monkeypatch.setenv("LINE_CHANNEL_SECRET", "secret")
+        monkeypatch.setenv("LINE_READ_ONLY_GROUPS", "Cread")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        from gateway.config import PlatformConfig
+
+        ad = LineAdapter(PlatformConfig(enabled=True))
+        ad._archive_read_only_message = MagicMock(side_effect=OSError("disk full"))
+        event = {
+            "type": "message",
+            "webhookEventId": "evt-write-failure",
+            "source": {"type": "group", "groupId": "Cread", "userId": "U123"},
+            "message": {"type": "text", "id": "m1", "text": "keep me"},
+        }
+        body = json.dumps({"events": [event]}).encode()
+        signature = base64.b64encode(
+            hmac.new(b"secret", body, hashlib.sha256).digest()
+        ).decode()
+        request = MagicMock(headers={"X-Line-Signature": signature})
+        request.read = AsyncMock(return_value=body)
+
+        response = asyncio.run(ad._handle_webhook(request))
+
+        assert response.status == 500
+        assert not ad._dedup.is_duplicate("evt-write-failure")
 
     def test_archive_group_preserves_prefix_dispatch(self, monkeypatch, tmp_path):
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")

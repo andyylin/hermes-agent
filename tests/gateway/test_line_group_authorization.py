@@ -52,3 +52,25 @@ def test_line_dm_not_authorized_by_allowed_group(monkeypatch):
     )
 
     assert _runner()._is_user_authorized(source) is False
+
+
+def test_line_group_policy_does_not_fall_back_to_process_global_in_profile_scope(monkeypatch):
+    from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+    monkeypatch.setenv("LINE_ALLOWED_GROUPS", "Cglobal")
+    monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+    source = SessionSource(
+        platform=Platform("line"),
+        chat_id="Cglobal",
+        chat_type="group",
+        user_id="Uother",
+        user_name="Uother",
+        profile="wife",
+    )
+
+    token = set_secret_scope({})
+    try:
+        assert _runner()._is_user_authorized(source) is False
+    finally:
+        reset_secret_scope(token)
