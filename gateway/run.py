@@ -1417,14 +1417,16 @@ def _platform_has_home_channel(
     """
     platform_name = platform.value if isinstance(platform, Platform) else str(platform)
     env_key = _home_target_env_var(platform_name)
+    multiplex_active = False
     try:
-        from agent.secret_scope import get_secret
+        from agent.secret_scope import get_secret, is_multiplex_active
 
+        multiplex_active = is_multiplex_active()
         if get_secret(env_key):
             return True
     except Exception:
         pass
-    if os.getenv(env_key):
+    if not multiplex_active and os.getenv(env_key):
         return True
 
     try:
@@ -9639,6 +9641,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
+        adapter._multiplex_profile_name = profile_name
+        from gateway.pairing import PairingStore
+
+        pairing_store = self.pairing_stores.get(profile_name)
+        if pairing_store is None:
+            pairing_store = PairingStore(profile=profile_name)
+            self.pairing_stores[profile_name] = pairing_store
+        adapter._profile_pairing_store = pairing_store
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)

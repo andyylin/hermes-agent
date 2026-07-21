@@ -3,7 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { $activeGatewayProfile, $activeGatewayProfileGeneration } from '@/store/profile'
 import { $connection } from '@/store/session'
 
-import { desktopGit, desktopGitForProfile, scanDesktopReposForProfile } from './desktop-git'
+import {
+  desktopGit,
+  desktopGitForProfile,
+  scanDesktopReposForProfile,
+  StaleDesktopGitProfileError
+} from './desktop-git'
 
 const repoStatus = vi.fn(async () => ({ branch: 'main' }))
 const scanRepos = vi.fn(async () => [{ label: 'Repo', root: '/repo' }])
@@ -132,5 +137,21 @@ describe('desktop git facade', () => {
       profile: 'remote-beta'
     })
     expect(repoStatus).not.toHaveBeenCalled()
+  })
+
+  it('classifies a delayed Git completion after a profile switch as stale cancellation', async () => {
+    let resolveStatus!: (value: { branch: string }) => void
+
+    repoStatus.mockImplementationOnce(() => new Promise(resolve => (resolveStatus = resolve)))
+    $activeGatewayProfile.set('alpha')
+    const generation = $activeGatewayProfileGeneration.get()
+    getConnection.mockResolvedValueOnce({ mode: 'local', profile: 'alpha' } as never)
+    const git = await desktopGitForProfile('alpha', generation)
+    const pending = git?.repoStatus('/work')
+
+    $activeGatewayProfile.set('beta')
+    resolveStatus({ branch: 'main' })
+
+    await expect(pending).rejects.toBeInstanceOf(StaleDesktopGitProfileError)
   })
 })

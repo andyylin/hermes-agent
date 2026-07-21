@@ -1674,7 +1674,7 @@ def load_gateway_config(*, prepare_multiplex: bool = False) -> GatewayConfig:
                     # require_mention (not a telegram: block), so the telegram plugin's
                     # apply_yaml_config_fn hook — which only runs when a telegram config
                     # block exists — can't cover the no-telegram-block case (#3979).
-                    if not os.getenv("TELEGRAM_REQUIRE_MENTION"):
+                    if not is_multiplex_active() and not os.getenv("TELEGRAM_REQUIRE_MENTION"):
                         os.environ["TELEGRAM_REQUIRE_MENTION"] = str(_tl_require_mention).lower()
 
             # Telegram settings → env vars / extra: migrated to the telegram

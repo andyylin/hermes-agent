@@ -67,7 +67,12 @@ vi.mock('@/lib/desktop-fs', () => ({
 
 vi.mock('@/lib/desktop-git', () => ({
   desktopGitForProfile,
-  scanDesktopReposForProfile: scanRepos
+  scanDesktopReposForProfile: scanRepos,
+  StaleDesktopGitProfileError: class extends Error {
+    constructor() {
+      super('Desktop Git operation belongs to a stale profile context')
+    }
+  }
 }))
 
 vi.mock('@/store/gateway', () => ({

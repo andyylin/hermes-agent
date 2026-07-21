@@ -4753,6 +4753,13 @@ class DiscordAdapter(BasePlatformAdapter):
         runner = getattr(self, "gateway_runner", None)
         if not runner:
             return
+        # The legacy admin-alert route uses the primary profile's home-channel
+        # config. A secondary multiplex adapter must not send its security event
+        # through that profile; until alerts have an explicit per-profile target,
+        # fail closed rather than leaking across the boundary.
+        if getattr(self, "_multiplex_profile_name", None):
+            logger.warning("[Discord] Suppressing cross-profile admin alert for multiplexed adapter")
+            return
         for target in (Platform.TELEGRAM, Platform.SLACK):
             try:
                 adapter = runner.adapters.get(target)

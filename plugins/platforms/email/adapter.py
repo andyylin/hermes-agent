@@ -35,7 +35,7 @@ from html import escape, unescape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from agent.secret_scope import UnscopedSecretError, get_secret, profile_env_bool, profile_env_int
+from agent.secret_scope import UnscopedSecretError, get_secret, is_multiplex_active, profile_env_bool, profile_env_int
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -1373,7 +1373,10 @@ def _is_connected(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
     if extra.get("address"):
         return True
+    if is_multiplex_active():
+        return bool((get_secret("EMAIL_ADDRESS") or "").strip())
     import hermes_cli.gateway as gateway_mod
+
     return bool((gateway_mod.get_env_value("EMAIL_ADDRESS") or "").strip())
 
 

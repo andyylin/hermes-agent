@@ -113,7 +113,7 @@ function reviewCtx(): ReviewContext | null {
     : null
 }
 
-const isReviewContextCurrent = (ctx: ReviewContext) =>
+const isReviewContextCurrent = (ctx: Pick<ReviewContext, 'cwd' | 'generation' | 'profile'>) =>
   repoCwd() === ctx.cwd &&
   activeReviewProfile() === ctx.profile &&
   $activeGatewayProfileGeneration.get() === ctx.generation
@@ -348,11 +348,24 @@ export async function revertReviewFile(path: null | string): Promise<void> {
 // routes through a confirm dialog. The target is `{ path }` where `path === null`
 // means "revert all"; `undefined` means no confirm is open. We wrap the path in
 // an object so the `null` ("all") case is distinguishable from "closed".
-export const $reviewRevertTarget = atom<{ path: null | string } | undefined>(undefined)
+interface ReviewRevertTarget {
+  cwd: string
+  generation: number
+  path: null | string
+  profile: string
+}
+
+export const $reviewRevertTarget = atom<ReviewRevertTarget | undefined>(undefined)
 
 /** Open the revert confirm for a single file, or `null` for all changes. */
 export function requestRevert(path: null | string): void {
-  $reviewRevertTarget.set({ path })
+  const ctx = reviewCtx()
+
+  if (!ctx) {
+    return
+  }
+
+  $reviewRevertTarget.set({ cwd: ctx.cwd, generation: ctx.generation, path, profile: ctx.profile })
 }
 
 export function cancelRevert(): void {
@@ -365,7 +378,7 @@ export async function confirmRevert(): Promise<void> {
 
   $reviewRevertTarget.set(undefined)
 
-  if (target) {
+  if (target && isReviewContextCurrent(target)) {
     await revertReviewFile(target.path)
   }
 }
@@ -507,6 +520,7 @@ $activeGatewayProfileGeneration.subscribe(value => {
   $reviewShipInfo.set({ ghReady: false, pr: null })
   $reviewShipBusy.set(false)
   $reviewCommitMsgBusy.set(false)
+  $reviewRevertTarget.set(undefined)
 
   if ($reviewOpen.get()) {
     scheduleReviewRefresh()

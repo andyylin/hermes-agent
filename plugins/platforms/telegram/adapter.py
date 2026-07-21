@@ -9281,8 +9281,12 @@ def _is_connected(config) -> bool:
     """
     token = getattr(config, "token", None)
     if not token:
-        import hermes_cli.gateway as gateway_mod
-        token = gateway_mod.get_env_value("TELEGRAM_BOT_TOKEN") or ""
+        if is_multiplex_active():
+            token = get_secret("TELEGRAM_BOT_TOKEN") or ""
+        else:
+            import hermes_cli.gateway as gateway_mod
+
+            token = gateway_mod.get_env_value("TELEGRAM_BOT_TOKEN") or ""
     return bool(str(token).strip())
 
 

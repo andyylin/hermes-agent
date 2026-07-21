@@ -349,15 +349,17 @@ describe('mutations', () => {
 
 describe('revert confirm dialog', () => {
   it('requestRevert opens a target, cancelRevert closes it', () => {
+    stubReview()
     requestRevert('a.ts')
-    expect($reviewRevertTarget.get()).toEqual({ path: 'a.ts' })
+    expect($reviewRevertTarget.get()).toMatchObject({ path: 'a.ts', profile: 'default' })
     cancelRevert()
     expect($reviewRevertTarget.get()).toBeUndefined()
   })
 
   it('requestRevert(null) encodes the "revert all" target distinctly from closed', () => {
+    stubReview()
     requestRevert(null)
-    expect($reviewRevertTarget.get()).toEqual({ path: null })
+    expect($reviewRevertTarget.get()).toMatchObject({ path: null, profile: 'default' })
   })
 
   it('confirmRevert closes the dialog then performs the revert', async () => {
@@ -376,6 +378,17 @@ describe('revert confirm dialog', () => {
 
     await confirmRevert()
 
+    expect(review.revert).not.toHaveBeenCalled()
+  })
+
+  it('drops a pending destructive revert after the active profile changes', async () => {
+    const review = stubReview()
+
+    requestRevert('a.ts')
+    $activeGatewayProfile.set('other')
+    await confirmRevert()
+
+    expect($reviewRevertTarget.get()).toBeUndefined()
     expect(review.revert).not.toHaveBeenCalled()
   })
 })

@@ -28,6 +28,7 @@ def _reset_signal_scheduler():
 from gateway.config import Platform
 from tools.send_message_tool import (
     _is_telegram_thread_not_found,
+    _live_adapter_for_session,
     _parse_target_ref,
     _send_matrix_via_adapter,
     _send_signal,
@@ -35,6 +36,33 @@ from tools.send_message_tool import (
     _send_to_platform,
     send_message_tool,
 )
+
+
+def test_live_adapter_uses_routed_multiplex_profile(monkeypatch):
+    primary = object()
+    secondary = object()
+    runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=True),
+        adapters={Platform.MATRIX: primary},
+        _profile_adapters={"secondary": {Platform.MATRIX: secondary}},
+        _active_profile_name=lambda: "default",
+    )
+    monkeypatch.setattr("gateway.session_context.get_session_env", lambda *_args: "secondary")
+
+    assert _live_adapter_for_session(runner, Platform.MATRIX) is secondary
+
+
+def test_live_adapter_fails_closed_without_routed_profile(monkeypatch):
+    primary = object()
+    runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=True),
+        adapters={Platform.MATRIX: primary},
+        _profile_adapters={},
+        _active_profile_name=lambda: "default",
+    )
+    monkeypatch.setattr("gateway.session_context.get_session_env", lambda *_args: "")
+
+    assert _live_adapter_for_session(runner, Platform.MATRIX) is None
 # Discord helpers moved to the plugin in #24325.  Import from the new path
 # and provide a thin ``_send_discord(token, ...)`` shim that mirrors the
 # pre-migration signature so the existing test bodies keep working.

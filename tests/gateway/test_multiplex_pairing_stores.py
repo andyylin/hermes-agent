@@ -15,6 +15,7 @@ the per-profile stores actually materialize.
 import asyncio
 from unittest.mock import MagicMock, patch
 
+from gateway.config import Platform
 from gateway.run import GatewayRunner
 
 
@@ -83,3 +84,23 @@ def test_pairing_store_scoped_to_profile_dir(tmp_path, monkeypatch):
     assert "profiles/ops/pairing" in str(store._dir).replace("\\", "/"), (
         f"store not profile-scoped: {store._dir}"
     )
+
+
+def test_secondary_adapter_receives_its_profile_pairing_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".hermes").mkdir()
+    runner = _bare_runner()
+    runner.session_store = MagicMock()
+    runner._busy_text_mode = "status"
+    runner._make_profile_message_handler = MagicMock(return_value=MagicMock())
+    runner._make_profile_fatal_error_handler = MagicMock(return_value=MagicMock())
+    runner._make_adapter_auth_check = MagicMock(return_value=MagicMock())
+    runner._handle_active_session_busy_message = MagicMock()
+    runner._recover_telegram_topic_thread_id = MagicMock()
+    adapter = MagicMock()
+
+    runner._configure_profile_adapter(adapter, "ops", Platform.YUANBAO)
+
+    assert adapter._multiplex_profile_name == "ops"
+    assert adapter._profile_pairing_store is runner.pairing_stores["ops"]
+    assert adapter._profile_pairing_store.profile == "ops"

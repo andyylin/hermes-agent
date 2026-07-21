@@ -116,6 +116,16 @@ function createRemoteGit(profile: () => string | undefined = desktopFsProfile): 
 
 const remoteGit = createRemoteGit()
 
+// A guarded Git method started under one profile/generation but completed after
+// the active owner changed. Callers must treat this as cancellation, not as an
+// operation failure belonging to the newly active profile.
+export class StaleDesktopGitProfileError extends Error {
+  constructor() {
+    super('Desktop Git operation belongs to a stale profile context')
+    this.name = 'StaleDesktopGitProfileError'
+  }
+}
+
 export function desktopGit(): GitBridge | undefined {
   // Profile activation publishes before the foreground connection atom finishes
   // synchronizing. Refuse that brief mismatch instead of routing B's operation
@@ -132,7 +142,7 @@ function guardedGitBridge(git: GitBridge, profile: string, generation: number): 
 
   const assertOwned = () => {
     if (!activeGatewayProfileContextIsCurrent(context)) {
-      throw new Error('Desktop Git profile ownership changed')
+      throw new StaleDesktopGitProfileError()
     }
   }
 

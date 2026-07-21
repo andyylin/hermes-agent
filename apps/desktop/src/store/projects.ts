@@ -8,7 +8,7 @@ import {
   selectDesktopPathsForProfile,
   writeDesktopFileTextForProfile
 } from '@/lib/desktop-fs'
-import { desktopGitForProfile, scanDesktopReposForProfile } from '@/lib/desktop-git'
+import { desktopGitForProfile, scanDesktopReposForProfile, StaleDesktopGitProfileError } from '@/lib/desktop-git'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
 import { resetProfileBoundWorkspaceLayout, setSidebarAgentsGrouped } from '@/store/layout'
@@ -304,12 +304,7 @@ interface ProjectRequestContext {
   profile: string
 }
 
-class StaleProjectProfileError extends Error {
-  constructor() {
-    super('Project operation belongs to a stale profile context')
-    this.name = 'StaleProjectProfileError'
-  }
-}
+const StaleProjectProfileError = StaleDesktopGitProfileError
 
 function projectContextIsCurrent(context: ProjectRequestContext): boolean {
   return (
