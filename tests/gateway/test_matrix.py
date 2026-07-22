@@ -5473,3 +5473,22 @@ class TestMatrixDispatchSyncIsolation:
 
         assert ran["ok"] is True  # the sibling handler still ran
         assert "event handler failed" in caplog.text  # failure surfaced, not swallowed
+
+
+def test_read_crypto_store_device_id_from_real_sqlite(tmp_path):
+    """The restart guard must read the persisted device ID from crypto.db."""
+    import sqlite3
+
+    from plugins.platforms.matrix.adapter import _read_crypto_store_device_id
+
+    db_path = tmp_path / "crypto.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE crypto_account (account_id TEXT PRIMARY KEY, device_id TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO crypto_account (account_id, device_id) VALUES (?, ?)",
+            ("@wife:example.org", "WIFE_DEVICE"),
+        )
+
+    assert _read_crypto_store_device_id(db_path, "@wife:example.org") == "WIFE_DEVICE"

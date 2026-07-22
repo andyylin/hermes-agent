@@ -59,6 +59,7 @@ import logging
 import mimetypes
 import os
 import re
+import sqlite3
 import time
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from dataclasses import dataclass, field
