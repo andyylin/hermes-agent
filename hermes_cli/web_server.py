@@ -16472,6 +16472,63 @@ def _ws_client_is_allowed(ws: "WebSocket") -> bool:
     return client_host in _LOOPBACK_HOSTS
 
 
+def _ws_origin_is_accepted(
+    origin: urllib.parse.ParseResult, bound_host: str
+) -> bool:
+    """Return True when a browser Origin is allowed for WS upgrades."""
+    if _is_accepted_host(origin.netloc, bound_host):
+        return True
+
+    # Cloudflare Tunnel / reverse-proxy deployments commonly rewrite the
+    # origin-facing Host header to the loopback upstream (e.g.
+    # ``httpHostHeader: 127.0.0.1:9119``) while the browser correctly sends
+    # ``Origin: https://hermes.example.com``. That is not a rebinding attack
+    # when the operator explicitly configured dashboard.public_url; it is the
+    # declared public origin. Keep the relief valve explicit so random public
+    # hostnames still die here.
+    try:
+        from hermes_cli.dashboard_auth.prefix import resolve_public_url
+
+        public_url = resolve_public_url()
+    except Exception:
+        public_url = ""
+
+    if not public_url:
+        return False
+
+    try:
+        public = urllib.parse.urlparse(public_url)
+        origin_explicit_port = origin.port
+        public_explicit_port = public.port
+    except ValueError:
+        return False
+
+    if origin_explicit_port == 0 or public_explicit_port == 0:
+        return False
+
+    origin_port = (
+        origin_explicit_port
+        if origin_explicit_port is not None
+        else (443 if origin.scheme.lower() == "https" else 80)
+    )
+    public_port = (
+        public_explicit_port
+        if public_explicit_port is not None
+        else (443 if public.scheme.lower() == "https" else 80)
+    )
+
+    if origin.username or origin.password or public.username or public.password:
+        return False
+
+    return (
+        origin.scheme.lower() == public.scheme.lower()
+        and bool(origin.hostname)
+        and bool(public.hostname)
+        and origin.hostname.lower() == public.hostname.lower()
+        and origin_port == public_port
+    )
+
+
 def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     """Return a Host/Origin rejection reason, or None when allowed.
 
@@ -16501,7 +16558,7 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     if not parsed.netloc:
         return f"origin_mismatch origin={origin} bound={bound_host}"
 
-    if not _is_accepted_host(parsed.netloc, bound_host):
+    if not _ws_origin_is_accepted(parsed, bound_host):
         return f"origin_mismatch origin={origin} bound={bound_host}"
     return None
 

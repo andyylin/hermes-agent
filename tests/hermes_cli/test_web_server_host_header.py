@@ -215,3 +215,55 @@ class TestWebSocketHostOriginGuard:
             },
         ):
             pass
+
+    def test_configured_public_url_origin_is_accepted_behind_loopback_proxy(self, monkeypatch):
+        """Cloudflare may rewrite Host to loopback while Origin stays public."""
+        from fastapi.testclient import TestClient
+
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.1", raising=False)
+        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+        monkeypatch.setattr(
+            "hermes_cli.dashboard_auth.prefix.resolve_public_url",
+            lambda: "https://hermes.andyylin.com",
+        )
+
+        client = TestClient(ws.app)
+        url = f"/api/events?token={ws._SESSION_TOKEN}&channel=security-test"
+        with client.websocket_connect(
+            url,
+            headers={
+                "Host": "127.0.0.1:9119",
+                "Origin": "https://hermes.andyylin.com",
+            },
+        ):
+            pass
+
+    @pytest.mark.parametrize(
+        ("public_url", "origin", "accepted"),
+        [
+            ("https://hermes.andyylin.com", "http://hermes.andyylin.com", False),
+            ("https://hermes.andyylin.com", "https://hermes.andyylin.com:443", True),
+            ("https://hermes.andyylin.com:8443", "https://hermes.andyylin.com:8443", True),
+            ("https://hermes.andyylin.com:8443", "https://hermes.andyylin.com", False),
+            ("https://hermes.andyylin.com", "https://evil.example", False),
+            ("https://hermes.andyylin.com", "https://hermes.andyylin.com:0", False),
+            ("https://hermes.andyylin.com:0", "https://hermes.andyylin.com", False),
+            ("https://hermes.andyylin.com:bad", "https://hermes.andyylin.com", False),
+            ("https://user@hermes.andyylin.com", "https://hermes.andyylin.com", False),
+        ],
+    )
+    def test_public_url_origin_requires_exact_origin_tuple(
+        self, monkeypatch, public_url, origin, accepted
+    ):
+        from urllib.parse import urlparse
+
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(
+            "hermes_cli.dashboard_auth.prefix.resolve_public_url",
+            lambda: public_url,
+        )
+
+        assert ws._ws_origin_is_accepted(urlparse(origin), "127.0.0.1") is accepted
