@@ -44,14 +44,23 @@ def _auth_env(name: str, default: str = "") -> str:
 
 
 def _line_auth_env(name: str, default: str = "") -> str:
-    """Read added LINE policy with the active profile scope as authority."""
+    """Read LINE group policy from an installed profile scope, fail closed.
+
+    ``get_secret`` intentionally falls through to ``os.environ`` when the
+    process is not a multiplex deployment. That is right for ordinary provider
+    credentials, but not for a per-profile LINE allowlist: a stamped profile
+    must never inherit the default profile's process-global group policy.
+    """
     try:
-        from agent.secret_scope import get_secret
+        from agent.secret_scope import current_secret_scope
     except ImportError:
         return (os.getenv(name) or default).strip()
 
-    value = get_secret(name)
-    return (str(value) if value is not None else default).strip()
+    scope = current_secret_scope()
+    if scope is not None:
+        value = scope.get(name)
+        return (str(value) if value is not None else default).strip()
+    return (os.getenv(name) or default).strip()
 
 
 def _coerce_allow_set(raw) -> set[str]:
