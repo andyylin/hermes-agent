@@ -43,6 +43,26 @@ def _auth_env(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
 
 
+def _line_auth_env(name: str, default: str = "") -> str:
+    """Read LINE group policy from an installed profile scope, fail closed.
+
+    ``get_secret`` intentionally falls through to ``os.environ`` when the
+    process is not a multiplex deployment. That is right for ordinary provider
+    credentials, but not for a per-profile LINE allowlist: a stamped profile
+    must never inherit the default profile's process-global group policy.
+    """
+    try:
+        from agent.secret_scope import current_secret_scope
+    except ImportError:
+        return (os.getenv(name) or default).strip()
+
+    scope = current_secret_scope()
+    if scope is not None:
+        value = scope.get(name)
+        return (str(value) if value is not None else default).strip()
+    return (os.getenv(name) or default).strip()
+
+
 def _coerce_allow_set(raw) -> set[str]:
     """Parse allowlist values from config or env var into a set of strings.
 
@@ -426,8 +446,13 @@ class GatewayAuthorizationMixin:
                 Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
                 Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
             }.get(source.platform, "")
+            if not chat_allowlist_env and source.platform and source.platform.value == "line":
+                chat_allowlist_env = "LINE_ALLOWED_GROUPS"
             if chat_allowlist_env:
-                raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
+                if source.platform and source.platform.value == "line":
+                    raw_chat_allowlist = _line_auth_env(chat_allowlist_env)
+                else:
+                    raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
                 if raw_chat_allowlist:
                     allowed_group_ids = {
                         cid.strip()
@@ -574,7 +599,10 @@ class GatewayAuthorizationMixin:
         group_chat_allowlist = ""
         if source.chat_type in {"group", "forum"}:
             group_user_allowlist = _auth_env(platform_group_user_env_map.get(source.platform, ""))
-            group_chat_allowlist = _auth_env(platform_group_chat_env_map.get(source.platform, ""))
+            if source.platform and source.platform.value == "line":
+                group_chat_allowlist = _line_auth_env("LINE_ALLOWED_GROUPS")
+            else:
+                group_chat_allowlist = _auth_env(platform_group_chat_env_map.get(source.platform, ""))
         global_allowlist = _auth_env("GATEWAY_ALLOWED_USERS")
 
         if not platform_allowlist and not group_user_allowlist and not group_chat_allowlist and not global_allowlist:
@@ -826,10 +854,16 @@ class GatewayAuthorizationMixin:
                 ),
                 Platform.QQBOT: ("QQ_GROUP_ALLOWED_USERS",),
             }
+            if platform and platform.value == "line":
+                platform_group_env_map[platform] = ("LINE_ALLOWED_GROUPS",)
             if os.getenv(platform_env_map.get(platform, ""), "").strip():
                 return "ignore"
             for env_key in platform_group_env_map.get(platform, ()):
-                if os.getenv(env_key, "").strip():
+                if platform and platform.value == "line":
+                    configured = _line_auth_env(env_key)
+                else:
+                    configured = os.getenv(env_key, "").strip()
+                if configured:
                     return "ignore"
 
         if os.getenv("GATEWAY_ALLOWED_USERS", "").strip():
