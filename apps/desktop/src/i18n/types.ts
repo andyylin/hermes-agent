@@ -262,6 +262,12 @@ export interface Translations {
     actions: Record<string, string>
   }
 
+  // Find-in-page bar (⌘F). `close` reuses common.close.
+  findInPage: {
+    next: string
+    previous: string
+  }
+
   language: {
     label: string
     description: string
@@ -449,6 +455,15 @@ export interface Translations {
       invalidJson: string
       keepAwakeTitle: string
       keepAwakeDesc: string
+    }
+    quickEntry: {
+      enabledTitle: string
+      enabledDesc: string
+      shortcutTitle: string
+      shortcutDesc: string
+      active: string
+      takenBy: string
+      invalidShortcut: string
     }
     credentials: {
       pasteKey: string
@@ -1451,6 +1466,29 @@ export interface Translations {
     copyPath: string
   }
 
+  artifactCard: {
+    kind: Record<'code' | 'html' | 'svg', string>
+    generating: (lines: number) => string
+    versionBadge: (count: number) => string
+    open: string
+  }
+
+  artifactPane: {
+    tabFallback: string
+    modePreview: string
+    modeSource: string
+    versionOf: (current: number, total: number) => string
+    olderVersion: string
+    newerVersion: string
+    latest: string
+    copyContent: string
+    download: string
+    openInBrowser: string
+    openInBrowserFailed: string
+    missingTitle: string
+    missingBody: string
+  }
+
   sidebar: {
     nav: Record<string, string>
     searchAria: string
@@ -1669,6 +1707,10 @@ export interface Translations {
   statusStack: {
     agents: string
     background: (count: number) => string
+    goalActive: string
+    goalDone: string
+    goalPaused: string
+    goalWaiting: string
     subagents: (count: number) => string
     todos: (done: number, total: number) => string
     running: string
@@ -1990,6 +2032,16 @@ export interface Translations {
       gatewayOffline: string
       gatewayRestarting: string
       gatewayTitle: string
+      customizeTitle: string
+      toggleApprovalMode: string
+      toggleBackendVersion: string
+      toggleCommandCenter: string
+      toggleContextUsage: string
+      toggleRunningTimer: string
+      toggleSessionTimer: string
+      toggleTerminal: string
+      toggleVersion: string
+      toggleWorkspace: string
       agents: string
       closeAgents: string
       openAgents: string
