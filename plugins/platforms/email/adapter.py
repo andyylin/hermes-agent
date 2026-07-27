@@ -183,6 +183,41 @@ def _decode_header_value(raw: str) -> str:
     return " ".join(decoded)
 
 
+def _standalone_looks_like_html(body: str) -> bool:
+    """Detect an HTML document or fragment in standalone delivery content."""
+    return bool(
+        re.search(
+            r"<(?:!doctype|html|body|div|p|h[1-6]|strong|em|ul|ol|li|table|br)\b",
+            body or "",
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _standalone_html_to_plain_text(body: str) -> str:
+    """Build a readable plain-text fallback without external dependencies."""
+    from html import unescape
+
+    text = re.sub(r"<\s*br\s*/?\s*>", "\n", body or "", flags=re.IGNORECASE)
+    text = re.sub(
+        r"</\s*(?:p|div|h[1-6]|li|tr)\s*>",
+        "\n",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"<[^>]+>", "", text)
+    lines = [line.strip() for line in unescape(text).splitlines()]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def _standalone_plain_text_to_html(body: str) -> str:
+    """Escape plain text into a compact HTML alternative."""
+    from html import escape
+
+    escaped = escape(body or "").replace("\n", "<br>\n")
+    return f"<html><body><p>{escaped}</p></body></html>"
+
+
 def _extract_text_body(msg: email_lib.message.Message) -> str:
     """Extract the plain-text body from a potentially multipart email."""
     if msg.is_multipart():
@@ -1200,8 +1235,6 @@ async def _standalone_send(
     standalone_sender_fn contract; replaces the legacy _send_email helper."""
     import smtplib
     import ssl as _ssl
-    from email.mime.text import MIMEText
-    from email.utils import formatdate
 
     extra = getattr(pconfig, "extra", {}) or {}
     address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
@@ -1216,11 +1249,20 @@ async def _standalone_send(
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
     try:
-        msg = MIMEText(message, "plain", "utf-8")
+        msg = MIMEMultipart("alternative")
         msg["From"] = address
         msg["To"] = chat_id
         msg["Subject"] = "Hermes Agent"
         msg["Date"] = formatdate(localtime=True)
+
+        if _standalone_looks_like_html(message or ""):
+            plain_body = _standalone_html_to_plain_text(message or "")
+            html_body = message or ""
+        else:
+            plain_body = message or ""
+            html_body = _standalone_plain_text_to_html(plain_body)
+        msg.attach(MIMEText(plain_body, "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
 
         server = smtplib.SMTP(smtp_host, smtp_port)
         server.starttls(context=_ssl.create_default_context())
