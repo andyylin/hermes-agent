@@ -638,6 +638,15 @@ export const zhHant = defineLocale({
       keepAwakeTitle: '保持電腦喚醒',
       keepAwakeDesc: '阻止本機睡眠，讓長時間或整夜執行持續進行。螢幕仍可變暗。'
     },
+    quickEntry: {
+      enabledTitle: '快速輸入',
+      enabledDesc: '用全域快速鍵在任何地方喚出一個小輸入框，無需開啟 Hermes 即可送出提示。',
+      shortcutTitle: '快速輸入快速鍵',
+      shortcutDesc: '至少需要一個修飾鍵，例如 CommandOrControl+Shift+Space。',
+      active: '快速鍵已生效。',
+      takenBy: '此快速鍵已被其他應用程式占用，請換一個。',
+      invalidShortcut: '不是有效的快速鍵。請至少包含一個修飾鍵。'
+    },
     credentials: {
       pasteKey: '貼上金鑰',
       pasteLabelKey: label => `貼上 ${label} 金鑰`,
@@ -1560,6 +1569,29 @@ export const zhHant = defineLocale({
     copyPath: '複製路徑'
   },
 
+  artifactCard: {
+    kind: { code: '程式碼', html: '互動頁面', svg: '圖形' },
+    generating: lines => `產生中… ${lines} 行`,
+    versionBadge: count => `${count} 個版本`,
+    open: '開啟'
+  },
+
+  artifactPane: {
+    tabFallback: '產物',
+    modePreview: '預覽',
+    modeSource: '原始碼',
+    versionOf: (current, total) => `第 ${current}/${total} 版`,
+    olderVersion: '較舊版本',
+    newerVersion: '較新版本',
+    latest: '最新',
+    copyContent: '複製內容',
+    download: '下載',
+    openInBrowser: '在瀏覽器中開啟',
+    openInBrowserFailed: '無法在瀏覽器中開啟',
+    missingTitle: '產物無法使用',
+    missingBody: '此產物已不在本機註冊表中。'
+  },
+
   sidebar: {
     nav: {
       'new-session': '新工作階段',
@@ -1825,6 +1857,10 @@ export const zhHant = defineLocale({
   statusStack: {
     agents: '代理',
     background: count => `${count} 個背景任務`,
+    goalActive: '目標進行中',
+    goalDone: '目標已完成',
+    goalPaused: '目標已暫停',
+    goalWaiting: '目標等待中',
     subagents: count => `${count} 個子代理`,
     todos: (done, total) => `任務 ${done}/${total}`,
     running: '執行中',

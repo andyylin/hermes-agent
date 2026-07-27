@@ -18,6 +18,7 @@ import { setSessionYolo } from '@/lib/yolo-session'
 import { openCommandPalettePage } from '@/store/command-palette'
 import { setComposerDraft } from '@/store/composer'
 import { enqueueQueuedPrompt } from '@/store/composer-queue'
+import { applyGoalStatusText } from '@/store/goals'
 import { dismissNotification, notify, notifyError } from '@/store/notifications'
 import { setPetScale } from '@/store/pet-gallery'
 import { $petGenInput, openPetGenerate } from '@/store/pet-generate'
@@ -232,6 +233,15 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           // `/goal <text>` looked like it did nothing.
           if ((dispatch.type === 'send' || dispatch.type === 'prefill') && dispatch.notice?.trim()) {
             renderSlashOutput(dispatch.notice.trim())
+
+            // `/goal <text>` returns its "⊙ Goal set …" notice here and kicks
+            // off the first turn immediately; the backend only emits a
+            // `status.update kind:"goal"` after that turn's post-turn judge
+            // runs. Seed the goal store from the notice so the indicator shows
+            // the active goal right away instead of after the first turn.
+            if (name === 'goal') {
+              applyGoalStatusText(sessionId, dispatch.notice.trim())
+            }
           }
 
           const message = ('message' in dispatch ? dispatch.message : '')?.trim() ?? ''
@@ -285,7 +295,16 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             return
           }
 
-          await submitPromptText(message)
+          // Submit into the session this command was resolved against — the
+          // same pair the output writer and the busy gate above already use.
+          // Bare `submitPromptText(message)` let submit re-resolve from
+          // `activeSessionIdRef`, which names the FOREGROUND chat: a `/work`
+          // typed into a fresh ⌘T tab loaded the skill in that tab, printed
+          // "⚡ loading skill" there, then fired its kickoff as a user message
+          // into whatever conversation was on screen. Every other target the
+          // dispatcher serves (tile, background queue drain, a session created
+          // by this very call) had the same leak.
+          await submitPromptText(message, { sessionId, storedSessionId })
         }
 
         try {
@@ -304,6 +323,15 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
           const output = result && typeof result === 'object' ? (result as SlashExecResponse) : null
           const body = output?.output || `/${name}: no output`
+
+          // `/goal status|pause|resume|clear` come back as plain exec output
+          // ("⊙ Goal (active, 3/20 turns): …", "⏸ Goal paused: …", "✓ Goal
+          // cleared." …). Mirror it into the goal store so the composer
+          // indicator tracks pause/resume/clear immediately.
+          if (name === 'goal' && output?.output) {
+            applyGoalStatusText(sessionId, output.output)
+          }
+
           renderSlashOutput(output?.warning ? `warning: ${output.warning}\n${body}` : body)
 
           return

@@ -929,6 +929,51 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     vi.restoreAllMocks()
   })
 
+  it('executes /approvals against the focused profile session and persists its mode', async () => {
+    const focusedProfile = 'work'
+    const focusedSessionId = 'work-runtime-session'
+    const persistedModes = new Map<string, string>()
+    const sessionProfiles = new Map([[focusedSessionId, focusedProfile]])
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'slash.exec') {
+        const sessionId = String(params?.session_id ?? '')
+        const profile = sessionProfiles.get(sessionId)
+        const command = String(params?.command ?? '')
+
+        if (profile && command === 'approvals off') {
+          persistedModes.set(profile, 'off')
+        }
+
+        return { output: 'Approval mode: off (persistent profile setting).' } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+
+    render(
+      <Harness
+        activeSessionId={focusedSessionId}
+        activeSessionIdRef={{ current: focusedSessionId }}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={focusedSessionId}
+      />
+    )
+
+    await handle!.submitText('/approvals off')
+
+    expect(requestGateway).toHaveBeenCalledWith('slash.exec', {
+      command: 'approvals off',
+      session_id: focusedSessionId
+    })
+    expect(persistedModes.get(focusedProfile)).toBe('off')
+    expect(persistedModes.has('default')).toBe(false)
+  })
+
   it('submits /goal send directives returned directly by slash.exec instead of rendering no output', async () => {
     const calls: { method: string; params?: Record<string, unknown> }[] = []
     const states: Record<string, unknown>[] = []
@@ -1164,6 +1209,56 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     expect(getQueuedPrompts('primary-stored')).toEqual([])
 
     dropSessionState(tileRuntimeId)
+    $queuedPromptsBySession.set({})
+  })
+
+  it("sends a skill's kickoff into the TAB that invoked it, not the foreground chat", async () => {
+    // `/work` in a fresh ⌘T tab: slash.exec returns a skill dispatch whose
+    // `message` is the kickoff prompt. The dispatcher resolved the tab as its
+    // target, printed "⚡ loading skill" there — then submitted the kickoff
+    // with no target at all, so submit re-resolved from activeSessionIdRef and
+    // fired it as a user message into whatever conversation was on screen.
+    const tabRuntimeId = 'tab-runtime'
+    const tabStoredId = 'tab-stored'
+
+    $queuedPromptsBySession.set({})
+    publishSessionState(tabRuntimeId, createClientSessionState(tabStoredId))
+
+    const submitted: (Record<string, unknown> | undefined)[] = []
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'prompt.submit') {
+        submitted.push(params)
+      }
+
+      return (
+        method === 'slash.exec'
+          ? { type: 'skill', name: 'work', message: 'Load the work skill, then: fix the tab bug' }
+          : {}
+      ) as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        activeSessionId="foreground-runtime"
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId="foreground-stored"
+      />
+    )
+
+    await handle!.submitText('/work fix the tab bug', { sessionId: tabRuntimeId })
+
+    expect(submitted).toEqual([
+      expect.objectContaining({
+        session_id: tabRuntimeId,
+        text: 'Load the work skill, then: fix the tab bug'
+      })
+    ])
+
+    dropSessionState(tabRuntimeId)
     $queuedPromptsBySession.set({})
   })
 

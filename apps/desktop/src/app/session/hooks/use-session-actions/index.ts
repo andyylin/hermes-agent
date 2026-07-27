@@ -53,7 +53,6 @@ import {
   setSelectedStoredSessionId,
   setSessions,
   setSessionStartedAt,
-  setSessionsTotal,
   setTurnStartedAt,
   setYoloActive
 } from '@/store/session'
@@ -476,13 +475,14 @@ export function useSessionActions({
    *  list (Cursor-style draft tab); it surfaces on the next refresh once the
    *  first message persists a turn. "Open in split" keeps the listed behavior. */
   const openNewSessionTile = useCallback(
-    async (dir: TileDock = 'right', options?: { listed?: boolean }) => {
+    async (dir: TileDock = 'right', options?: { cwd?: null | string; listed?: boolean }) => {
       const listed = options?.listed ?? true
 
       try {
-        // Fresh tile → the resolved new-session cwd (project/default), not the
-        // primary composer's live cwd.
-        const params = await desktopSessionCreateParams(resolveNewSessionCwd().trim())
+        // Fresh tile → the caller's workspace when one was named (the sidebar
+        // "+" on a project/worktree lane), else the resolved new-session cwd
+        // (project/default) — never the primary composer's live cwd.
+        const params = await desktopSessionCreateParams((options?.cwd || resolveNewSessionCwd()).trim())
         const created = await requestGateway<SessionCreateResponse>('session.create', params)
         const stored = created.stored_session_id
 
@@ -1292,9 +1292,6 @@ export function useSessionActions({
       // the delete RPC is in flight, so a racing refresh can't flash it back.
       tombstoneSessions(removedIds)
       beginSessionMutation(removedIds)
-      // Keep $sessionsTotal in sync so the sidebar's "Load N more" footer
-      // doesn't keep claiming the removed row is still on the server.
-      setSessionsTotal(prev => Math.max(0, prev - 1))
       $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== removedPinId))
 
       // Tear down before awaiting so the route effect can't resume the
@@ -1329,7 +1326,6 @@ export function useSessionActions({
       } catch (err) {
         if (removed) {
           setSessions(prev => [removed, ...prev])
-          setSessionsTotal(prev => prev + 1)
         }
 
         untombstoneSessions(removedIds)
@@ -1392,10 +1388,6 @@ export function useSessionActions({
       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
       tombstoneSessions(archivedIds)
       beginSessionMutation(archivedIds)
-      // Archived sessions are hidden by the listSessions(min_messages=1) query
-      // on the next refresh, so they count as "removed" for the load-more
-      // footer math.
-      setSessionsTotal(prev => Math.max(0, prev - 1))
       $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== archivedPinId))
 
       if (wasSelected) {
@@ -1418,7 +1410,6 @@ export function useSessionActions({
       } catch (err) {
         if (archived) {
           setSessions(prev => [archived, ...prev.filter(session => !sessionMatchesStoredId(session, storedSessionId))])
-          setSessionsTotal(prev => prev + 1)
         }
 
         untombstoneSessions(archivedIds)

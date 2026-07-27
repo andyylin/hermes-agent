@@ -288,6 +288,20 @@ def _corrupt_middle_table_leaf(
     return leaf_page
 
 
+def _corrupt_table_root(path: Path, root_page: int) -> None:
+    data = bytearray(path.read_bytes())
+    page_size = int.from_bytes(data[16:18], "big")
+    if page_size == 1:
+        page_size = 65_536
+    page_start = (root_page - 1) * page_size
+    header_offset = page_start + (100 if root_page == 1 else 0)
+    assert data[header_offset] in {0x02, 0x05, 0x0A, 0x0D}
+    # Damage the root enough that no rowid bounds can be read. This reproduces
+    # a fully failed sessions copy while leaving the messages b-tree intact.
+    data[header_offset + 3 : header_offset + 5] = b"\xff\xff"
+    path.write_bytes(data)
+
+
 def test_snapshot_blocks_connections_opened_during_the_copy(
     tmp_path: Path,
 ) -> None:
@@ -393,11 +407,21 @@ def test_partial_recovery_keeps_messages_when_sessions_are_unsalvageable(
     source = tmp_path / "sessions-destroyed.db"
     output = tmp_path / "sessions-destroyed-recovered.db"
 
+    messages_per_session = {
+        "doomed-session-a": 40,
+        "doomed-session-b": 35,
+        "doomed-session-c": 45,
+    }
     db = SessionDB(db_path=source)
     try:
-        db.create_session("doomed-session", "cli", cwd="/tmp/doomed")
-        for index in range(120):
-            db.append_message("doomed-session", "user", f"irreplaceable {index}")
+        for session_id, message_count in messages_per_session.items():
+            db.create_session(session_id, "cli", cwd=f"/tmp/{session_id}")
+            for index in range(message_count):
+                db.append_message(
+                    session_id,
+                    "user",
+                    f"irreplaceable {session_id} {index}",
+                )
     finally:
         db.close()
 
@@ -420,20 +444,26 @@ def test_partial_recovery_keeps_messages_when_sessions_are_unsalvageable(
     assert cleanup["messages_removed"] == 0, (
         "salvaged messages were deleted for lack of a session row"
     )
-    assert cleanup["sessions_reconstructed"] >= 1
+    assert cleanup["sessions_reconstructed"] == len(messages_per_session)
     assert cleanup["messages_retained"] == 120
 
     with sqlite3.connect(str(output)) as verify:
-        sessions = verify.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        recovered_sessions = verify.execute(
+            "SELECT id, source, title, message_count FROM sessions ORDER BY id"
+        ).fetchall()
         messages = verify.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-        placeholder_source = verify.execute(
-            "SELECT source FROM sessions LIMIT 1"
-        ).fetchone()[0]
     assert messages == 120, f"expected all 120 messages retained, got {messages}"
-    assert sessions >= 1
+    assert len(recovered_sessions) == len(messages_per_session)
 
-    # A fabricated session must be identifiable as such.
-    assert placeholder_source == "recovered"
+    # Fabricated sessions must be identifiable and carry collision-safe titles.
+    assert {row[0] for row in recovered_sessions} == set(messages_per_session)
+    assert {row[1] for row in recovered_sessions} == {"recovered"}
+    recovered_titles = [str(row[2]) for row in recovered_sessions]
+    assert all(title.startswith("[recovered ") for title in recovered_titles)
+    assert len(set(recovered_titles)) == len(recovered_titles)
+    assert {
+        str(row[0]): int(row[3]) for row in recovered_sessions
+    } == messages_per_session
 
     # Retaining the data is still a lossy outcome and must say so.
     assert report["verification"]["loss_detected"] is True
@@ -907,7 +937,7 @@ def test_cli_allow_partial_salvages_rows_across_a_corrupt_leaf(
     }
 
 
-def test_partial_recovery_removes_messages_for_unreadable_sessions(
+def test_partial_recovery_reconstructs_unreadable_sessions_without_message_loss(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "corrupt-sessions.db"
@@ -935,19 +965,37 @@ def test_partial_recovery_removes_messages_for_unreadable_sessions(
     assert _sha256(source) == source_hash
     assert report["copy"]["sessions"]["status"] == "partial"
     assert report["copy"]["messages"]["status"] == "complete"
-    removed_messages = report["orphan_cleanup"]["messages_removed"]
-    assert removed_messages > 0
-    assert report["orphan_cleanup"]["total_removed_or_relinked"] >= removed_messages
+    copied_sessions = int(report["copy"]["sessions"]["copied_rows"])
+    expected_reconstructed = session_count - copied_sessions
+    cleanup = report["orphan_cleanup"]
+    assert expected_reconstructed > 1
+    assert cleanup["sessions_reconstructed"] == expected_reconstructed
+    assert cleanup["messages_retained"] == expected_reconstructed
+    assert cleanup["messages_removed"] == 0
     assert report["verification"]["foreign_key_check"] == []
+    assert report["verification"]["integrity_check"] == ["ok"]
+    assert report["verification"]["table_counts"]["sessions"] == session_count
+    assert report["verification"]["table_counts"]["messages"] == session_count
 
     conn = sqlite3.connect(str(output))
     try:
-        recovered_sessions = {
-            str(row[0]) for row in conn.execute("SELECT id FROM sessions")
+        recovered_sessions = conn.execute(
+            "SELECT id, source, title FROM sessions ORDER BY id"
+        ).fetchall()
+        recovered_ids = {str(row[0]) for row in recovered_sessions}
+        assert recovered_ids == {
+            f"partial-session-{session_number:04d}"
+            for session_number in range(session_count)
         }
-        assert "partial-session-0000" in recovered_sessions
-        assert f"partial-session-{session_count - 1:04d}" in recovered_sessions
-        assert 0 < len(recovered_sessions) < session_count
+        placeholder_rows = [
+            row for row in recovered_sessions if str(row[1]) == "recovered"
+        ]
+        assert len(placeholder_rows) == expected_reconstructed
+        placeholder_titles = [str(row[2]) for row in placeholder_rows]
+        assert len(set(placeholder_titles)) == expected_reconstructed
+        assert all(
+            title.startswith("[recovered ") for title in placeholder_titles
+        )
         assert (
             conn.execute(
                 "SELECT COUNT(*) FROM messages AS message "
@@ -957,11 +1005,65 @@ def test_partial_recovery_removes_messages_for_unreadable_sessions(
             ).fetchone()[0]
             == 0
         )
-        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == len(
-            recovered_sessions
+        assert (
+            conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            == session_count
         )
     finally:
         conn.close()
+
+
+def test_partial_recovery_verifies_fully_reconstructed_sessions(
+    tmp_path: Path,
+) -> None:
+    """A failed sessions copy is recoverable when every parent is rebuilt.
+
+    Reported July 2026: all 194 original session rows were unreadable, but
+    partial recovery reconstructed 194 placeholders, retained 20,817 readable
+    messages, removed none, and produced clean integrity, FK, and FTS checks.
+    The verifier still treated ``sessions copy status is failed`` as fatal and
+    printed "Do not install it" for a structurally healthy partial output.
+    """
+    source = tmp_path / "sessions-root-destroyed.db"
+    output = tmp_path / "sessions-root-destroyed-recovered.db"
+    session_count = 60
+    sessions_root = _make_many_sessions_source(source, session_count)
+    _corrupt_table_root(source, sessions_root)
+    source_hash = _sha256(source)
+
+    report = recover_session_database(
+        source,
+        output,
+        work_dir=tmp_path,
+        chunk_size=8,
+        allow_partial=True,
+    )
+
+    assert report["copy"]["sessions"]["status"] == "failed"
+    assert report["copy"]["messages"]["status"] == "complete"
+    cleanup = report["orphan_cleanup"]
+    assert cleanup["sessions_reconstructed"] == session_count
+    assert cleanup["messages_retained"] == session_count
+    assert cleanup["messages_removed"] == 0
+
+    verification = report["verification"]
+    assert verification["errors"] == []
+    assert "sessions copy status is failed" in verification["warnings"]
+    assert verification["integrity_check"] == ["ok"]
+    assert verification["foreign_key_check"] == []
+    assert verification["table_counts"]["sessions"] == session_count
+    assert verification["table_counts"]["messages"] == session_count
+    assert report["verified"] is True
+    assert report["complete"] is False
+    assert report["partial"] is True
+    assert report["source_unchanged"] is True
+    assert _sha256(source) == source_hash
+
+    with sqlite3.connect(str(output)) as conn:
+        recovered = conn.execute(
+            "SELECT source, COUNT(*) FROM sessions GROUP BY source"
+        ).fetchall()
+    assert recovered == [("recovered", session_count)]
 
 
 def test_cli_recover_writes_verified_report_without_touching_source(
