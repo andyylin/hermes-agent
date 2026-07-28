@@ -2373,7 +2373,9 @@ class TestGatewaySessionDbRecovery:
         assert "parent" not in store._dirty_transcripts
         assert "child" not in store._dirty_transcripts
 
-    def test_transcript_append_rebuilds_fts_and_retries_dirty_rows_in_order(self):
+    def test_transcript_append_never_rebuilds_retired_fts_on_canonical_corruption(self):
+        """Canonical DB failures use the bounded dirty queue without attempting
+        the retired derived-index recovery path."""
         import threading
 
         class FakeDb:
@@ -2389,7 +2391,7 @@ class TestGatewaySessionDbRecovery:
             def append_message(self, **kwargs):
                 content = kwargs["content"]
                 self.attempts.append(content)
-                if len(self.attempts) <= 2:
+                if len(self.attempts) == 1:
                     raise RuntimeError("database disk image is malformed")
                 self.persisted.append(content)
 
@@ -2402,10 +2404,11 @@ class TestGatewaySessionDbRecovery:
 
         store.append_to_transcript("s1", {"role": "user", "content": "first"})
         assert [m["content"] for m in store._dirty_transcripts["s1"]] == ["first"]
-        assert store._db.rebuild_calls == 1
+        assert store._db.rebuild_calls == 0
 
         store.append_to_transcript("s1", {"role": "assistant", "content": "second"})
 
+        assert store._db.attempts == ["first", "first", "second"]
         assert store._db.persisted == ["first", "second"]
         assert "s1" not in store._dirty_transcripts
 
