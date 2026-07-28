@@ -722,17 +722,16 @@ def test_recovery_rebuilds_canonical_data_without_opening_source(
         assert conn.execute("SELECT COUNT(*) FROM async_delegations").fetchone()[0] == 1
         assert (
             conn.execute(
-                "SELECT COUNT(*) FROM messages_fts "
-                "WHERE messages_fts MATCH 'recoverable'"
+                "SELECT COUNT(*) FROM messages WHERE content LIKE '%recoverable%'"
             ).fetchone()[0]
             == expected["messages"]
         )
         assert (
             conn.execute(
-                "SELECT COUNT(*) FROM messages_fts_trigram "
-                "WHERE messages_fts_trigram MATCH 'cover'"
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE name LIKE 'messages_fts%'"
             ).fetchone()[0]
-            == expected["messages"]
+            == 0
         )
     finally:
         conn.close()

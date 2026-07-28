@@ -6983,23 +6983,51 @@ class SessionDB:
 
         Sole search implementation after live FTS retirement. Operates only on
         ``messages`` / ``sessions`` so a derived index cannot fail or corrupt
-        the search path. Token AND matching preserves normal FTS query
-        semantics while boolean operator words are ignored as bare tokens.
+        Boolean semantics match the retired FTS path: adjacent terms and
+        explicit ``AND`` are conjunctive, ``OR`` starts an alternative group,
+        and ``NOT`` excludes the following term.
         """
-        non_op_tokens = [
-            t for t in raw_query.split()
-            if t.upper() not in {"AND", "OR", "NOT"}
-        ] or [raw_query]
-        token_clauses = []
+        positive_groups: list[list[str]] = [[]]
+        negative_tokens: list[str] = []
+        negate_next = False
+        for token in raw_query.split():
+            operator = token.upper()
+            if operator == "OR" and not negate_next:
+                if positive_groups[-1]:
+                    positive_groups.append([])
+                continue
+            if operator == "AND" and not negate_next:
+                continue
+            if operator == "NOT" and not negate_next:
+                negate_next = True
+                continue
+            if negate_next:
+                negative_tokens.append(token)
+                negate_next = False
+            else:
+                positive_groups[-1].append(token)
+
+        positive_groups = [group for group in positive_groups if group]
+        if not positive_groups:
+            positive_groups = [[raw_query]]
+        first_search_token = positive_groups[0][0]
         like_params: list = []
-        for tok in non_op_tokens:
-            esc = tok.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            token_clauses.append(
+
+        def _token_clause(token: str) -> str:
+            esc = token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            like_params.extend([f"%{esc}%", f"%{esc}%", f"%{esc}%"])
+            return (
                 "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' "
                 "OR m.tool_calls LIKE ? ESCAPE '\\')"
             )
-            like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
-        like_where = [f"({' AND '.join(token_clauses)})"]
+
+        group_clauses = [
+            f"({' AND '.join(_token_clause(token) for token in group)})"
+            for group in positive_groups
+        ]
+        like_where = [f"({' OR '.join(group_clauses)})"]
+        for token in negative_tokens:
+            like_where.append(f"NOT {_token_clause(token)}")
         if not include_inactive:
             like_where.append("(m.active = 1 OR m.compacted = 1)")
         if source_filter is not None:
@@ -7036,8 +7064,8 @@ class SessionDB:
             LIMIT ? OFFSET ?
         """
         like_params.extend([limit, offset])
-        # instr() for snippet uses first search token
-        like_params = [non_op_tokens[0]] + like_params
+        # instr() for snippet uses the first positive search token.
+        like_params = [first_search_token] + like_params
         with self._read_ctx() as conn:
             like_cursor = conn.execute(like_sql, like_params)
             return [dict(row) for row in like_cursor.fetchall()]
