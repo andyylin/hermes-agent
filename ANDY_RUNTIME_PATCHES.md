@@ -18,7 +18,7 @@ Upstream is authoritative for Projects. Existing state databases are migration a
 - Actual live runtime ancestry: `01ffcd6529a7d626990eafff0784a2ad09a16560`
 - Previously published live-derived merge: `9877fb69fc3c00c2ce2365424f0c0c3a0b13c7a3`
 - Classified retained-overlay parent: `56e6855edd4abcef1ffcefc3d5336a8a078cf5fa`
-- Frozen latest-upstream cutoff: `f228e145ba35cbbf785eded2021ae6682285b91b`
+- Frozen latest-upstream cutoff: `585726ac2e08dcc2bd32c134e0124e0657ecc519`
 - Linear candidate branch: `integrate/andy-runtime-upstream-linear-20260728T155822Z`
 - Candidate worktree: `/home/pi/.hermes/worktrees/integrate/andy-runtime-upstream-linear-20260728T155822Z`
 - Candidate lease: `/home/pi/.hermes/recovery/runtime-update-owner-20260728T155822Z.json`
@@ -148,7 +148,7 @@ The linear candidate first merges the frozen cutoff into the actual live-derived
 ## UPSTREAM
 
 - **Projects authority and repository discovery**
-  - Frozen upstream cutoff `f228e145b` owns Project records, repository discovery, Project RPCs, and Desktop Project UI behavior.
+  - Frozen upstream cutoff `585726ac2` owns Project records, repository discovery, Project RPCs, and Desktop Project UI behavior.
   - Candidate-only diff against the frozen cutoff must contain no retired custom Project authority.
 
 - **Discord smart provisional titles and first-exchange semantic retitling**
