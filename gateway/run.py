@@ -324,28 +324,18 @@ def _non_conversational_metadata(
     return merged
 
 
-def _seed_hygiene_system_prompt(
-    agent: Any,
-    session_row: Optional[Dict[str, Any]],
-) -> bool:
-    """Keep gateway hygiene from rebuilding a live session's system prompt.
-
-    The hygiene helper intentionally skips memory-provider initialization.
-    Compression is allowed to persist a system prompt, so letting that helper
-    rebuild one would strip external provider blocks from the live session.
-    Seed the exact persisted prompt instead.  When no usable prompt can be
-    restored, seed an empty cache entry.  Compression either preserves that
-    unusable value or rebuilds with the hygiene-only platform marker; the real
-    turn will rebuild either form with its fully initialized providers.
-    """
-    stored_prompt = ""
-    if isinstance(session_row, dict):
-        raw_prompt = session_row.get("system_prompt")
-        if isinstance(raw_prompt, str) and raw_prompt.strip():
-            stored_prompt = raw_prompt
-
-    agent._cached_system_prompt = stored_prompt
-    return bool(stored_prompt)
+def _silent_progress_metadata(
+    metadata: Optional[Dict[str, Any]] = None,
+    *,
+    platform: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Mark Matrix progress/status events as visible, non-pushing notices."""
+    merged = _non_conversational_metadata(metadata, platform=platform)
+    if _gateway_platform_value(platform) != "matrix":
+        return merged
+    merged = dict(merged or {})
+    merged["silent_notification"] = True
+    return merged
 
 
 def _is_transient_network_error(exc: BaseException) -> bool:
@@ -21544,17 +21534,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "reply_to_message_id": event_message_id,
             }
         else:
-            _status_thread_metadata = (
-                self._thread_metadata_for_source(source, event_message_id)
-                if _progress_thread_id == source.thread_id
-                else self._thread_metadata_for_target(
-                    source.platform,
-                    source.chat_id,
-                    _progress_thread_id,
-                    chat_type=getattr(source, "chat_type", None),
-                    reply_to_message_id=event_message_id,
-                )
-            ) if _progress_thread_id else None
+            _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
+        _silent_status_metadata = _silent_progress_metadata(
+            _status_thread_metadata,
+            platform=source.platform,
+        )
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():

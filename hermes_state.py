@@ -347,6 +347,10 @@ _last_init_error_lock = threading.Lock()
 _wal_fallback_warned_paths: set[str] = set()
 _wal_fallback_warned_lock = threading.Lock()
 
+# Dedup WARNING for vulnerable SQLite builds that must not enable WAL.
+_wal_reset_bug_warned_paths: set[str] = set()
+_wal_reset_bug_warned_lock = threading.Lock()
+
 _BASE_FTS_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
@@ -953,10 +957,8 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         # Best-effort tokenizer load: a DB carrying the messages_fts_cjk
         # index needs the cjk_unicode61 extension before any statement can
         # touch that table — including the trigger-driven write probe below.
-        # Without it, this probe sees the DB exactly as a tokenizer-less
-        # SessionDB open would (which drops the cjk triggers to keep writes
-        # working), so tokenizer absence must never classify as corruption.
-        load_fts5_cjk_extension(conn)
+        # Live FTS is retired; integrity checks inspect only canonical schema
+        # and must not depend on an optional tokenizer extension.
         conn.execute("PRAGMA journal_mode").fetchone()
         rows = conn.execute("PRAGMA integrity_check").fetchall()
         problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
@@ -1663,7 +1665,11 @@ class SessionDB:
                     apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
                 )
                 self._conn.execute("PRAGMA foreign_keys=ON")
-                self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
+                # Live FTS is retired. Do not load/register CJK FTS tokenizers
+                # on writer or read connections; canonical LIKE search owns
+                # both Latin and CJK recall.
+                self._fts_cjk_loaded = False
+                self._fts_cjk_available = False
                 self._init_schema()
 
             try:
@@ -1746,12 +1752,8 @@ class SessionDB:
                 isolation_level=None,
             )
             conn.row_factory = sqlite3.Row
-            # Load the CJK tokenizer extension on this connection so
-            # messages_fts_cjk queries work on the read path. The .so
-            # registers the tokenizer in the connection's in-memory
-            # registry, not the database file, so mode=ro is fine.
-            if self._fts_cjk_loaded:
-                load_fts5_cjk_extension(conn)
+            # Live FTS is retired, so read connections need no tokenizer
+            # extension registration.
             with self._read_conns_lock:
                 if self._read_conns_closed:
                     # close() already drained — don't register; close
@@ -1923,74 +1925,50 @@ class SessionDB:
         )
 
     def _try_wal_checkpoint(self) -> None:
-        """Best-effort PASSIVE WAL checkpoint.  Never raises.
+        """Best-effort PASSIVE WAL checkpoint. Never raises.
 
-        Flushes committed WAL frames back into the main DB file without
-        requiring an exclusive lock.  PASSIVE is safe for frequent
-        periodic use because it does not block concurrent writers and
-        cannot corrupt B-tree pages under I/O pressure.
-
-        PASSIVE does not truncate the WAL file — it stays at its
-        high-water mark.  WAL truncation is reserved for pre-VACUUM
-        checkpoints under controlled single-owner conditions.  ``close()``
-        also uses PASSIVE: short-lived multi-connection SessionDB lifetimes
-        must never request exclusive TRUNCATE (residual of issue #45383).
-
-        The gap's extent is unknown, so the only safe recovery is a from-
-        scratch rebuild: drop the table + triggers, clear the breadcrumb,
-        recreate via ``_ensure_fts_cjk_schema`` (which sets fresh backfill
-        markers on a populated DB). Called from ``optimize_fts_storage`` on
-        a tokenizer-capable host; no-op when not stale.
+        Live FTS is retired, so this helper is strictly a WAL lifecycle
+        operation. PASSIVE avoids exclusive-lock pressure and is safe while
+        tracked read connections are active.
         """
-        if not self._fts_cjk_loaded:
+        if self.read_only or not self._wal_active:
             return
-
-        def _do(conn):
-            stale = conn.execute(
-                "SELECT 1 FROM state_meta WHERE key = ?",
-                (FTS_CJK_STALE_KEY,),
-            ).fetchone()
-            if not stale:
-                return False
-            for trig in _FTS_CJK_TRIGGERS:
-                conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
-            conn.execute("DROP TABLE IF EXISTS messages_fts_cjk")
-            conn.execute("DROP VIEW IF EXISTS messages_fts_cjk_src")
-            conn.execute(
-                "DELETE FROM state_meta WHERE key IN "
-                f"('{FTS_CJK_STALE_KEY}', 'fts_cjk_rebuild_high_water', "
-                "'fts_cjk_rebuild_progress')"
-            )
-            return True
-        was_stale = self._execute_write(_do)
-        if was_stale:
-            # Recreate outside the write transaction — _ensure_fts_cjk_schema
-            # uses executescript(), which implicitly commits any pending
-            # transaction and must not run inside _execute_write's BEGIN
-            # IMMEDIATE. Sets fresh backfill markers on a populated DB.
+        try:
             with self._lock:
-                self._ensure_fts_cjk_schema(self._conn)
-                self._conn.commit()
+                if self._conn is None:
+                    return
+                result = self._conn.execute(
+                    "PRAGMA wal_checkpoint(PASSIVE)"
+                ).fetchone()
+                if result and result[1] > 0:
+                    logger.debug(
+                        "WAL checkpoint: %d/%d pages checkpointed",
+                        result[2], result[1],
+                    )
+        except Exception as exc:
+            logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
 
     def close(self):
-        """Close the database connection.
+        """Drain writers/readers, checkpoint PASSIVE, and close the database.
 
-        Uses a PASSIVE WAL checkpoint only. Concurrent multi-connection
-        ``TRUNCATE`` checkpoints on large state DBs are a known B-tree
-        corruption class (issue #45383); ``close()`` is on the hot path for
-        every short-lived SessionDB (gateway request handlers, CLI, concurrent
-        threads) so it must never request exclusive TRUNCATE. WAL truncation
-        is reserved for :meth:`vacuum` under controlled single-owner conditions.
+        Short-lived multi-connection SessionDB instances must never request an
+        exclusive TRUNCATE checkpoint: that is reserved for controlled vacuum
+        maintenance. Connection cleanup is independent of retired FTS state.
         """
-        if not self._fts_enabled:
-            return {"ok": False, "reason": "fts5_unavailable"}
-        if self.read_only:
-            return {"ok": False, "reason": "read_only"}
+        self._stop_token_writer()
+        atexit.unregister(self._drain_token_queue_at_exit)
 
-        # Only demote if we're actually still on the legacy shape. If a prior
-        # run already demoted (markers/trash present), skip straight to
-        # finishing the backfill + teardown — this is what makes re-running
-        # after an interruption safe.
+        with self._read_conns_lock:
+            self._read_conns_closed = True
+            read_conns = list(self._read_conns)
+            self._read_conns.clear()
+        for conn in read_conns:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._read_local.conn = None
+
         with self._lock:
             if self._conn:
                 try:
@@ -2319,72 +2297,10 @@ class SessionDB:
                         )
                 except sqlite3.OperationalError as exc:
                     logger.debug("v22 session_model_usage rebuild skipped: %s", exc)
-            if current_version < 23:
-                # v23: FTS storage redesign (issues #22478, #43690, #55233).
-                # The v11 inline-mode FTS tables each store a full private
-                # copy of every message (content || tool_name || tool_calls),
-                # and the trigram index additionally covers role='tool' rows
-                # (~90% of message bytes: base64 payloads, file dumps) at
-                # ~2.6x amplification — together ~75% of state.db on heavy
-                # installs (observed: 18.9 GB of a 25 GB DB).
-                #
-                # OPT-IN, NOT AUTOMATIC. The transition (demote old vtables →
-                # new external-content schema → backfill → teardown → VACUUM)
-                # is disk-heavy (transient ~2x file size to fully reclaim via
-                # VACUUM) and long (~1-2h background on a 25 GB DB). Doing it
-                # silently on every big user's next open — with a completeness
-                # guarantee that depends on the process staying alive long
-                # enough — is the wrong default. So on an EXISTING install we
-                # touch nothing here: the v22 inline FTS keeps working exactly
-                # as before, and we only record a flag advertising that the
-                # optimization is available. `hermes sessions optimize-storage`
-                # performs the whole transition as one deliberate, disk-checked,
-                # progress-reported foreground operation.
-                #
-                # DECOUPLED VERSIONING. Crucially, this does NOT hold back the
-                # main schema_version. The FTS storage LAYOUT is tracked by an
-                # independent `fts_storage_version` marker (see
-                # _fts_storage_version / SETTLE below), so schema_version
-                # advances to SCHEMA_VERSION here like every other migration —
-                # future v24+ migrations land automatically for legacy-FTS
-                # users too. Only the FTS *layout* waits for opt-in.
-                if fts5_available and self._db_has_legacy_inline_fts(cursor):
-                    self.set_meta("fts_optimize_available", "1", cursor=cursor)
-
-            # The FTS storage layout is versioned independently of the main
-            # schema (see the v23 note above). Stamp the current layout so the
-            # main version can always advance: a fresh/optimized DB is at
-            # FTS_STORAGE_VERSION; a legacy DB is left at whatever it had
-            # (absent/0) until `optimize-storage` runs. An INTERRUPTED
-            # optimize (legacy vtables already demoted, but rebuild markers
-            # or demoted trash tables still present) is NOT stamped either —
-            # the marker is the source of truth for "fully optimized", and
-            # `fts_optimize_available()` keeps offering the resume until the
-            # transition actually completes.
-            if (
-                fts5_available
-                and not self._db_has_legacy_inline_fts(cursor)
-                and cursor.execute(
-                    "SELECT 1 FROM state_meta "
-                    "WHERE key = 'fts_rebuild_high_water' LIMIT 1"
-                ).fetchone() is None
-                and not self._has_fts_trash(cursor)
-            ):
-                self.set_meta(
-                    "fts_storage_version", str(FTS_STORAGE_VERSION), cursor=cursor
-                )
-
-            # Advance schema_version to current for ALL non-FTS-layout
-            # migrations. This is deliberately NOT gated on the FTS opt-in —
-            # holding the whole version back would block every future schema
-            # migration for a user who never optimizes. FTS5 being unavailable
-            # is the one case we skip (we can't have created the current FTS
-            # objects, so claiming the current schema would be a lie).
-            if (
-                current_version < SCHEMA_VERSION
-                and fts_migrations_complete
-                and fts5_available
-            ):
+            # v23's live-FTS storage migration is retired in this runtime.
+            # Canonical schema migrations still advance normally; the final
+            # retirement pass below removes any residual FTS objects.
+            if current_version < SCHEMA_VERSION:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",
                     (SCHEMA_VERSION,),
@@ -7161,84 +7077,6 @@ class SessionDB:
             sort=sort_norm,
         )
 
-        # Deferred-rebuild supplement (schema v23): while the background
-        # backfill is pending, the FTS indexes only cover rows outside the
-        # (progress, high_water] gap. Top the results up with a bounded LIKE
-        # scan over just that id range so search never silently loses old
-        # messages mid-rebuild. The range shrinks as the backfill advances,
-        # so this cost decays to zero. The CJK LIKE-fallback path above
-        # already scans the whole base table and needs no supplement.
-        rebuild_status = self.fts_rebuild_status()
-        if rebuild_status is not None and len(matches) < limit:
-            try:
-                gap_matches = self._search_unindexed_gap(
-                    query,
-                    limit - len(matches),
-                    include_inactive=include_inactive,
-                    source_filter=source_filter,
-                    exclude_sources=exclude_sources,
-                    role_filter=role_filter,
-                )
-                seen_ids = {m["id"] for m in matches}
-                matches.extend(m for m in gap_matches if m["id"] not in seen_ids)
-            except sqlite3.OperationalError as exc:
-                logger.debug("Unindexed-gap supplement skipped: %s", exc)
-
-        # Pure-Latin queries run against the unicode61 ``messages_fts`` table,
-        # whose tokenizer does not insert a boundary between Latin letters and
-        # adjacent CJK characters: "修改youer服务端" is indexed as one token,
-        # so MATCH "youer" finds nothing even though the substring is present
-        # (#54242). When the exact-token search returns nothing, retry on the
-        # substring-capable indexes. Preference order:
-        #   1. messages_fts_cjk (when built): its tokenizer splits Latin runs
-        #      off adjacent CJK, so "youer" is an exact ranked token match.
-        #   2. messages_fts_trigram: substring matching, needs >=3-char
-        #      tokens (shorter tokens produce no trigrams).
-        # Gated on a zero-result miss so successful Latin searches keep their
-        # unicode61 ranking — strictly additive, never reorders existing
-        # hits. Trade-off on the trigram leg: any zero-result Latin query
-        # gains substring semantics (e.g. "cat" can then match
-        # "concatenate"). Genuinely absent terms still return []. Skipped for
-        # role_filter=['tool'] queries — both fallback indexes exclude tool
-        # rows (v23), so a retry could never add hits.
-        if (
-            not matches
-            and not is_cjk
-            and not (bool(role_filter) and "tool" in role_filter)
-        ):
-            _fb_query = query.strip('"').strip()
-            if self._fts_cjk_available:
-                cjk_fb = self._run_trigram_search(
-                    _fb_query,
-                    table="messages_fts_cjk",
-                    order_by_sql=order_by_sql,
-                    include_inactive=include_inactive,
-                    source_filter=source_filter,
-                    exclude_sources=exclude_sources,
-                    role_filter=role_filter,
-                    limit=limit,
-                    offset=offset,
-                )
-                if cjk_fb:
-                    matches = cjk_fb
-            if (
-                not matches
-                and self._trigram_available
-                and self._trigram_eligible_tokens(query)
-            ):
-                tri_matches = self._run_trigram_search(
-                    _fb_query,
-                    order_by_sql=order_by_sql,
-                    include_inactive=include_inactive,
-                    source_filter=source_filter,
-                    exclude_sources=exclude_sources,
-                    role_filter=role_filter,
-                    limit=limit,
-                    offset=offset,
-                )
-                if tri_matches:
-                    matches = tri_matches
-
         # Add surrounding context (1 message before + after each match).
         # Each query takes its own fresh read transaction via _read_ctx, so
         # we never hold a lock across N sequential queries.
@@ -9335,6 +9173,21 @@ class SessionDB:
 
     # Live FTS is fully retired — never create/optimize/rebuild virtual tables.
     _FTS_TABLES: tuple = ()
+
+    def fts_rebuild_status(self) -> Optional[Dict[str, Any]]:
+        """Compatibility status for callers surviving the FTS retirement."""
+        return None
+
+    def optimize_fts_storage(
+        self,
+        *,
+        progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+        vacuum: bool = True,
+    ) -> Dict[str, Any]:
+        """Report the retired operator path without recreating live FTS."""
+        if progress_cb is not None:
+            progress_cb({"phase": "retired", "percent": 100, "indexed": 0, "total": 0})
+        return {"ok": False, "reason": "live_fts_retired", "vacuum": bool(vacuum)}
 
     def _fts_table_exists(self, name: str) -> bool:
         """True if an FTS5 virtual table is still queryable (should be False)."""
