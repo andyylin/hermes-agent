@@ -114,6 +114,11 @@ declare global {
       notify: (payload: HermesNotification) => Promise<boolean>
       requestMicrophoneAccess: () => Promise<boolean>
       readFileDataUrl: (filePath: string) => Promise<string>
+      /** Settings → Chat: max size for local files loaded as data URLs (attach/preview). */
+      dataUrlReadMax?: {
+        get: () => Promise<{ defaultMaxMb: number; maxBytes: number; maxMb: number }>
+        set: (maxMb: number) => Promise<{ defaultMaxMb: number; maxBytes: number; maxMb: number }>
+      }
       readFileText: (filePath: string) => Promise<HermesReadFileTextResult>
       selectPaths: (options?: HermesSelectPathsOptions) => Promise<string[]>
       writeClipboard: (text: string) => Promise<boolean>
@@ -124,6 +129,7 @@ declare global {
       normalizePreviewTarget: (target: string, baseDir?: string) => Promise<HermesPreviewTarget | null>
       watchPreviewFile: (url: string) => Promise<HermesPreviewWatch>
       stopPreviewFileWatch: (id: string) => Promise<boolean>
+      setActiveWork?: (payload: HermesActiveWork) => void
       setTitleBarTheme?: (payload: HermesTitleBarTheme) => void
       setNativeTheme?: (mode: 'dark' | 'light' | 'system') => void
       setTranslucency?: (payload: { intensity: number }) => void
@@ -456,6 +462,12 @@ export interface HermesConnection {
 export interface HermesTitleBarTheme {
   background: string
   foreground: string
+}
+
+/** Turns in flight, so the main process can confirm before a quit kills them. */
+export interface HermesActiveWork {
+  count: number
+  titles: string[]
 }
 
 export interface HermesWindowState {

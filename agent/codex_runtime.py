@@ -74,7 +74,10 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
             try:
                 if not agent._session_db_created:
                     agent._ensure_db_session()
-                agent._session_db.update_token_counts(
+                # Enqueued for the SessionDB background writer — keeps the
+                # per-call accounting write off the turn thread (see
+                # conversation_loop's queue_token_counts call).
+                agent._session_db.queue_token_counts(
                     agent.session_id,
                     model=agent.model,
                     billing_provider=agent.provider,
@@ -154,7 +157,8 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         try:
             if not agent._session_db_created:
                 agent._ensure_db_session()
-            agent._session_db.update_token_counts(
+            # Enqueued for the SessionDB background writer (see above).
+            agent._session_db.queue_token_counts(
                 agent.session_id,
                 input_tokens=canonical_usage.input_tokens,
                 output_tokens=canonical_usage.output_tokens,
@@ -778,11 +782,26 @@ def run_codex_app_server_turn(
         # the already-flushed user turn). See gateway/run.py agent_persisted.
         if getattr(agent, "_session_db", None) is not None:
             try:
-                agent._flush_messages_to_session_db(messages)
+                _codex_flush_ok = agent._flush_messages_to_session_db(messages)
             except Exception:
-                logger.debug(
+                _codex_flush_ok = False
+                logger.warning(
                     "codex app-server projected-message flush failed",
                     exc_info=True,
+                )
+            if _codex_flush_ok is False:
+                # Unlike the chat-completions loop (which fails closed BEFORE
+                # projection — see conversation_loop session_persistence_failed),
+                # codex output has already streamed to the user by the time this
+                # flush runs, so there is nothing left to withhold. We cannot
+                # flip agent_persisted=False either: the gateway fallback write
+                # would re-INSERT the already-flushed user turn (#860/#42039).
+                # Surface the durability gap loudly instead of a silent debug.
+                logger.warning(
+                    "codex app-server turn was delivered but could NOT be "
+                    "persisted to the session DB (session=%s) — this turn "
+                    "will be missing after restart/resume",
+                    getattr(agent, "session_id", None),
                 )
 
 
@@ -1332,7 +1351,20 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 try:
                     close_fn()
                 except Exception:
-                    pass
+                    # A failed close can leave this response's connection
+                    # checked out of the httpx pool while the caller's finally
+                    # reports a reuse-reason close (e.g. interrupt_check broke
+                    # the event loop with collected output) — caching the
+                    # client with the leaked connection. Poison the slot so
+                    # that close really closes the pool (owner-thread abort;
+                    # mirrors the chat-streaming interrupt-break handling).
+                    # ``client is None`` means the shared primary client,
+                    # which is never reuse-cached and must not have its
+                    # sockets force-shut here.
+                    if client is not None:
+                        agent._abort_request_openai_client(
+                            active_client, reason="codex_stream_close_failed"
+                        )
 
 
 def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None):

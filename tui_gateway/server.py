@@ -33,6 +33,8 @@ from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
+from agent.skill_commands import describe_skill_invocation
+from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe
 from tui_gateway.turn_marker import (
     clear_turn_marker,
@@ -6236,6 +6238,73 @@ def _is_display_hidden_marker(role: str | None, text: str) -> bool:
     return role == "user" and text.lstrip().startswith("[System:")
 
 
+def _skill_scaffold_projection(content_text: str) -> str:
+    """Return the invocation a slash-skill-expanded turn came from, else "".
+
+    A ``/skill`` invocation expands into a model-facing message that embeds the
+    whole skill body. That payload belongs to the agent — every UI renders the
+    invocation (``/work fix the leak``) instead, so no surface can leak the
+    body into a chat bubble.
+    """
+    return describe_skill_invocation(content_text, separator=" ") or ""
+
+
+def _expand_skill_invocation_for_replay(text: str, task_id: str) -> str:
+    """Re-expand a projected `/skill` invocation before re-running that turn.
+
+    The inverse of :func:`_skill_scaffold_projection`. Because a skill turn is
+    displayed as its invocation, a rewind/regenerate hands us back
+    ``/work fix the leak`` rather than the body the agent originally saw —
+    re-running that verbatim would drop the skill. Re-expanding here keeps the
+    body server-side (no client ever holds it) and makes the replayed turn
+    identical to the original.
+
+    Returns *text* unchanged when it isn't a resolvable skill invocation.
+    """
+    head, _, arg = (text or "").strip().partition(" ")
+    if not head.startswith("/"):
+        return text
+
+    try:
+        from agent.skill_commands import (
+            build_skill_invocation_message,
+            resolve_skill_command_key,
+        )
+
+        cmd_key = resolve_skill_command_key(head.lstrip("/"))
+        if cmd_key is None:
+            return text
+
+        return build_skill_invocation_message(cmd_key, arg.strip(), task_id=task_id) or text
+    except Exception:
+        # A skill that no longer resolves (renamed, disabled, external dir
+        # gone) must not break the rewind — replay the text as typed.
+        logger.debug("skill re-expansion failed for replay", exc_info=True)
+        return text
+
+
+# Opening of the crash-recovery note synthesized by _auto_continue_note.
+# Matched (not just built) so a row persisted before the display type was
+# stamped at turn start still reads as a timeline event, and to recognize the
+# messaging gateway's twin note.
+_AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn was interrupted mid-run"
+
+
+def _legacy_display_kind(role: str, text: str) -> str | None:
+    """Infer the display type of a synthetic row persisted without one.
+
+    Turn-start typing (see ``persist_user_display_kind``) covers everything
+    written from here on. Sessions already on disk carry untyped rows — and a
+    turn killed mid-run never reached the post-turn stamp at all, which is
+    exactly the auto-continue case — so the raw recovery note would paint as a
+    user bubble forever. Sniffing the one fixed synthetic prefix is the
+    migration for those rows; it is not how new rows get typed.
+    """
+    if role == "user" and text.lstrip().startswith(_AUTO_CONTINUE_NOTE_PREFIX):
+        return "auto_continue"
+    return None
+
+
 def _history_to_messages(history: list[dict]) -> list[dict]:
     messages = []
     tool_call_args = {}
@@ -6245,6 +6314,13 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             continue
         role = m.get("role")
         if role not in {"user", "assistant", "tool", "system"}:
+            continue
+        # An explicit display_kind="hidden" row is model-facing scaffolding
+        # (compaction references, interrupted-turn checkpoints). The string
+        # sniff below only catches the "[System:" convention; honor the
+        # declared field too, or scaffolding reaches every surface that reads
+        # this projection.
+        if m.get("display_kind") == "hidden":
             continue
         content_text = _coerce_message_text(m.get("content"))
         if _is_display_hidden_marker(role, content_text):
@@ -6289,6 +6365,14 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if not content_text.strip() and not has_reasoning:
             continue
         msg = {"role": role, "text": content_text}
+        if role == "user":
+            invocation = _skill_scaffold_projection(content_text)
+            if invocation:
+                # Show the invocation, never the expanded skill body. The raw
+                # payload stays server-side: a rewind/regenerate re-sends the
+                # turn by ordinal, so no client needs it.
+                msg["text"] = invocation
+                msg["display_kind"] = "skill_invocation"
         if role == "assistant":
             for key in reasoning_keys:
                 if key in m and m.get(key) is not None:
@@ -6296,8 +6380,9 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         # Forward display-only timeline metadata so the TUI can render
         # model switches and delegation completions as events instead of
         # opaque user messages, and hide compaction handoffs entirely.
-        if m.get("display_kind"):
-            msg["display_kind"] = m["display_kind"]
+        display_kind = m.get("display_kind") or _legacy_display_kind(role, content_text)
+        if display_kind:
+            msg["display_kind"] = display_kind
         if m.get("display_metadata"):
             msg["display_metadata"] = m["display_metadata"]
         messages.append(msg)
@@ -6507,10 +6592,10 @@ def _auto_continue_note(prompt: str) -> str:
     # crash persists nothing of the interrupted turn to the session DB — this
     # note is the only copy the model will see.
     return (
-        "[System note: Your previous turn was interrupted mid-run — the app or "
-        "its backend process stopped before the turn could finish. Some of the "
-        "work may already be complete; check the current state before redoing "
-        "anything, then finish the task. The interrupted request was:]\n\n"
+        f"{_AUTO_CONTINUE_NOTE_PREFIX} — the app or its backend process "
+        "stopped before the turn could finish. Some of the work may already "
+        "be complete; check the current state before redoing anything, then "
+        "finish the task. The interrupted request was:]\n\n"
         f"{prompt}"
     )
 
@@ -6653,7 +6738,7 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any
+    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -6666,8 +6751,15 @@ def _handle_busy_submit(
     Modes: ``interrupt`` (default) → redirect the live turn, falling back to
     hard interrupt + queue for older agents; ``queue`` → queue without
     interrupting; ``steer`` → inject after the current atomic action.
+
+    ``queued=True`` (client's queue drain, ``prompt.submit`` param) overrides
+    the mode entirely: the message was explicitly queued as "run after", so it
+    must NEVER become a live-turn correction or interrupt. Without this, a
+    drain that loses the settle race (client observed idle, server still
+    unwinding the turn) redirected the live turn with next-turn text — queue
+    semantics betrayed by a millisecond race the user can't see.
     """
-    mode = _load_busy_input_mode()
+    mode = "queue" if queued else _load_busy_input_mode()
     agent = session.get("agent")
     with session["history_lock"]:
         if not session.get("running"):
@@ -10030,13 +10122,20 @@ def _(rid, params: dict) -> dict:
     removed = 0
     with session["history_lock"]:
         history = session.get("history", [])
-        while history and history[-1].get("role") in {"assistant", "tool"}:
-            history.pop()
-            removed += 1
-        if history and history[-1].get("role") == "user":
-            history.pop()
-            removed += 1
-        if removed:
+        # Truncate from the last *real* user turn (no display_kind). Popping
+        # only trailing assistant/tool then one user left timeline markers
+        # (async_delegation_complete, model_switch, …) as the undo target —
+        # so session.undo removed bookkeeping instead of the last exchange.
+        # Match list_recent_user_messages / CLI turn counting.
+        last_user_idx = None
+        for i in range(len(history) - 1, -1, -1):
+            msg = history[i]
+            if msg.get("role") == "user" and not msg.get("display_kind"):
+                last_user_idx = i
+                break
+        if last_user_idx is not None:
+            removed = len(history) - last_user_idx
+            del history[last_user_idx:]
             session["history_version"] = int(session.get("history_version", 0)) + 1
     return _ok(rid, {"removed": removed})
 
@@ -10312,6 +10411,9 @@ def _(rid, params: dict) -> dict:
             history = [dict(msg) for msg in session.get("history", [])]
         if not history:
             return _err(rid, 4008, "nothing to branch — send a message first")
+        count = params.get("count")
+        if isinstance(count, int) and count > 0:
+            history = history[:count]
         new_key = _new_session_key()
         new_sid = uuid.uuid4().hex[:8]
         source = _session_source(session)
@@ -10415,7 +10517,19 @@ def _(rid, params: dict) -> dict:
         if lease is not None:
             lease.release()
         return _err(rid, 5000, f"agent init failed on branch: {e}")
-    return _ok(rid, {"session_id": new_sid, "title": title, "parent": old_key})
+    branched_session = _sessions.get(new_sid)
+    return _ok(
+        rid,
+        {
+            "session_id": new_sid,
+            "stored_session_id": new_key,
+            "title": title,
+            "parent": old_key,
+            "message_count": len(history),
+            "messages": _history_to_messages(history),
+            "info": _session_info(agent, branched_session),
+        },
+    )
 
 
 @method("session.interrupt")
@@ -10733,6 +10847,14 @@ def _(rid, params: dict) -> dict:
         accepted = agent.steer(text)
     except Exception as exc:
         return _err(rid, 5000, f"steer failed: {exc}")
+    if accepted:
+        # Record the correction on the live turn exactly like session.redirect
+        # does. Without this, a resume/reconnect while the turn is running
+        # rebuilds the transcript from the inflight snapshot and the steered
+        # text has no user bubble — the "my message vanished on reload" loss.
+        with session["history_lock"]:
+            _record_inflight_correction(session, text)
+            session["last_active"] = time.time()
     return _ok(rid, {"status": "queued" if accepted else "rejected", "text": text})
 
 
@@ -10804,6 +10926,14 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if truncate_user_ordinal is not None and isinstance(text, str):
+        # A rewind/regenerate replays a turn from what the transcript shows. A
+        # skill turn shows its invocation, so re-expand it here — otherwise
+        # re-running `/work fix it` sends the agent nine literal characters
+        # instead of the skill it originally loaded.
+        text = _expand_skill_invocation_for_replay(
+            text, str(session.get("session_key") or "")
+        )
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
     # Re-bind to the current client transport for this request. This keeps
@@ -10822,7 +10952,10 @@ def _(rid, params: dict) -> dict:
                 busy_transport = t or session.get("transport")
             else:
                 break
-        busy_response = _handle_busy_submit(rid, sid, session, text, busy_transport)
+        busy_response = _handle_busy_submit(
+            rid, sid, session, text, busy_transport,
+            queued=bool(params.get("queued")),
+        )
         if busy_response is not None:
             return busy_response
         # The old turn finished between the two lock acquisitions. Retry the
@@ -10843,7 +10976,10 @@ def _(rid, params: dict) -> dict:
             except (TypeError, ValueError):
                 return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
             history = session.get("history", [])
-            user_indices = [i for i, m in enumerate(history) if m.get("role") == "user"]
+            user_indices = [
+                i for i, m in enumerate(history)
+                if m.get("role") == "user" and not m.get("display_kind")
+            ]
             # Reject out-of-range ordinals on BOTH ends. A negative value would
             # otherwise sail past the upper-bound check and hit Python's negative
             # indexing below (user_indices[-1] -> the LAST user turn), silently
@@ -11667,6 +11803,7 @@ def _run_prompt_submit(
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         secret_token = None
         goal_followup = None  # set by the post-turn goal hook below
+        result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         one_turn_restore = session.pop("one_turn_model_restore", None)
         # True once a failed turn's snapshot was retained for resume replay —
@@ -11860,11 +11997,21 @@ def _run_prompt_submit(
                     _build_persist_user_message(prompt, images, run_message) if images else prompt
                 ),
             }
+            # Type a synthesized turn at turn START so the crash persist writes
+            # its row as a timeline event, instead of leaving a raw user bubble
+            # until the turn ends — and forever if it never does, which is
+            # exactly the auto-continue case. The post-turn stamp below is the
+            # fallback for an older agent without the parameter; re-stamping
+            # the same value is a no-op.
             try:
-                if "task_id" in inspect.signature(agent.run_conversation).parameters:
-                    run_kwargs["task_id"] = session["session_key"]
+                _run_params = inspect.signature(agent.run_conversation).parameters
             except (TypeError, ValueError):
-                pass
+                _run_params = {}
+            if "task_id" in _run_params:
+                run_kwargs["task_id"] = session["session_key"]
+            if display_kind and "persist_user_display_kind" in _run_params:
+                run_kwargs["persist_user_display_kind"] = display_kind
+                run_kwargs["persist_user_display_metadata"] = display_metadata
             result = agent.run_conversation(run_message, **run_kwargs)
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
@@ -11986,6 +12133,15 @@ def _run_prompt_submit(
                     result.get("failed") or result.get("partial")
                 ):
                     raw = f"Error: {result.get('error')}"
+                # "Operation interrupted: waiting for model response (…)" is
+                # cancellation metadata, not assistant prose. gateway/run.py
+                # and the ACP adapter already suppress this sentinel; without
+                # this the desktop paints it as the agent's reply whenever a
+                # stop/steer lands mid-request (#7921).
+                if status == "interrupted" and isinstance(raw, str) and raw.strip().startswith(
+                    INTERRUPT_WAITING_FOR_MODEL_PREFIX
+                ):
+                    raw = ""
                 lr = result.get("last_reasoning")
                 if isinstance(lr, str) and lr.strip():
                     last_reasoning = lr.strip()
@@ -12242,6 +12398,16 @@ def _run_prompt_submit(
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
         # the goal judge / notifications re-evaluate at the end of that turn.
+        # Leftover /steer: the steer arrived after the last tool batch (e.g.
+        # during the final API call), so the agent couldn't inject it and
+        # returned it in result["pending_steer"]. Requeue it as the next turn
+        # so it isn't silently dropped — same rule as cli.py and gateway/run.py.
+        # A real queued prompt still wins: the merge in _enqueue_prompt keeps
+        # both texts.
+        _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
+        if isinstance(_leftover_steer, str) and _leftover_steer.strip():
+            with session["history_lock"]:
+                _enqueue_prompt(session, _leftover_steer, session.get("transport"))
         if _drain_queued_prompt(rid, sid, session):
             return
 
@@ -15389,6 +15555,9 @@ def _(rid, params: dict) -> dict:
                 "type": "send",
                 "message": msg,
                 "notice": notice,
+                # UIs render this, never `message` — the expanded bundle body
+                # is model-facing scaffolding (see _skill_scaffold_projection).
+                "display": _skill_scaffold_projection(msg),
             },
         )
 
@@ -15411,6 +15580,9 @@ def _(rid, params: dict) -> dict:
                         "type": "skill",
                         "message": msg,
                         "name": cmds[key].get("name", name),
+                        # UIs render this, never `message` — the expanded skill
+                        # body is model-facing scaffolding.
+                        "display": _skill_scaffold_projection(msg),
                     },
                 )
     except Exception:
@@ -15557,10 +15729,16 @@ def _(rid, params: dict) -> dict:
         history = session.get("history", [])
         if not history:
             return _err(rid, 4018, "no previous user message to retry")
-        # Walk backwards to find the last user message
+        # Walk backwards to the last *real* user turn. Timeline bookkeeping
+        # rows (display_kind set) are durable role=user but no client counts
+        # them as user turns — same predicate as CLI resume/count and the
+        # prompt.submit ordinal fix. Without this, /retry re-sends opaque
+        # markers (model_switch / async_delegation_complete / auto_continue)
+        # and truncates only the marker instead of the failed exchange.
         last_user_idx = None
         for i in range(len(history) - 1, -1, -1):
-            if history[i].get("role") == "user":
+            msg = history[i]
+            if msg.get("role") == "user" and not msg.get("display_kind"):
                 last_user_idx = i
                 break
         if last_user_idx is None:
@@ -16121,6 +16299,31 @@ def _fuzzy_basename_rank(name: str, query: str) -> tuple[int, int] | None:
     return None
 
 
+def _abs_completion_prefix_exists(path_part: str) -> bool:
+    """True when ``path_part`` reads sensibly as an absolute path.
+
+    A leading `/` is only meant literally if something is actually there:
+    the parent directory has to exist, and a partially-typed final segment
+    has to match at least one of its entries. Used to decide whether
+    `@/foo` is the absolute `/foo` or shorthand for `foo` under the cwd.
+    """
+    expanded = _normalize_completion_path(path_part)
+    parent = os.path.dirname(expanded.rstrip("/")) or "/"
+    tail = os.path.basename(expanded.rstrip("/"))
+
+    if not os.path.isdir(parent):
+        return False
+
+    if not tail or expanded.endswith("/"):
+        return os.path.isdir(expanded) or expanded == "/"
+
+    try:
+        tail_lower = tail.lower()
+        return any(e.lower().startswith(tail_lower) for e in os.listdir(parent))
+    except OSError:
+        return False
+
+
 @method("complete.path")
 def _(rid, params: dict) -> dict:
     word = params.get("word", "")
@@ -16156,6 +16359,21 @@ def _(rid, params: dict) -> dict:
             prefix_tag = ""
             path_part = query if is_context else query
 
+        # `@/foo` almost always means "foo, from here" rather than the absolute
+        # `/foo`: the `@` already says "this is a path", so the slash reads as a
+        # separator people type out of habit. Take the absolute reading only
+        # when something is actually there, else drop the slash and resolve
+        # relative to the cwd — otherwise `@/Desktop` dead-ends on a directory
+        # that exists one level down. Real absolute paths (`@/usr/local`,
+        # `@/etc/hosts`) still resolve, since those prefixes do exist.
+        if (
+            is_context
+            and path_part.startswith("/")
+            and not path_part.startswith("//")
+            and not _abs_completion_prefix_exists(path_part)
+        ):
+            path_part = path_part.lstrip("/")
+
         # Fuzzy basename search across the repo when the user types a bare
         # name with no path separator — `@appChrome` surfaces every file
         # whose basename matches, regardless of directory depth. Matches what
@@ -16169,24 +16387,54 @@ def _(rid, params: dict) -> dict:
             and "/" not in path_part
             and prefix_tag != "folder"
         ):
-            ranked: list[tuple[tuple[int, int], str, str]] = []
-            for rel in _list_repo_files(root):
-                basename = os.path.basename(rel)
-                if basename.startswith(".") and not path_part.startswith("."):
-                    continue
-                rank = _fuzzy_basename_rank(basename, path_part)
-                if rank is None:
-                    continue
-                ranked.append((rank, rel, basename))
+            ranked: list[tuple[tuple[int, int], str, str, bool]] = []
+            walked_dirs: set[str] = set()
+            seen: set[str] = set()
+            want_hidden = path_part.startswith(".")
 
-            ranked.sort(key=lambda r: (r[0], len(r[1]), r[1]))
+            def _consider(rel: str, name: str, is_dir: bool) -> None:
+                if rel in seen or (name.startswith(".") and not want_hidden):
+                    return
+                rank = _fuzzy_basename_rank(name, path_part)
+                if rank is not None:
+                    seen.add(rel)
+                    ranked.append((rank, rel, name, is_dir))
+
+            # Seed with root's immediate children. `_list_repo_files` is capped
+            # at _FUZZY_CACHE_MAX_FILES, and outside a git repo the fallback
+            # walk can burn that whole budget on one deep subtree before ever
+            # reaching a sibling — which is why `@Desk` in a non-repo $HOME
+            # found nothing. One listdir keeps the top level always reachable.
+            try:
+                for entry in os.listdir(root):
+                    if entry not in _FUZZY_FALLBACK_EXCLUDES:
+                        _consider(entry, entry, os.path.isdir(os.path.join(root, entry)))
+            except OSError:
+                pass
+
+            for rel in _list_repo_files(root):
+                _consider(rel, os.path.basename(rel), False)
+
+                # Directories are only implied by the file listing, so rank each
+                # ancestor too. Without this a bare `@Desktop` finds nothing —
+                # a folder with no name-matching file inside it is invisible to
+                # a file-only scan, which is the "can't @ a folder by name" bug.
+                parent = os.path.dirname(rel)
+                while parent and parent not in walked_dirs:
+                    walked_dirs.add(parent)
+                    _consider(parent, os.path.basename(parent), True)
+                    parent = os.path.dirname(parent)
+
+            # Same rank tier: folders first, so `@Desktop` leads with the folder
+            # rather than a file that merely fuzzy-matches the same letters.
+            ranked.sort(key=lambda r: (r[0], not r[3], len(r[1]), r[1]))
             tag = prefix_tag or "file"
-            for _, rel, basename in ranked[:30]:
+            for _, rel, basename, is_dir in ranked[:30]:
                 items.append(
                     {
-                        "text": f"@{tag}:{rel}",
-                        "display": basename,
-                        "meta": os.path.dirname(rel),
+                        "text": f"@{'folder' if is_dir else tag}:{rel}{'/' if is_dir else ''}",
+                        "display": basename + ("/" if is_dir else ""),
+                        "meta": "dir" if is_dir else os.path.dirname(rel),
                     }
                 )
 
@@ -17623,12 +17871,17 @@ def _(rid, params: dict) -> dict:
                 removed = 0
                 with session["history_lock"]:
                     history = session.get("history", [])
-                    while history and history[-1].get("role") in {"assistant", "tool"}:
-                        history.pop()
-                        removed += 1
-                    if history and history[-1].get("role") == "user":
-                        history.pop()
-                        removed += 1
+                    # Truncate from the last *real* user turn (no display_kind).
+                    # Same predicate as list_recent_user_messages / /undo / /retry.
+                    last_user_idx = None
+                    for i in range(len(history) - 1, -1, -1):
+                        msg = history[i]
+                        if msg.get("role") == "user" and not msg.get("display_kind"):
+                            last_user_idx = i
+                            break
+                    if last_user_idx is not None:
+                        removed = len(history) - last_user_idx
+                        del history[last_user_idx:]
                     if removed:
                         session["history_version"] = (
                             int(session.get("history_version", 0)) + 1

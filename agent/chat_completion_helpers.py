@@ -188,6 +188,31 @@ def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
     return preferences
 
 
+def _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs: dict) -> dict:
+    """Merge Portal ``tags`` / ``session_id`` onto an Anthropic Messages kwargs dict.
+
+    The Nous provider profile is only consulted by the OpenAI-wire transport;
+    anthropic_messages callers must merge it themselves. Passes ``session_id``
+    only — not ``provider_preferences`` (those become a top-level ``provider``
+    routing object on the OpenAI wire). Never blocks a turn on tagging.
+    """
+    if getattr(agent, "provider", None) not in {"nous", "nous-portal", "nousresearch"}:
+        return anthropic_kwargs
+    try:
+        from providers import get_provider_profile
+
+        nous_profile = get_provider_profile("nous")
+        if nous_profile is not None:
+            anthropic_kwargs.setdefault("extra_body", {}).update(
+                nous_profile.build_extra_body(
+                    session_id=getattr(agent, "session_id", None)
+                )
+            )
+    except Exception as exc:  # noqa: BLE001 — never block a turn on tagging
+        logger.debug("Nous Portal extra_body merge failed: %s", exc)
+    return anthropic_kwargs
+
+
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, str(default)))
@@ -494,10 +519,16 @@ def direct_api_call(agent, api_kwargs: dict):
 
     def _abort_active_request(reason: str) -> None:
         """Abort the inline request from a watchdog/interrupt thread."""
+        # Abort while still holding the holder lock: the instant it is
+        # released, the inline finally may pop + cache the client for reuse
+        # and the NEXT call check it out — a late abort would then poison
+        # the slot and shut down an innocent in-flight request's sockets
+        # (same atomicity contract as _close_request_client_once in the
+        # interruptible variants; the abort itself never blocks).
         with request_client_lock:
             request_client = request_client_holder["client"]
-        if request_client is not None:
-            agent._abort_request_openai_client(request_client, reason=reason)
+            if request_client is not None:
+                agent._abort_request_openai_client(request_client, reason=reason)
 
     def _make_client(reason: str, kind: str = "openai"):
         # direct_api_call only runs for OpenAI-wire chat_completions cron
@@ -510,6 +541,10 @@ def direct_api_call(agent, api_kwargs: dict):
         agent._active_request_abort = _abort_active_request
         return client
 
+    # Only a clean return may report the reuse reason (request_complete):
+    # after an error or interrupt the wire client is really closed so the
+    # retry builds a fresh pool (see _REQUEST_CLIENT_REUSE_REASONS).
+    succeeded = False
     try:
         response = _dispatch_nonstreaming_api_request(
             agent, api_kwargs, make_client=_make_client
@@ -522,6 +557,7 @@ def direct_api_call(agent, api_kwargs: dict):
         if getattr(agent, "_interrupt_requested", False):
             raise InterruptedError("Agent interrupted during API call")
         _reset_stale_streak(agent)
+        succeeded = True
         return response
     finally:
         if getattr(agent, "_active_request_abort", None) is _abort_active_request:
@@ -530,7 +566,10 @@ def direct_api_call(agent, api_kwargs: dict):
             request_client = request_client_holder["client"]
             request_client_holder["client"] = None
         if request_client is not None:
-            agent._close_request_openai_client(request_client, reason="request_complete")
+            agent._close_request_openai_client(
+                request_client,
+                reason="request_complete" if succeeded else "request_error_cleanup",
+            )
 
 
 def interruptible_api_call(agent, api_kwargs: dict):
@@ -608,20 +647,28 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 and owner_tid is not None
                 and owner_tid != threading.get_ident()
             )
-            if not stranger_thread:
-                # Owning thread (or no recorded owner) → pop and fully close.
-                request_client_holder["client"] = None
-                request_client_holder["owner_tid"] = None
+            if stranger_thread:
+                # Abort while still holding the holder lock: the instant it
+                # is released, the worker's finally may pop + cache the client
+                # for reuse and the NEXT call check it out — an abort landing
+                # after that would poison the slot and shut down an innocent
+                # in-flight request's sockets. The abort itself never blocks
+                # (socket shutdown + slot poison), so holding the lock across
+                # it only delays the racing pop, never the data path.
+                if request_client_kind.get("value", "openai") == "anthropic_messages":
+                    agent._abort_request_anthropic_client(
+                        request_client, reason=reason
+                    )
+                else:
+                    agent._abort_request_openai_client(request_client, reason=reason)
+                return
+            # Owning thread (or no recorded owner) → pop and fully close.
+            request_client_holder["client"] = None
+            request_client_holder["owner_tid"] = None
         if request_client is None:
             return
-        kind = request_client_kind.get("value", "openai")
-        if kind == "anthropic_messages":
-            if stranger_thread:
-                agent._abort_request_anthropic_client(request_client, reason=reason)
-            else:
-                agent._close_request_anthropic_client(request_client, reason=reason)
-        elif stranger_thread:
-            agent._abort_request_openai_client(request_client, reason=reason)
+        if request_client_kind.get("value", "openai") == "anthropic_messages":
+            agent._close_request_anthropic_client(request_client, reason=reason)
         else:
             agent._close_request_openai_client(request_client, reason=reason)
 
@@ -658,7 +705,15 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 return
             result["error"] = e
         finally:
-            _close_request_client_once("request_complete")
+            # Reuse reason only on a clean response; any other outcome —
+            # error, or the cancel-swallow return above (which leaves both
+            # result slots None) — really closes so the next attempt builds
+            # a fresh pool (see _REQUEST_CLIENT_REUSE_REASONS).
+            _close_request_client_once(
+                "request_complete"
+                if result["response"] is not None
+                else "request_error_cleanup"
+            )
 
     # ── Stale-call timeout (mirrors streaming stale detector) ────────
     # Non-streaming calls return nothing until the full response is
@@ -1023,7 +1078,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
         if ephemeral_out is not None:
             agent._ephemeral_max_output_tokens = None  # consume immediately
-        return _transport.build_kwargs(
+        anthropic_kwargs = _transport.build_kwargs(
             model=agent.model,
             messages=anthropic_messages,
             tools=tools_for_api,
@@ -1036,6 +1091,12 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             fast_mode=(agent.request_overrides or {}).get("speed") == "fast",
             drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
         )
+        # Nous Portal reads ``tags`` and ``session_id`` as top-level body fields
+        # on its Messages route the same way it does on /chat/completions, but
+        # the profile hook that produces them is only consulted by the
+        # OpenAI-wire transport. Merge them here so Messages traffic keeps
+        # product attribution and sticky routing.
+        return _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs)
 
     # AWS Bedrock native Converse API — bypasses the OpenAI client entirely.
     # The adapter handles message/tool conversion and boto3 calls directly.
@@ -1341,6 +1402,17 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     if isinstance(_san_content, str) and _san_content:
         from agent.redact import redact_sensitive_text
         _san_content = redact_sensitive_text(_san_content)
+
+    # NOTE (empty-content class fix): textless assistant turns are NOT padded
+    # here.  The single owner for "never send a turn strict wire validation
+    # rejects as empty" is ``repair_empty_non_final_messages`` in
+    # agent_runtime_helpers, which runs inside ``sanitize_api_messages`` — the
+    # unconditional pre-send chokepoint for both the main loop and the summary
+    # path.  Padding at write time was tried (a single-space pad, later a
+    # placeholder) and rejected: it forked the concept across three sites,
+    # broke codex commentary turns (content:'' is a designed state there), and
+    # a DB-side pad can't survive ``_rows_to_conversation``'s whitespace strip
+    # anyway.  Repair belongs at the send boundary, once.
 
     msg = {
         "role": "assistant",
@@ -1701,6 +1773,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
         if fb_provider == "openai-codex":
             fb_api_mode = "codex_responses"
+        elif fb_provider in {"nous", "nous-portal", "nousresearch"}:
+            # Portal is dual-wire: anthropic/* must land on /v1/messages.
+            # resolve_provider_client still returns an OpenAI client for
+            # Nous; the anthropic_messages branch below rebuilds the native
+            # client from that credential + base_url.
+            from hermes_cli.providers import nous_api_mode
+
+            fb_api_mode = nous_api_mode(fb_model)
         elif (
             fb_provider == "anthropic"
             or fb_base_url.rstrip("/").lower().endswith("/anthropic")
@@ -2127,7 +2207,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 _ant_kw = _tsum.build_kwargs(model=agent.model, messages=api_messages, tools=None,
                                max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
                                is_oauth=agent._is_anthropic_oauth,
-                               preserve_dots=agent._anthropic_preserve_dots())
+                               preserve_dots=agent._anthropic_preserve_dots(),
+                               base_url=getattr(agent, "_anthropic_base_url", None))
+                _ant_kw = _merge_nous_portal_messages_extra_body(agent, _ant_kw)
                 summary_response = agent._anthropic_messages_create(_ant_kw)
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
@@ -2157,7 +2239,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 _ant_kw2 = _tretry.build_kwargs(model=agent.model, messages=api_messages, tools=None,
                                 is_oauth=agent._is_anthropic_oauth,
                                 max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
-                                preserve_dots=agent._anthropic_preserve_dots())
+                                preserve_dots=agent._anthropic_preserve_dots(),
+                                base_url=getattr(agent, "_anthropic_base_url", None))
+                _ant_kw2 = _merge_nous_portal_messages_extra_body(agent, _ant_kw2)
                 retry_response = agent._anthropic_messages_create(_ant_kw2)
                 _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_retry_result.content or "").strip()
@@ -2588,20 +2672,27 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 and owner_tid is not None
                 and owner_tid != threading.get_ident()
             )
-            if not stranger_thread:
-                request_client_holder["client"] = None
-                request_client_holder["owner_tid"] = None
+            if stranger_thread:
+                # Abort under the holder lock — see the non-streaming variant
+                # for why the holder read and the abort must be atomic (a late
+                # abort would otherwise hit the NEXT request's checkout).
+                if request_client_kind.get("value", "openai") == "anthropic_messages":
+                    agent._abort_request_anthropic_client(
+                        request_client, reason=reason
+                    )
+                else:
+                    agent._abort_request_openai_client(request_client, reason=reason)
+                return
+            request_client_holder["client"] = None
+            request_client_holder["owner_tid"] = None
         if request_client is None:
             return
+        # Stranger threads returned under the lock above, so only the owner
+        # (or an any-thread-safe stream handle) reaches the close dispatch.
         if request_kind == "stream":
             _close_request_stream_handle(request_client, reason)
         elif request_kind == "anthropic_messages":
-            if stranger_thread:
-                agent._abort_request_anthropic_client(request_client, reason=reason)
-            else:
-                agent._close_request_anthropic_client(request_client, reason=reason)
-        elif stranger_thread:
-            agent._abort_request_openai_client(request_client, reason=reason)
+            agent._close_request_anthropic_client(request_client, reason=reason)
         else:
             agent._close_request_openai_client(request_client, reason=reason)
 
@@ -2890,6 +2981,23 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 pass
 
             if agent._interrupt_requested:
+                # Abandoning a half-read SSE response leaves its connection
+                # permanently checked out of the httpx pool — and the partial
+                # response built below makes the worker's finally report a
+                # reuse-reason close, which would cache the client together
+                # with the leaked connection (each interrupt leaking one more
+                # until the pool exhausts). Close the stream here, on the
+                # owning thread, so the connection is released first.
+                try:
+                    stream.close()
+                except Exception:
+                    # Connection may still be checked out — poison the slot so
+                    # the finally's close really closes the pool instead of
+                    # caching it (owner-thread abort: shutdown is safe, and the
+                    # FD release still happens in the finally below).
+                    agent._abort_request_openai_client(
+                        request_client, reason="interrupt_stream_close_failed"
+                    )
                 break
 
             if not _stream_attempt_is_active(stream_attempt_id):
@@ -3641,7 +3749,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             result["error"] = e
             return
         finally:
-            _close_request_client_once("stream_request_complete")
+            # Reuse reason only on a clean stream; any other outcome (error,
+            # cancel-swallow) really closes so the next attempt builds a
+            # fresh pool (see _REQUEST_CLIENT_REUSE_REASONS).
+            _close_request_client_once(
+                "stream_request_complete"
+                if result["response"] is not None
+                else "stream_error_cleanup"
+            )
 
     # Provider-configured stale timeout takes priority over env default.
     _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
@@ -3875,6 +3990,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     result["error"],
                 )
                 _stub_finish_reason = FINISH_REASON_LENGTH
+            # NOTE (empty-content class fix): the stub is deliberately allowed
+            # to carry empty content here.  The conversation loop's truncation
+            # path detects an EMPTY partial-stream stub (PARTIAL_STREAM_STUB_ID
+            # + no content) and skips appending it to history entirely — only
+            # the continuation nudge is sent.  Substituting placeholder text at
+            # this site was tried and reverted: it defeats that guard (the stub
+            # no longer looks empty), gets appended to history, and the
+            # placeholder leaks into the stitched final response via
+            # truncated_response_parts.  Transcripts that already carry a
+            # persisted empty turn are healed at the send boundary by
+            # ``repair_empty_non_final_messages`` (the single owner).
             _stub_msg = SimpleNamespace(
                 role="assistant", content=_partial_text, tool_calls=None,
                 reasoning_content=None,

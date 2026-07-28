@@ -1804,20 +1804,25 @@ class AIAgent:
         from agent.agent_runtime_helpers import note_turn_persisted
 
         persist_lock = getattr(self, "_session_persist_lock", None)
-        if persist_lock is None:
+
+        def _persist_and_drain() -> None:
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
             self._save_session_log(messages)
             self._flush_messages_to_session_db(messages, conversation_history)
+            # Drain async token-accounting deltas at every persist point (turn
+            # finalize + error exits) so a crash after this line loses at most
+            # the in-flight API call's delta. Cheap no-op when nothing queued.
+            if self._session_db is not None:
+                self._session_db.flush_token_counts()
             note_turn_persisted(self)
+
+        if persist_lock is None:
+            _persist_and_drain()
             return
 
         with persist_lock:
-            self._drop_trailing_empty_response_scaffolding(messages)
-            self._session_messages = messages
-            self._save_session_log(messages)
-            self._flush_messages_to_session_db(messages, conversation_history)
-            note_turn_persisted(self)
+            _persist_and_drain()
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
@@ -1918,9 +1923,9 @@ class AIAgent:
         # where the next live turn re-reads it as an instruction and the agent
         # "becomes" the curator. Hard-stop before any DB touch.
         if getattr(self, "_persist_disabled", False):
-            return
+            return None
         if not self._session_db:
-            return
+            return None
         # Persist user-message override (#48677 chokepoint): historically this
         # mutated the live `messages` list in place, which — on the early
         # crash-resilience persist that runs BEFORE the API call is built —
@@ -2112,6 +2117,7 @@ class AIAgent:
                         and not msg.get("_compressed_summary_has_user_turn")
                         else msg.get("display_kind")
                     ),
+                    display_metadata=msg.get("display_metadata"),
                     compression_lock_holder=getattr(
                         self, "_active_compression_lock_holder", None
                     ),
@@ -2122,8 +2128,10 @@ class AIAgent:
             # allocated next turn at a recycled address.
             self._flushed_db_message_ids = set()
             self._last_flushed_db_idx = len(messages)
+            return True
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
+            return False
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """
@@ -3443,6 +3451,14 @@ class AIAgent:
                 "the model produced no follow-up text. Send `continue` to "
                 "let it summarize."
             )
+        if reason == "session_persistence_failed":
+            return (
+                prefix
+                + "the turn was stopped because session storage could not be "
+                "written (the transcript would have been lost on restart). "
+                "Check disk space / permissions for the state DB, then send "
+                "your message again."
+            )
         # Unknown/diagnostic-only reasons (e.g. "unknown", guardrail_halt
         # which already surfaces its own message) — don't second-guess.
         return ""
@@ -3496,6 +3512,17 @@ class AIAgent:
     def get_rate_limit_state(self):
         """Return the last captured RateLimitState, or None."""
         return self._rate_limit_state
+
+    def _capture_anthropic_response_headers(self, http_response: Any) -> None:
+        """Capture out-of-band state from Anthropic Messages response headers.
+
+        The Anthropic SDK's aggregated ``Message`` drops HTTP headers. Portal
+        (and other providers) put rate-limit and credits state there — the same
+        families the OpenAI-wire streaming path captures via
+        ``stream.response``. Fail-open: each capture swallows its own errors.
+        """
+        self._capture_rate_limits(http_response)
+        self._capture_credits(http_response)
 
     def _capture_credits(self, http_response: Any) -> None:
         """Parse x-nous-credits-* headers, cache CreditsState, fire threshold notices.
@@ -3853,6 +3880,13 @@ class AIAgent:
         except Exception:
             pass
 
+        # Also drop the cached per-request wire client (reused across
+        # sequential LLM calls) — same socket/memory rationale as above.
+        try:
+            self._close_cached_request_openai_client(reason="cache_evict")
+        except Exception:
+            pass
+
     def close(self) -> None:
         """Release all resources held by this agent instance.
 
@@ -3906,6 +3940,13 @@ class AIAgent:
             if client is not None:
                 self._close_openai_client(client, reason="agent_close", shared=True)
                 self.client = None
+        except Exception:
+            pass
+
+        # 5b. Close the cached per-request wire client (reused across
+        # sequential LLM calls; see _create_request_openai_client).
+        try:
+            self._close_cached_request_openai_client(reason="agent_close")
         except Exception:
             pass
 
@@ -4618,6 +4659,27 @@ class AIAgent:
 
         return copilot_request_headers(is_agent_turn=True, is_vision=is_vision)
 
+    # Close reasons the request workers' own ``finally`` unwind reports for
+    # a request that produced a response — the only closes that both come
+    # from the thread that owns the pool's FDs AND attest a healthy pool.
+    # Only these may keep the wire client for the next call, and poisoning
+    # still wins: a cross-thread abort (#29507) marks the slot so even a
+    # worker-finally close discards it. Every other reason (error cleanups,
+    # stale/interrupt kills, retry cleanups) gets a real close, so a retry
+    # after a request error always builds a fresh pool.
+    _REQUEST_CLIENT_REUSE_REASONS = frozenset({
+        "request_complete",
+        "stream_request_complete",
+    })
+
+    def _request_client_cache_ref(self) -> dict:
+        # Lazy init — tests build agents via AIAgent.__new__ without __init__.
+        cache = getattr(self, "_request_client_cache", None)
+        if cache is None:
+            cache = {"client": None, "kwargs": None, "poisoned": False, "in_use": False}
+            self._request_client_cache = cache
+        return cache
+
     def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
         from unittest.mock import Mock
 
@@ -4644,9 +4706,96 @@ class AIAgent:
             and self._api_kwargs_have_image_parts(api_kwargs or {})
         ):
             request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
-        return self._create_openai_client(request_kwargs, reason=reason, shared=False)
+        # Reuse the cached wire client while the effective kwargs are
+        # unchanged: constructing openai.OpenAI + its httpx pool costs
+        # ~19-35ms per LLM call (fresh TCP+TLS handshake), ~5x per turn.
+        # The cache is a single checked-out slot: `in_use` prevents two
+        # concurrent calls from sharing one pool's close/abort lifecycle
+        # (a second concurrent call gets a fresh untracked client with
+        # the old build-per-request behavior).
+        stale = None
+        with self._openai_client_lock():
+            cache = self._request_client_cache_ref()
+            cached = cache["client"]
+            if cached is not None and not cache["in_use"]:
+                if (
+                    not cache["poisoned"]
+                    and cache["kwargs"] == request_kwargs
+                    and not self._is_openai_client_closed(cached)
+                ):
+                    cache["in_use"] = True
+                    return cached
+                # kwargs changed (credential rotation, provider failover),
+                # poisoned by a cross-thread abort (#29507), or externally
+                # closed — never reuse; discard and rebuild below.
+                stale = cached
+                cache["client"] = None
+                cache["kwargs"] = None
+                cache["poisoned"] = False
+        if stale is not None:
+            # Safe to close from this thread: in_use was False, so no
+            # worker thread owns the pool's FDs (#29507 concerns clients
+            # with an in-flight request on another thread).
+            self._close_openai_client(stale, reason=f"reuse_evict:{reason}", shared=False)
+        client = self._create_openai_client(request_kwargs, reason=reason, shared=False)
+        with self._openai_client_lock():
+            cache = self._request_client_cache_ref()
+            if cache["client"] is None:
+                cache["client"] = client
+                # Snapshot nested dicts (default_headers): rotation sites
+                # assign fresh inner dicts today, but an aliased inner
+                # object would compare equal even after in-place mutation.
+                cache["kwargs"] = {
+                    k: dict(v) if isinstance(v, dict) else v
+                    for k, v in request_kwargs.items()
+                }
+                cache["poisoned"] = False
+                cache["in_use"] = True
+            # else: a concurrent call holds the slot — hand this client
+            # out untracked; _close_request_openai_client fully closes
+            # untracked clients, preserving the per-request lifecycle.
+        return client
 
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
+        with self._openai_client_lock():
+            cache = self._request_client_cache_ref()
+            if cache["client"] is client:
+                if reason in self._REQUEST_CLIENT_REUSE_REASONS and not cache["poisoned"]:
+                    # Clean finish on the owning thread — keep the wire client
+                    # (and its warm httpx pool) for the next sequential call.
+                    cache["in_use"] = False
+                    return
+                # Failure / kill / abort outcome: drop the slot and fall
+                # through to a real close. This runs on the owning worker
+                # thread, which is where the FD release belongs (#29507).
+                cache["client"] = None
+                cache["kwargs"] = None
+                cache["poisoned"] = False
+                cache["in_use"] = False
+        self._close_openai_client(client, reason=reason, shared=False)
+
+    def _close_cached_request_openai_client(self, *, reason: str) -> None:
+        """Teardown hook: really close the cached per-request wire client."""
+        with self._openai_client_lock():
+            cache = getattr(self, "_request_client_cache", None)
+            client = cache["client"] if cache else None
+            in_use = bool(cache["in_use"]) if cache else False
+            if cache is not None:
+                cache["client"] = None
+                cache["kwargs"] = None
+                cache["poisoned"] = False
+                cache["in_use"] = False
+        if client is None:
+            return
+        if in_use:
+            # A worker thread has this client checked out for an in-flight
+            # request (workers can outlive turns — see interruptible_api_call).
+            # client.close() here would release its FDs from a stranger thread,
+            # the #29507 race teardown must not reintroduce. Abort the sockets
+            # instead; the slot is already cleared, so the worker's own finally
+            # sees an untracked client and does the real close on its thread.
+            self._abort_request_openai_client(client, reason=f"{reason}_in_flight")
+            return
         self._close_openai_client(client, reason=reason, shared=False)
 
     def _abort_request_openai_client(self, client: Any, *, reason: str) -> None:
@@ -4665,14 +4814,32 @@ class AIAgent:
         """
         if client is None:
             return
+        # A pool whose sockets were shut down from a stranger thread must
+        # never be reused: poison the cache slot so the owner-thread close
+        # discards it and the next create builds a fresh client.
+        with self._openai_client_lock():
+            cache = self._request_client_cache_ref()
+            if cache["client"] is client:
+                cache["poisoned"] = True
         try:
             shutdown_count = self._force_close_tcp_sockets(client)
-            logger.info(
+            # tcp_force_closed=0 means the stranger-thread abort found no
+            # sockets to shut down — the worker stays blocked in recv and the
+            # provider keeps the slot (#72975). Surface that as WARNING so it
+            # cannot be mistaken for a successful abort in the logs.
+            _log = logger.warning if shutdown_count == 0 else logger.info
+            _log(
                 "OpenAI client aborted (%s, shared=False, tcp_force_closed=%d, "
-                "deferred_close=stranger_thread) %s",
+                "deferred_close=stranger_thread) %s%s",
                 reason,
                 shutdown_count,
                 self._client_log_context(),
+                (
+                    " — no sockets found; in-flight request may keep running "
+                    "until the provider finishes"
+                    if shutdown_count == 0
+                    else ""
+                ),
             )
         except Exception as exc:
             logger.debug(
@@ -4762,13 +4929,23 @@ class AIAgent:
             return
         try:
             shutdown_count = self._force_close_tcp_sockets(client)
-            logger.info(
+            # Same visibility contract as the OpenAI abort path (#72975):
+            # zero sockets shut down means the abort did not unblock the
+            # worker — log WARNING, not a success-shaped INFO.
+            _log = logger.warning if shutdown_count == 0 else logger.info
+            _log(
                 "Anthropic client aborted (%s, shared=False, tcp_force_closed=%d, "
-                "deferred_close=stranger_thread) provider=%s model=%s",
+                "deferred_close=stranger_thread) provider=%s model=%s%s",
                 reason,
                 shutdown_count,
                 getattr(self, "provider", None),
                 getattr(self, "model", None),
+                (
+                    " — no sockets found; in-flight request may keep running "
+                    "until the provider finishes"
+                    if shutdown_count == 0
+                    else ""
+                ),
             )
         except Exception as exc:
             logger.debug(
@@ -4868,7 +5045,12 @@ class AIAgent:
         *,
         force: bool = True,
     ) -> bool:
-        if self.api_mode != "chat_completions" or self.provider != "nous":
+        if self.provider != "nous":
+            return False
+        # Portal serves anthropic/* on the native Messages route, so a session
+        # can be holding either client kind when its short-lived invoke JWT
+        # expires. Both need the refresh or the turn dies on a 401.
+        if self.api_mode not in ("chat_completions", "anthropic_messages"):
             return False
 
         try:
@@ -4891,6 +5073,13 @@ class AIAgent:
 
         self.api_key = api_key.strip()
         self.base_url = base_url.strip().rstrip("/")
+
+        if self.api_mode == "anthropic_messages":
+            self._anthropic_api_key = self.api_key
+            self._anthropic_base_url = self.base_url
+            self._rebuild_anthropic_client()
+            return True
+
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
         # Nous requests should not inherit OpenRouter-only attribution headers.
@@ -5054,6 +5243,11 @@ class AIAgent:
             self._client_kwargs["default_headers"] = _codex_cloudflare_headers(
                 self._client_kwargs.get("api_key", "")
             )
+        elif base_url_host_matches(base_url, "x.ai"):
+            # Cover both provider=xai and provider=xai-oauth (api.x.ai).
+            from tools.xai_http import hermes_xai_default_headers
+
+            self._client_kwargs["default_headers"] = hermes_xai_default_headers()
         else:
             # No URL-specific headers — check profile.default_headers before clearing.
             _ph_headers = None
@@ -5212,6 +5406,10 @@ class AIAgent:
             api_kwargs,
             log_prefix=getattr(self, "log_prefix", ""),
             prefer_stream=not bool(getattr(self, "_disable_streaming", False)),
+            # Rate-limit + credits state live in response headers, which the
+            # parsed Message drops. No-ops on providers that don't send the
+            # matching header families (x-ratelimit-* / x-nous-credits-*).
+            on_response=self._capture_anthropic_response_headers,
         )
 
     def _rebuild_anthropic_client(self) -> None:
@@ -5287,7 +5485,6 @@ class AIAgent:
                         pass
                 self._record_streamed_assistant_text(tail)
         self._current_streamed_assistant_text = ""
-        self._current_streamed_reasoning_text = ""
 
     def _record_streamed_assistant_text(self, text: str) -> None:
         """Accumulate visible assistant text emitted through stream callbacks."""
@@ -5628,15 +5825,6 @@ class AIAgent:
                 cb(text)
             except Exception:
                 pass
-            else:
-                # Only checkpoint reasoning that a surface actually displayed.
-                # show_reasoning=false leaves the callback unset, so hidden
-                # provider thinking never becomes visible transcript content.
-                if isinstance(text, str) and text:
-                    self._current_streamed_reasoning_text = (
-                        getattr(self, "_current_streamed_reasoning_text", "")
-                        + text
-                    )
 
     def _fire_tool_gen_started(self, tool_name: str) -> None:
         """Notify display layer that the model is generating tool call arguments.
@@ -6810,6 +6998,8 @@ class AIAgent:
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_display_kind: Optional[str] = None,
+        persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
@@ -6854,6 +7044,8 @@ class AIAgent:
                     stream_callback,
                     persist_user_message,
                     persist_user_timestamp=persist_user_timestamp,
+                    persist_user_display_kind=persist_user_display_kind,
+                    persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
                 )
             finally:

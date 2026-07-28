@@ -1472,6 +1472,14 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
        known but ``poolside`` isn't) but the model is a vendor-prefixed
        aggregator slug, keep the user's CURRENT aggregator if they're on
        one, else fall back to openrouter.
+
+       Named custom providers (``custom:litellm``, etc.) are excluded from
+       this fallback: ``_KNOWN_PROVIDER_NAMES`` only lists the bare
+       ``"custom"`` bucket, never a specific ``custom:<name>`` slug, so
+       without this exclusion every named custom provider paired with a
+       slash-bearing model (e.g. ``ollama/glm-5.2`` behind a LiteLLM proxy)
+       looked exactly like the stray-vendor-prefix case above and got
+       silently reassigned to ``openrouter``.
     2. Model-format normalization for the resolved provider via
        ``normalize_model_for_provider`` (e.g. ``anthropic/claude-opus-4.6``
        on native anthropic → ``claude-opus-4-6``).
@@ -1506,7 +1514,21 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
     if custom_provider is not None:
         return custom_provider.id, model_in
 
-    if canonical not in _KNOWN_PROVIDER_NAMES and "/" in model_in:
+    # A named custom provider that didn't resolve above (typo, config
+    # mismatch, entry missing from custom_providers/providers) must still
+    # not be treated as a stray vendor prefix -- it isn't a known Hermes
+    # provider/alias, but it also isn't the analytics-vendor case this
+    # fallback exists for. Match only the durable named-custom syntax
+    # (bare "custom" bucket, or "custom:<name>" per
+    # ``providers.custom_provider_slug``) -- a bare ``startswith("custom")``
+    # would also swallow unrelated unconfigured vendor names that merely
+    # happen to start with "custom" (e.g. "customproxy").
+    is_custom_provider_slug = canonical == "custom" or canonical.startswith("custom:")
+    if (
+        canonical not in _KNOWN_PROVIDER_NAMES
+        and not is_custom_provider_slug
+        and "/" in model_in
+    ):
         # Vendor prefix posing as a provider (analytics fallback). Resolve
         # against the user's current provider when it's an aggregator that
         # serves vendor-prefixed slugs; otherwise default to openrouter.
@@ -11673,9 +11695,10 @@ async def get_session_stats(profile: Optional[str] = None):
         messages = db.message_count()
         by_source: Dict[str, int] = {}
         try:
-            for s in db.list_sessions_rich(limit=10000, include_archived=True, compact_rows=True):
-                src = str(s.get("source") or "cli")
-                by_source[src] = by_source.get(src, 0) + 1
+            by_source = db.session_count_by_source(
+                include_archived=True,
+                exclude_children=True,
+            )
         except Exception:
             pass
         return {
@@ -13168,15 +13191,18 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
         # (Figma's MCP catalog, etc.) 403 the register call before any
         # authorization URL exists — surface what's actually happening
         # instead of a bare "403 Forbidden".
-        lowered = msg.lower()
-        if "403" in msg and ("regist" in lowered or "forbidden" in lowered):
-            msg = (
-                f"'{flow.server_name}' only allows pre-approved OAuth clients — it rejected "
-                "client registration (403), so no browser flow can start. "
-                "Options: add a pre-registered client to this server's entry "
-                "(oauth: {client_id: ..., client_secret: ...}), or use the "
-                "provider's stdio / API-key server instead."
+        try:
+            from tools.mcp_oauth import humanize_oauth_registration_error
+
+            humanized = humanize_oauth_registration_error(
+                flow.server_name,
+                exc,
+                server_url=cfg.get("url") if isinstance(cfg, dict) else None,
             )
+            if humanized:
+                msg = humanized
+        except Exception:
+            pass
         flow.mark_error(msg)
     finally:
         flow.mark_worker_done()

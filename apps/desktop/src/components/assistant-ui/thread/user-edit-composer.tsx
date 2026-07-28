@@ -30,6 +30,7 @@ import {
   type InlineRefInput,
   insertInlineRefsIntoEditor
 } from '@/app/chat/composer/inline-refs'
+import { chipTypedPathOnSpace, pathifyRefs } from '@/app/chat/composer/path-refs'
 import {
   composerPlainText,
   insertComposerContentsAtCaret,
@@ -543,7 +544,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
     recordUndoPoint()
 
     // Links land as `@url:` chips, same as the main composer.
-    insertComposerContentsAtCaret(event.currentTarget, linkifyUrls(pastedText))
+    insertComposerContentsAtCaret(event.currentTarget, pathifyRefs(linkifyUrls(pastedText)))
     syncDraftFromEditor(event.currentTarget)
   }
 
@@ -555,7 +556,17 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
     }
 
     setSubmitting(true)
-    aui.composer().send()
+
+    // `aui.composer().send()` throws "Composer is not available" when the edit
+    // composer core has been torn down (e.g. a blur-driven cancel raced the
+    // click). Reset `submitting` on failure so the arrow can't wedge on `true`
+    // and leave revert as the only way out (#49903 is the same unguarded-core
+    // hazard on the main composer).
+    try {
+      aui.composer().send()
+    } catch {
+      setSubmitting(false)
+    }
   }
 
   const handleEditBlur = useCallback(
@@ -590,7 +601,15 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
         }
 
         closeTrigger()
-        aui.composer().cancel()
+
+        // Swallow the unbound-core throw: if the composer core was already torn
+        // down (a send/cancel raced this timer), cancel() throws "Composer is
+        // not available" as an uncaught renderer error. Nothing to cancel then.
+        try {
+          aui.composer().cancel()
+        } catch {
+          // Composer core already gone — the edit is closing anyway.
+        }
       }, 80)
     },
     [aui, closeTrigger, submitting, syncDraftFromEditor]
@@ -660,6 +679,15 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
 
     // A typed link finished with a space chips like a pasted one.
     if (withUndoPoint(() => chipTypedUrlOnSpace(event))) {
+      event.preventDefault()
+      rememberInitialDraft()
+      syncDraftFromEditor(event.currentTarget)
+
+      return
+    }
+
+    // Same for a bare `@path`.
+    if (withUndoPoint(() => chipTypedPathOnSpace(event))) {
       event.preventDefault()
       rememberInitialDraft()
       syncDraftFromEditor(event.currentTarget)
@@ -786,6 +814,13 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
                   submitEdit(editor)
                 }
               }}
+              // Keep focus in the editor on click: macOS doesn't focus a button
+              // on mousedown, so without this the arrow-click blurs the editor,
+              // the blur timer cancels the edit (tearing down the composer
+              // core), and the click's send() then throws against a dead core —
+              // the edit silently never sends. The restore button guards the
+              // same way.
+              onPointerDown={event => event.preventDefault()}
               title={copy.sendEdited}
               type="button"
             >
