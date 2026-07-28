@@ -1873,12 +1873,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             continue
 
         target_content = cleaned_delivery_content
-        if platform_name.lower() == "email":
-            target_content = _append_cron_email_reference_footer(job, target_content)
 
-        # Prefer the live adapter when the gateway is running — this supports E2EE
-        # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
-        runtime_adapter = (adapters or {}).get(platform)
+        # Prefer the resolved live transport when the gateway is running. This
+        # supports E2EE native adapters and relay-fronted logical platforms.
+        live_adapter_ready = (
+            runtime_adapter is not None
+            and loop is not None
+            and getattr(loop, "is_running", lambda: False)()
+        )
         delivered = False
         target_errors = []
 

@@ -1350,6 +1350,7 @@ async def _standalone_send(
     standalone_sender_fn contract; replaces the legacy _send_email helper."""
     import smtplib
     import ssl as _ssl
+    from agent.secret_scope import get_secret
 
     extra = getattr(pconfig, "extra", {}) or {}
     address = extra.get("address") or get_secret("EMAIL_ADDRESS", "") or ""

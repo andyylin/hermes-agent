@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from hermes_state import (
-    FTS_STORAGE_VERSION,
     SCHEMA_VERSION,
     SessionDB,
     _db_opens_cleanly,
@@ -1051,26 +1050,21 @@ def _verify_recovered_database(
             ).fetchall()
         }
         verification["fts_meta"] = meta
-        if meta.get("fts_storage_version") != str(FTS_STORAGE_VERSION):
+        if meta:
             verification["errors"].append(
-                "fresh FTS storage version was not established"
+                "retired FTS metadata remains in the recovered database"
             )
-        pending_keys = sorted(
-            key
-            for key in (
-                "fts_optimize_available",
-                "fts_rebuild_high_water",
-                "fts_rebuild_progress",
-                "fts_cjk_stale",
-                "fts_cjk_rebuild_high_water",
-                "fts_cjk_rebuild_progress",
-            )
-            if key in meta
-        )
-        verification["pending_fts_keys"] = pending_keys
-        if pending_keys:
+
+        fts_objects = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE 'messages_fts%'"
+            ).fetchall()
+        ]
+        verification["fts_objects"] = fts_objects
+        if fts_objects:
             verification["errors"].append(
-                "derived FTS transition markers remain in the recovered database"
+                "retired FTS schema objects remain in the recovered database"
             )
 
         counts: dict[str, int] = {}
@@ -1151,22 +1145,7 @@ def _verify_recovered_database(
                 )
                 verification["loss_detected"] = True
 
-        fts_checks: dict[str, str] = {}
-        for table in ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"):
-            if not _table_columns(conn, table):
-                continue
-            try:
-                conn.execute(
-                    f'INSERT INTO "{table}" ("{table}") VALUES (\'integrity-check\')'
-                )
-                conn.execute(
-                    f'SELECT 1 FROM "{table}" WHERE "{table}" MATCH \'""\' LIMIT 1'
-                ).fetchone()
-                fts_checks[table] = "ok"
-            except sqlite3.DatabaseError as exc:
-                fts_checks[table] = str(exc)
-                verification["errors"].append(f"{table} integrity check failed: {exc}")
-        verification["fts_checks"] = fts_checks
+        verification["fts_checks"] = {}
     except sqlite3.DatabaseError as exc:
         verification["errors"].append(f"verification query failed: {exc}")
     finally:
@@ -1180,18 +1159,17 @@ def _verify_recovered_database(
 
 
 def _finalize_derived_metadata(destination: sqlite3.Connection) -> dict[str, Any]:
-    """Stamp only metadata that the newly created destination actually owns."""
+    """Remove retired FTS metadata from a fresh recovery destination."""
 
-    fts_tables = {
+    fts_objects = [
         str(row[0])
         for row in destination.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type='table' AND name IN ('messages_fts', 'messages_fts_trigram')"
+            "SELECT name FROM sqlite_master WHERE name LIKE 'messages_fts%'"
         ).fetchall()
-    }
-    result: dict[str, Any] = {"fts_tables": sorted(fts_tables), "finalized": False}
-    if fts_tables != {"messages_fts", "messages_fts_trigram"}:
-        result["error"] = "fresh destination is missing required FTS tables"
+    ]
+    result: dict[str, Any] = {"fts_tables": fts_objects, "finalized": False}
+    if fts_objects:
+        result["error"] = "fresh destination contains retired FTS schema objects"
         return result
 
     fts_keys = tuple(key for key in _GENERATED_META_KEYS if key.startswith("fts_"))
@@ -1201,11 +1179,6 @@ def _finalize_derived_metadata(destination: sqlite3.Connection) -> dict[str, Any
         destination.execute(
             f"DELETE FROM state_meta WHERE key IN ({placeholders})",
             fts_keys,
-        )
-        destination.execute(
-            "INSERT INTO state_meta(key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            ("fts_storage_version", str(FTS_STORAGE_VERSION)),
         )
         destination.execute("COMMIT")
     except BaseException:

@@ -351,6 +351,14 @@ _wal_fallback_warned_lock = threading.Lock()
 _wal_reset_bug_warned_paths: set[str] = set()
 _wal_reset_bug_warned_lock = threading.Lock()
 
+# Compatibility names retained for upstream callers/tests. Live CJK FTS is
+# intentionally disabled by the custom runtime's canonical-LIKE policy.
+FTS_CJK_STALE_KEY = "fts_cjk_stale"
+
+
+def _cjk_fts_config_enabled() -> bool:
+    return False
+
 _BASE_FTS_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
@@ -6920,24 +6928,10 @@ class SessionDB:
                 )
 
     def _describe_search_path(self, query: str) -> str:
-        """Best-effort name of the routing path a query takes (log-only)."""
+        """Return the canonical LIKE path used after live FTS retirement."""
         try:
-            sanitized = self._sanitize_fts5_query(query or "")
-            if not sanitized:
-                return "empty"
-            if not self._contains_cjk(sanitized):
-                return "fts5"
-            raw = sanitized.strip('"').strip()
-            if self._fts_cjk_available and not self._has_lone_cjk_run(raw):
-                return "fts_cjk"
-            tokens = [
-                t for t in raw.split()
-                if t.upper() not in {"AND", "OR", "NOT"} and self._contains_cjk(t)
-            ]
-            short = any(self._count_cjk(t) < 3 for t in tokens)
-            if self._count_cjk(raw) >= 3 and not short and self._trigram_available:
-                return "trigram"
-            return "like_scan"
+            sanitized = self._sanitize_search_query(query or "")
+            return "like_scan" if sanitized else "empty"
         except Exception:
             return "unknown"
 
@@ -7012,11 +7006,11 @@ class SessionDB:
         like_params.extend([limit, offset])
         # instr() for snippet uses first search token
         like_params = [non_op_tokens[0]] + like_params
-        with self._lock:
-            like_cursor = self._conn.execute(like_sql, like_params)
+        with self._read_ctx() as conn:
+            like_cursor = conn.execute(like_sql, like_params)
             return [dict(row) for row in like_cursor.fetchall()]
 
-    def search_messages(
+    def _search_messages_impl(
         self,
         query: str,
         source_filter: List[str] = None,

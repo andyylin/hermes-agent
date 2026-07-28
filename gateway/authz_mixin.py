@@ -29,42 +29,11 @@ from gateway.whatsapp_identity import (
 
 
 def _auth_env(name: str, default: str = "") -> str:
-    """Read allowlist/auth env; prefer profile secret_scope under multiplex."""
+    """Read auth policy from the installed profile scope, fail closed."""
     if not name:
         return default
     try:
-        from agent.secret_scope import get_secret
-    except ImportError:
-        return (os.getenv(name) or default).strip()
-
-    # The profile scope is authoritative. In multiplex mode get_secret()
-    # deliberately raises when no scope is installed; do not swallow that
-    # signal and leak a process-global allowlist from another profile.
-    val = get_secret(name)
-    return (str(val) if val is not None else default).strip()
-
-
-def _line_auth_env(name: str, default: str = "") -> str:
-    """Read added LINE policy with the active profile scope as authority."""
-    try:
-        from agent.secret_scope import get_secret
-    except ImportError:
-        return (os.getenv(name) or default).strip()
-
-    value = get_secret(name)
-    return (str(value) if value is not None else default).strip()
-
-
-def _line_auth_env(name: str, default: str = "") -> str:
-    """Read LINE group policy from an installed profile scope, fail closed.
-
-    ``get_secret`` intentionally falls through to ``os.environ`` when the
-    process is not a multiplex deployment. That is right for ordinary provider
-    credentials, but not for a per-profile LINE allowlist: a stamped profile
-    must never inherit the default profile's process-global group policy.
-    """
-    try:
-        from agent.secret_scope import current_secret_scope
+        from agent.secret_scope import current_secret_scope, get_secret
     except ImportError:
         return (os.getenv(name) or default).strip()
 
@@ -72,7 +41,13 @@ def _line_auth_env(name: str, default: str = "") -> str:
     if scope is not None:
         value = scope.get(name)
         return (str(value) if value is not None else default).strip()
-    return (os.getenv(name) or default).strip()
+    value = get_secret(name)
+    return (str(value) if value is not None else default).strip()
+
+
+def _line_auth_env(name: str, default: str = "") -> str:
+    """LINE authorization uses the same profile-scoped fail-closed policy."""
+    return _auth_env(name, default)
 
 
 def _coerce_allow_set(raw) -> set[str]:
