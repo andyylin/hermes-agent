@@ -1193,7 +1193,6 @@ class SessionStore:
         self._transcript_reroutes: Dict[str, str] = {}
         self._dirty_transcripts: Dict[str, List[Dict[str, Any]]] = {}
         self._transcript_append_failures: Dict[str, int] = {}
-        self._fts_rebuild_attempted = False
         self._has_active_processes_fn = has_active_processes_fn
         # Whether to keep writing the legacy sessions.json mirror alongside
         # the primary gateway_routing table in state.db. Default True for
@@ -3035,19 +3034,6 @@ class SessionStore:
                             session_id,
                         )
                         return
-                if self._is_fts_corruption_error(exc) and self._rebuild_fts_once():
-                    try:
-                        self._append_transcript_message(session_id, msg)
-                    except Exception as retry_exc:
-                        exc = retry_exc
-                    else:
-                        with self._transcript_retry_lock:
-                            if pending and pending[0] is msg:
-                                pending.pop(0)
-                            if not pending:
-                                self._dirty_transcripts.pop(queue_session_id, None)
-                                self._transcript_append_failures.pop(session_id, None)
-                        continue
                 with self._transcript_retry_lock:
                     failures = self._transcript_append_failures.get(session_id, 0) + 1
                     self._transcript_append_failures[session_id] = failures
@@ -3095,50 +3081,6 @@ class SessionStore:
     # Maximum in-memory pending messages per session before dropping the
     # oldest. Prevents unbounded growth when the DB is persistently broken.
     _MAX_PENDING_PER_SESSION = 200
-
-    @staticmethod
-    def _is_fts_corruption_error(exc: Exception) -> bool:
-        """True if *exc* looks like an FTS index corruption error.
-
-        Matches the specific SQLite error strings for malformed disk images
-        and FTS table corruption — not bare ``"fts"`` substrings which match
-        unrelated words like ``"shifts"`` or ``"gifts"``.
-        """
-        text = str(exc).lower()
-        return any(
-            marker in text
-            for marker in (
-                "database disk image is malformed",
-                "malformed database schema",
-                "messages_fts",
-                "no such table: messages_fts",
-            )
-        )
-
-    def _rebuild_fts_once(self) -> bool:
-        """Attempt FTS5 ``rebuild`` command once per store lifetime.
-
-        Delegates to ``SessionDB.rebuild_fts()`` which handles locking and
-        table-existence checks internally. Returns ``True`` when at least
-        one index was rebuilt.
-        """
-        if self._fts_rebuild_attempted:
-            return False
-        self._fts_rebuild_attempted = True
-        db = self._db
-        if db is None or not hasattr(db, "rebuild_fts"):
-            return False
-        try:
-            rebuilt = db.rebuild_fts()
-        except Exception as exc:
-            logger.warning("Session DB FTS rebuild failed: %s", exc)
-            return False
-        if rebuilt:
-            logger.warning(
-                "Rebuilt %d Session DB FTS index(es) after append corruption",
-                rebuilt,
-            )
-        return rebuilt > 0
 
     def _clear_dirty_transcript(self, session_id: str) -> None:
         """Drop queued pending messages for a session.

@@ -2292,7 +2292,6 @@ class TestGatewaySessionDbRecovery:
         store._transcript_retry_lock = threading.Lock()
         store._dirty_transcripts = {}
         store._transcript_append_failures = {}
-        store._fts_rebuild_attempted = False
 
         store.append_to_transcript(
             "parent", {"role": "assistant", "content": "routed to child"}
@@ -2331,7 +2330,6 @@ class TestGatewaySessionDbRecovery:
             ]
         }
         store._transcript_append_failures = {"parent": 2}
-        store._fts_rebuild_attempted = True
         child_attempts = []
         failed_old_2 = False
 
@@ -2400,7 +2398,6 @@ class TestGatewaySessionDbRecovery:
         store._transcript_retry_lock = threading.Lock()
         store._dirty_transcripts = {}
         store._transcript_append_failures = {}
-        store._fts_rebuild_attempted = False
 
         store.append_to_transcript("s1", {"role": "user", "content": "first"})
         assert [m["content"] for m in store._dirty_transcripts["s1"]] == ["first"]
@@ -2436,7 +2433,6 @@ class TestGatewaySessionDbRecovery:
         store._transcript_retry_lock = threading.Lock()
         store._dirty_transcripts = {}
         store._transcript_append_failures = {}
-        store._fts_rebuild_attempted = True  # prevent rebuild attempt
 
         # Queue a failed message
         store.append_to_transcript("s1", {"role": "user", "content": "stale"})
@@ -2473,29 +2469,12 @@ class TestGatewaySessionDbRecovery:
         store._transcript_retry_lock = threading.Lock()
         store._dirty_transcripts = {}
         store._transcript_append_failures = {}
-        store._fts_rebuild_attempted = True
 
         store.append_to_transcript("s1", {"role": "user", "content": "stale"})
         assert "s1" in store._dirty_transcripts
 
         store.rewind_session("s1", 1)
         assert "s1" not in store._dirty_transcripts
-
-    def test_fts_corruption_error_does_not_match_false_positives(self):
-        """_is_fts_corruption_error must not match unrelated error strings
-        containing 'fts' as a substring (e.g. 'shifts', 'gifts')."""
-        assert SessionStore._is_fts_corruption_error(
-            RuntimeError("database disk image is malformed")
-        )
-        assert SessionStore._is_fts_corruption_error(
-            RuntimeError("no such table: messages_fts")
-        )
-        assert not SessionStore._is_fts_corruption_error(
-            RuntimeError("shifts were applied")
-        )
-        assert not SessionStore._is_fts_corruption_error(
-            RuntimeError("gifts received")
-        )
 
     def test_pending_queue_caps_at_max(self):
         """Pending queue should drop oldest messages when exceeding the cap
@@ -2518,7 +2497,6 @@ class TestGatewaySessionDbRecovery:
         store._transcript_retry_lock = threading.Lock()
         store._dirty_transcripts = {}
         store._transcript_append_failures = {}
-        store._fts_rebuild_attempted = True
 
         # Fill beyond the cap
         for i in range(store._MAX_PENDING_PER_SESSION + 10):

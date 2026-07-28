@@ -119,6 +119,7 @@ The linear candidate first merges the frozen cutoff into the actual live-derived
 - **Retired live FTS write/rebuild surface**
   - Canonical LIKE search remains authoritative.
   - Healthy opens avoid retired FTS DDL/rebuild/write-retry behavior.
+  - Gateway transcript failures use the bounded canonical dirty queue and never classify generic SQLite corruption as a derived-index repair opportunity.
   - Preserved from the protected minimal live ancestry.
 
 ### Sessions, cron, and email
