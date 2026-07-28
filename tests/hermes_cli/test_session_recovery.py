@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 import hermes_state
-from hermes_state import FTS_STORAGE_VERSION, SCHEMA_VERSION, SessionDB
+from hermes_state import SCHEMA_VERSION, SessionDB
 from hermes_cli import session_recovery
 from hermes_cli.session_recovery import (
     SessionRecoverySafetyError,
@@ -700,7 +700,7 @@ def test_recovery_rebuilds_canonical_data_without_opening_source(
         )
         assert conn.execute(
             "SELECT value FROM state_meta WHERE key = 'fts_storage_version'"
-        ).fetchone()[0] == str(FTS_STORAGE_VERSION)
+        ).fetchone() is None
         assert (
             conn.execute(
                 "SELECT COUNT(*) FROM state_meta "

@@ -6983,8 +6983,8 @@ class SessionDB:
 
         Sole search implementation after live FTS retirement. Operates only on
         ``messages`` / ``sessions`` so a derived index cannot fail or corrupt
-        the search path. Token OR matching preserves the previous CJK multi-
-        token behaviour; boolean operators are ignored as bare tokens.
+        the search path. Token AND matching preserves normal FTS query
+        semantics while boolean operator words are ignored as bare tokens.
         """
         non_op_tokens = [
             t for t in raw_query.split()
@@ -6999,7 +6999,7 @@ class SessionDB:
                 "OR m.tool_calls LIKE ? ESCAPE '\\')"
             )
             like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
-        like_where = [f"({' OR '.join(token_clauses)})"]
+        like_where = [f"({' AND '.join(token_clauses)})"]
         if not include_inactive:
             like_where.append("(m.active = 1 OR m.compacted = 1)")
         if source_filter is not None:

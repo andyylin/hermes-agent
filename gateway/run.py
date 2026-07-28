@@ -17611,7 +17611,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return None
 
-            if not await self._wait_for_lifecycle_delivery_ready(adapter, platform):
+            if not await self._wait_for_lifecycle_delivery_ready(transport.adapter, platform):
                 return None
 
             metadata = self._thread_metadata_for_target(
