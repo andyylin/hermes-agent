@@ -106,15 +106,21 @@ class TestInPlaceCompaction:
             assert len(all_rows) == 10
             archived = [m for m in all_rows if not m.get("active", 1)]
             assert len(archived) == 8
-            # The originals remain FTS-searchable (active=0 is a content-
-            # preserving UPDATE; the fts triggers don't key on active).
-            hit = db._conn.execute(
-                "SELECT 1 FROM messages_fts f JOIN messages m ON m.id = f.rowid "
-                "WHERE m.session_id = ? AND messages_fts MATCH 'msg' AND m.active = 0 "
-                "LIMIT 1",
-                (sid,),
+            # When SQLite FTS is available, the originals remain searchable
+            # (active=0 is a content-preserving UPDATE; the FTS triggers don't
+            # key on active). Some valid SQLite builds omit FTS5 entirely.
+            has_fts = db._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'messages_fts'"
             ).fetchone()
-            assert hit is not None
+            if has_fts:
+                hit = db._conn.execute(
+                    "SELECT 1 FROM messages_fts f JOIN messages m ON m.id = f.rowid "
+                    "WHERE m.session_id = ? AND messages_fts MATCH 'msg' AND m.active = 0 "
+                    "LIMIT 1",
+                    (sid,),
+                ).fetchone()
+                assert hit is not None
             # Flush identity/cursor reset so next-turn appends diff against the
             # compacted transcript (rebuilds the identity set on next flush).
             assert agent._last_flushed_db_idx == 0

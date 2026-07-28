@@ -34,13 +34,25 @@ def _auth_env(name: str, default: str = "") -> str:
         return default
     try:
         from agent.secret_scope import get_secret
+    except ImportError:
+        return (os.getenv(name) or default).strip()
 
-        val = get_secret(name)
-        if val is not None and str(val).strip():
-            return str(val).strip()
-    except Exception:
-        pass
-    return (os.getenv(name) or default).strip()
+    # The profile scope is authoritative. In multiplex mode get_secret()
+    # deliberately raises when no scope is installed; do not swallow that
+    # signal and leak a process-global allowlist from another profile.
+    val = get_secret(name)
+    return (str(val) if val is not None else default).strip()
+
+
+def _line_auth_env(name: str, default: str = "") -> str:
+    """Read added LINE policy with the active profile scope as authority."""
+    try:
+        from agent.secret_scope import get_secret
+    except ImportError:
+        return (os.getenv(name) or default).strip()
+
+    value = get_secret(name)
+    return (str(value) if value is not None else default).strip()
 
 
 def _line_auth_env(name: str, default: str = "") -> str:
@@ -360,18 +372,19 @@ class GatewayAuthorizationMixin:
         return False
 
     def _pairing_store_for(self, source: "SessionSource"):
-        """Pick the per-profile PairingStore for a source, falling back to global.
+        """Pick the per-profile PairingStore for a source.
 
-        In a multiplexing gateway, each profile owns its own pairing whitelist
-        so isolation is preserved. When the source has no profile (single-
-        profile gateway, or a path that hasn't stamped profile yet) or the
-        profile isn't registered, fall back to ``self.pairing_store`` (the
-        global default) so existing behavior is preserved.
+        In a multiplexing gateway, each profile owns its own pairing whitelist.
+        A stamped profile missing from the registry fails closed rather than
+        inheriting the default profile's pairing grants.
         """
         per_profile = getattr(self, "pairing_stores", None) or {}
         profile = getattr(source, "profile", None)
         if profile and profile in per_profile:
             return per_profile[profile]
+        config = getattr(self, "config", None)
+        if profile and getattr(config, "multiplex_profiles", False):
+            return None
         return getattr(self, "pairing_store", None)
 
     def _is_user_authorized(self, source: SessionSource) -> bool:
@@ -494,7 +507,7 @@ class GatewayAuthorizationMixin:
         }
         if getattr(source, "is_bot", False):
             allow_bots_var = platform_allow_bots_map.get(source.platform)
-            if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
+            if allow_bots_var and _auth_env(allow_bots_var, "none").lower() in {"mentions", "all"}:
                 return True
 
         if not user_id:
@@ -866,7 +879,7 @@ class GatewayAuthorizationMixin:
                 if configured:
                     return "ignore"
 
-        if os.getenv("GATEWAY_ALLOWED_USERS", "").strip():
+        if _auth_env("GATEWAY_ALLOWED_USERS"):
             return "ignore"
 
         return "pair"

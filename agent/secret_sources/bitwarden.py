@@ -62,6 +62,40 @@ from agent.secret_sources.base import ErrorKind, SecretSource
 logger = logging.getLogger(__name__)
 
 
+def _source_environ():
+    """Return the registry's isolated fetch environment when provided."""
+    try:
+        from agent.secret_sources.registry import current_source_environ
+        scoped = current_source_environ()
+    except ImportError:
+        scoped = None
+    return scoped if scoped is not None else os.environ
+
+
+_BWS_ENV_ALLOWLIST = (
+    "PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "SystemRoot",
+    "TMPDIR", "TMP", "TEMP", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+)
+
+
+def _bws_child_env(access_token: str, server_url: str = "") -> Dict[str, str]:
+    """Build a least-privilege environment for the Bitwarden CLI child."""
+    source = _source_environ()
+    env = {
+        key: source[key]
+        for key in _BWS_ENV_ALLOWLIST
+        if source.get(key) is not None
+    }
+    env["BWS_ACCESS_TOKEN"] = access_token
+    if server_url:
+        env["BWS_SERVER_URL"] = server_url
+    env["NO_COLOR"] = "1"
+    return env
+
+
 # ---------------------------------------------------------------------------
 # Configuration constants
 # ---------------------------------------------------------------------------
@@ -532,6 +566,12 @@ def fetch_bitwarden_secrets(
     if not project_id:
         raise RuntimeError("Bitwarden project_id is empty")
 
+    # Encrypted mode is exclusive even when the network fetch fails. Remove a
+    # legacy plaintext cache before any read/fetch path so an auth or outage
+    # cannot leave raw credentials parked on disk indefinitely.
+    if encrypted_cache_enabled:
+        _purge_plaintext_disk_cache(home_path)
+
     cache_key = (_token_fingerprint(access_token), project_id, server_url or "")
     if use_cache and cache_ttl_seconds > 0:
         cached = _CACHE.get(cache_key)
@@ -667,17 +707,7 @@ def _run_bws_list(
     bws: Path, access_token: str, project_id: str, server_url: str = ""
 ) -> Tuple[Dict[str, str], List[str]]:
     cmd = [str(bws), "secret", "list", project_id, "--output", "json"]
-    env = os.environ.copy()
-    env["BWS_ACCESS_TOKEN"] = access_token
-    # Make sure we're not echoing telemetry / colour codes into json.
-    env.setdefault("NO_COLOR", "1")
-    # Region / self-hosted support.  bws defaults to https://vault.bitwarden.com
-    # (US Cloud); EU Cloud users need https://vault.bitwarden.eu, and
-    # self-hosted users need their own URL.  When unset, fall back to whatever
-    # BWS_SERVER_URL the caller already had in their shell env (preserved by
-    # the copy above) so manual overrides keep working too.
-    if server_url:
-        env["BWS_SERVER_URL"] = server_url
+    env = _bws_child_env(access_token, server_url)
 
     try:
         proc = subprocess.run(  # noqa: S603 — bws path is trusted
@@ -772,6 +802,13 @@ def apply_bitwarden_secrets(
 
     if not enabled:
         return result
+
+    if encrypted_cache_enabled:
+        try:
+            _purge_plaintext_disk_cache(home_path)
+        except RuntimeError as exc:
+            result.error = str(exc)
+            return result
 
     access_token = os.environ.get(access_token_env, "").strip()
     if not access_token:
@@ -904,8 +941,28 @@ class BitwardenSource(SecretSource):
         cfg = cfg if isinstance(cfg, dict) else {}
         result = FetchResult()
 
+        encrypted_cfg = cfg.get("encrypted_cache")
+        encrypted_cfg = encrypted_cfg if isinstance(encrypted_cfg, dict) else {}
+        encrypted_enabled = bool(encrypted_cfg.get("enabled", False))
+        try:
+            encrypted_max_stale = float(encrypted_cfg.get("max_stale_seconds", 0))
+        except (TypeError, ValueError):
+            encrypted_max_stale = 0.0
+        if encrypted_enabled:
+            try:
+                _purge_plaintext_disk_cache(home_path)
+            except RuntimeError as exc:
+                result.error = str(exc)
+                result.error_kind = ErrorKind.UNKNOWN
+                return result
+
         access_token_env = str(cfg.get("access_token_env") or "BWS_ACCESS_TOKEN")
-        access_token = os.environ.get(access_token_env, "").strip()
+        from agent.secret_sources.registry import current_source_environ
+
+        source_env = current_source_environ()
+        access_token = (source_env if source_env is not None else os.environ).get(
+            access_token_env, ""
+        ).strip()
         if not access_token:
             result.error = (
                 f"secrets.bitwarden.enabled is true but {access_token_env} is "

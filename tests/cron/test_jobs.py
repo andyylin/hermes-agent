@@ -1,5 +1,6 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import json
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
@@ -1964,6 +1965,29 @@ class TestLateEnvRepointScopesStore:
         # the import-time compatibility constants are untouched
         assert jobs.JOBS_FILE != store.jobs_file
 
+    def test_late_env_repoint_scopes_ticker_files(self, tmp_path, monkeypatch):
+        import cron.jobs as jobs
+
+        written = []
+        read = []
+        monkeypatch.setattr(jobs, "_atomic_write_epoch", written.append)
+        monkeypatch.setattr(jobs, "_epoch_file_age", lambda path: read.append(path) or 0.0)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        jobs.record_ticker_heartbeat(success=True)
+        assert jobs.get_ticker_heartbeat_age() == 0.0
+        assert jobs.get_ticker_success_age() == 0.0
+
+        cron_dir = tmp_path.resolve() / "cron"
+        assert written == [
+            cron_dir / "ticker_heartbeat",
+            cron_dir / "ticker_last_success",
+        ]
+        assert read == [
+            cron_dir / "ticker_heartbeat",
+            cron_dir / "ticker_last_success",
+        ]
+
     def test_unchanged_home_returns_import_time_constants(self, monkeypatch):
         import cron.jobs as jobs
 
@@ -2163,3 +2187,25 @@ class TestJobsJsonUtf8Bom:
         loaded = load_jobs()
         assert [j["id"] for j in loaded] == ["ctrlbom01"]
         assert "newline" in loaded[0]["name"]
+
+
+class TestCronDefinitionsExport:
+    def test_email_subject_template_is_preserved_in_definition_export(self):
+        from cron.definitions_export import render_cron_definitions
+
+        rendered = render_cron_definitions([
+            {
+                "id": "brief",
+                "name": "brief",
+                "enabled": True,
+                "schedule": {"kind": "interval", "minutes": 30},
+                "prompt": "Brief",
+                "email_subject_template": "Joi Morning Briefing - {date}",
+                "email_thread_key": "joi-morning-briefing",
+                "next_run_at": "2026-01-01T00:30:00+00:00",
+            }
+        ])
+        job = json.loads(rendered)["jobs"][0]
+        assert job["email_subject_template"] == "Joi Morning Briefing - {date}"
+        assert job["email_thread_key"] == "joi-morning-briefing"
+        assert "next_run_at" not in job

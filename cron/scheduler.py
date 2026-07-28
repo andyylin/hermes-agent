@@ -1607,6 +1607,21 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        email_subject = _format_cron_email_subject_payload(job) if str(platform_name).lower() == "email" else None
+
+        for_discord = str(platform_name).lower() == "discord"
+        for_email = str(platform_name).lower() == "email"
+        if wrap_response:
+            delivery_content = _format_cron_delivery_content(
+                job,
+                content,
+                for_discord=for_discord,
+                for_email=for_email,
+            )
+        else:
+            delivery_content = _markdown_tables_to_bullets(content) if for_discord else content
+        media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
         for_discord = str(platform_name).lower() == "discord"
         if wrap_response:
@@ -1853,6 +1868,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
 
+            if email_subject and platform_name.lower() == "email":
+                route_metadata = dict(route_metadata or {})
+                if isinstance(email_subject, dict):
+                    route_metadata.update(email_subject)
+                else:
+                    route_metadata["subject"] = email_subject
+                    route_metadata["suppress_threading"] = True
+
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
                 # Route through the gateway's DeliveryRouter so the live send
@@ -1861,7 +1884,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # standalone cron path lacked this, so DM-topic cron deliveries
                 # landed in the General topic or were rejected by Bot API 10.0
                 # (#22773).
-                text_to_send = cleaned_delivery_content.strip()
+                text_to_send = target_content.strip()
                 adapter_ok = True
                 timed_out = False
                 if text_to_send:
@@ -2101,7 +2124,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            send_subject = email_subject if platform_name.lower() == "email" else None
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                target_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                subject=send_subject,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -2130,7 +2162,27 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        # ContextVars do not propagate into fresh executor
+                        # threads automatically. Preserve the profile secret
+                        # scope used by this cron delivery.
+                        from contextvars import copy_context
+
+                        def _run_standalone_send():
+                            return asyncio.run(
+                                _send_to_platform(
+                                    platform,
+                                    pconfig,
+                                    chat_id,
+                                    target_content,
+                                    thread_id=thread_id,
+                                    media_files=media_files,
+                                    subject=send_subject,
+                                )
+                            )
+
+                        future = pool.submit(
+                            copy_context().run, _run_standalone_send
+                        )
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -3220,12 +3272,19 @@ def run_job(
         # is set (mirrors startup), and the Bitwarden value-cache keeps the
         # forced re-pull off the network. load_hermes_dotenv also handles the
         # utf-8/latin-1 encoding fallback internally.
-        from hermes_cli.env_loader import (
-            load_hermes_dotenv,
-            reset_secret_source_cache,
-        )
-        reset_secret_source_cache()
-        load_hermes_dotenv(hermes_home=_get_hermes_home())
+        from agent.secret_scope import current_secret_scope
+        if current_secret_scope() is None:
+            from hermes_cli.env_loader import (
+                load_hermes_dotenv,
+                reset_secret_source_cache,
+            )
+            reset_secret_source_cache()
+            load_hermes_dotenv(hermes_home=_get_hermes_home())
+        else:
+            logger.debug(
+                "Job '%s': isolated profile scope already refreshed; skipping global dotenv reload",
+                job_id,
+            )
 
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
@@ -3944,6 +4003,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    _scope_token = None
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
@@ -3985,7 +4045,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         )
 
         _scope_token = set_secret_scope(
-            build_profile_secret_scope(_get_hermes_home())
+            build_profile_secret_scope(
+                _get_hermes_home(), include_external=True
+            )
         )
         # Defer the cron agent's async-resource teardown until AFTER delivery.
         # run_job normally closes the agent (and reaps stale async clients) in
@@ -4008,8 +4070,6 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
             raise
-        finally:
-            reset_secret_scope(_scope_token)
 
         # Everything from here through delivery runs with the agent still live
         # (deferred teardown). Wrap it ALL in a try/finally so that if any step
@@ -4086,6 +4146,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             mark_job_run(job["id"], False, str(e))
         finish_execution(execution_id, success=False, error=str(e))
         return False
+    finally:
+        if _scope_token is not None:
+            reset_secret_scope(_scope_token)
 
 
 def _notify_provider_jobs_changed() -> None:

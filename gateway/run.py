@@ -1846,10 +1846,11 @@ def load_gateway_config_for_runner() -> "GatewayConfig":
 
 
 def _platform_has_bot_credential(platform: "Platform", platform_config: "PlatformConfig") -> bool:
-    """Return True when a token-authenticated platform has a usable bot credential.
+    """Return True when a token-authenticated platform has a usable credential.
 
     Platforms that do not use ``PlatformConfig.token`` always return True so we
     never skip them here (Signal session paths, port-binding HTTP adapters, etc.).
+    Matrix also supports password auth when no access token is configured.
     """
     from gateway.config import PLATFORM_TOKEN_ENV_NAMES
 
@@ -1862,6 +1863,13 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
     api_key = getattr(platform_config, "api_key", None) or ""
     if isinstance(api_key, str) and api_key.strip():
         return True
+    if platform.value == "matrix":
+        extra = getattr(platform_config, "extra", None) or {}
+        from agent.secret_scope import get_secret
+
+        password = extra.get("password", "") or get_secret("MATRIX_PASSWORD", "")
+        if isinstance(password, str) and password.strip():
+            return True
     return False
 
 
@@ -8363,6 +8371,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _set_reaction(self._handle_reaction_event)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
             adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
+            adapter._pairing_store = getattr(self, "pairing_store", None)
             adapter._busy_text_mode = self._busy_text_mode
             
             # Try to connect
@@ -9442,6 +9451,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _set_reaction(self._handle_reaction_event)
                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
                     adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
+                    adapter._pairing_store = getattr(self, "pairing_store", None)
                     adapter._busy_text_mode = self._busy_text_mode
 
                     # Reconnect after an outage: preserve the platform's
@@ -10296,7 +10306,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
                 claimed[(platform, fp)] = profile_name
 
-            self._configure_profile_adapter(adapter, profile_name, platform)
+            self._configure_profile_adapter(
+                adapter, profile_name, platform, profile_home=profile_home
+            )
 
             try:
                 with _profile_runtime_scope(profile_home):
@@ -10320,6 +10332,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter: BasePlatformAdapter,
         profile_name: str,
         platform: Platform,
+        *,
+        profile_home: "Path",
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
@@ -10335,6 +10349,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter.set_authorization_check(
             self._make_adapter_auth_check(platform, profile_name=profile_name)
         )
+        from gateway.pairing import PairingStore
+
+        stores = getattr(self, "pairing_stores", None)
+        if stores is None:
+            # Partial/test runners may omit the registry. Keep authorization
+            # fail-closed instead of creating storage in an unknown home.
+            stores = {}
+            self.pairing_stores = stores
+            store = None
+        else:
+            store = stores.get(profile_name)
+            if store is None:
+                store = PairingStore(
+                    profile=profile_name,
+                    pairing_dir=Path(profile_home) / "pairing",
+                )
+                stores[profile_name] = store
+        adapter._pairing_store = store
         adapter._busy_text_mode = self._busy_text_mode
 
     async def _run_secondary_profile_reconnect(
@@ -10364,7 +10396,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                             return
                         self._configure_profile_adapter(
-                            adapter, profile_name, platform
+                            adapter, profile_name, platform, profile_home=profile_home
                         )
                         success = await self._connect_adapter_with_timeout(
                             adapter, platform, is_reconnect=True
@@ -11076,9 +11108,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Rate-limit ALL pairing responses (code or rejection) to
                 # prevent spamming the user with repeated messages when
                 # multiple DMs arrive in quick succession.
-                if self.pairing_store._is_rate_limited(platform_name, source.user_id):
+                pairing_store = self._pairing_store_for(source)
+                if pairing_store is None:
+                    logger.warning(
+                        "No pairing store for profile %r; denying pairing request",
+                        source.profile,
+                    )
                     return None
-                code = self.pairing_store.generate_code(
+                if pairing_store._is_rate_limited(platform_name, source.user_id):
+                    return None
+                code = pairing_store.generate_code(
                     platform_name, source.user_id, source.user_name or ""
                 )
                 if code:
@@ -11100,7 +11139,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Please try again later!"
                         )
                     # Record rate limit so subsequent messages are silently ignored
-                    self.pairing_store._record_rate_limit(platform_name, source.user_id)
+                    pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
         # Intercept messages that are responses to a pending /update prompt.
@@ -17568,6 +17607,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return None
 
+            if not await self._wait_for_lifecycle_delivery_ready(adapter, platform):
+                return None
+
             metadata = self._thread_metadata_for_target(
                 platform,
                 chat_id,
@@ -17613,6 +17655,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         finally:
             notify_path.unlink(missing_ok=True)
 
+    @staticmethod
+    async def _wait_for_lifecycle_delivery_ready(adapter, platform: Platform) -> bool:
+        """Give adapters with explicit health gating time to become send-ready."""
+        # Resolve on the class so permissive mocks do not manufacture a waiter.
+        waiter = getattr(type(adapter), "wait_until_send_ready", None)
+        if not callable(waiter):
+            return True
+        try:
+            ready = await waiter(adapter)
+        except Exception as exc:
+            logger.warning(
+                "Lifecycle delivery readiness check failed for %s: %s",
+                platform.value,
+                exc,
+            )
+            return False
+        if not ready:
+            logger.warning(
+                "Lifecycle delivery path did not become ready for %s before timeout",
+                platform.value,
+            )
+        return bool(ready)
+
     async def _send_home_channel_startup_notifications(
         self,
         *,
@@ -17649,6 +17714,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             try:
+                if not await self._wait_for_lifecycle_delivery_ready(adapter, platform):
+                    continue
                 metadata = self._thread_metadata_for_target(
                     platform,
                     home.chat_id,
@@ -18749,7 +18816,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             await adapter.send(
                                 chat_id,
                                 message_text,
-                                metadata=_non_conversational_metadata(send_meta, platform=platform_name),
+                                metadata=_silent_progress_metadata(send_meta, platform=platform_name),
                             )
                         except Exception as e:
                             logger.error("Watcher delivery error: %s", e)
@@ -18779,7 +18846,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await adapter.send(
                             chat_id,
                             message_text,
-                            metadata=_non_conversational_metadata(send_meta, platform=platform_name),
+                            metadata=_silent_progress_metadata(send_meta, platform=platform_name),
                         )
                     except Exception as e:
                         logger.error("Watcher delivery error: %s", e)
@@ -21005,7 +21072,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reply_to_message_id=event_message_id,
             )
         ) if _progress_thread_id else None
-        _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
+        _progress_metadata = _silent_progress_metadata(_progress_metadata, platform=source.platform)
         _progress_reply_to = (
             event_message_id
             if source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id
@@ -21506,7 +21573,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
             _fut = safe_schedule_threadsafe(
-                _send_or_update_status_coro(_status_adapter, _status_chat_id, event_type, prepared_message, _status_thread_metadata),
+                _send_or_update_status_coro(_status_adapter, _status_chat_id, event_type, prepared_message, _silent_status_metadata),
                 _loop_for_step,
                 logger=logger,
                 log_message=f"status_callback ({event_type}) scheduling error",
@@ -21671,7 +21738,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             adapter=_adapter,
                             chat_id=source.chat_id,
                             config=_consumer_cfg,
-                            metadata=_status_thread_metadata,
+                            metadata=_silent_status_metadata,
                             on_new_message=(
                                 (lambda: progress_queue.put(("__reset__",)))
                                 if progress_queue is not None
@@ -21705,7 +21772,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _status_adapter.send(
                         _status_chat_id,
                         display_text,
-                        metadata=_status_thread_metadata,
+                        metadata=_silent_status_metadata,
                     ),
                     _loop_for_step,
                     logger=logger,
@@ -22057,7 +22124,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _status_adapter.send(
                         _status_chat_id,
                         message,
-                        metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
+                        metadata=_silent_status_metadata,
                     ),
                     _loop_for_step,
                     logger=logger,

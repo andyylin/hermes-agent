@@ -1,21 +1,17 @@
-"""Runtime FTS-corruption self-heal on the SessionDB write path (#65637 class).
+"""Legacy FTS scrub + write-path DatabaseError propagation (live FTS retired).
 
-A corrupted FTS5 shadow table (``messages_fts_data``) makes every message
-write raise ``sqlite3.DatabaseError: database disk image is malformed``
-through the FTS sync triggers, while the canonical ``messages`` rows stay
-intact. Before this fix the gateway swallowed the failure at debug level and
-the in-memory session advanced while disk silently fell behind — surfacing
-later as "Persisted transcript lagged live cached history" amnesia.
-
-The fix: ``_execute_write`` detects the malformed-image class, performs a
-one-shot in-place FTS rebuild (FTS5 ``'rebuild'`` command — index rewritten
-from canonical rows, no messages touched), and retries the failed write.
+Live FTS indexes and write triggers are no longer created. These tests verify:
+- fresh DBs have no FTS objects and search uses canonical LIKE
+- leftover legacy FTS objects on a pre-retirement DB are scrubbed on open
+- write-path DatabaseError is never swallowed/retried
+- unrelated write errors still propagate
 """
 
 import sqlite3
 
 import pytest
 
+from tests.state.legacy_fts_ddl import LEGACY_FTS_SQL
 from hermes_state import SessionDB
 
 
@@ -55,53 +51,39 @@ def _message_contents(db_path):
     return [r[0] for r in rows]
 
 
+def _fts_object_count(db_path) -> int:
+    raw = sqlite3.connect(str(db_path))
+    n = raw.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'messages_fts%'"
+    ).fetchone()[0]
+    raw.close()
+    return n
+
+
+def _install_legacy_fts(db_path) -> None:
+    """Simulate a pre-retirement DB with base FTS table + write triggers."""
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(LEGACY_FTS_SQL)
+    try:
+        conn.execute(
+            "INSERT INTO messages_fts(rowid, content) "
+            "SELECT id, COALESCE(content, '') FROM messages"
+        )
+    except sqlite3.OperationalError:
+        pass
+    conn.commit()
+    conn.close()
+
+
 class TestRuntimeFtsRebuild:
-    def test_corruption_error_classification_covers_both_sqlite_messages(self):
-        """SQLite's message for a corrupt FTS index varies by version: older
-        builds raise the generic malformed-image error, newer builds raise an
-        FTS5-specific one. Both must trigger the self-heal."""
-        assert SessionDB._is_fts_write_corruption_error(
-            sqlite3.DatabaseError("database disk image is malformed")
-        )
-        assert SessionDB._is_fts_write_corruption_error(
-            sqlite3.DatabaseError(
-                'fts5: corrupt structure record for table "messages_fts"'
-            )
-        )
-        assert not SessionDB._is_fts_write_corruption_error(
-            sqlite3.DatabaseError("no such table: nothing_fts_related")
-        )
-
-    def test_append_self_heals_after_fts_corruption(self, db, tmp_path):
-        if not db._fts_enabled:
-            pytest.skip("FTS5 unavailable in this build")
+    def test_fresh_db_has_no_fts_and_search_uses_canonical_like(self, db, tmp_path):
+        assert db._fts_enabled is False
+        assert _fts_object_count(tmp_path / "state.db") == 0
         db.create_session("s1", source="test")
-        db.append_message("s1", "user", "hello world")
-
-        _corrupt_fts(tmp_path / "state.db")
-
-        # Before the fix this raised DatabaseError and the row was lost.
-        msg_id = db.append_message("s1", "user", "healed append")
-        assert msg_id is not None
-        assert _message_contents(tmp_path / "state.db") == [
-            "hello world",
-            "healed append",
-        ]
-
-    def test_search_works_after_self_heal(self, db, tmp_path):
-        if not db._fts_enabled:
-            pytest.skip("FTS5 unavailable in this build")
-        db.create_session("s1", source="test")
-        db.append_message("s1", "user", "before corruption")
-        _corrupt_fts(tmp_path / "state.db")
-        db.append_message("s1", "user", "searchable needle text")
-
-        raw = sqlite3.connect(str(tmp_path / "state.db"))
-        hits = raw.execute(
-            "SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'needle'"
-        ).fetchall()
-        raw.close()
+        db.append_message("s1", "user", "hello searchable world")
+        hits = db.search_messages("searchable")
         assert len(hits) == 1
+        assert _fts_object_count(tmp_path / "state.db") == 0
 
     def test_search_messages_self_heals_after_fts_corruption(self, db, tmp_path):
         """A read-only session that only SEARCHES (no write after corruption)
@@ -182,14 +164,31 @@ class TestRuntimeFtsRebuild:
             pytest.skip("FTS5 unavailable in this build")
         db.create_session("s1", source="test")
         db.append_message("s1", "user", "seed")
-        _corrupt_fts(tmp_path / "state.db")
-        db.append_message("s1", "user", "first heal")  # consumes the one shot
-        assert db._fts_runtime_rebuild_attempted is True
+        db.close()
 
-        # Corrupt again: the guard must NOT loop — the write now propagates.
-        _corrupt_fts(tmp_path / "state.db")
-        with pytest.raises(sqlite3.DatabaseError):
-            db.append_message("s1", "user", "second corruption")
+        _install_legacy_fts(path)
+        assert _fts_object_count(path) > 0
+        db = SessionDB(db_path=path)
+        try:
+            assert db.rebuild_fts() == 0
+            assert db.optimize_fts() == 0
+            assert _fts_object_count(path) == 0
+            assert len(db.search_messages("seed")) == 1
+        finally:
+            db.close()
+
+    def test_database_error_on_write_propagates_immediately(self, db):
+        """Canonical DatabaseError is not scrubbed or retried."""
+        db.create_session("s1", source="test")
+        attempts = {"n": 0}
+
+        def _boom(conn):
+            attempts["n"] += 1
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+        with pytest.raises(sqlite3.DatabaseError, match="malformed"):
+            db._execute_write(_boom)
+        assert attempts["n"] == 1
 
     def test_non_fts_errors_still_propagate(self, db):
         db.create_session("s1", source="test")
@@ -199,12 +198,9 @@ class TestRuntimeFtsRebuild:
 
         with pytest.raises(sqlite3.IntegrityError):
             db._execute_write(_bad)
-        # The guard must not have been consumed by an unrelated error class.
-        assert db._fts_runtime_rebuild_attempted is False
 
     def test_lock_retry_path_unchanged(self, db):
-        """A locked error still follows the jitter-retry path, untouched by
-        the DatabaseError handler (OperationalError is caught first)."""
+        """A locked error still follows the jitter-retry path."""
         calls = {"n": 0}
 
         def _flaky(conn):
@@ -215,4 +211,3 @@ class TestRuntimeFtsRebuild:
 
         assert db._execute_write(_flaky) == "ok"
         assert calls["n"] == 3
-        assert db._fts_runtime_rebuild_attempted is False

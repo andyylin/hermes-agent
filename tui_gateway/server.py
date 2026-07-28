@@ -4994,6 +4994,8 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
 
 
 def _agent_cbs(sid: str) -> dict:
+    from tools.clarify_gateway import get_clarify_timeout
+
     callbacks = {
         "tool_start_callback": lambda tc_id, name, args: _on_tool_start(
             sid, tc_id, name, args

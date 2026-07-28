@@ -707,6 +707,29 @@ class TestAdapterInit:
         assert ad.channel_access_token == "env-tok"
         assert ad.webhook_port == 1234
 
+    def test_multiplex_scope_overrides_poisoned_process_credentials(self, monkeypatch):
+        from agent.secret_scope import (
+            reset_secret_scope,
+            set_multiplex_active,
+            set_secret_scope,
+        )
+        from gateway.config import PlatformConfig
+
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "foreign-token")
+        monkeypatch.setenv("LINE_CHANNEL_SECRET", "foreign-secret")
+        set_multiplex_active(True)
+        token = set_secret_scope({
+            "LINE_CHANNEL_ACCESS_TOKEN": "profile-token",
+            "LINE_CHANNEL_SECRET": "profile-secret",
+        })
+        try:
+            ad = LineAdapter(PlatformConfig(enabled=True, extra={}))
+            assert ad.channel_access_token == "profile-token"
+            assert ad.channel_secret == "profile-secret"
+        finally:
+            reset_secret_scope(token)
+            set_multiplex_active(False)
+
     def test_csv_allowlist_parsed(self, monkeypatch):
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
         monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")

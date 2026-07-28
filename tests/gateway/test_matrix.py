@@ -1,5 +1,6 @@
 """Tests for Matrix platform adapter (mautrix-python backend)."""
 import asyncio
+import os
 import re
 import stat
 import sys
@@ -10,6 +11,15 @@ from unittest.mock import MagicMock, patch, AsyncMock
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageType
+
+
+@pytest.fixture(autouse=True)
+def _isolate_matrix_environment(monkeypatch, tmp_path):
+    """Keep host Matrix credentials and policy out of adapter unit tests."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    for key in list(os.environ):
+        if key.startswith("MATRIX_") or key.startswith("HERMES_MATRIX_"):
+            monkeypatch.delenv(key, raising=False)
 
 
 def _make_fake_mautrix():
@@ -984,6 +994,17 @@ class TestMatrixRenderingPayloads:
         assert "<strong>Bold</strong>" in content["formatted_body"]
 
     @pytest.mark.asyncio
+    async def test_silent_notification_metadata_sends_notice(self):
+        result = await self.adapter.send(
+            "!room:example.org",
+            "🔧 Running a tool",
+            metadata={"silent_notification": True},
+        )
+
+        assert result.success is True
+        assert self._sent_contents()[0]["msgtype"] == "m.notice"
+
+    @pytest.mark.asyncio
     async def test_thread_payload_uses_m_thread_with_reply_fallback(self):
         result = await self.adapter.send(
             "!room:example.org",
@@ -1030,6 +1051,35 @@ class TestMatrixRenderingPayloads:
         }
         assert content["m.new_content"]["body"] == "edited **body**"
         assert content["body"] == "* edited **body**"
+
+    @pytest.mark.asyncio
+    async def test_silent_notification_edit_stays_notice(self):
+        result = await self.adapter.edit_message(
+            "!room:example.org",
+            "$original",
+            "🔧 Tool finished",
+            metadata={"silent_notification": True},
+        )
+
+        assert result.success is True
+        content = self._sent_contents()[0]
+        assert content["msgtype"] == "m.notice"
+        assert content["m.new_content"]["msgtype"] == "m.notice"
+
+
+    def test_matrix_silent_progress_metadata_preserves_thread_context(self):
+        from gateway.config import Platform
+        from gateway.run import _silent_progress_metadata
+
+        metadata = _silent_progress_metadata(
+            {"thread_id": "$root"},
+            platform=Platform.MATRIX,
+        )
+
+        assert metadata == {
+            "thread_id": "$root",
+            "silent_notification": True,
+        }
 
     @pytest.mark.asyncio
     async def test_long_response_split_preserves_thread_context(self):
@@ -1193,6 +1243,16 @@ class TestMatrixDisplayName:
 # ---------------------------------------------------------------------------
 
 class TestMatrixModuleImport:
+    def test_store_path_follows_hermes_home_set_after_import(
+        self, tmp_path, monkeypatch
+    ):
+        import plugins.platforms.matrix.adapter as matrix_mod
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        expected = tmp_path.resolve() / "platforms" / "matrix" / "store"
+        assert matrix_mod._get_matrix_store_dir() == expected
+
     def test_module_importable_without_mautrix(self):
         """plugins.platforms.matrix.adapter must be importable even when mautrix is
         not installed — otherwise the gateway crashes for ALL platforms.
@@ -1471,6 +1531,7 @@ class TestMatrixAccessTokenAuth:
         mock_client.device_id = None
         mock_client.state_store = MagicMock()
         mock_client.sync_store = MagicMock()
+        mock_client.sync_store.get_next_batch = AsyncMock(return_value=None)
         mock_client.sync_store.put_next_batch = AsyncMock()
         mock_client.crypto = None
         mock_client.whoami = AsyncMock(
@@ -1629,6 +1690,11 @@ class TestMatrixE2EEHardFail:
 
         assert result is True
         assert adapter._encryption is False
+        mock_client.sync.assert_awaited_once_with(
+            since=None,
+            timeout=10000,
+            full_state=True,
+        )
         await adapter.disconnect()
 
     @pytest.mark.asyncio
@@ -1855,6 +1921,21 @@ class TestMatrixDeviceIdConfig:
 
         mc = config.platforms[Platform.MATRIX]
         assert "device_id" not in mc.extra
+
+
+class TestMatrixInitialSync:
+    @pytest.mark.asyncio
+    async def test_initial_sync_resumes_from_durable_next_batch(self):
+        from plugins.platforms.matrix.adapter import _matrix_initial_sync_kwargs
+
+        sync_store = MagicMock()
+        sync_store.get_next_batch = AsyncMock(return_value="persisted-since-token")
+
+        assert await _matrix_initial_sync_kwargs(sync_store) == {
+            "since": "persisted-since-token",
+            "timeout": 10000,
+            "full_state": True,
+        }
 
 
 class TestMatrixSyncLoop:
@@ -4531,6 +4612,78 @@ class TestMatrixClockSkewWarning:
 
 
 # ---------------------------------------------------------------------------
+# Room auto-thread allowlist
+# ---------------------------------------------------------------------------
+
+class TestMatrixRoomAutoThreadAllowlist:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._is_dm_room = AsyncMock(return_value=False)
+        self.adapter._get_display_name = AsyncMock(return_value="Alice")
+        self.adapter._background_read_receipt = MagicMock()
+        self.adapter._require_mention = False
+        self.adapter._matrix_session_scope = "room"
+        self.adapter._auto_thread = False
+        self.adapter._auto_thread_rooms = {"!threaded:ex"}
+
+    async def _context(self, room_id: str, event_id: str):
+        return await self.adapter._resolve_message_context(
+            room_id=room_id,
+            sender="@alice:ex",
+            event_id=event_id,
+            body="hello",
+            source_content={"body": "hello"},
+            relates_to={},
+        )
+
+    @pytest.mark.asyncio
+    async def test_selected_room_creates_thread_despite_room_session_scope(self):
+        ctx = await self._context("!threaded:ex", "$thread-root")
+
+        assert ctx is not None
+        _body, _is_dm, _chat_type, thread_id, _display, source = ctx
+        assert thread_id == "$thread-root"
+        assert source.thread_id == "$thread-root"
+
+    @pytest.mark.asyncio
+    async def test_unselected_room_remains_room_scoped(self):
+        ctx = await self._context("!plain:ex", "$plain-message")
+
+        assert ctx is not None
+        _body, _is_dm, _chat_type, thread_id, _display, source = ctx
+        assert thread_id is None
+        assert source.thread_id is None
+
+    def test_yaml_room_list_bridges_to_matrix_environment(self, monkeypatch):
+        from plugins.platforms.matrix.adapter import _apply_yaml_config
+
+        monkeypatch.delenv("MATRIX_AUTO_THREAD_ROOMS", raising=False)
+        _apply_yaml_config(
+            {},
+            {"auto_thread_rooms": ["!one:ex", "!two:ex"]},
+        )
+
+        assert os.environ["MATRIX_AUTO_THREAD_ROOMS"] == "!one:ex,!two:ex"
+
+    def test_adapter_reads_room_list_from_platform_config(self):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        adapter = MatrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="syt_test_token",
+                extra={
+                    "homeserver": "https://matrix.example.org",
+                    "user_id": "@bot:example.org",
+                    "auto_thread_rooms": ["!one:ex", "!two:ex"],
+                },
+            )
+        )
+
+        assert adapter._auto_thread_rooms == {"!one:ex", "!two:ex"}
+
+
+# ---------------------------------------------------------------------------
 # DM auto-thread
 # ---------------------------------------------------------------------------
 
@@ -4542,6 +4695,14 @@ class TestMatrixDmAutoThread:
         self.adapter._background_read_receipt = MagicMock()
         # Disable require_mention so DMs pass gating
         self.adapter._require_mention = False
+
+    def test_yaml_dm_auto_thread_bridges_to_matrix_environment(self, monkeypatch):
+        from plugins.platforms.matrix.adapter import _apply_yaml_config
+
+        monkeypatch.delenv("MATRIX_DM_AUTO_THREAD", raising=False)
+        _apply_yaml_config({}, {"dm_auto_thread": True})
+
+        assert os.environ["MATRIX_DM_AUTO_THREAD"] == "true"
 
     @pytest.mark.asyncio
     async def test_dm_auto_thread_enabled_creates_thread(self):
@@ -5312,3 +5473,22 @@ class TestMatrixDispatchSyncIsolation:
 
         assert ran["ok"] is True  # the sibling handler still ran
         assert "event handler failed" in caplog.text  # failure surfaced, not swallowed
+
+
+def test_read_crypto_store_device_id_from_real_sqlite(tmp_path):
+    """The restart guard must read the persisted device ID from crypto.db."""
+    import sqlite3
+
+    from plugins.platforms.matrix.adapter import _read_crypto_store_device_id
+
+    db_path = tmp_path / "crypto.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE crypto_account (account_id TEXT PRIMARY KEY, device_id TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO crypto_account (account_id, device_id) VALUES (?, ?)",
+            ("@wife:example.org", "WIFE_DEVICE"),
+        )
+
+    assert _read_crypto_store_device_id(db_path, "@wife:example.org") == "WIFE_DEVICE"

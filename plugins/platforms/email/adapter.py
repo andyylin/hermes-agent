@@ -31,6 +31,7 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email.utils import formatdate
 from email import encoders
+from html import unescape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -43,7 +44,6 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
 )
 from gateway.config import Platform, PlatformConfig
-from utils import env_int, env_bool
 
 logger = logging.getLogger(__name__)
 # Automated sender patterns — emails from these are silently ignored
@@ -158,16 +158,39 @@ def _is_automated_sender(address: str, headers: dict) -> bool:
             return True
     return False
     
+def _email_env(name: str, default: str = "") -> str:
+    """Read EMAIL/GATEWAY settings from the active profile secret scope."""
+    try:
+        from agent.secret_scope import get_secret
+    except ImportError:
+        return (os.getenv(name) or default).strip()
+
+    value = get_secret(name, default)
+    return (str(value) if value is not None else default).strip()
+
+
+def _email_env_int(name: str, default: int) -> int:
+    try:
+        return int(_email_env(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _email_env_bool(name: str, default: bool = False) -> bool:
+    raw = _email_env(name, "true" if default else "false").lower()
+    return raw in {"true", "1", "yes", "on"}
+
+
 def check_email_requirements() -> bool:
     """Check if email platform settings are available and non-blank.
 
     Treats blank/whitespace-only values as missing so an abandoned setup that
     left empty ``EMAIL_*`` keys in ``.env`` does not enable the platform (#40715).
     """
-    addr = os.getenv("EMAIL_ADDRESS", "").strip()
-    pwd = os.getenv("EMAIL_PASSWORD", "").strip()
-    imap = os.getenv("EMAIL_IMAP_HOST", "").strip()
-    smtp = os.getenv("EMAIL_SMTP_HOST", "").strip()
+    addr = _email_env("EMAIL_ADDRESS")
+    pwd = _email_env("EMAIL_PASSWORD")
+    imap = _email_env("EMAIL_IMAP_HOST")
+    smtp = _email_env("EMAIL_SMTP_HOST")
     return all([addr, pwd, imap, smtp])
 
 
@@ -454,14 +477,28 @@ def _extract_attachments(
     return attachments
 
 
+def _stable_thread_message_id(key: str, domain: str) -> Optional[str]:
+    """Build a deterministic Message-ID-like anchor for recurring notifications."""
+    key = str(key or "").strip().lower()
+    domain = str(domain or "").strip().lower()
+    if not key or not domain:
+        return None
+    safe_key = re.sub(r"[^a-z0-9._-]+", "-", key).strip(".-_")[:80]
+    safe_domain = re.sub(r"[^a-z0-9.-]+", "", domain).strip(".")
+    if not safe_key or not safe_domain:
+        return None
+    return f"<hermes-thread-{safe_key}@{safe_domain}>"
+
+
 class EmailAdapter(BasePlatformAdapter):
-    """Email gateway adapter using IMAP (receive) and SMTP (send)."""
+    """Email platform adapter."""
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.EMAIL)
 
-        # Resolve connection settings from the env vars first, then fall back to
-        # PlatformConfig.extra (address/imap_host/smtp_host) — the canonical dict
+        # Resolve connection settings from profile-owned PlatformConfig first,
+        # then the active profile secret scope — never process-global env under
+        # multiplex. PlatformConfig.extra is the canonical dict
         # gateway.config populates and that the "connected" check, the
         # send-helper, and `hermes config show` already read. Without the
         # fallback a config.yaml-only setup left these empty. Host/address values
@@ -469,13 +506,13 @@ class EmailAdapter(BasePlatformAdapter):
         # misleading ``[Errno 8] nodename nor servname`` (an unresolvable name)
         # instead of an obvious "host not set" error.
         extra = config.extra or {}
-        self._address = (os.getenv("EMAIL_ADDRESS", "") or extra.get("address", "")).strip()
-        self._password = os.getenv("EMAIL_PASSWORD", "")
-        self._imap_host = (os.getenv("EMAIL_IMAP_HOST", "") or extra.get("imap_host", "")).strip()
-        self._imap_port = env_int("EMAIL_IMAP_PORT", 993)
-        self._smtp_host = (os.getenv("EMAIL_SMTP_HOST", "") or extra.get("smtp_host", "")).strip()
-        self._smtp_port = env_int("EMAIL_SMTP_PORT", 587)
-        self._poll_interval = env_int("EMAIL_POLL_INTERVAL", 15)
+        self._address = (extra.get("address", "") or _email_env("EMAIL_ADDRESS")).strip()
+        self._password = _email_env("EMAIL_PASSWORD")
+        self._imap_host = (extra.get("imap_host", "") or _email_env("EMAIL_IMAP_HOST")).strip()
+        self._imap_port = int(extra.get("imap_port") or _email_env_int("EMAIL_IMAP_PORT", 993))
+        self._smtp_host = (extra.get("smtp_host", "") or _email_env("EMAIL_SMTP_HOST")).strip()
+        self._smtp_port = int(extra.get("smtp_port") or _email_env_int("EMAIL_SMTP_PORT", 587))
+        self._poll_interval = int(extra.get("poll_interval") or _email_env_int("EMAIL_POLL_INTERVAL", 15))
 
         # Skip attachments — configured via config.yaml:
         #   platforms:
@@ -499,7 +536,7 @@ class EmailAdapter(BasePlatformAdapter):
         # gate below is skipped.
         if "require_authenticated_sender" in extra:
             self._require_authenticated_sender = bool(extra["require_authenticated_sender"])
-        elif env_bool("EMAIL_TRUST_FROM_HEADER", False):
+        elif _email_env_bool("EMAIL_TRUST_FROM_HEADER", False):
             self._require_authenticated_sender = False
         else:
             self._require_authenticated_sender = True
@@ -508,7 +545,7 @@ class EmailAdapter(BasePlatformAdapter):
         # own receiving server (defends against an injected header that sorts
         # first). Defaults to the From-domain of the agent's own address.
         self._authserv_id = (
-            extra.get("authserv_id", "") or os.getenv("EMAIL_AUTHSERV_ID", "")
+            extra.get("authserv_id", "") or _email_env("EMAIL_AUTHSERV_ID")
         ).strip().lower()
 
         # Track message IDs we've already processed to avoid duplicates
@@ -791,8 +828,8 @@ class EmailAdapter(BasePlatformAdapter):
         """
         truthy = {"true", "1", "yes"}
         return (
-            os.getenv("EMAIL_ALLOW_ALL_USERS", "").strip().lower() in truthy
-            or os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in truthy
+            _email_env("EMAIL_ALLOW_ALL_USERS").lower() in truthy
+            or _email_env("GATEWAY_ALLOW_ALL_USERS").lower() in truthy
         )
 
     @staticmethod
@@ -806,8 +843,8 @@ class EmailAdapter(BasePlatformAdapter):
         and the authentication gate is unnecessary.
         """
         return bool(
-            os.getenv("EMAIL_ALLOWED_USERS", "").strip()
-            or os.getenv("GATEWAY_ALLOWED_USERS", "").strip()
+            _email_env("EMAIL_ALLOWED_USERS")
+            or _email_env("GATEWAY_ALLOWED_USERS")
         )
 
     async def _dispatch_message(self, msg_data: Dict[str, Any]) -> None:
@@ -828,10 +865,10 @@ class EmailAdapter(BasePlatformAdapter):
         # that the gateway will never authorize.  Without this early guard,
         # a race between dispatch and authorization can result in the adapter
         # sending a reply even though the handler returned None.
-        allowed_raw = os.getenv("EMAIL_ALLOWED_USERS", "").strip()
+        allowed_raw = _email_env("EMAIL_ALLOWED_USERS")
         if not allowed_raw:
-            if os.getenv("EMAIL_ALLOW_ALL_USERS", "").strip().lower() not in {"true", "1", "yes"} and (
-                os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() not in {"true", "1", "yes"}
+            if _email_env("EMAIL_ALLOW_ALL_USERS").lower() not in {"true", "1", "yes"} and (
+                _email_env("GATEWAY_ALLOW_ALL_USERS").lower() not in {"true", "1", "yes"}
             ):
                 logger.debug(
                     "[Email] Dropping sender at dispatch — EMAIL_ALLOWED_USERS is unset "
@@ -935,8 +972,23 @@ class EmailAdapter(BasePlatformAdapter):
         """Send an email reply to the given address."""
         try:
             loop = asyncio.get_running_loop()
+            meta = metadata or {}
+            subject = meta.get("subject")
+            suppress_threading = bool(meta.get("suppress_threading"))
+            thread_key = (
+                meta.get("thread_anchor_key")
+                or meta.get("email_thread_key")
+                or meta.get("thread_key")
+            )
             message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, content, reply_to
+                None,
+                self._send_email,
+                chat_id,
+                content,
+                reply_to,
+                subject,
+                suppress_threading,
+                thread_key,
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -958,21 +1010,35 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         reply_to_msg_id: Optional[str] = None,
+        subject_override: Optional[str | Dict[str, Any]] = None,
+        suppress_threading: bool = False,
+        thread_anchor_key: Optional[str] = None,
     ) -> str:
+
         """Send an email via SMTP. Runs in executor thread."""
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        # Thread context for reply
+        # Thread context for reply, unless the caller supplies a fresh subject.
+        if isinstance(subject_override, dict):
+            suppress_threading = bool(subject_override.get("suppress_threading"))
+            thread_anchor_key = subject_override.get("thread_anchor_key") or thread_anchor_key
+            subject_override = subject_override.get("subject")
+        notification_like = bool(subject_override) or suppress_threading
         ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
+        if subject_override:
+            subject = str(subject_override)
+        else:
+            subject = ctx.get("subject", "Hermes Agent")
+            if not subject.startswith("Re:"):
+                subject = f"Re: {subject}"
         msg["Subject"] = subject
 
         # Threading headers
-        original_msg_id = reply_to_msg_id or ctx.get("message_id")
+        domain = self._address.split("@", 1)[1] if "@" in self._address else ""
+        thread_anchor_msg_id = _stable_thread_message_id(str(thread_anchor_key or ""), domain)
+        original_msg_id = thread_anchor_msg_id or (None if suppress_threading else (reply_to_msg_id or ctx.get("message_id")))
         if original_msg_id:
             msg["In-Reply-To"] = original_msg_id
             msg["References"] = original_msg_id
@@ -981,7 +1047,15 @@ class EmailAdapter(BasePlatformAdapter):
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
         msg["Message-ID"] = msg_id
 
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+        if notification_like:
+            from tools.email_rendering import append_notification_reference_footer
+
+            body = append_notification_reference_footer(
+                body,
+                subject=subject,
+                ask="investigate this REF",
+            )
+        self._attach_body(msg, body)
 
         smtp = self._connect_smtp()
         try:
@@ -995,6 +1069,46 @@ class EmailAdapter(BasePlatformAdapter):
 
         logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, subject)
         return msg_id
+
+    @staticmethod
+    def _looks_like_html(body: str) -> bool:
+        """Return True for complete or fragment HTML bodies worth sending as text/html."""
+        return bool(re.search(r"</?(?:html|body|h[1-6]|p|ul|ol|li|br|strong|em|table|tr|td|div|span)\b", body, re.IGNORECASE))
+
+    @staticmethod
+    def _html_to_plain_text(html: str) -> str:
+        """Best-effort plain-text fallback for multipart/alternative HTML email."""
+        text = re.sub(r"<\s*br\s*/?>", "\n", html, flags=re.IGNORECASE)
+        text = re.sub(r"<\s*/\s*(?:p|div|h[1-6]|li|tr)\s*>", "\n", text, flags=re.IGNORECASE)
+        text = re.sub(r"<\s*li\b[^>]*>", "- ", text, flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", "", text)
+        text = unescape(text)
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    @staticmethod
+    def _plain_text_to_html(body: str) -> str:
+        """Render Markdown-ish notification text as safe email HTML."""
+        from tools.email_rendering import plain_text_to_html
+
+        return plain_text_to_html(body)
+
+    def _attach_body(self, msg: MIMEMultipart, body: str) -> None:
+        """Attach email body as HTML when content is HTML, with a plain fallback."""
+        if self._looks_like_html(body):
+            from tools.email_rendering import sanitize_email_html
+
+            body = sanitize_email_html(body)
+            alt = MIMEMultipart("alternative")
+            alt.attach(MIMEText(self._html_to_plain_text(body), "plain", "utf-8"))
+            alt.attach(MIMEText(body, "html", "utf-8"))
+            msg.attach(alt)
+        else:
+            alt = MIMEMultipart("alternative")
+            alt.attach(MIMEText(body, "plain", "utf-8"))
+            alt.attach(MIMEText(self._plain_text_to_html(body), "html", "utf-8"))
+            msg.attach(alt)
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Email has no typing indicator — no-op."""
@@ -1095,7 +1209,7 @@ class EmailAdapter(BasePlatformAdapter):
         msg["Message-ID"] = msg_id
 
         if body:
-            msg.attach(MIMEText(body, "plain", "utf-8"))
+            self._attach_body(msg, body)
 
         for file_path in file_paths:
             p = Path(file_path)
@@ -1230,6 +1344,7 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    subject=None,
 ):
     """Out-of-process Email delivery via SMTP (one-shot). Implements the
     standalone_sender_fn contract; replaces the legacy _send_email helper."""
@@ -1237,11 +1352,11 @@ async def _standalone_send(
     import ssl as _ssl
 
     extra = getattr(pconfig, "extra", {}) or {}
-    address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
-    password = os.getenv("EMAIL_PASSWORD", "")
-    smtp_host = extra.get("smtp_host") or os.getenv("EMAIL_SMTP_HOST", "")
+    address = extra.get("address") or get_secret("EMAIL_ADDRESS", "") or ""
+    password = get_secret("EMAIL_PASSWORD", "") or ""
+    smtp_host = extra.get("smtp_host") or get_secret("EMAIL_SMTP_HOST", "") or ""
     try:
-        smtp_port = int(os.getenv("EMAIL_SMTP_PORT", "587"))
+        smtp_port = int(extra.get("smtp_port") or get_secret("EMAIL_SMTP_PORT", "587") or "587")
     except (ValueError, TypeError):
         smtp_port = 587
 
@@ -1252,8 +1367,40 @@ async def _standalone_send(
         msg = MIMEMultipart("alternative")
         msg["From"] = address
         msg["To"] = chat_id
-        msg["Subject"] = "Hermes Agent"
+        thread_anchor_key = None
+        if isinstance(subject, dict):
+            suppress_threading = bool(subject.get("suppress_threading"))
+            thread_anchor_key = subject.get("thread_anchor_key")
+            subject = subject.get("subject")
+        msg["Subject"] = subject or "Hermes Agent"
         msg["Date"] = formatdate(localtime=True)
+        domain = address.split("@", 1)[1] if "@" in address else ""
+        thread_anchor_msg_id = _stable_thread_message_id(str(thread_anchor_key or ""), domain)
+        if thread_anchor_msg_id:
+            msg["In-Reply-To"] = thread_anchor_msg_id
+            msg["References"] = thread_anchor_msg_id
+        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{domain or 'localhost'}>"
+        msg["Message-ID"] = msg_id
+
+        if subject:
+            from tools.email_rendering import append_notification_reference_footer
+
+            message = append_notification_reference_footer(
+                message or "",
+                subject=str(subject),
+                ask="investigate this REF",
+            )
+
+        if _standalone_looks_like_html(message or ""):
+            from tools.email_rendering import sanitize_email_html
+
+            html_body = sanitize_email_html(message or "")
+            plain_body = _standalone_html_to_plain_text(html_body)
+        else:
+            plain_body = message or ""
+            html_body = _standalone_plain_text_to_html(plain_body)
+        msg.attach(MIMEText(plain_body, "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
 
         if _standalone_looks_like_html(message or ""):
             plain_body = _standalone_html_to_plain_text(message or "")
@@ -1269,7 +1416,7 @@ async def _standalone_send(
         server.login(address, password)
         server.send_message(msg)
         server.quit()
-        return {"success": True, "platform": "email", "chat_id": chat_id}
+        return {"success": True, "platform": "email", "chat_id": chat_id, "message_id": msg_id}
     except Exception as e:
         try:
             from tools.send_message_tool import _error as _e
@@ -1285,8 +1432,7 @@ def _is_connected(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
     if extra.get("address"):
         return True
-    import hermes_cli.gateway as gateway_mod
-    return bool((gateway_mod.get_env_value("EMAIL_ADDRESS") or "").strip())
+    return bool(_email_env("EMAIL_ADDRESS"))
 
 
 def _build_adapter(config):

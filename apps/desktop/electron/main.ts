@@ -4977,12 +4977,12 @@ async function waitForHermes(baseUrl, token, signal?, authMode?) {
   })
 }
 
-function getWindowButtonPosition() {
+function getWindowButtonPosition(win = mainWindow) {
   if (!IS_MAC) {
     return null
   }
 
-  return mainWindow?.getWindowButtonPosition?.() || WINDOW_BUTTON_POSITION
+  return win?.getWindowButtonPosition?.() || WINDOW_BUTTON_POSITION
 }
 
 function getNativeOverlayWidth() {
@@ -4995,7 +4995,7 @@ function getWindowState(win = mainWindow) {
     isMinimized: Boolean(win?.isMinimized?.()),
     isVisible: Boolean(win?.isVisible?.()),
     nativeOverlayWidth: getNativeOverlayWidth(),
-    windowButtonPosition: getWindowButtonPosition()
+    windowButtonPosition: getWindowButtonPosition(win)
   }
 }
 
@@ -9662,7 +9662,9 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
 })
 
-ipcMain.handle('hermes:profile:get', async () => ({ profile: readActiveDesktopProfile() }))
+ipcMain.handle('hermes:profile:get', async () => (
+  buildProfileBridgePayload(readActiveDesktopProfile(), HERMES_HOME)
+))
 ipcMain.handle('hermes:profile:set', async (_event, name) => {
   const next = writeActiveDesktopProfile(name)
 

@@ -289,6 +289,14 @@ describe('ToolsetConfigPanel', () => {
   })
 
   it('saves an API key for a provider env var', async () => {
+    const keyedConfig = config()
+    keyedConfig.active_provider = 'ElevenLabs'
+    keyedConfig.providers = keyedConfig.providers.map(provider => ({
+      ...provider,
+      is_active: provider.name === 'ElevenLabs'
+    }))
+    getToolsetConfig.mockResolvedValue(keyedConfig)
+
     const { ToolsetConfigPanel } = await import('./toolset-config-panel')
     render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
 
