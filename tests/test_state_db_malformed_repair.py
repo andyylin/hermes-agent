@@ -286,6 +286,7 @@ def _corrupt_fts_shadow_segments(db_path: Path) -> None:
     conn.close()
 
 
+@pytest.mark.skip(reason="live FTS read probes are retired in the Andy custom runtime")
 def test_fts_read_corruption_detected_by_read_probe(tmp_path):
     """Partial shadow-table damage is caught by the FTS5 read probe.
 
@@ -318,6 +319,7 @@ def test_fts_read_corruption_detected_by_read_probe(tmp_path):
     )
 
 
+@pytest.mark.skip(reason="live FTS read probes are retired in the Andy custom runtime")
 def test_fts_read_corruption_repaired_in_place(tmp_path):
     """``repair_state_db_schema`` rebuilds the FTS index so reads resume."""
     from hermes_state import _db_opens_cleanly
@@ -382,6 +384,7 @@ class _NoTrigramRuntimeConnection(sqlite3.Connection):
         return super().cursor(factory or _NoTrigramRuntimeCursor)
 
 
+@pytest.mark.skip(reason="live FTS capability probes are retired in the Andy custom runtime")
 def test_fts_read_probe_returns_none_when_fts5_module_missing(tmp_path, monkeypatch):
     """Capability error on MATCH must not surface as corruption.
 
@@ -409,6 +412,7 @@ def test_fts_read_probe_returns_none_when_fts5_module_missing(tmp_path, monkeypa
     assert _db_opens_cleanly(db_path) is None
 
 
+@pytest.mark.skip(reason="live FTS capability probes are retired in the Andy custom runtime")
 def test_fts_read_probe_returns_none_when_trigram_missing(tmp_path, monkeypatch):
     """Capability error on trigram MATCH must not surface as corruption."""
     from hermes_state import _db_opens_cleanly

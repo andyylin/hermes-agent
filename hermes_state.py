@@ -1059,6 +1059,24 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         bpath = _backup_db_file(db_path)
         report["backup_path"] = str(bpath) if bpath else None
 
+    # Rebuild stale canonical B-tree indexes before touching derived FTS
+    # remnants. REINDEX rewrites indexes from canonical table rows and is the
+    # least-destructive repair for "wrong # of entries in index" corruption.
+    try:
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        try:
+            conn.execute("REINDEX")
+            conn.commit()
+        finally:
+            conn.close()
+        if _db_opens_cleanly(db_path) is None:
+            report["repaired"] = True
+            report["strategy"] = "reindex_btree"
+            logger.warning("state.db B-tree indexes rebuilt via REINDEX: %s", db_path)
+            return report
+    except sqlite3.DatabaseError as exc:
+        logger.warning("state.db REINDEX pass failed: %s", exc)
+
     # ── Strategy 0: drop all FTS schema (live FTS is retired — never rebuild)
     # When sqlite_master has duplicate FTS definitions, ordinary DROP TABLE
     # fails with "malformed database schema". Prefer writable_schema surgery
@@ -1819,6 +1837,16 @@ class SessionDB:
         ``writable_schema`` surgery runs only when residual ``messages_fts%``
         rows remain after DROP (e.g. corrupt shadows that reject DROP TABLE).
         """
+        def _clear_fts_meta() -> None:
+            try:
+                count = cursor.execute(
+                    "SELECT COUNT(*) FROM state_meta WHERE key LIKE 'fts_%'"
+                ).fetchone()[0]
+                if count:
+                    cursor.execute("DELETE FROM state_meta WHERE key LIKE 'fts_%'")
+            except sqlite3.DatabaseError:
+                pass
+
         try:
             present = cursor.execute(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'messages_fts%'"
@@ -1827,12 +1855,15 @@ class SessionDB:
             # Schema unreadable (malformed master) — leave offline repair to
             # repair_state_db_schema; still mark live FTS disabled.
             present = 0
+            _clear_fts_meta()
             self._fts_enabled = False
             self._trigram_available = False
             return
 
         if not present:
-            # Healthy no-FTS DB: zero schema mutation on open.
+            # Healthy no-FTS DB: zero schema mutation unless stale FTS metadata
+            # from an older runtime still needs removal.
+            _clear_fts_meta()
             self._fts_enabled = False
             self._trigram_available = False
             return
@@ -1871,6 +1902,7 @@ class SessionDB:
                     cursor.execute("PRAGMA writable_schema=OFF")
                 except sqlite3.DatabaseError:
                     pass
+        _clear_fts_meta()
         self._fts_enabled = False
         self._trigram_available = False
 

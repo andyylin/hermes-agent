@@ -7126,6 +7126,10 @@ def _(rid, params: dict) -> dict:
                             "started_at": s.get("started_at") or 0,
                             "message_count": s.get("message_count") or 0,
                             "source": s.get("source") or "",
+                            "last_active": s.get("last_active") or 0,
+                            "cwd": s.get("cwd") or "",
+                            "parent_session_id": s.get("parent_session_id"),
+                            "profile_name": s.get("profile_name"),
                         }
                         for s in rows
                     ]

@@ -3385,34 +3385,14 @@ DEFAULT_CONFIG = {
         # GBs of disk on heavy users.  Opt in only if you have an external
         # tool that consumes the JSON files directly.
         "write_json_snapshots": False,
-        # Search-index (FTS) storage optimization — the compact v23 layout
-        # that drops duplicate content copies and stops trigram-indexing tool
-        # output (typically reclaims ~60%+ of state.db on heavy users). It is
-        # OPT-IN: existing databases keep their working legacy index until the
-        # user runs `hermes sessions optimize-storage`, because the rebuild is
-        # disk-heavy and long on large DBs (see that command's disk preflight).
-        #
-        #   "advise" (default): `hermes update` prints a one-line notice with
-        #     the reclaimable size and the command, when a legacy index is
-        #     detected. Nothing is changed automatically.
-        #   "require": the notice is shown as a REQUIRED upgrade (firmer copy),
-        #     and future tooling may gate on it. Flip this default in a future
-        #     release when we're ready to make the v23 layout mandatory — the
-        #     command, progress bar, and resumability are already in place, so
-        #     enforcement is a copy/gating change, not new migration code.
-        #   "off": suppress the notice entirely.
-        "fts_optimize_notice": "advise",
-        # CJK-bigram search index (messages_fts_cjk, cjk_unicode61 loadable
-        # tokenizer). When the extension is built (native/fts5_cjk/build.sh →
-        # ~/.hermes/lib/libfts5_cjk.so), 1-2 char CJK terms (일본, 项目, ...)
-        # get index-speed exact matching instead of LIKE full-table scans.
-        # True (default): use the index when the extension is present; the
-        # setting is inert when it isn't. False: never load the extension or
-        # serve the cjk index. Bridged to HERMES_CJK_FTS (internal carrier).
-        "cjk_fts": True,
+        # Compatibility keys for upstream config parsing. The custom runtime
+        # retires live FTS and therefore has no storage migration to advertise.
+        "fts_optimize_notice": "off",
+        # Compatibility no-op: canonical LIKE search owns Latin and CJK recall,
+        # and optional tokenizer extensions cannot reactivate live indexes.
+        "cjk_fts": False,
         # Slow session-search log threshold in milliseconds: searches at or
-        # above it log one INFO line with the routing path taken (fts_cjk /
-        # fts5 / trigram / like_scan) so latency regressions stay
+        # above it log one INFO line with the canonical like_scan path.
         # attributable per query shape. 0 logs every search. Bridged to
         # HERMES_SEARCH_SLOW_MS (internal carrier).
         "search_slow_ms": 1000,

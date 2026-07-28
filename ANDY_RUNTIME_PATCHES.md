@@ -196,6 +196,17 @@ Generic workspace metadata is retained because it does not assign, move, or own 
 - **Historical reconciliation-only material**
   - Merge-resolution commits, stale ledgers, fixture-only repairs with no surviving behavior, dead helper scaffolding, malformed snapshots, and duplicated predecessor implementations.
 
+## Latest-upstream policy divergence
+
+The custom runtime intentionally keeps live SQLite FTS retired. Latest upstream's
+new CJK tokenizer, live FTS migration, external-content FTS, and FTS read-probe
+tests are therefore marked skipped in this fork with explicit reasons. They are
+replaced by active coverage for canonical LIKE search, no-FTS fresh/open/migration
+behavior, stale FTS object and metadata retirement, nonblocking WAL read paths,
+PASSIVE checkpointing, connection cleanup, canonical b-tree REINDEX repair, and
+recovered-database verification without derived indexes. This is an intentional
+safety policy, not a temporary CI waiver.
+
 ## Verification contract
 
 The retained-overlay parent previously passed independent review and carried regression coverage for profile-scoped authorization, SMTP scope, Matrix sync, Desktop-local plugin discovery, encrypted Bitwarden fallback, raw-HTML sanitization, cron scope lifetime, and sibling policy paths. That evidence explains the retained contracts but does **not** transfer to this new composition SHA.

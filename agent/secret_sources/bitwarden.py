@@ -157,13 +157,7 @@ def _disk_cache_path(home_path: Optional[Path] = None) -> Path:
 
 
 def _purge_plaintext_disk_cache(home_path: Optional[Path] = None) -> None:
-    """Remove the legacy plaintext cache or fail closed.
-
-    ``DiskCache.clear`` is deliberately best-effort for ordinary cache
-    housekeeping, but encrypted mode is a security boundary: continuing after
-    an unlink failure would leave raw secrets on disk while claiming encrypted
-    caching is active.
-    """
+    """Remove the legacy plaintext cache or fail closed."""
     path = _disk_cache_path(home_path)
     try:
         path.unlink()
@@ -469,7 +463,6 @@ def _write_encrypted_disk_cache(
         payload = {
             "version": _ENCRYPTED_CACHE_VERSION,
             "key": serialized_key,
-            "fetched_at": entry.fetched_at,
             "salt": _b64e(salt),
             "nonce": _b64e(nonce),
             "ciphertext": _b64e(ciphertext),
@@ -482,18 +475,21 @@ def _write_encrypted_disk_cache(
                 json.dump(payload, f)
             os.chmod(tmp, 0o600)
             os.replace(tmp, path)
-            # Encrypted mode is exclusive. Plaintext removal is a security
-            # boundary, not best-effort cleanup: abort if it cannot be removed.
-            _purge_plaintext_disk_cache(home_path)
+            # A successful encrypted write completes migration; remove the
+            # legacy plaintext cache so stale secrets cannot remain on disk.
+            try:
+                _disk_cache_path(home_path).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
         except BaseException:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
             raise
-    except RuntimeError:
-        raise
-    except Exception:  # noqa: BLE001 — encryption write remains best-effort
+    except Exception:  # noqa: BLE001 — best-effort cache only
         return
 
 
@@ -517,12 +513,6 @@ def _read_encrypted_disk_cache(
             return None
         if payload.get("key") != serialized_key:
             return None
-        fetched_at = payload.get("fetched_at")
-        if not isinstance(fetched_at, (int, float)):
-            return None
-        entry_age = time.time() - float(fetched_at)
-        if entry_age < 0 or entry_age > max_age_seconds:
-            return None
         salt = _b64d(str(payload.get("salt", "")))
         nonce = _b64d(str(payload.get("nonce", "")))
         ciphertext = _b64d(str(payload.get("ciphertext", "")))
@@ -536,6 +526,9 @@ def _read_encrypted_disk_cache(
         secrets = inner.get("secrets")
         inner_fetched_at = inner.get("fetched_at")
         if not isinstance(secrets, dict) or not isinstance(inner_fetched_at, (int, float)):
+            return None
+        entry_age = time.time() - float(inner_fetched_at)
+        if entry_age < 0 or entry_age > max_age_seconds:
             return None
         typed = {
             k: v for k, v in secrets.items()
@@ -625,30 +618,60 @@ def fetch_bitwarden_secrets(
     try:
         secrets, warnings = _run_bws_list(bws, access_token, project_id, server_url)
     except RuntimeError as exc:
+        # Live fetch failed. Fall back to a stale disk cache ONLY for
+        # transport-level failures (network down, DNS error, transient BWS
+        # outage / timeout) — never for AUTH_FAILED or a malformed-output
+        # INTERNAL error, where serving old secrets would mask a real
+        # config/credential problem the caller needs to see.  Without this
+        # fallback a fleet of bots sharing one BWS project all stop working
+        # on a single network blip.
+        #
+        # Two fallback tiers share the transport-only gate:
+        # * encrypted cache (opt-in) — AES-GCM payload keyed off the
+        #   bootstrap token, with its own max_stale_seconds window.  When
+        #   enabled it is the ONLY fallback consulted: the whole point is
+        #   that the at-rest payload is never plaintext, so we don't
+        #   quietly serve the plaintext file alongside it.
+        # * plaintext disk cache (default) — the ordinary DiskCache file.
+        #   `cache_ttl_seconds <= 0` means the caller opted out of caching
+        #   entirely (DiskCache.read/write both short-circuit on it) —
+        #   honor that on the fallback path too.  `ttl_seconds=inf` on the
+        #   read bypasses freshness (we explicitly want a stale hit); the
+        #   caller's real TTL gates whether we even attempt the read.
         kind = _classify_bws_error(str(exc))
-        if (
-            use_cache
-            and encrypted_cache_enabled
-            and kind in {ErrorKind.NETWORK, ErrorKind.TIMEOUT}
-        ):
-            stale = _read_encrypted_disk_cache(
-                cache_key=cache_key,
-                access_token=access_token,
-                max_age_seconds=encrypted_cache_max_stale_seconds,
-                home_path=home_path,
-            )
-            if stale is not None:
-                return stale.secrets, [
-                    "Using stale encrypted Bitwarden cache after "
-                    f"{kind.value} fetching BWS secrets"
-                ]
+        if use_cache and kind in (ErrorKind.NETWORK, ErrorKind.TIMEOUT):
+            if encrypted_cache_enabled:
+                stale = _read_encrypted_disk_cache(
+                    cache_key=cache_key,
+                    access_token=access_token,
+                    max_age_seconds=encrypted_cache_max_stale_seconds,
+                    home_path=home_path,
+                )
+                if stale is not None:
+                    age = max(0.0, time.time() - stale.fetched_at)
+                    _CACHE[cache_key] = stale
+                    return stale.secrets, [
+                        f"bws live fetch failed ({exc}); falling back to "
+                        f"stale ENCRYPTED disk cache ({int(age)}s old)"
+                    ]
+            elif cache_ttl_seconds > 0:
+                stale = _DISK_CACHE.read(cache_key, float("inf"), home_path)
+                if stale is not None:
+                    age = max(0.0, time.time() - stale.fetched_at)
+                    _CACHE[cache_key] = stale
+                    return stale.secrets, [
+                        f"bws live fetch failed ({exc}); "
+                        f"falling back to stale disk cache ({int(age)}s old)"
+                    ]
         raise
-
     entry = _CachedFetch(secrets=secrets, fetched_at=time.time())
     if use_cache:
         if cache_ttl_seconds > 0:
             _CACHE[cache_key] = entry
         if encrypted_cache_enabled:
+            # Encryption is the storage policy; max_stale_seconds only controls
+            # whether an outage may consume the last-good entry.  Never fall
+            # back to the plaintext cache just because stale fallback is off.
             _write_encrypted_disk_cache(
                 cache_key=cache_key,
                 access_token=access_token,
@@ -1061,7 +1084,7 @@ def _classify_bws_error(message: str) -> ErrorKind:
 
 
 def clear_caches(home_path: Optional[Path] = None) -> None:
-    """Drop in-process, plaintext disk, and encrypted disk caches.
+    """Drop in-process AND disk caches (plaintext and encrypted).
 
     Used after a token rotation (`hermes secrets bitwarden token`) so the
     next startup fetches fresh with the new credential instead of serving

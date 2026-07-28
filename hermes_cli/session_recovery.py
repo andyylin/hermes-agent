@@ -1050,6 +1050,7 @@ def _verify_recovered_database(
             ).fetchall()
         }
         verification["fts_meta"] = meta
+        verification["pending_fts_keys"] = []
         if meta:
             verification["errors"].append(
                 "retired FTS metadata remains in the recovered database"

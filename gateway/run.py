@@ -338,6 +338,20 @@ def _silent_progress_metadata(
     return merged
 
 
+def _seed_hygiene_system_prompt(
+    agent: Any,
+    session_row: Optional[Dict[str, Any]],
+) -> bool:
+    """Seed hygiene with the exact persisted prompt, never a rebuilt variant."""
+    stored_prompt = ""
+    if isinstance(session_row, dict):
+        raw_prompt = session_row.get("system_prompt")
+        if isinstance(raw_prompt, str) and raw_prompt.strip():
+            stored_prompt = raw_prompt
+    agent._cached_system_prompt = stored_prompt
+    return bool(stored_prompt)
+
+
 def _is_transient_network_error(exc: BaseException) -> bool:
     """Return True for transient network errors safe to log + swallow.
 
@@ -17704,7 +17718,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             try:
-                if not await self._wait_for_lifecycle_delivery_ready(adapter, platform):
+                if not await self._wait_for_lifecycle_delivery_ready(transport.adapter, platform):
                     continue
                 metadata = self._thread_metadata_for_target(
                     platform,

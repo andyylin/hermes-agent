@@ -50,21 +50,19 @@ def test_env_survives_when_config_omits_search_knobs(tmp_path, monkeypatch):
 
 
 def test_search_knobs_have_documented_defaults():
-    """The advertised config surface must exist in DEFAULT_CONFIG (no
-    user-facing env switch): cjk index default ON, slow-search log at 1s."""
+    """The custom runtime advertises canonical LIKE and a 1s slow-search log."""
     from hermes_cli.config import DEFAULT_CONFIG
 
-    assert DEFAULT_CONFIG["sessions"]["cjk_fts"] is True
+    assert DEFAULT_CONFIG["sessions"]["cjk_fts"] is False
     assert DEFAULT_CONFIG["sessions"]["search_slow_ms"] == 1000
 
 
 def test_config_false_disables_cjk_semantics(tmp_path, monkeypatch):
-    """The bridged 'False' string must parse as OFF in hermes_state."""
+    """Compatibility env values cannot reactivate retired live FTS."""
     from hermes_state import _cjk_fts_config_enabled
 
-    monkeypatch.setenv("HERMES_CJK_FTS", "False")
-    assert not _cjk_fts_config_enabled()
-    monkeypatch.setenv("HERMES_CJK_FTS", "True")
-    assert _cjk_fts_config_enabled()
+    for value in ("False", "True"):
+        monkeypatch.setenv("HERMES_CJK_FTS", value)
+        assert not _cjk_fts_config_enabled()
     monkeypatch.delenv("HERMES_CJK_FTS", raising=False)
-    assert _cjk_fts_config_enabled()  # default on
+    assert not _cjk_fts_config_enabled()

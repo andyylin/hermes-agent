@@ -1103,6 +1103,7 @@ class TestSessionLifecycle:
         finally:
             db.close()
 
+    @pytest.mark.skip(reason="live FTS migrations are retired in the Andy custom runtime")
     def test_v11_migration_retires_fts_without_recreating(
         self, tmp_path, monkeypatch
     ):
@@ -4418,6 +4419,7 @@ class TestSchemaInit:
 
         migrated_db.close()
 
+    @pytest.mark.skip(reason="live FTS migrations are retired in the Andy custom runtime")
     def test_v9_migration_skips_v10_trigram_backfill_before_v11_rebuild(self, tmp_path, monkeypatch):
         """Direct v9→current migration should do only the v23 FTS rebuild.
 
@@ -5866,6 +5868,7 @@ class TestFTS5ToolCallIndexing:
         assert len(db.search_messages("RENAMEDTOOL")) == 1
 
 
+@pytest.mark.skip(reason="live FTS tool-call indexes are retired in the Andy custom runtime")
 class TestFTS5ToolCallMigration:
     """v11 migration: pre-existing state.db with old external-content FTS tables
     must be re-indexed so tool_name / tool_calls become searchable after upgrade."""
@@ -5973,6 +5976,7 @@ class TestFTS5ToolCallMigration:
             session_db.close()
 
 
+@pytest.mark.skip(reason="live FTS storage migrations are retired in the Andy custom runtime")
 class TestFTSExternalContentMigration:
     """v23 migration: inline-mode FTS tables (v11-v22) are rebuilt as
     external-content tables, and role='tool' rows are excluded from the
