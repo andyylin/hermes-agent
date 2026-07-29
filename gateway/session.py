@@ -1157,6 +1157,14 @@ class AsyncSessionStore:
         return _offloaded
 
 
+class TranscriptQueueFullError(RuntimeError):
+    """Raised when transcript persistence backpressure reaches its hard cap.
+
+    Existing pending messages are preserved; callers must surface the failure
+    rather than accepting new work that cannot be durably recorded.
+    """
+
+
 class SessionStore:
     """
     Manages session storage and retrieval.
@@ -1193,7 +1201,6 @@ class SessionStore:
         self._transcript_reroutes: Dict[str, str] = {}
         self._dirty_transcripts: Dict[str, List[Dict[str, Any]]] = {}
         self._transcript_append_failures: Dict[str, int] = {}
-        self._fts_rebuild_attempted = False
         self._has_active_processes_fn = has_active_processes_fn
         # Whether to keep writing the legacy sessions.json mirror alongside
         # the primary gateway_routing table in state.db. Default True for
@@ -2952,16 +2959,21 @@ class SessionStore:
         """
         with self._transcript_retry_lock:
             pending = self._dirty_transcripts.setdefault(session_id, [])
-            pending.append(dict(message))
-            # Cap pending messages per session to avoid unbounded memory
-            # growth when the DB is persistently broken. Drop the oldest.
-            if len(pending) > self._MAX_PENDING_PER_SESSION:
-                dropped = pending.pop(0)
-                logger.warning(
-                    "Session DB transcript pending queue full for %s "
-                    "(cap=%d); dropping oldest message to make room",
-                    session_id, self._MAX_PENDING_PER_SESSION,
+            # Bound memory without silently evicting older canonical messages.
+            # Once full, apply explicit backpressure so callers surface the
+            # persistence failure instead of pretending a new message was saved.
+            if len(pending) >= self._MAX_PENDING_PER_SESSION:
+                logger.error(
+                    "Session DB transcript pending queue full for %s (cap=%d); "
+                    "rejecting new append",
+                    session_id,
+                    self._MAX_PENDING_PER_SESSION,
                 )
+                raise TranscriptQueueFullError(
+                    f"transcript pending queue full for {session_id} "
+                    f"(cap={self._MAX_PENDING_PER_SESSION})"
+                )
+            pending.append(dict(message))
             # Snapshot the first pending message, then release the lock
             # before the DB write so other sessions are not blocked.
             msg = pending[0]
@@ -3035,19 +3047,6 @@ class SessionStore:
                             session_id,
                         )
                         return
-                if self._is_fts_corruption_error(exc) and self._rebuild_fts_once():
-                    try:
-                        self._append_transcript_message(session_id, msg)
-                    except Exception as retry_exc:
-                        exc = retry_exc
-                    else:
-                        with self._transcript_retry_lock:
-                            if pending and pending[0] is msg:
-                                pending.pop(0)
-                            if not pending:
-                                self._dirty_transcripts.pop(queue_session_id, None)
-                                self._transcript_append_failures.pop(session_id, None)
-                        continue
                 with self._transcript_retry_lock:
                     failures = self._transcript_append_failures.get(session_id, 0) + 1
                     self._transcript_append_failures[session_id] = failures
@@ -3092,53 +3091,9 @@ class SessionStore:
             api_content=extract_api_content_sidecar(message),
         )
 
-    # Maximum in-memory pending messages per session before dropping the
-    # oldest. Prevents unbounded growth when the DB is persistently broken.
+    # Maximum in-memory pending messages per session before explicit
+    # backpressure. Prevents both unbounded growth and silent old-message loss.
     _MAX_PENDING_PER_SESSION = 200
-
-    @staticmethod
-    def _is_fts_corruption_error(exc: Exception) -> bool:
-        """True if *exc* looks like an FTS index corruption error.
-
-        Matches the specific SQLite error strings for malformed disk images
-        and FTS table corruption — not bare ``"fts"`` substrings which match
-        unrelated words like ``"shifts"`` or ``"gifts"``.
-        """
-        text = str(exc).lower()
-        return any(
-            marker in text
-            for marker in (
-                "database disk image is malformed",
-                "malformed database schema",
-                "messages_fts",
-                "no such table: messages_fts",
-            )
-        )
-
-    def _rebuild_fts_once(self) -> bool:
-        """Attempt FTS5 ``rebuild`` command once per store lifetime.
-
-        Delegates to ``SessionDB.rebuild_fts()`` which handles locking and
-        table-existence checks internally. Returns ``True`` when at least
-        one index was rebuilt.
-        """
-        if self._fts_rebuild_attempted:
-            return False
-        self._fts_rebuild_attempted = True
-        db = self._db
-        if db is None or not hasattr(db, "rebuild_fts"):
-            return False
-        try:
-            rebuilt = db.rebuild_fts()
-        except Exception as exc:
-            logger.warning("Session DB FTS rebuild failed: %s", exc)
-            return False
-        if rebuilt:
-            logger.warning(
-                "Rebuilt %d Session DB FTS index(es) after append corruption",
-                rebuilt,
-            )
-        return rebuilt > 0
 
     def _clear_dirty_transcript(self, session_id: str) -> None:
         """Drop queued pending messages for a session.

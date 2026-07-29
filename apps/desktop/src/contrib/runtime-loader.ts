@@ -27,11 +27,11 @@
  * trust seam.
  */
 
-import { getStatus } from '@/hermes'
 import { installPluginSdk, sdkImportMap } from '@/sdk/runtime'
 import { notifyError } from '@/store/notifications'
 
 import { createPluginContext, type HermesPlugin } from './plugin'
+import { getLocalDesktopPluginsDir } from './plugin-path'
 import { dropPlugin, pluginActive, type PluginKind, publishPlugin } from './plugins-store'
 
 interface LoadOptions {
@@ -183,8 +183,9 @@ export async function loadRuntimePlugin(
 // (agent- or user-written). SELF-MAINTAINING — no reload ceremony:
 //  - each plugin.js is fs-watched (the preview watcher IPC, debounced in
 //    main): saving the file hot-reloads the plugin in place;
-//  - a slow visible-tab poll of the directory picks up new folders (load +
-//    watch) and removed ones (unload + unwatch).
+//  - the directory itself is fs-watched too (watchDirectory IPC), so new
+//    folders load + removed ones unload on the change tick; older Electron
+//    shells without watchDirectory fall back to the slow visible-tab poll.
 // Panes land via placement adoption and STAY where the user drags them —
 // the tree treats not-yet-loaded pane ids as hidden, so boot and reload are
 // collapse -> appear, never a placeholder flash.
@@ -246,8 +247,8 @@ async function scanDiskPlugins(): Promise<void> {
   scanning = true
 
   try {
-    const { hermes_home } = await getStatus()
-    const { entries } = await desktop.readDir(`${hermes_home}/desktop-plugins`)
+    const pluginsDir = await getLocalDesktopPluginsDir()
+    const { entries } = await desktop.readDir(pluginsDir)
     const seen = new Set<string>()
 
     for (const dir of entries.filter(e => e.isDirectory)) {
@@ -307,7 +308,7 @@ async function scanDiskPlugins(): Promise<void> {
 export const discoverRuntimePlugins = scanDiskPlugins
 
 /** Start the self-maintaining disk door: initial scan, per-file hot reload,
- *  slow folder reconciliation while the window is visible. Idempotent. */
+ *  fs-watched folder reconciliation (poll fallback on older shells). Idempotent. */
 export function watchRuntimePlugins(): void {
   const desktop = window.hermesDesktop
 
@@ -317,7 +318,16 @@ export function watchRuntimePlugins(): void {
 
   watching = true
 
+  let dirWatchId: null | string = null
+
   desktop.onPreviewFileChanged(({ id }) => {
+    // Directory tick: a plugin folder appeared or vanished — reconcile.
+    if (dirWatchId && id === dirWatchId) {
+      void scanDiskPlugins()
+
+      return
+    }
+
     for (const [name, record] of disk) {
       if (record.watchId === id) {
         void loadDiskPlugin(name, record.file)
@@ -327,10 +337,45 @@ export function watchRuntimePlugins(): void {
     }
   })
 
-  void scanDiskPlugins()
-  window.setInterval(() => {
-    if (document.visibilityState === 'visible') {
-      void scanDiskPlugins()
+  const startDirWatch = async (): Promise<boolean> => {
+    if (!desktop.watchDirectory) {
+      return false
     }
-  }, DISK_POLL_MS)
+
+    try {
+      const pluginsDir = await getLocalDesktopPluginsDir()
+      dirWatchId = (await desktop.watchDirectory(pluginsDir)).id
+
+      return true
+    } catch {
+      // Dir missing (no plugins yet) or unwatchable — fall back to the poll,
+      // which also handles the dir being created later.
+      return false
+    }
+  }
+
+  void scanDiskPlugins()
+  void startDirWatch().then(watched => {
+    if (watched) {
+      return
+    }
+
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== 'visible') {
+        return
+      }
+
+      void scanDiskPlugins()
+
+      // The dir may have been created since — upgrade to the watch and retire
+      // this poll once it lands.
+      if (dirWatchId === null) {
+        void startDirWatch().then(upgraded => {
+          if (upgraded) {
+            window.clearInterval(timer)
+          }
+        })
+      }
+    }, DISK_POLL_MS)
+  })
 }

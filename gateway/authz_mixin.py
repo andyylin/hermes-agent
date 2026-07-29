@@ -29,18 +29,25 @@ from gateway.whatsapp_identity import (
 
 
 def _auth_env(name: str, default: str = "") -> str:
-    """Read allowlist/auth env; prefer profile secret_scope under multiplex."""
+    """Read auth policy from the installed profile scope, fail closed."""
     if not name:
         return default
     try:
-        from agent.secret_scope import get_secret
+        from agent.secret_scope import current_secret_scope, get_secret
+    except ImportError:
+        return (os.getenv(name) or default).strip()
 
-        val = get_secret(name)
-        if val is not None and str(val).strip():
-            return str(val).strip()
-    except Exception:
-        pass
-    return (os.getenv(name) or default).strip()
+    scope = current_secret_scope()
+    if scope is not None:
+        value = scope.get(name)
+        return (str(value) if value is not None else default).strip()
+    value = get_secret(name)
+    return (str(value) if value is not None else default).strip()
+
+
+def _line_auth_env(name: str, default: str = "") -> str:
+    """LINE authorization uses the same profile-scoped fail-closed policy."""
+    return _auth_env(name, default)
 
 
 def _coerce_allow_set(raw) -> set[str]:
@@ -340,18 +347,19 @@ class GatewayAuthorizationMixin:
         return False
 
     def _pairing_store_for(self, source: "SessionSource"):
-        """Pick the per-profile PairingStore for a source, falling back to global.
+        """Pick the per-profile PairingStore for a source.
 
-        In a multiplexing gateway, each profile owns its own pairing whitelist
-        so isolation is preserved. When the source has no profile (single-
-        profile gateway, or a path that hasn't stamped profile yet) or the
-        profile isn't registered, fall back to ``self.pairing_store`` (the
-        global default) so existing behavior is preserved.
+        In a multiplexing gateway, each profile owns its own pairing whitelist.
+        A stamped profile missing from the registry fails closed rather than
+        inheriting the default profile's pairing grants.
         """
         per_profile = getattr(self, "pairing_stores", None) or {}
         profile = getattr(source, "profile", None)
         if profile and profile in per_profile:
             return per_profile[profile]
+        config = getattr(self, "config", None)
+        if profile and getattr(config, "multiplex_profiles", False):
+            return None
         return getattr(self, "pairing_store", None)
 
     def _is_user_authorized(self, source: SessionSource) -> bool:
@@ -426,8 +434,13 @@ class GatewayAuthorizationMixin:
                 Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
                 Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
             }.get(source.platform, "")
+            if not chat_allowlist_env and source.platform and source.platform.value == "line":
+                chat_allowlist_env = "LINE_ALLOWED_GROUPS"
             if chat_allowlist_env:
-                raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
+                if source.platform and source.platform.value == "line":
+                    raw_chat_allowlist = _line_auth_env(chat_allowlist_env)
+                else:
+                    raw_chat_allowlist = _auth_env(chat_allowlist_env)
                 if raw_chat_allowlist:
                     allowed_group_ids = {
                         cid.strip()
@@ -469,7 +482,7 @@ class GatewayAuthorizationMixin:
         }
         if getattr(source, "is_bot", False):
             allow_bots_var = platform_allow_bots_map.get(source.platform)
-            if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
+            if allow_bots_var and _auth_env(allow_bots_var, "none").lower() in {"mentions", "all"}:
                 return True
 
         if not user_id:
@@ -574,7 +587,10 @@ class GatewayAuthorizationMixin:
         group_chat_allowlist = ""
         if source.chat_type in {"group", "forum"}:
             group_user_allowlist = _auth_env(platform_group_user_env_map.get(source.platform, ""))
-            group_chat_allowlist = _auth_env(platform_group_chat_env_map.get(source.platform, ""))
+            if source.platform and source.platform.value == "line":
+                group_chat_allowlist = _line_auth_env("LINE_ALLOWED_GROUPS")
+            else:
+                group_chat_allowlist = _auth_env(platform_group_chat_env_map.get(source.platform, ""))
         global_allowlist = _auth_env("GATEWAY_ALLOWED_USERS")
 
         if not platform_allowlist and not group_user_allowlist and not group_chat_allowlist and not global_allowlist:
@@ -826,13 +842,19 @@ class GatewayAuthorizationMixin:
                 ),
                 Platform.QQBOT: ("QQ_GROUP_ALLOWED_USERS",),
             }
-            if os.getenv(platform_env_map.get(platform, ""), "").strip():
+            if platform and platform.value == "line":
+                platform_group_env_map[platform] = ("LINE_ALLOWED_GROUPS",)
+            if _auth_env(platform_env_map.get(platform, "")):
                 return "ignore"
             for env_key in platform_group_env_map.get(platform, ()):
-                if os.getenv(env_key, "").strip():
+                if platform and platform.value == "line":
+                    configured = _line_auth_env(env_key)
+                else:
+                    configured = _auth_env(env_key)
+                if configured:
                     return "ignore"
 
-        if os.getenv("GATEWAY_ALLOWED_USERS", "").strip():
+        if _auth_env("GATEWAY_ALLOWED_USERS"):
             return "ignore"
 
         return "pair"

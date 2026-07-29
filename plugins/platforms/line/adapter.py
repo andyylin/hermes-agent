@@ -23,7 +23,9 @@ button and always Push-fallback instead.
 
 **Three-allowlist gating.** Separate allowlists for users (U-prefixed),
 groups (C-prefixed), and rooms (R-prefixed). ``LINE_ALLOW_ALL_USERS=true``
-is a dev-only escape hatch.
+is a dev-only escape hatch. ``LINE_READ_ONLY_GROUPS`` archives selected
+groups without dispatching, while ``LINE_ARCHIVE_GROUPS`` archives selected
+groups while preserving normal reply/prefix behavior.
 
 **Media via public HTTPS.** LINE's Messaging API does *not* accept
 binary uploads — images, audio, and video must be reachable HTTPS URLs.
@@ -92,7 +94,10 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_audio_from_bytes,
+    cache_document_from_bytes,
     cache_image_from_bytes,
+    cache_video_from_bytes,
 )
 from gateway.config import Platform
 
@@ -390,6 +395,10 @@ class _MessageDeduplicator:
             self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
         self._seen[event_id] = time.time()
         return False
+    def forget(self, event_id: str) -> None:
+        """Allow a failed webhook event to be retried."""
+        if event_id:
+            self._seen.pop(event_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -626,11 +635,28 @@ def _csv_set(value: str) -> Set[str]:
     return {x.strip() for x in value.split(",") if x.strip()}
 
 
+def _csv_list(value: str) -> List[str]:
+    if not value:
+        return []
+    return [x.strip() for x in value.split(",") if x.strip()]
+
+
+def _profile_env(name: str, default: str = "") -> str:
+    """Read a LINE setting without crossing profile scopes in multiplex mode."""
+    try:
+        from agent.secret_scope import get_secret
+    except ImportError:
+        return os.getenv(name, default)
+
+    value = get_secret(name)
+    return str(value) if value is not None else default
+
+
 def _truthy_env(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
+    value = _profile_env(name)
+    if not value:
         return default
-    return v.strip().lower() in {"1", "true", "yes", "on"}
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ---------------------------------------------------------------------------
@@ -651,19 +677,19 @@ class LineAdapter(BasePlatformAdapter):
 
         # Credentials
         self.channel_access_token = (
-            os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+            _profile_env("LINE_CHANNEL_ACCESS_TOKEN")
             or extra.get("channel_access_token", "")
         )
         self.channel_secret = (
-            os.getenv("LINE_CHANNEL_SECRET")
+            _profile_env("LINE_CHANNEL_SECRET")
             or extra.get("channel_secret", "")
         )
 
         # Webhook server
-        self.webhook_host = os.getenv("LINE_HOST") or extra.get("host", "0.0.0.0")
+        self.webhook_host = _profile_env("LINE_HOST") or extra.get("host", "0.0.0.0")
         try:
             self.webhook_port = int(
-                os.getenv("LINE_PORT") or extra.get("port", DEFAULT_WEBHOOK_PORT)
+                _profile_env("LINE_PORT") or extra.get("port", DEFAULT_WEBHOOK_PORT)
             )
         except (TypeError, ValueError):
             self.webhook_port = DEFAULT_WEBHOOK_PORT
@@ -672,7 +698,7 @@ class LineAdapter(BasePlatformAdapter):
         # Public base URL — required for media sending when bind isn't
         # publicly reachable.
         self.public_base_url = (
-            os.getenv("LINE_PUBLIC_URL")
+            _profile_env("LINE_PUBLIC_URL")
             or extra.get("public_url", "")
             or ""
         ).rstrip("/")
@@ -682,19 +708,31 @@ class LineAdapter(BasePlatformAdapter):
             "LINE_ALLOW_ALL_USERS", bool(extra.get("allow_all_users", False))
         )
         self.allowed_users = _csv_set(
-            os.getenv("LINE_ALLOWED_USERS", "")
+            _profile_env("LINE_ALLOWED_USERS")
         ) | set(extra.get("allowed_users", []))
         self.allowed_groups = _csv_set(
-            os.getenv("LINE_ALLOWED_GROUPS", "")
+            _profile_env("LINE_ALLOWED_GROUPS")
         ) | set(extra.get("allowed_groups", []))
+        self.read_only_groups = _csv_set(
+            _profile_env("LINE_READ_ONLY_GROUPS")
+        ) | set(extra.get("read_only_groups", []))
+        self.archive_groups = _csv_set(
+            _profile_env("LINE_ARCHIVE_GROUPS")
+        ) | set(extra.get("archive_groups", []))
+        self.require_prefix_groups = _csv_set(
+            _profile_env("LINE_REQUIRE_PREFIX_GROUPS")
+        ) | set(extra.get("require_prefix_groups", []))
+        self.group_prefixes = _csv_list(
+            _profile_env("LINE_GROUP_PREFIXES")
+        ) or list(extra.get("group_prefixes", [])) or ["Hermes:"]
         self.allowed_rooms = _csv_set(
-            os.getenv("LINE_ALLOWED_ROOMS", "")
+            _profile_env("LINE_ALLOWED_ROOMS")
         ) | set(extra.get("allowed_rooms", []))
 
         # Slow-LLM postback button threshold
         try:
             self.slow_response_threshold = float(
-                os.getenv("LINE_SLOW_RESPONSE_THRESHOLD")
+                _profile_env("LINE_SLOW_RESPONSE_THRESHOLD")
                 or extra.get("slow_response_threshold", DEFAULT_SLOW_RESPONSE_THRESHOLD)
             )
         except (TypeError, ValueError):
@@ -702,19 +740,19 @@ class LineAdapter(BasePlatformAdapter):
 
         # User-overridable copy
         self.pending_text = (
-            os.getenv("LINE_PENDING_TEXT")
+            _profile_env("LINE_PENDING_TEXT")
             or extra.get("pending_text", DEFAULT_PENDING_REPLY_TEXT)
         )
         self.button_label = (
-            os.getenv("LINE_BUTTON_LABEL")
+            _profile_env("LINE_BUTTON_LABEL")
             or extra.get("button_label", DEFAULT_BUTTON_LABEL)
         )
         self.delivered_text = (
-            os.getenv("LINE_DELIVERED_TEXT")
+            _profile_env("LINE_DELIVERED_TEXT")
             or extra.get("delivered_text", DEFAULT_DELIVERED_TEXT)
         )
         self.interrupted_text = (
-            os.getenv("LINE_INTERRUPTED_TEXT")
+            _profile_env("LINE_INTERRUPTED_TEXT")
             or extra.get("interrupted_text", DEFAULT_INTERRUPTED_TEXT)
         )
 
@@ -888,12 +926,17 @@ class LineAdapter(BasePlatformAdapter):
             return web.Response(status=400, text="bad json")
 
         events = payload.get("events", []) or []
+        had_dispatch_error = False
         for event in events:
             try:
                 await self._dispatch_event(event)
             except Exception:
+                self._dedup.forget(event.get("webhookEventId", "") or "")
+                had_dispatch_error = True
                 logger.exception("LINE: dispatch_event failed")
 
+        if had_dispatch_error:
+            return web.Response(status=500, text="event processing failed")
         return web.Response(status=200, text="ok")
 
     async def _dispatch_event(self, event: Dict[str, Any]) -> None:
@@ -911,12 +954,14 @@ class LineAdapter(BasePlatformAdapter):
         if self._bot_user_id and sender_user_id == self._bot_user_id:
             return
 
-        # Allowlist gate.
+        # Allowlist gate. Read-only/archive groups are intentionally admitted
+        # here, then short-circuited in _handle_message_event before agent
+        # dispatch when appropriate.
         if not _allowed_for_source(
             source,
             allow_all=self.allow_all,
             user_ids=self.allowed_users,
-            group_ids=self.allowed_groups,
+            group_ids=self.allowed_groups | self.read_only_groups | self.archive_groups,
             room_ids=self.allowed_rooms,
         ):
             logger.info("LINE: rejecting unauthorized source %s", source)
@@ -930,6 +975,91 @@ class LineAdapter(BasePlatformAdapter):
             logger.info("LINE: lifecycle event %s from %s", event_type, source)
         else:
             logger.debug("LINE: ignoring event type %r", event_type)
+
+    def _archive_read_only_message(
+        self,
+        event: Dict[str, Any],
+        *,
+        text: str,
+        msg_type: str,
+        media_urls: List[str],
+        media_types: List[str],
+    ) -> None:
+        """Persist a LINE group message without necessarily dispatching it.
+
+        Media messages are downloaded before read-only dispatch is short-circuited;
+        keep their local cache paths so downstream digest jobs can run OCR/vision
+        instead of seeing only opaque ``[image]`` placeholders.
+        """
+        source = event.get("source") or {}
+        chat_id, chat_type = _resolve_chat(source)
+        try:
+            from hermes_constants import get_hermes_home
+
+            hermes_home = Path(get_hermes_home()).resolve()
+        except Exception:
+            hermes_home = Path.home().joinpath(".hermes").resolve()
+
+        archive_dir = hermes_home / "data" / "line-read-only"
+        archive_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        archive_dir.chmod(0o700)
+        safe_chat_id = re.sub(r"[^A-Za-z0-9_.-]", "_", chat_id or "unknown")
+        message = event.get("message") or {}
+        webhook_event_id = event.get("webhookEventId", "") or ""
+        message_id = message.get("id", "") or ""
+        if webhook_event_id:
+            event_key = f"webhook:{webhook_event_id}"
+        elif message_id:
+            event_key = f"message:{chat_id}:{message_id}"
+        else:
+            identity = json.dumps(
+                {
+                    "timestamp": event.get("timestamp"),
+                    "source": source,
+                    "message": message,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            event_key = f"sha256:{hashlib.sha256(identity.encode()).hexdigest()}"
+        record = {
+            "received_at": time.time(),
+            "event_key": event_key,
+            "event_timestamp": event.get("timestamp"),
+            "webhook_event_id": webhook_event_id,
+            "chat_id": chat_id,
+            "chat_type": chat_type,
+            "user_id": source.get("userId", ""),
+            "message_id": message_id,
+            "message_type": msg_type,
+            "text": text,
+            "media_urls": media_urls,
+            "media_types": media_types,
+        }
+        archive_path = archive_dir / f"{safe_chat_id}.jsonl"
+        fd = os.open(archive_path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+        os.chmod(archive_path, 0o600)
+        with os.fdopen(fd, "a+", encoding="utf-8") as fh:
+            fh.seek(0)
+            for line in fh:
+                try:
+                    existing = json.loads(line)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if existing.get("event_key") == event_key:
+                    return
+                if webhook_event_id and existing.get("webhook_event_id") == webhook_event_id:
+                    return
+                if (
+                    message_id
+                    and existing.get("chat_id") == chat_id
+                    and existing.get("message_id") == message_id
+                ):
+                    return
+            fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
 
     async def _handle_message_event(self, event: Dict[str, Any]) -> None:
         msg = event.get("message") or {}
@@ -955,11 +1085,15 @@ class LineAdapter(BasePlatformAdapter):
 
         if msg_type == "text":
             text = msg.get("text", "") or ""
-        elif msg_type in {"image", "audio", "video", "file"}:
-            local_path = await self._download_media(message_id, msg_type)
+        elif msg_type in ("image", "audio", "video", "file"):
+            local_path, media_type = await self._download_media(
+                message_id,
+                msg_type,
+                filename=msg.get("fileName") or msg.get("file_name"),
+            )
             if local_path:
                 media_urls.append(local_path)
-                media_types.append(msg_type)
+                media_types.append(media_type)
             text = f"[{msg_type}]"
         elif msg_type == "sticker":
             keywords = msg.get("keywords") or []
@@ -970,6 +1104,74 @@ class LineAdapter(BasePlatformAdapter):
             text = f"[location: {title} {address}]".strip()
         else:
             text = f"[unsupported message type: {msg_type}]"
+
+        if (
+            chat_type == "group"
+            and chat_id in self.archive_groups
+            and chat_id not in self.read_only_groups
+        ):
+            self._archive_read_only_message(
+                event,
+                text=text,
+                msg_type=msg_type,
+                media_urls=media_urls,
+                media_types=media_types,
+            )
+            logger.info(
+                "LINE: archived group message chat=%s user=%s type=%s",
+                chat_id,
+                user_id,
+                msg_type,
+            )
+
+        if chat_type == "group" and chat_id in self.read_only_groups:
+            self._reply_tokens.pop(chat_id, None)
+            self._archive_read_only_message(
+                event,
+                text=text,
+                msg_type=msg_type,
+                media_urls=media_urls,
+                media_types=media_types,
+            )
+            logger.info(
+                "LINE: archived read-only group message chat=%s user=%s type=%s",
+                chat_id,
+                user_id,
+                msg_type,
+            )
+            return
+
+        if chat_type == "group" and chat_id in self.require_prefix_groups:
+            if msg_type != "text":
+                self._reply_tokens.pop(chat_id, None)
+                logger.info(
+                    "LINE: ignoring non-text group message without prefix chat=%s user=%s type=%s",
+                    chat_id,
+                    user_id,
+                    msg_type,
+                )
+                return
+            matched_prefix = next(
+                (prefix for prefix in self.group_prefixes if text.startswith(prefix)),
+                "",
+            )
+            if not matched_prefix:
+                self._reply_tokens.pop(chat_id, None)
+                logger.info(
+                    "LINE: ignoring group message without required prefix chat=%s user=%s",
+                    chat_id,
+                    user_id,
+                )
+                return
+            text = text[len(matched_prefix):].lstrip()
+            if not text:
+                self._reply_tokens.pop(chat_id, None)
+                logger.info(
+                    "LINE: ignoring empty group message after required prefix chat=%s user=%s",
+                    chat_id,
+                    user_id,
+                )
+                return
 
         # Best-effort typing indicator (DM only).
         if chat_type == "dm" and self._client:
@@ -1054,14 +1256,20 @@ class LineAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-    async def _download_media(self, message_id: str, msg_type: str) -> Optional[str]:
+    async def _download_media(
+        self,
+        message_id: str,
+        msg_type: str,
+        *,
+        filename: Optional[str] = None,
+    ) -> Tuple[Optional[str], str]:
         if not self._client or not message_id:
-            return None
+            return None, ""
         try:
             data = await self._client.fetch_content(message_id)
         except Exception as exc:
             logger.warning("LINE: failed to fetch %s content for %s: %s", msg_type, message_id, exc)
-            return None
+            return None, ""
         ext = {
             "image": ".jpg",
             "audio": ".m4a",
@@ -1069,10 +1277,22 @@ class LineAdapter(BasePlatformAdapter):
             "file": ".bin",
         }.get(msg_type, ".bin")
         try:
-            return cache_image_from_bytes(data, ext=ext)
+            if msg_type == "image":
+                return cache_image_from_bytes(data, ext=ext), "image/jpeg"
+            if msg_type == "audio":
+                media_type = mimetypes.guess_type(f"audio{ext}")[0] or "audio/mp4"
+                return cache_audio_from_bytes(data, ext=ext), media_type
+            if msg_type == "video":
+                media_type = mimetypes.guess_type(f"video{ext}")[0] or "video/mp4"
+                return cache_video_from_bytes(data, ext=ext), media_type
+            document_name = filename or f"line_file{ext}"
+            return (
+                cache_document_from_bytes(data, document_name),
+                mimetypes.guess_type(document_name)[0] or "application/octet-stream",
+            )
         except Exception as exc:
             logger.warning("LINE: failed to cache %s payload: %s", msg_type, exc)
-            return None
+            return None, ""
 
     # ------------------------------------------------------------------
     # Outbound send (text)
@@ -1481,9 +1701,9 @@ def _is_relative_to(child: Path, parent: Path) -> bool:
 
 def check_requirements() -> bool:
     """Plugin gate: require credentials AND aiohttp at runtime."""
-    if not os.getenv("LINE_CHANNEL_ACCESS_TOKEN"):
+    if not _profile_env("LINE_CHANNEL_ACCESS_TOKEN"):
         return False
-    if not os.getenv("LINE_CHANNEL_SECRET"):
+    if not _profile_env("LINE_CHANNEL_SECRET"):
         return False
     try:
         import aiohttp  # noqa: F401
@@ -1495,10 +1715,10 @@ def check_requirements() -> bool:
 def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
     has_token = bool(
-        os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or extra.get("channel_access_token")
+        _profile_env("LINE_CHANNEL_ACCESS_TOKEN") or extra.get("channel_access_token")
     )
     has_secret = bool(
-        os.getenv("LINE_CHANNEL_SECRET") or extra.get("channel_secret")
+        _profile_env("LINE_CHANNEL_SECRET") or extra.get("channel_secret")
     )
     return has_token and has_secret
 
@@ -1515,20 +1735,24 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
     in ``.env`` without a ``platforms.line`` block in ``config.yaml``.
     Mirrors the IRC plugin's pattern.
     """
-    if not (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") and os.getenv("LINE_CHANNEL_SECRET")):
+    if not (_profile_env("LINE_CHANNEL_ACCESS_TOKEN") and _profile_env("LINE_CHANNEL_SECRET")):
         return None
     seeded: Dict[str, Any] = {}
-    if os.getenv("LINE_PORT"):
+    line_port = _profile_env("LINE_PORT")
+    if line_port:
         try:
-            seeded["port"] = int(os.environ["LINE_PORT"])
+            seeded["port"] = int(line_port)
         except ValueError:
             pass
-    if os.getenv("LINE_HOST"):
-        seeded["host"] = os.environ["LINE_HOST"]
-    if os.getenv("LINE_PUBLIC_URL"):
-        seeded["public_url"] = os.environ["LINE_PUBLIC_URL"]
-    if os.getenv("LINE_HOME_CHANNEL"):
-        seeded["home_channel"] = os.environ["LINE_HOME_CHANNEL"]
+    line_host = _profile_env("LINE_HOST")
+    if line_host:
+        seeded["host"] = line_host
+    public_url = _profile_env("LINE_PUBLIC_URL")
+    if public_url:
+        seeded["public_url"] = public_url
+    home_channel = _profile_env("LINE_HOME_CHANNEL")
+    if home_channel:
+        seeded["home_channel"] = home_channel
     return seeded or {}
 
 
@@ -1555,7 +1779,7 @@ async def _standalone_send(
     """
     extra = getattr(pconfig, "extra", {}) or {}
     token = (
-        os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+        _profile_env("LINE_CHANNEL_ACCESS_TOKEN")
         or extra.get("channel_access_token", "")
     )
     if not token or not chat_id:

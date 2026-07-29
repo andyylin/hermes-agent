@@ -9,7 +9,9 @@ import {
   startSpeechStream,
   stopVoicePlayback
 } from '@/lib/voice-playback'
+import { isVoiceStopCommand } from '@/lib/voice-stop-word'
 import { notify, notifyError } from '@/store/notifications'
+import { $voicePlayback } from '@/store/voice-playback'
 
 import { useMicRecorder } from './use-mic-recorder'
 
@@ -25,20 +27,26 @@ interface VoiceConversationOptions {
   busy: boolean
   enabled: boolean
   onFatalError?: () => void
+  onStopWord?: () => void
   onSubmit: (text: string) => Promise<void> | void
   onTranscribeAudio?: (audio: Blob) => Promise<string>
   pendingResponse: () => PendingVoiceResponse | null
   consumePendingResponse: () => void
+  /** Awaited right before the mic is opened. Used to let the wake-word listener
+   *  fully release the capture device first, so the two never contend. */
+  beforeMicOpen?: () => Promise<void> | void
 }
 
 export function useVoiceConversation({
   busy,
   enabled,
   onFatalError,
+  onStopWord,
   onSubmit,
   onTranscribeAudio,
   pendingResponse,
-  consumePendingResponse
+  consumePendingResponse,
+  beforeMicOpen
 }: VoiceConversationOptions) {
   const { t } = useI18n()
   const voiceCopy = t.notifications.voice
@@ -54,11 +62,25 @@ export function useVoiceConversation({
   const speechSessionRef = useRef<null | SpeechStreamSession>(null)
   const stopBargeMonitorRef = useRef<(() => void) | null>(null)
   const bargeCapturePendingRef = useRef(false)
+  const speechStartSequenceRef = useRef(0)
   const enabledRef = useRef(enabled)
   const mutedRef = useRef(muted)
   const busyRef = useRef(busy)
   const statusRef = useRef<ConversationStatus>('idle')
   const wasEnabledRef = useRef(enabled)
+  const onStopWordRef = useRef(onStopWord)
+
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
+  useEffect(() => {
+    onStopWordRef.current = onStopWord
+  }, [onStopWord])
+
+  const beforeMicOpenRef = useRef(beforeMicOpen)
+
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
+  useEffect(() => {
+    beforeMicOpenRef.current = beforeMicOpen
+  }, [beforeMicOpen])
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
@@ -132,6 +154,18 @@ export function useVoiceConversation({
             return
           }
 
+          // A spoken "stop" (or "never mind", "goodbye", …) ends the
+          // conversation instead of being submitted as a turn. Only whole-
+          // utterance stop commands match, so "stop the container" still goes
+          // through as a real request.
+          if (isVoiceStopCommand(transcript)) {
+            dropSpeechSession()
+            setStatus('idle')
+            onStopWordRef.current?.()
+
+            return
+          }
+
           awaitingSpokenResponseRef.current = true
           dropSpeechSession()
           await onSubmit(transcript)
@@ -164,6 +198,20 @@ export function useVoiceConversation({
     }
 
     if (statusRef.current !== 'idle') {
+      return
+    }
+
+    // Let the wake-word listener fully release the capture device before we
+    // open ours — opening the mic while wake still holds it makes getUserMedia
+    // fail (the "clicked voice but it never starts listening" bug).
+    try {
+      await beforeMicOpenRef.current?.()
+    } catch {
+      // A pause failure shouldn't block the user's explicit start.
+    }
+
+    // enabled/muted/busy or an interleaved turn may have changed while we waited.
+    if (!enabledRef.current || mutedRef.current || busyRef.current || statusRef.current !== 'idle') {
       return
     }
 
@@ -211,7 +259,15 @@ export function useVoiceConversation({
 
       dropSpeechSession()
 
-      if (enabledRef.current) {
+      // If stopVoicePlayback() was called externally (Stop button, end), the
+      // voice-playback sequence has advanced past what we captured at speech
+      // start — don't auto-start the next sentence, the user chose to stop.
+      const stoppedByUser =
+        speechStartSequenceRef.current > 0 && $voicePlayback.get().sequence > speechStartSequenceRef.current
+
+      speechStartSequenceRef.current = 0
+
+      if (enabledRef.current && !stoppedByUser) {
         pendingStartRef.current = true
       }
 
@@ -341,6 +397,8 @@ export function useVoiceConversation({
           barged = true
         })
 
+        speechStartSequenceRef.current = $voicePlayback.get().sequence
+
         void playSpeechText(response.text, { source: 'voice-conversation' })
           .catch(error => notifyError(error, voiceCopy.playbackFailed))
           .finally(() => {
@@ -365,6 +423,7 @@ export function useVoiceConversation({
     (responseId: string) => {
       responseIdRef.current = responseId
       spokenSourceLengthRef.current = 0
+      speechStartSequenceRef.current = $voicePlayback.get().sequence
       setStatus('speaking')
 
       let barged = false

@@ -1489,17 +1489,17 @@ def run_doctor(args):
             conn.close()
             check_ok(f"{_DHH}/state.db exists ({count} sessions)")
 
-            # FTS write-health probe (#50502): `SELECT COUNT(*)` above succeeds
-            # even when the FTS index is corrupt and every message write fails
-            # through the triggers. `_db_opens_cleanly` now drives a rolled-back
-            # write so this otherwise-silent corruption class is surfaced (and
-            # repaired in place with --fix).
+            # Retired-FTS write-health probe (#50502): `SELECT COUNT(*)` above
+            # succeeds even when corrupt leftover triggers/shadow tables poison
+            # every canonical message write. `_db_opens_cleanly` drives a
+            # rolled-back write so this otherwise-silent corruption class is
+            # surfaced and the derived artifacts can be retired with --fix.
             from hermes_state import _db_opens_cleanly, repair_state_db_schema
 
             _write_reason = _db_opens_cleanly(state_db_path)
             if _write_reason is not None:
                 check_warn(
-                    f"{_DHH}/state.db fails a write-health probe (FTS index may be corrupt)",
+                    f"{_DHH}/state.db fails a write-health probe (retired FTS artifacts may be corrupt)",
                     f"({_write_reason})",
                 )
                 if should_fix:
@@ -1510,23 +1510,24 @@ def run_doctor(args):
                             if report.get("backup_path") else "n/a"
                         )
                         check_ok(
-                            "Repaired state.db FTS write health",
+                            "Repaired state.db write health and retired corrupt FTS artifacts",
                             f"(strategy: {report.get('strategy')}; backup: {backup_name})",
                         )
                         fixed_count += 1
                     else:
                         check_warn(
-                            "state.db FTS write-health repair did not recover automatically",
+                            "state.db retired-FTS repair did not recover automatically",
                             f"({report.get('error')}; backup: {report.get('backup_path')})",
                         )
                         issues.append(
-                            "state.db FTS write corruption and auto-repair failed — "
+                            "state.db write corruption and retired-FTS cleanup failed — "
                             "restore from the backup copy beside state.db"
                         )
                 else:
                     issues.append(
-                        "state.db FTS write corruption — run 'hermes doctor --fix' "
-                        "(or 'hermes sessions repair') to rebuild the FTS index"
+                        "state.db write corruption — run 'hermes doctor --fix' "
+                        "(or 'hermes sessions repair') to retire corrupted FTS "
+                        "artifacts while preserving canonical sessions/messages"
                     )
         except Exception as e:
             from hermes_state import is_malformed_db_error, repair_state_db_schema
@@ -1534,8 +1535,8 @@ def run_doctor(args):
             if is_malformed_db_error(e):
                 # sqlite_master itself is malformed (e.g. duplicate
                 # messages_fts) — every statement fails before it runs, so
-                # this is NOT a plain FTS-index rebuild. Repair sqlite_master
-                # in place (backup first; sessions/messages preserved).
+                # this is not a plain retired-FTS cleanup. Repair sqlite_master
+                # in place (backup first; canonical rows preserved).
                 check_warn(
                     f"{_DHH}/state.db schema is malformed (sessions hidden until repaired)",
                     f"({e})",

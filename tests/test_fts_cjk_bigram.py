@@ -13,6 +13,10 @@ import pytest
 
 from hermes_state import FTS_CJK_STALE_KEY, SessionDB
 
+pytestmark = pytest.mark.skip(
+    reason="Andy custom runtime retires all live FTS indexes; canonical LIKE search is authoritative"
+)
+
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "native" / "fts5_cjk" / "fts5_cjk.c"
 VENDOR = REPO / "native" / "fts5_cjk" / "vendor"

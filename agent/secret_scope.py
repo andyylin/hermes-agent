@@ -211,12 +211,15 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
     return secrets
 
 
-def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
-    """Build a profile's secret mapping from its ``<home>/.env``.
+def build_profile_secret_scope(
+    hermes_home: Path, *, include_external: bool = False
+) -> Dict[str, str]:
+    """Build a profile's isolated secret mapping.
 
-    Returns a fresh dict (safe to install via ``set_secret_scope``). Genuinely
-    global vars are intentionally NOT copied in — ``get_secret`` reads those
-    from ``os.environ`` directly, so the scope holds only profile secrets.
+    ``include_external`` resolves configured secret sources directly into the
+    mapping instead of process-global ``os.environ``. This is required for
+    multiplexed cron jobs: provider keys must be present in the job scope but
+    must never bleed into concurrent profiles.
     """
     home = Path(hermes_home)
     secrets = load_env_file(home / ".env")

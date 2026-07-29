@@ -37,6 +37,8 @@ Environment variables:
     MATRIX_TOOLS_ALLOW_ROOM_CREATE
                               Allow Matrix room creation tool execution (default: false)
     MATRIX_AUTO_THREAD          Auto-create threads for room messages (default: true)
+    MATRIX_AUTO_THREAD_ROOMS    Comma-separated room IDs whose root messages always
+                                become thread roots, even with session_scope=room
     MATRIX_DM_AUTO_THREAD       Auto-create threads for DM messages (default: false)
     MATRIX_RECOVERY_KEY         Recovery key for cross-signing verification after device key rotation
     MATRIX_DM_MENTION_THREADS   Create a thread when bot is @mentioned in a DM (default: false)
@@ -52,11 +54,16 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+import array
 import inspect
 import logging
 import mimetypes
 import os
 import re
+import sqlite3
+import shutil
+import subprocess
+import sys
 import time
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from dataclasses import dataclass, field
@@ -134,6 +141,165 @@ from gateway.platforms.base import (
 from gateway.platforms.helpers import ThreadParticipationTracker
 
 logger = logging.getLogger(__name__)
+
+
+def _matrix_env(name: str, default: str = "") -> str:
+    """Read Matrix policy from the active profile scope when one exists."""
+    try:
+        from agent.secret_scope import current_secret_scope, get_secret
+    except ImportError:
+        return os.getenv(name, default)
+    if current_secret_scope() is None:
+        return os.getenv(name, default)
+    value = get_secret(name, default)
+    return str(value or default).strip()
+
+
+def _set_matrix_env_default(name: str, value: object) -> None:
+    """Seed YAML policy in the current profile scope, or legacy global env."""
+    try:
+        from agent.secret_scope import current_secret_scope
+        scope = current_secret_scope()
+    except ImportError:
+        scope = None
+    if isinstance(scope, dict):
+        if not scope.get(name):
+            scope[name] = str(value)
+    elif not os.getenv(name):
+        os.environ[name] = str(value)
+_MATRIX_VOICE_WAVEFORM_BINS = 30
+
+
+def _matrix_voice_metadata_for_file(path: Path) -> Dict[str, Any]:
+    """Return best-effort Matrix voice metadata for an audio file.
+
+    Matrix clients such as Element render ``m.audio`` events with
+    ``org.matrix.msc3245.voice`` as voice bubbles. They are more reliable when
+    the event also includes duration and MSC1767 waveform metadata. Metadata
+    extraction is deliberately best-effort: media delivery must still work on
+    systems without ffprobe/ffmpeg.
+    """
+    metadata: Dict[str, Any] = {}
+
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        try:
+            result = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                stdin=subprocess.DEVNULL,
+            )
+            if result.returncode == 0:
+                duration = float((result.stdout or "").strip() or 0)
+                if duration > 0:
+                    metadata["duration"] = int(duration * 1000)
+        except Exception:
+            logger.debug("Matrix: failed to probe voice duration for %s", path, exc_info=True)
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        try:
+            result = subprocess.run(
+                [
+                    ffmpeg,
+                    "-v",
+                    "error",
+                    "-i",
+                    str(path),
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "8000",
+                    "-f",
+                    "s16le",
+                    "-",
+                ],
+                capture_output=True,
+                timeout=15,
+                stdin=subprocess.DEVNULL,
+            )
+            if result.returncode == 0 and result.stdout:
+                samples = array.array("h")
+                samples.frombytes(result.stdout)
+                if sys.byteorder != "little":
+                    samples.byteswap()
+                if samples:
+                    count = len(samples)
+                    waveform = []
+                    for idx in range(_MATRIX_VOICE_WAVEFORM_BINS):
+                        start = idx * count // _MATRIX_VOICE_WAVEFORM_BINS
+                        end = max(start + 1, (idx + 1) * count // _MATRIX_VOICE_WAVEFORM_BINS)
+                        peak = max(abs(value) for value in samples[start:end])
+                        waveform.append(min(1024, int(peak / 32767 * 1024)))
+                    metadata["waveform"] = waveform
+        except Exception:
+            logger.debug("Matrix: failed to build voice waveform for %s", path, exc_info=True)
+
+    return metadata
+
+def _matrix_transcode_voice_to_ogg(path: str) -> Optional[str]:
+    """Best-effort transcode of an audio file to Ogg/Opus for MSC3245 delivery.
+
+    Returns the path of a NEW temporary ``.ogg`` file (caller owns cleanup), or
+    ``None`` when ffmpeg is unavailable or fails — callers then send the
+    original file, matching the adapter's previous behaviour. Runs blocking
+    subprocess work; call via ``asyncio.to_thread`` from async code.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    import tempfile
+
+    fd, ogg_path = tempfile.mkstemp(prefix="matrix_voice_", suffix=".ogg")
+    os.close(fd)
+    try:
+        result = subprocess.run(
+            [
+                ffmpeg,
+                "-v",
+                "error",
+                "-y",
+                "-i",
+                str(path),
+                "-acodec",
+                "libopus",
+                "-ac",
+                "1",
+                "-b:a",
+                "48k",
+                "-vbr",
+                "on",
+                "-application",
+                "voip",
+                "-compression_level",
+                "10",
+                ogg_path,
+            ],
+            capture_output=True,
+            timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
+        if result.returncode == 0 and os.path.getsize(ogg_path) > 0:
+            return ogg_path
+    except Exception:
+        logger.debug("Matrix: voice transcode to Ogg/Opus failed for %s", path, exc_info=True)
+    try:
+        os.unlink(ogg_path)
+    except OSError:
+        pass
+    return None
+
 
 _MATRIX_BANG_COMMAND_RE = re.compile(
     r"^!([A-Za-z][A-Za-z0-9_-]*)(?=$|\s)(.*)$",
@@ -365,7 +531,7 @@ def _resolve_max_message_length(config) -> int:
     extra = getattr(config, "extra", {}) or {}
     raw = extra.get("max_message_length")
     if raw is None:
-        raw = os.getenv("MATRIX_MAX_MESSAGE_LENGTH")
+        raw = _matrix_env("MATRIX_MAX_MESSAGE_LENGTH")
     if raw is None:
         try:
             from gateway.platform_registry import platform_registry
@@ -387,12 +553,66 @@ def _resolve_max_message_length(config) -> int:
 # Back-compat alias for callers/tests that import the module constant.
 MAX_MESSAGE_LENGTH = DEFAULT_MAX_MESSAGE_LENGTH
 
-# Store directory for E2EE keys and sync state.
-# Uses get_hermes_home() so each profile gets its own Matrix store.
+# Store directory for E2EE keys and sync state. Resolve it lazily so importing
+# the plugin before a profile scope selects HERMES_HOME cannot pin another
+# profile's encrypted state for the lifetime of the process.
 from hermes_constants import get_hermes_dir as _get_hermes_dir
 
-_STORE_DIR = _get_hermes_dir("platforms/matrix/store", "matrix/store")
-_CRYPTO_DB_PATH = _STORE_DIR / "crypto.db"
+
+def _get_matrix_store_dir() -> Path:
+    return _get_hermes_dir("platforms/matrix/store", "matrix/store")
+
+
+def _get_matrix_crypto_db_path(store_dir: Optional[Path] = None) -> Path:
+    return (store_dir or _get_matrix_store_dir()) / "crypto.db"
+
+def _read_crypto_store_device_id(db_path: Path, account_id: str) -> Optional[str]:
+    """Read the persisted Matrix device ID without opening the encrypted account.
+
+    This is a restart/rotation guard: PgCryptoStore encrypts the account pickle
+    with a key derived from the configured device ID, so opening a store under a
+    different ID otherwise fails later with the opaque ``BAD_ACCOUNT_KEY``.
+    """
+    if not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+        try:
+            row = conn.execute(
+                "SELECT device_id FROM crypto_account WHERE account_id = ? LIMIT 1",
+                (account_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    return str(row[0]) if row and row[0] else None
+
+
+async def _matrix_initial_sync_kwargs(sync_store: Any) -> Dict[str, Any]:
+    """Build initial sync arguments using the durable crypto-store token."""
+    next_batch = await sync_store.get_next_batch()
+    return {
+        "since": next_batch or None,
+        "timeout": 10000,
+        "full_state": True,
+    }
+
+
+def _secure_matrix_store_permissions(store_dir: Optional[Path] = None) -> None:
+    """Keep the E2EE store owner-only, including SQLite WAL sidecars."""
+    store_dir = store_dir or _get_matrix_store_dir()
+    try:
+        store_dir.chmod(0o700)
+    except OSError:
+        return
+    for name in ("crypto.db", "crypto.db-wal", "crypto.db-shm"):
+        path = store_dir / name
+        try:
+            if path.exists():
+                path.chmod(0o600)
+        except OSError:
+            logger.warning("Matrix: could not tighten permissions on %s", path)
 
 # Grace period: ignore messages older than this many seconds before startup.
 _STARTUP_GRACE_SECONDS = 5
@@ -576,12 +796,12 @@ def _normalize_e2ee_mode(value: Any) -> str:
 def _resolve_e2ee_mode(extra: Optional[Dict[str, Any]] = None) -> str:
     """Resolve E2EE mode with MATRIX_ENCRYPTION backwards compatibility."""
     extra = extra or {}
-    explicit = extra.get("e2ee_mode") or os.getenv("MATRIX_E2EE_MODE", "")
+    explicit = extra.get("e2ee_mode") or _matrix_env("MATRIX_E2EE_MODE", "")
     if explicit:
         return _normalize_e2ee_mode(explicit)
     legacy_enabled = extra.get(
         "encryption",
-        os.getenv("MATRIX_ENCRYPTION", "").lower() in ("true", "1", "yes"),
+        _matrix_env("MATRIX_ENCRYPTION", "").lower() in ("true", "1", "yes"),
     )
     return "required" if legacy_enabled else "off"
 
@@ -600,7 +820,7 @@ def _write_matrix_recovery_key_output_file(recovery_key: str) -> Optional[Path]:
     The file is created with mode 0600 and never overwritten. Returns the path
     when written, otherwise None.
     """
-    output_file = os.getenv("MATRIX_RECOVERY_KEY_OUTPUT_FILE", "").strip()
+    output_file = _matrix_env("MATRIX_RECOVERY_KEY_OUTPUT_FILE", "").strip()
     if not output_file:
         return None
     path = Path(output_file).expanduser()
@@ -622,7 +842,7 @@ def _write_matrix_recovery_key_output_file(recovery_key: str) -> Optional[Path]:
 
 def _get_matrix_recovery_key_output_target() -> tuple[Optional[Path], str]:
     """Return a usable one-time recovery-key output path, or a redacted reason."""
-    output_file = os.getenv("MATRIX_RECOVERY_KEY_OUTPUT_FILE", "").strip()
+    output_file = _matrix_env("MATRIX_RECOVERY_KEY_OUTPUT_FILE", "").strip()
     if not output_file:
         return None, "not_configured"
     path = Path(output_file).expanduser()
@@ -727,9 +947,9 @@ def check_matrix_requirements() -> bool:
     forever and broke E2EE connect with ``No module named 'asyncpg'``
     (#31116).  Rebinds module-level type globals on success.
     """
-    token = os.getenv("MATRIX_ACCESS_TOKEN", "")
-    password = os.getenv("MATRIX_PASSWORD", "")
-    homeserver = os.getenv("MATRIX_HOMESERVER", "")
+    token = _matrix_env("MATRIX_ACCESS_TOKEN", "")
+    password = _matrix_env("MATRIX_PASSWORD", "")
+    homeserver = _matrix_env("MATRIX_HOMESERVER", "")
 
     if not token and not password:
         logger.debug("Matrix: neither MATRIX_ACCESS_TOKEN nor MATRIX_PASSWORD set")
@@ -853,24 +1073,26 @@ class MatrixAdapter(BasePlatformAdapter):
         self._split_threshold = max(100, self.max_message_length - 100)
 
         self._homeserver: str = (
-            config.extra.get("homeserver", "") or os.getenv("MATRIX_HOMESERVER", "")
+            config.extra.get("homeserver", "") or _matrix_env("MATRIX_HOMESERVER", "")
         ).rstrip("/")
-        self._access_token: str = config.token or os.getenv("MATRIX_ACCESS_TOKEN", "")
-        self._user_id: str = config.extra.get("user_id", "") or os.getenv(
+        self._access_token: str = config.token or _matrix_env("MATRIX_ACCESS_TOKEN", "")
+        self._user_id: str = config.extra.get("user_id", "") or _matrix_env(
             "MATRIX_USER_ID", ""
         )
-        self._password: str = config.extra.get("password", "") or os.getenv(
+        self._password: str = config.extra.get("password", "") or _matrix_env(
             "MATRIX_PASSWORD", ""
         )
         self._e2ee_mode: str = _resolve_e2ee_mode(config.extra)
         self._encryption: bool = self._e2ee_mode != "off"
-        self._device_id: str = config.extra.get("device_id", "") or os.getenv(
+        self._device_id: str = config.extra.get("device_id", "") or _matrix_env(
             "MATRIX_DEVICE_ID", ""
         )
         self._device_id_unverified: bool = False
 
         self._client: Any = None  # mautrix.client.Client
         self._crypto_db: Any = None  # mautrix.util.async_db.Database
+        self._store_dir: Optional[Path] = None
+        self._crypto_db_path: Optional[Path] = None
         self._sync_task: Optional[asyncio.Task] = None
         self._invite_join_tasks: Dict[str, asyncio.Task] = {}
         self._closing = False
@@ -894,7 +1116,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self._room_identity_cached_at: Dict[str, float] = {}
         try:
             self._room_identity_ttl_seconds = float(
-                os.getenv("MATRIX_ROOM_IDENTITY_TTL_SECONDS", "60")
+                _matrix_env("MATRIX_ROOM_IDENTITY_TTL_SECONDS", "60")
             )
         except ValueError:
             self._room_identity_ttl_seconds = 60.0
@@ -918,7 +1140,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self._thread_require_mention: bool = self._parse_thread_require_mention(config)
         free_rooms_raw = config.extra.get("free_response_rooms")
         if free_rooms_raw is None:
-            free_rooms_raw = os.getenv("MATRIX_FREE_RESPONSE_ROOMS", "")
+            free_rooms_raw = _matrix_env("MATRIX_FREE_RESPONSE_ROOMS", "")
         if isinstance(free_rooms_raw, list):
             self._free_rooms: Set[str] = {
                 str(r).strip() for r in free_rooms_raw if str(r).strip()
@@ -930,7 +1152,7 @@ class MatrixAdapter(BasePlatformAdapter):
         # If non-empty, bot ONLY responds in these rooms (whitelist); DMs exempt.
         allowed_rooms_raw = config.extra.get("allowed_rooms")
         if allowed_rooms_raw is None:
-            allowed_rooms_raw = os.getenv("MATRIX_ALLOWED_ROOMS", "")
+            allowed_rooms_raw = _matrix_env("MATRIX_ALLOWED_ROOMS", "")
         if isinstance(allowed_rooms_raw, list):
             self._allowed_rooms: Set[str] = {
                 str(r).strip() for r in allowed_rooms_raw if str(r).strip()
@@ -939,30 +1161,45 @@ class MatrixAdapter(BasePlatformAdapter):
             self._allowed_rooms: Set[str] = {
                 r.strip() for r in str(allowed_rooms_raw).split(",") if r.strip()
             }
-        self._allow_room_mentions: bool = os.getenv(
+        self._allow_room_mentions: bool = _matrix_env(
             "MATRIX_ALLOW_ROOM_MENTIONS", "false"
         ).lower() in ("true", "1", "yes")
-        self._auto_thread: bool = os.getenv("MATRIX_AUTO_THREAD", "true").lower() in (
+        self._auto_thread: bool = _matrix_env("MATRIX_AUTO_THREAD", "true").lower() in (
             "true",
             "1",
             "yes",
         )
-        self._dm_auto_thread: bool = os.getenv(
+        auto_thread_rooms_raw = config.extra.get("auto_thread_rooms")
+        if auto_thread_rooms_raw is None:
+            auto_thread_rooms_raw = _matrix_env("MATRIX_AUTO_THREAD_ROOMS", "")
+        if isinstance(auto_thread_rooms_raw, list):
+            self._auto_thread_rooms: Set[str] = {
+                str(room).strip()
+                for room in auto_thread_rooms_raw
+                if str(room).strip()
+            }
+        else:
+            self._auto_thread_rooms = {
+                room.strip()
+                for room in str(auto_thread_rooms_raw).split(",")
+                if room.strip()
+            }
+        self._dm_auto_thread: bool = _matrix_env(
             "MATRIX_DM_AUTO_THREAD", "false"
         ).lower() in {"true", "1", "yes"}
-        self._dm_mention_threads: bool = os.getenv(
+        self._dm_mention_threads: bool = _matrix_env(
             "MATRIX_DM_MENTION_THREADS", "false"
         ).lower() in ("true", "1", "yes")
-        raw_session_scope = os.getenv("MATRIX_SESSION_SCOPE", "auto").strip().lower()
+        raw_session_scope = _matrix_env("MATRIX_SESSION_SCOPE", "auto").strip().lower()
         self._matrix_session_scope = (
             raw_session_scope if raw_session_scope in {"auto", "room", "thread"} else "auto"
         )
-        self._process_notices: bool = os.getenv(
+        self._process_notices: bool = _matrix_env(
             "MATRIX_PROCESS_NOTICES", "false"
         ).lower() in ("true", "1", "yes")
 
         # Reactions: configurable via MATRIX_REACTIONS (default: true).
-        self._reactions_enabled: bool = os.getenv(
+        self._reactions_enabled: bool = _matrix_env(
             "MATRIX_REACTIONS", "true"
         ).lower() not in {"false", "0", "no"}
         self._pending_reactions: dict[tuple[str, str], str] = {}
@@ -978,17 +1215,17 @@ class MatrixAdapter(BasePlatformAdapter):
         if self._proxy_url:
             logger.info("Matrix: proxy configured — %s", self._proxy_url)
         try:
-            self._max_media_bytes = int(os.getenv("MATRIX_MAX_MEDIA_BYTES", str(100 * 1024 * 1024)))
+            self._max_media_bytes = int(_matrix_env("MATRIX_MAX_MEDIA_BYTES", str(100 * 1024 * 1024)))
         except ValueError:
             self._max_media_bytes = 100 * 1024 * 1024
 
         # Text batching: merge rapid successive messages (Telegram-style).
         # Matrix clients split long messages around 4000 chars.
         self._text_batch_delay_seconds = float(
-            os.getenv("HERMES_MATRIX_TEXT_BATCH_DELAY_SECONDS", "0.6")
+            _matrix_env("HERMES_MATRIX_TEXT_BATCH_DELAY_SECONDS", "0.6")
         )
         self._text_batch_split_delay_seconds = float(
-            os.getenv("HERMES_MATRIX_TEXT_BATCH_SPLIT_DELAY_SECONDS", "2.0")
+            _matrix_env("HERMES_MATRIX_TEXT_BATCH_SPLIT_DELAY_SECONDS", "2.0")
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
@@ -1006,23 +1243,31 @@ class MatrixAdapter(BasePlatformAdapter):
         }
         self._approval_prompts_by_event: Dict[str, _MatrixApprovalPrompt] = {}
         self._approval_prompt_by_session: Dict[str, str] = {}
-        self._approval_require_sender: bool = os.getenv(
+        self._approval_require_sender: bool = _matrix_env(
             "MATRIX_APPROVAL_REQUIRE_SENDER", "true"
         ).lower() in ("true", "1", "yes")
         try:
             self._approval_timeout_seconds = int(
-                os.getenv("MATRIX_APPROVAL_TIMEOUT_SECONDS", "300")
+                _matrix_env("MATRIX_APPROVAL_TIMEOUT_SECONDS", "300")
             )
         except ValueError:
             self._approval_timeout_seconds = 300
         self._model_picker_prompts_by_event: Dict[str, _MatrixModelPickerPrompt] = {}
         self._choice_picker_prompts_by_event: Dict[str, _MatrixChoicePickerPrompt] = {}
-        allowed_users_raw = os.getenv("MATRIX_ALLOWED_USERS", "")
+        allowed_users_raw = config.extra.get("allowed_users")
+        if isinstance(allowed_users_raw, list):
+            allowed_users_raw = ",".join(str(v) for v in allowed_users_raw)
+        allowed_users_raw = str(allowed_users_raw or _matrix_env("MATRIX_ALLOWED_USERS", ""))
         self._allowed_user_ids: Set[str] = {
             u.strip() for u in allowed_users_raw.split(",") if u.strip()
         }
         self._allowed_room_ids: Set[str] = set(self._allowed_rooms)
-        ignore_patterns_raw = os.getenv("MATRIX_IGNORE_USER_PATTERNS", "")
+        ignore_patterns_raw = config.extra.get("ignore_user_patterns")
+        if isinstance(ignore_patterns_raw, list):
+            ignore_patterns_raw = ",".join(str(v) for v in ignore_patterns_raw)
+        ignore_patterns_raw = str(
+            ignore_patterns_raw or _matrix_env("MATRIX_IGNORE_USER_PATTERNS", "")
+        )
         self._ignored_user_patterns: list[re.Pattern[str]] = []
         for pattern in (p.strip() for p in ignore_patterns_raw.split(",") if p.strip()):
             try:
@@ -1062,7 +1307,7 @@ class MatrixAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
-        return os.getenv(
+        return _matrix_env(
             "MATRIX_REQUIRE_MENTION", "true"
         ).lower() not in {"false", "0", "no", "off"}
 
@@ -1083,7 +1328,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 return configured.lower() not in {"false", "0", "no", "off"}
             # int, float, etc. — truthiness fallback
             return bool(configured)
-        return os.getenv(
+        return _matrix_env(
             "MATRIX_THREAD_REQUIRE_MENTION", "false"
         ).lower() in {"true", "1", "yes", "on"}
 
@@ -1174,7 +1419,7 @@ class MatrixAdapter(BasePlatformAdapter):
                     "Matrix: server has different identity keys for device %s — "
                     "local crypto state is stale. Delete %s and restart.",
                     client.device_id,
-                    _CRYPTO_DB_PATH,
+                    self._crypto_db_path or _get_matrix_crypto_db_path(),
                 )
                 return False
 
@@ -1231,7 +1476,12 @@ class MatrixAdapter(BasePlatformAdapter):
             return False
 
         # Ensure store dir exists for E2EE key persistence.
-        _STORE_DIR.mkdir(parents=True, exist_ok=True)
+        store_dir = _get_matrix_store_dir()
+        crypto_db_path = _get_matrix_crypto_db_path(store_dir)
+        self._store_dir = store_dir
+        self._crypto_db_path = crypto_db_path
+        store_dir.mkdir(parents=True, exist_ok=True)
+        _secure_matrix_store_permissions(store_dir)
 
         # Create the HTTP API layer.
         client_session = _create_matrix_session(self._proxy_url)
@@ -1363,7 +1613,7 @@ class MatrixAdapter(BasePlatformAdapter):
                     from mautrix.crypto.store.asyncpg import PgCryptoStore
                     from mautrix.util.async_db import Database
 
-                    _STORE_DIR.mkdir(parents=True, exist_ok=True)
+                    store_dir.mkdir(parents=True, exist_ok=True)
                 except Exception as exc:
                     if self._e2ee_mode == "optional":
                         logger.warning(
@@ -1383,8 +1633,29 @@ class MatrixAdapter(BasePlatformAdapter):
                         return False
             if self._encryption:
                 try:
+                    persisted_device_id = _read_crypto_store_device_id(
+                        crypto_db_path,
+                        self._user_id or "hermes",
+                    )
+                    effective_device_id = str(client.device_id or "")
+                    if (
+                        persisted_device_id
+                        and effective_device_id
+                        and persisted_device_id != effective_device_id
+                    ):
+                        logger.error(
+                            "Matrix: crypto store belongs to device %s but config/login "
+                            "resolved device %s. Refusing to open it under the wrong "
+                            "pickle key. Preserve and move the whole store directory "
+                            "before an intentional device rotation.",
+                            persisted_device_id,
+                            effective_device_id,
+                        )
+                        await api.session.close()
+                        return False
+
                     # Remove legacy pickle file from pre-SQLite era.
-                    legacy_pickle = _STORE_DIR / "crypto_store.pickle"
+                    legacy_pickle = store_dir / "crypto_store.pickle"
                     if legacy_pickle.exists():
                         logger.info(
                             "Matrix: removing legacy crypto_store.pickle (migrated to SQLite)"
@@ -1392,7 +1663,7 @@ class MatrixAdapter(BasePlatformAdapter):
                         legacy_pickle.unlink()
 
                     crypto_db = Database.create(
-                        f"sqlite:///{_CRYPTO_DB_PATH}",
+                        f"sqlite:///{crypto_db_path}",
                         upgrade_table=PgCryptoStore.upgrade_table,
                     )
                     await crypto_db.start()
@@ -1409,6 +1680,12 @@ class MatrixAdapter(BasePlatformAdapter):
 
                     if client.device_id:
                         await crypto_store.put_device_id(client.device_id)
+
+                    # PgCryptoStore persists next_batch in crypto_account. Reuse
+                    # it across gateway restarts instead of replaying the entire
+                    # room timeline through a fresh MemorySyncStore each time.
+                    client.sync_store = crypto_store
+                    _secure_matrix_store_permissions(store_dir)
 
                     crypto_state = _CryptoStateStore(state_store, self._joined_rooms)
                     olm = OlmMachine(client, crypto_store, crypto_state)
@@ -1439,7 +1716,7 @@ class MatrixAdapter(BasePlatformAdapter):
                             return False
                         logger.warning("Matrix: share_keys() warning during startup: %s", exc)
 
-                    recovery_key = os.getenv("MATRIX_RECOVERY_KEY", "").strip()
+                    recovery_key = _matrix_env("MATRIX_RECOVERY_KEY", "").strip()
                     if recovery_key:
                         try:
                             await olm.verify_with_recovery_key(recovery_key)
@@ -1494,7 +1771,7 @@ class MatrixAdapter(BasePlatformAdapter):
                     client.crypto = olm
                     logger.info(
                         "Matrix: E2EE enabled (store: %s%s)",
-                        str(_CRYPTO_DB_PATH),
+                        str(crypto_db_path),
                         f", device_id={client.device_id}" if client.device_id else "",
                     )
                 except Exception as exc:
@@ -1548,7 +1825,8 @@ class MatrixAdapter(BasePlatformAdapter):
         self._closing = False
 
         try:
-            sync_data = await client.sync(timeout=10000, full_state=True)
+            initial_sync_kwargs = await _matrix_initial_sync_kwargs(client.sync_store)
+            sync_data = await client.sync(**initial_sync_kwargs)
             if isinstance(sync_data, dict):
                 self._last_sync_ts = time.time()
                 rooms_join = sync_data.get("rooms", {}).get("join", {})
@@ -1628,6 +1906,8 @@ class MatrixAdapter(BasePlatformAdapter):
                 await self._crypto_db.stop()
             except Exception as exc:
                 logger.debug("Matrix: could not close crypto DB on disconnect: %s", exc)
+            self._crypto_db = None
+            _secure_matrix_store_permissions(self._store_dir)
 
         if self._client:
             try:
@@ -1655,7 +1935,8 @@ class MatrixAdapter(BasePlatformAdapter):
 
         last_event_id = None
         for i, chunk in enumerate(chunks):
-            msg_content = self._build_text_message_content(chunk)
+            msgtype = "m.notice" if (metadata or {}).get("silent_notification") else "m.text"
+            msg_content = self._build_text_message_content(chunk, msgtype=msgtype)
 
             self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
 
@@ -1736,8 +2017,10 @@ class MatrixAdapter(BasePlatformAdapter):
                 "mode": self._e2ee_mode,
                 "enabled": bool(self._encryption),
                 "deps_available": _check_e2ee_deps(),
-                "crypto_store_path": str(_CRYPTO_DB_PATH),
-                "recovery_key_configured": bool(os.getenv("MATRIX_RECOVERY_KEY", "").strip()),
+                "crypto_store_path": str(
+                    self._crypto_db_path or _get_matrix_crypto_db_path()
+                ),
+                "recovery_key_configured": bool(_matrix_env("MATRIX_RECOVERY_KEY", "").strip()),
             },
             "policy": {
                 "allowed_user_count": len(self._allowed_user_ids),
@@ -1747,7 +2030,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 "free_response_room_count": len(self._free_rooms),
                 "allow_room_mentions": self._allow_room_mentions,
                 "process_notices": self._process_notices,
-                "allow_public_rooms": os.getenv("MATRIX_ALLOW_PUBLIC_ROOMS", "").lower()
+                "allow_public_rooms": _matrix_env("MATRIX_ALLOW_PUBLIC_ROOMS", "").lower()
                 in ("true", "1", "yes"),
             },
             "media": {
@@ -1779,14 +2062,21 @@ class MatrixAdapter(BasePlatformAdapter):
 
 
     async def edit_message(
-        self, chat_id: str, message_id: str, content: str, *, finalize: bool = False
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit an existing message (via m.replace)."""
 
         formatted = self.format_message(content)
-        new_content = self._build_text_message_content(formatted)
+        msgtype = "m.notice" if (metadata or {}).get("silent_notification") else "m.text"
+        new_content = self._build_text_message_content(formatted, msgtype=msgtype)
         msg_content: Dict[str, Any] = {
-            "msgtype": "m.text",
+            "msgtype": msgtype,
             "body": f"* {formatted}",
             "m.new_content": new_content,
         }
@@ -2032,16 +2322,47 @@ class MatrixAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Upload an audio file as a voice message (MSC3245 native voice)."""
-        return await self._send_local_file(
-            chat_id,
-            audio_path,
-            "m.audio",
-            caption,
-            reply_to,
-            metadata=metadata,
-            is_voice=True,
-        )
+        """Upload an audio file as a voice message (MSC3245 native voice).
+
+        Matrix voice bubbles require Opus in an Ogg container (MSC3245), but
+        callers can reach this with any audio format — e.g. a model-invoked
+        ``text_to_speech`` result routed through gateway media delivery, not
+        just ``_send_voice_reply``. Enforce the codec at this boundary:
+        transcode non-Ogg input to Ogg/Opus (best-effort — if ffmpeg is
+        unavailable the original file is sent unchanged, preserving the
+        previous behaviour).
+        """
+        converted_path: Optional[str] = None
+        send_path = audio_path
+        if not str(audio_path).lower().endswith((".ogg", ".oga", ".opus")):
+            converted_path = await asyncio.to_thread(
+                _matrix_transcode_voice_to_ogg, audio_path
+            )
+            if converted_path:
+                send_path = converted_path
+        try:
+            return await self._send_local_file(
+                chat_id,
+                send_path,
+                "m.audio",
+                caption,
+                reply_to,
+                # keep the caller's basename (the temp transcode file has a
+                # generated name) so the event body stays meaningful
+                file_name=(
+                    Path(audio_path).with_suffix(".ogg").name
+                    if converted_path
+                    else None
+                ),
+                metadata=metadata,
+                is_voice=True,
+            )
+        finally:
+            if converted_path:
+                try:
+                    os.unlink(converted_path)
+                except OSError:
+                    pass
 
     async def send_video(
         self,
@@ -2293,6 +2614,7 @@ class MatrixAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         is_voice: bool = False,
+        voice_metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Upload bytes to Matrix and send as a media message."""
         if len(data) > self._max_media_bytes:
@@ -2349,6 +2671,17 @@ class MatrixAdapter(BasePlatformAdapter):
         # Add MSC3245 voice flag for native voice messages.
         if is_voice:
             msg_content["org.matrix.msc3245.voice"] = {}
+            duration = (voice_metadata or {}).get("duration")
+            waveform = (voice_metadata or {}).get("waveform")
+            if duration is not None:
+                msg_content["info"]["duration"] = duration
+            if duration is not None or waveform is not None:
+                audio_metadata: Dict[str, Any] = {}
+                if duration is not None:
+                    audio_metadata["duration"] = duration
+                if waveform is not None:
+                    audio_metadata["waveform"] = waveform
+                msg_content["org.matrix.msc1767.audio"] = audio_metadata
 
         self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
 
@@ -2397,9 +2730,25 @@ class MatrixAdapter(BasePlatformAdapter):
         fname = file_name or p.name
         ct = mimetypes.guess_type(fname)[0] or "application/octet-stream"
         data = p.read_bytes()
+        # ffprobe/ffmpeg probing is blocking (subprocess timeouts up to 15s) —
+        # run it off the event loop so voice uploads never stall the adapter.
+        voice_metadata = (
+            await asyncio.to_thread(_matrix_voice_metadata_for_file, p)
+            if is_voice
+            else None
+        )
 
         return await self._upload_and_send(
-            room_id, data, fname, ct, msgtype, caption, reply_to, metadata, is_voice
+            room_id,
+            data,
+            fname,
+            ct,
+            msgtype,
+            caption,
+            reply_to,
+            metadata,
+            is_voice,
+            voice_metadata,
         )
 
     # ------------------------------------------------------------------
@@ -2821,6 +3170,9 @@ class MatrixAdapter(BasePlatformAdapter):
                 if self._dm_auto_thread:
                     thread_id = event_id
                     self._threads.mark(thread_id)
+            elif room_id in self._auto_thread_rooms:
+                thread_id = event_id
+                self._threads.mark(thread_id)
             elif self._matrix_session_scope == "room":
                 thread_id = None
             elif self._matrix_session_scope == "thread":
@@ -3139,7 +3491,7 @@ class MatrixAdapter(BasePlatformAdapter):
         # federated Matrix user could invite the bot into arbitrary rooms,
         # exposing its presence and metadata. Mirrors the allow-list gate
         # used on the message/reaction paths.
-        allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {
+        allow_all = _matrix_env("GATEWAY_ALLOW_ALL_USERS").lower() in {
             "true",
             "1",
             "yes",
@@ -3510,7 +3862,7 @@ class MatrixAdapter(BasePlatformAdapter):
         prompt: Any,
         prompt_label: str,
     ) -> bool:
-        allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {
+        allow_all = _matrix_env("GATEWAY_ALLOW_ALL_USERS").lower() in {
             "true",
             "1",
             "yes",
@@ -3758,7 +4110,7 @@ class MatrixAdapter(BasePlatformAdapter):
         """Create a new Matrix room."""
         if not self._client:
             return None
-        if preset == "public_chat" and os.getenv("MATRIX_ALLOW_PUBLIC_ROOMS", "").lower() not in (
+        if preset == "public_chat" and _matrix_env("MATRIX_ALLOW_PUBLIC_ROOMS", "").lower() not in (
             "true",
             "1",
             "yes",
@@ -4574,8 +4926,8 @@ async def _standalone_send(
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
-        homeserver = (extra.get("homeserver") or os.getenv("MATRIX_HOMESERVER", "")).rstrip("/")
-        token = token or os.getenv("MATRIX_ACCESS_TOKEN", "")
+        homeserver = (extra.get("homeserver") or _matrix_env("MATRIX_HOMESERVER", "")).rstrip("/")
+        token = token or _matrix_env("MATRIX_ACCESS_TOKEN", "")
         if not homeserver or not token:
             return {"error": "Matrix not configured (MATRIX_HOMESERVER, MATRIX_ACCESS_TOKEN required)"}
         txn_id = f"hermes_{int(time.time() * 1000)}_{os.urandom(4).hex()}"
@@ -4716,39 +5068,50 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
     matrix_cfg block from gateway/config.py::load_gateway_config(). Env vars
     take precedence over YAML. Returns None — everything flows through env.
     """
-    if "require_mention" in matrix_cfg and not os.getenv("MATRIX_REQUIRE_MENTION"):
-        os.environ["MATRIX_REQUIRE_MENTION"] = str(matrix_cfg["require_mention"]).lower()
+    seeded_extra = dict(matrix_cfg.get("extra") or {})
+    for key, value in matrix_cfg.items():
+        if key != "extra":
+            seeded_extra.setdefault(key, value)
+    if "require_mention" in matrix_cfg and not _matrix_env("MATRIX_REQUIRE_MENTION"):
+        _set_matrix_env_default("MATRIX_REQUIRE_MENTION", str(matrix_cfg["require_mention"]).lower())
     au = matrix_cfg.get("allowed_users")
-    if au is not None and not os.getenv("MATRIX_ALLOWED_USERS"):
+    if au is not None and not _matrix_env("MATRIX_ALLOWED_USERS"):
         if isinstance(au, list):
             au = ",".join(str(v) for v in au)
-        os.environ["MATRIX_ALLOWED_USERS"] = str(au)
+        _set_matrix_env_default("MATRIX_ALLOWED_USERS", au)
     frc = matrix_cfg.get("free_response_rooms")
-    if frc is not None and not os.getenv("MATRIX_FREE_RESPONSE_ROOMS"):
+    if frc is not None and not _matrix_env("MATRIX_FREE_RESPONSE_ROOMS"):
         if isinstance(frc, list):
             frc = ",".join(str(v) for v in frc)
-        os.environ["MATRIX_FREE_RESPONSE_ROOMS"] = str(frc)
+        _set_matrix_env_default("MATRIX_FREE_RESPONSE_ROOMS", frc)
     ar = matrix_cfg.get("allowed_rooms")
-    if ar is not None and not os.getenv("MATRIX_ALLOWED_ROOMS"):
+    if ar is not None and not _matrix_env("MATRIX_ALLOWED_ROOMS"):
         if isinstance(ar, list):
             ar = ",".join(str(v) for v in ar)
-        os.environ["MATRIX_ALLOWED_ROOMS"] = str(ar)
+        _set_matrix_env_default("MATRIX_ALLOWED_ROOMS", ar)
     ignore_patterns = matrix_cfg.get("ignore_user_patterns")
-    if ignore_patterns is not None and not os.getenv("MATRIX_IGNORE_USER_PATTERNS"):
+    if ignore_patterns is not None and not _matrix_env("MATRIX_IGNORE_USER_PATTERNS"):
         if isinstance(ignore_patterns, list):
             ignore_patterns = ",".join(str(v) for v in ignore_patterns)
-        os.environ["MATRIX_IGNORE_USER_PATTERNS"] = str(ignore_patterns)
-    if "process_notices" in matrix_cfg and not os.getenv("MATRIX_PROCESS_NOTICES"):
-        os.environ["MATRIX_PROCESS_NOTICES"] = str(matrix_cfg["process_notices"]).lower()
-    if "session_scope" in matrix_cfg and not os.getenv("MATRIX_SESSION_SCOPE"):
-        os.environ["MATRIX_SESSION_SCOPE"] = str(matrix_cfg["session_scope"]).lower()
-    if "auto_thread" in matrix_cfg and not os.getenv("MATRIX_AUTO_THREAD"):
-        os.environ["MATRIX_AUTO_THREAD"] = str(matrix_cfg["auto_thread"]).lower()
-    if "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):
-        os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
-    if "max_message_length" in matrix_cfg and not os.getenv("MATRIX_MAX_MESSAGE_LENGTH"):
-        os.environ["MATRIX_MAX_MESSAGE_LENGTH"] = str(matrix_cfg["max_message_length"])
-    return None
+        _set_matrix_env_default("MATRIX_IGNORE_USER_PATTERNS", ignore_patterns)
+    if "process_notices" in matrix_cfg and not _matrix_env("MATRIX_PROCESS_NOTICES"):
+        _set_matrix_env_default("MATRIX_PROCESS_NOTICES", str(matrix_cfg["process_notices"]).lower())
+    if "session_scope" in matrix_cfg and not _matrix_env("MATRIX_SESSION_SCOPE"):
+        _set_matrix_env_default("MATRIX_SESSION_SCOPE", str(matrix_cfg["session_scope"]).lower())
+    if "auto_thread" in matrix_cfg and not _matrix_env("MATRIX_AUTO_THREAD"):
+        _set_matrix_env_default("MATRIX_AUTO_THREAD", str(matrix_cfg["auto_thread"]).lower())
+    if "dm_auto_thread" in matrix_cfg and not _matrix_env("MATRIX_DM_AUTO_THREAD"):
+        _set_matrix_env_default("MATRIX_DM_AUTO_THREAD", str(matrix_cfg["dm_auto_thread"]).lower())
+    auto_thread_rooms = matrix_cfg.get("auto_thread_rooms")
+    if auto_thread_rooms is not None and not _matrix_env("MATRIX_AUTO_THREAD_ROOMS"):
+        if isinstance(auto_thread_rooms, list):
+            auto_thread_rooms = ",".join(str(v) for v in auto_thread_rooms)
+        _set_matrix_env_default("MATRIX_AUTO_THREAD_ROOMS", auto_thread_rooms)
+    if "dm_mention_threads" in matrix_cfg and not _matrix_env("MATRIX_DM_MENTION_THREADS"):
+        _set_matrix_env_default("MATRIX_DM_MENTION_THREADS", str(matrix_cfg["dm_mention_threads"]).lower())
+    if "max_message_length" in matrix_cfg and not _matrix_env("MATRIX_MAX_MESSAGE_LENGTH"):
+        _set_matrix_env_default("MATRIX_MAX_MESSAGE_LENGTH", matrix_cfg["max_message_length"])
+    return seeded_extra or None
 
 
 def _is_connected(config) -> bool:

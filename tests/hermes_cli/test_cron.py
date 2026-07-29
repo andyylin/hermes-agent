@@ -39,6 +39,19 @@ class TestCronCommandLifecycle:
         assert "Resumed job" in out
         assert "Triggered job" in out
 
+    def test_export_definitions_follows_late_hermes_home(
+        self, tmp_path, monkeypatch
+    ):
+        captured = []
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(
+            "cron.jobs.export_definitions_file",
+            lambda *, output_path: captured.append(output_path) or True,
+        )
+
+        assert cron_cli.cron_export_definitions(SimpleNamespace(output=None)) == 0
+        assert captured == [tmp_path.resolve() / "cron" / "jobs.definitions.json"]
+
     def test_edit_can_replace_and_clear_skills(self, tmp_cron_dir, capsys):
         job = create_job(
             prompt="Combine skill outputs",

@@ -648,6 +648,35 @@ async def test_unauthorized_dm_pairs_by_default(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_secondary_profile_dm_uses_secondary_pairing_store(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    config = GatewayConfig(
+        multiplex_profiles=True,
+        platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
+    )
+    runner, adapter = _make_runner(Platform.WHATSAPP, config)
+    secondary_store = MagicMock()
+    secondary_store.is_approved.return_value = False
+    secondary_store._is_rate_limited.return_value = False
+    secondary_store.generate_code.return_value = "SECOND12"
+    runner.pairing_stores = {"coder": secondary_store}
+    runner._profile_adapters = {"coder": {Platform.WHATSAPP: adapter}}
+    event = _make_event(
+        Platform.WHATSAPP,
+        "15551234567@s.whatsapp.net",
+        "15551234567@s.whatsapp.net",
+    )
+    event.source.profile = "coder"
+
+    assert await runner._handle_message(event) is None
+    secondary_store.generate_code.assert_called_once_with(
+        "whatsapp", "15551234567@s.whatsapp.net", "tester"
+    )
+    runner.pairing_store.generate_code.assert_not_called()
+    adapter.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_unauthorized_whatsapp_dm_can_be_ignored(monkeypatch):
     _clear_auth_env(monkeypatch)
     config = GatewayConfig(

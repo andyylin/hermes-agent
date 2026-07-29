@@ -1308,6 +1308,284 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     return targets[0] if targets else None
 
 
+def _job_delivers_to_discord(job: dict) -> bool:
+    """Return True when this job's resolved delivery includes Discord."""
+    try:
+        return any(
+            str(target.get("platform", "")).lower() == "discord"
+            for target in _resolve_delivery_targets(job)
+        )
+    except Exception:
+        return False
+
+
+def _markdown_tables_to_bullets(markdown_text: str) -> str:
+    """Best-effort conversion of simple Markdown tables into bullet lists.
+
+    Discord's Markdown table rendering is inconsistent and hard to read in
+    alert channels. This keeps cron alerts Discord-friendly even when a
+    no-agent script or LLM slips a table into the body.
+    """
+    lines = markdown_text.splitlines()
+    output: list[str] = []
+    i = 0
+
+    def _table_cells(line: str) -> list[str]:
+        stripped = line.strip().strip("|")
+        return [cell.strip() for cell in stripped.split("|")]
+
+    def _is_separator(line: str) -> bool:
+        cells = _table_cells(line)
+        if not cells:
+            return False
+        return all(cell and set(cell.replace(":", "").replace("-", "")) == set() and "-" in cell for cell in cells)
+
+    while i < len(lines):
+        if "|" in lines[i] and i + 1 < len(lines) and _is_separator(lines[i + 1]):
+            headers = _table_cells(lines[i])
+            rows: list[list[str]] = []
+            i += 2
+            while i < len(lines) and "|" in lines[i] and lines[i].strip():
+                rows.append(_table_cells(lines[i]))
+                i += 1
+            if output and output[-1].strip():
+                output.append("")
+            for row in rows:
+                pairs = []
+                for idx, value in enumerate(row):
+                    header = headers[idx] if idx < len(headers) and headers[idx] else f"Column {idx + 1}"
+                    if value:
+                        pairs.append(f"**{header}:** {value}")
+                if pairs:
+                    output.append(f"- {'; '.join(pairs)}")
+            if i < len(lines) and lines[i].strip():
+                output.append("")
+            continue
+        output.append(lines[i])
+        i += 1
+
+    return "\n".join(output)
+
+
+def _format_cron_email_subject(job: dict) -> Optional[str]:
+    """Return an explicit email subject for cron delivery when a job asks for one.
+
+    Supports ``{date}`` / ``{date_compact}`` / ``{job_name}`` / ``{job_id}``
+    templates. Dates are evaluated at delivery time in Hermes' configured
+    timezone, so daily email automations do not thread into one endless chain.
+    """
+    template = job.get("email_subject_template") or job.get("delivery_subject_template")
+    if not template:
+        return None
+    now = _hermes_now()
+    return str(template).format(
+        date=now.strftime("%Y-%m-%d"),
+        date_compact=now.strftime("%Y%m%d"),
+        job_name=job.get("name", job.get("id", "")),
+        job_id=job.get("id", ""),
+    )
+
+
+def _format_cron_email_subject_payload(job: dict):
+    """Return the subject payload for email delivery.
+
+    Most jobs get a plain subject string. Jobs with ``email_thread_key`` opt
+    into explicit RFC 5322 threading headers so mail clients that do not rely
+    on Gmail-style same-subject heuristics (notably Apple Mail) can keep a
+    recurring stream in one conversation.
+    """
+    subject = _format_cron_email_subject(job)
+    if not subject:
+        return None
+    thread_key = str(job.get("email_thread_key") or "").strip()
+    if not thread_key:
+        return subject
+    return {"subject": subject, "thread_anchor_key": thread_key}
+
+
+def _is_one_shot_job(job: dict) -> bool:
+    """Return True when a cron job is configured to run only once."""
+    repeat = job.get("repeat")
+    if isinstance(repeat, dict) and repeat.get("times") == 1:
+        return True
+    if repeat == 1:
+        return True
+
+    schedule = job.get("schedule")
+    if isinstance(schedule, dict) and schedule.get("kind") == "once":
+        return True
+    return False
+
+
+def _one_shot_delivery_footer(job: dict) -> str:
+    """Human-facing footer for one-shot deliveries.
+
+    One-off reminders should not imply there is a recurring job to stop.
+    """
+    label_source = " ".join(
+        str(job.get(field) or "")
+        for field in ("name", "prompt")
+    ).lower()
+    noun = "reminder" if "remind" in label_source or "reminder" in label_source else "job"
+    return f"This was a one-off {noun}; it will not repeat."
+
+
+def _append_cron_email_reference_footer(job: dict, body: str) -> str:
+    """Add a copy/paste reference code to cron email notifications."""
+    from tools.email_rendering import append_notification_reference_footer, make_notification_ref
+
+    job_id = str(job.get("id") or "")
+    task_name = str(job.get("name") or job_id or "cron-job")
+    script = str(job.get("script") or "")
+    source = f"/home/pi/.hermes/scripts/{script}" if script else "Hermes cron job definition"
+    return append_notification_reference_footer(
+        body,
+        ref=make_notification_ref("cron", task_name, job_id),
+        job_id=job_id,
+        script=script or None,
+        source=source,
+        ask="investigate this REF",
+    )
+
+
+
+
+def _cron_repair_gate_alert_routing_enabled() -> bool:
+    """Whether source cron alerts should be held for the repair gate.
+
+    When enabled, ordinary automations still record failed/warning output and
+    ``last_status`` normally, but the source job does not immediately notify the
+    user. The universal automation repairer scans that state, attempts one
+    bounded repair, and reports only repaired/blocked/escalated outcomes.
+    """
+    env = os.getenv("HERMES_CRON_ROUTE_ALERTS_THROUGH_REPAIR_GATE", "").strip().lower()
+    if env in {"1", "true", "yes", "on"}:
+        return True
+    if env in {"0", "false", "no", "off"}:
+        return False
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron") or {} if isinstance(cfg, dict) else {}
+        return bool(cron_cfg.get("route_alerts_through_repair_gate", False))
+    except Exception as exc:
+        logger.debug("Could not read cron repair-gate alert routing config: %s", exc)
+        return False
+
+
+def _is_repair_gate_job(job: dict) -> bool:
+    return (
+        job.get("script") == "automation_failure_repair_gate.py"
+        or job.get("name") == "automation-failure-first-pass-repairer"
+    )
+
+
+def _looks_like_cron_warning_or_error_alert(content: str) -> bool:
+    """Best-effort guard for successful jobs that emitted an alert payload.
+
+    This is intentionally conservative so routine reports that merely contain a
+    risks/caveats section still deliver. It catches deterministic watchdog
+    outputs and short alert-style LLM responses whose leading line/status says
+    warning/error/attention/report.
+    """
+    text = (content or "").strip()
+    if not text:
+        return False
+    head = "\n".join(line.strip() for line in text.splitlines()[:8] if line.strip())
+    if re.search(r'(?is)^\s*\{.*"status"\s*:\s*"(REPORT|WARNING|FAILURE|ERROR)"', text[:2000]):
+        return True
+    return bool(re.search(
+        r"(?im)^(?:[#*_\s>`-]*)?(?:⚠|⚠️|warning[:：]|error[:：]|alert[:：]|attention needed\b|action required\b|.+\bfailed\b)",
+        head,
+    ))
+
+def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool, for_email: bool = False) -> str:
+    """Apply the cron wrapper, using native formatting for delivery surfaces."""
+    task_name = job.get("name", job["id"])
+    job_id = job.get("id", "")
+    body = _markdown_tables_to_bullets(content) if for_discord else content
+    if for_email and re.search(r"</?(?:html|body|h[1-6]|p|ul|ol|li|br|strong|em|table|tr|td|div|span|blockquote)\b", body or "", re.IGNORECASE):
+        from html import escape
+
+        body_match = re.search(r"<body[^>]*>(.*?)</body>", body, flags=re.IGNORECASE | re.DOTALL)
+        body_html = body_match.group(1) if body_match else body
+        manage = (
+            f'To stop or manage this job, send me a new message '
+            f'(e.g. &quot;stop reminder {escape(str(task_name))}&quot;).'
+        )
+        if _is_one_shot_job(job):
+            manage = escape(_one_shot_delivery_footer(job))
+        html_body = (
+            '<!doctype html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'
+            "'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.45; color:#24292f; "
+            'font-size:15px; max-width:860px; margin:0 auto; padding:16px;">'
+            '<style>a{color:#0969da} code{background:#f6f8fa; padding:2px 4px; border-radius:4px; '
+            'font-family:SFMono-Regular,Consolas,monospace} table{border-collapse:collapse; width:100%;} '
+            'th,td{border:1px solid #d0d7de; padding:6px; vertical-align:top;} '
+            'th{background:#f6f8fa; text-align:left;} blockquote{border-left:4px solid #d0d7de; '
+            'margin:16px 0; padding:8px 12px; color:#57606a; background:#f6f8fa;}</style>'
+            f"<h2>Cron Alert: {escape(str(task_name))}</h2>"
+            f"<p><strong>Job ID:</strong> <code>{escape(str(job_id))}</code></p>"
+            "<hr>"
+            f"{body_html}"
+            "<hr>"
+            f"<p>{manage}</p>"
+            "</body></html>"
+        )
+        return _append_cron_email_reference_footer(job, html_body)
+    if _is_one_shot_job(job):
+        footer = _one_shot_delivery_footer(job)
+        if for_email:
+            return _append_cron_email_reference_footer(job, (
+                f"## Cron Alert: {task_name}\n\n"
+                f"**Job ID:** `{job_id}`\n\n"
+                f"### Report\n\n"
+                f"{body}\n\n"
+                f"### One-off\n\n"
+                f"{footer}"
+            ))
+        if for_discord:
+            return (
+                f"# Cron Alert: {task_name}\n\n"
+                f"**Job ID:** `{job_id}`\n\n"
+                f"## Report\n\n"
+                f"{body}\n\n"
+                f"## One-off\n\n"
+                f"{footer}"
+            )
+        return (
+            f"Cronjob Response: {task_name}\n"
+            f"(job_id: {job_id})\n"
+            f"-------------\n\n"
+            f"{body}\n\n"
+            f"{footer}"
+        )
+    if for_email:
+        return _append_cron_email_reference_footer(job, (
+            f"## Cron Alert: {task_name}\n\n"
+            f"**Job ID:** `{job_id}`\n\n"
+            f"### Report\n\n"
+            f"{body}\n\n"
+            f"### Manage\n\n"
+            f"To stop or manage this job, send me a new message (e.g. `stop reminder {task_name}`)."
+        ))
+    if for_discord:
+        return (
+            f"# Cron Alert: {task_name}\n\n"
+            f"**Job ID:** `{job_id}`\n\n"
+            f"## Report\n\n"
+            f"{body}\n\n"
+            f"## Manage\n\n"
+            f"To stop or manage this job, send me a new message, e.g. `stop reminder {task_name}`."
+        )
+    return (
+        f"Cronjob Response: {task_name}\n"
+        f"(job_id: {job_id})\n"
+        f"-------------\n\n"
+        f"{body}\n\n"
+        f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+    )
+
+
 # Media extension sets — audio routing is centralized in gateway.platforms.base
 # via should_send_media_as_audio() so Telegram-specific rules stay in one place.
 _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
@@ -1494,23 +1772,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception:
         pass
 
-    if wrap_response:
-        task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
-    else:
-        delivery_content = content
-
-    # Extract MEDIA: tags so attachments are forwarded as files, not raw text
+    # Extracting and platform-specific formatting happen per target below.
+    # A fan-out may include Discord plus email/Telegram, and one shared payload
+    # would leak Discord's table-to-bullet rendering into every sibling target.
     from gateway.platforms.base import BasePlatformAdapter
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
@@ -1538,6 +1803,21 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        email_subject = _format_cron_email_subject_payload(job) if str(platform_name).lower() == "email" else None
+
+        for_discord = str(platform_name).lower() == "discord"
+        for_email = str(platform_name).lower() == "email"
+        if wrap_response:
+            delivery_content = _format_cron_delivery_content(
+                job,
+                content,
+                for_discord=for_discord,
+                for_email=for_email,
+            )
+        else:
+            delivery_content = _markdown_tables_to_bullets(content) if for_discord else content
+        media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -1592,16 +1872,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_errors.append(msg)
             continue
 
+        target_content = cleaned_delivery_content
+
         # Prefer the resolved live transport when the gateway is running. This
         # supports E2EE native adapters and relay-fronted logical platforms.
-        # The live-send path (which SEEDS the flat in_channel continuation
-        # session via _seed_cron_channel_session) needs not just a live adapter
-        # but a running event loop to schedule the async send onto. Compute that
-        # gate ONCE so the in_channel thread_id clear below stays in lockstep
-        # with the live-send/seed block further down (they used to drift): an
-        # adapter can be present while the loop is absent/not-running, in which
-        # case the live-send block is skipped and delivery falls through to the
-        # standalone path — which cannot seed the flat session (r3609147550).
         live_adapter_ready = (
             runtime_adapter is not None
             and loop is not None
@@ -1772,6 +2046,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
 
+            if email_subject and platform_name.lower() == "email":
+                route_metadata = dict(route_metadata or {})
+                if isinstance(email_subject, dict):
+                    route_metadata.update(email_subject)
+                else:
+                    route_metadata["subject"] = email_subject
+                    route_metadata["suppress_threading"] = True
+
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
                 # Route through the gateway's DeliveryRouter so the live send
@@ -1780,7 +2062,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # standalone cron path lacked this, so DM-topic cron deliveries
                 # landed in the General topic or were rejected by Bot API 10.0
                 # (#22773).
-                text_to_send = cleaned_delivery_content.strip()
+                text_to_send = target_content.strip()
                 adapter_ok = True
                 timed_out = False
                 if text_to_send:
@@ -2020,7 +2302,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            send_subject = email_subject if platform_name.lower() == "email" else None
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                target_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                subject=send_subject,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -2049,7 +2340,27 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        # ContextVars do not propagate into fresh executor
+                        # threads automatically. Preserve the profile secret
+                        # scope used by this cron delivery.
+                        from contextvars import copy_context
+
+                        def _run_standalone_send():
+                            return asyncio.run(
+                                _send_to_platform(
+                                    platform,
+                                    pconfig,
+                                    chat_id,
+                                    target_content,
+                                    thread_id=thread_id,
+                                    media_files=media_files,
+                                    subject=send_subject,
+                                )
+                            )
+
+                        future = pool.submit(
+                            copy_context().run, _run_standalone_send
+                        )
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -2541,6 +2852,12 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "Never combine [SILENT] with content — either report your "
         "findings normally, or say [SILENT] and nothing more.]\n\n"
     )
+    if _job_delivers_to_discord(job):
+        cron_hint += (
+            "[DISCORD FORMAT: This cron output is delivered to Discord. "
+            "Use Markdown headings (`#`/`##`) and short bullets. "
+            "Do not use Markdown tables or pipe-table formatting; convert tabular data into grouped bullets instead.]\n\n"
+        )
     prompt = cron_hint + prompt
     if skills is None:
         legacy = job.get("skill")
@@ -3133,12 +3450,19 @@ def run_job(
         # is set (mirrors startup), and the Bitwarden value-cache keeps the
         # forced re-pull off the network. load_hermes_dotenv also handles the
         # utf-8/latin-1 encoding fallback internally.
-        from hermes_cli.env_loader import (
-            load_hermes_dotenv,
-            reset_secret_source_cache,
-        )
-        reset_secret_source_cache()
-        load_hermes_dotenv(hermes_home=_get_hermes_home())
+        from agent.secret_scope import current_secret_scope
+        if current_secret_scope() is None:
+            from hermes_cli.env_loader import (
+                load_hermes_dotenv,
+                reset_secret_source_cache,
+            )
+            reset_secret_source_cache()
+            load_hermes_dotenv(hermes_home=_get_hermes_home())
+        else:
+            logger.debug(
+                "Job '%s': isolated profile scope already refreshed; skipping global dotenv reload",
+                job_id,
+            )
 
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
@@ -3150,12 +3474,20 @@ def run_job(
                 else str(delivery_target["thread_id"])
             )
 
-        # Model resolution precedence: per-job override > HERMES_MODEL env >
-        # config.yaml ``model:`` (string or ``{default: ...}``). The per-job
-        # value is intentionally re-read from storage every tick so a
-        # ``cronjob action=update model=...`` after a failed run takes effect
-        # on the next tick — there is no in-memory cache.
+        # Model resolution precedence: per-job override > cron.model (the
+        # cron-fleet default) > HERMES_MODEL env > config.yaml ``model:``
+        # (string or ``{default: ...}``). The per-job value is intentionally
+        # re-read from storage every tick so a ``cronjob action=update
+        # model=...`` after a failed run takes effect on the next tick — there
+        # is no in-memory cache.
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+
+        # cron.model / cron.model_provider: a deliberate cron-fleet default
+        # so unattended jobs stop shadowing chat `/model` switches. When an
+        # axis resolves from here, the #44585 drift guard is skipped for that
+        # axis — following cron.model is explicit, not drift.
+        _cron_default_model = ""
+        _cron_default_provider = ""
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
@@ -3179,8 +3511,20 @@ def run_job(
                 # Coerce null/missing to {} so a falsy default never
                 # clobbers an already-resolved env value with ``None``.
                 _model_cfg = _cfg.get("model") or {}
+                _cron_cfg_for_model = _cfg.get("cron") or {}
+                if isinstance(_cron_cfg_for_model, dict):
+                    _cron_default_model = str(
+                        _cron_cfg_for_model.get("model") or ""
+                    ).strip()
+                    _cron_default_provider = str(
+                        _cron_cfg_for_model.get("model_provider") or ""
+                    ).strip()
                 if not job.get("model"):
-                    if isinstance(_model_cfg, str):
+                    if _cron_default_model:
+                        # Cron-fleet default beats the global chat model: it is
+                        # the user's explicit "cron runs on this" setting.
+                        model = _cron_default_model
+                    elif isinstance(_model_cfg, str):
                         model = _model_cfg
                     elif isinstance(_model_cfg, dict):
                         # Mirror the CLI/oneshot resolution: prefer ``default``,
@@ -3279,7 +3623,10 @@ def run_job(
             # circuits that precedence and can resurrect old providers (for
             # example DeepSeek) for cron jobs that do not pin provider/model.
             runtime_kwargs = {
-                "requested": job.get("provider"),
+                # Per-job user pin wins; otherwise the cron-fleet default
+                # provider (cron.model_provider); otherwise resolve from
+                # persisted global config.
+                "requested": job.get("provider") or _cron_default_provider or None,
                 # Derive provider-specific api_mode from the model this job
                 # will actually run (per-job pin > env > config default), not
                 # the stale persisted default — mirrors the fallback path
@@ -3363,10 +3710,18 @@ def run_job(
         # Back-compat: an axis with no snapshot (pre-existing jobs, no_agent, or
         # any axis whose creation-time resolution failed) behaves exactly as
         # before — the guard never engages for it. Pinned axes are unaffected.
+        #
+        # cron.model / cron.model_provider: an axis resolved from the explicit
+        # cron-fleet default is NOT drift — the user deliberately routed
+        # unpinned cron jobs there, so the guard is skipped for that axis.
         if cron_model_drift_guard_enabled(_cfg):
             _drift: list[str] = []
             _provider_snapshot = (job.get("provider_snapshot") or "").strip().lower()
-            if _provider_snapshot and not (job.get("provider") or "").strip():
+            if (
+                _provider_snapshot
+                and not (job.get("provider") or "").strip()
+                and not _cron_default_provider
+            ):
                 _current_provider = str(
                     primary_provider_for_drift or runtime.get("provider") or ""
                 ).strip().lower()
@@ -3375,7 +3730,11 @@ def run_job(
                         f"provider '{_provider_snapshot}' -> '{_current_provider}'"
                     )
             _model_snapshot = (job.get("model_snapshot") or "").strip().lower()
-            if _model_snapshot and not (job.get("model") or "").strip():
+            if (
+                _model_snapshot
+                and not (job.get("model") or "").strip()
+                and not _cron_default_model
+            ):
                 _current_model = str(primary_model_for_drift or "").strip().lower()
                 if _current_model and _current_model != _model_snapshot:
                     _drift.append(
@@ -3857,6 +4216,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    _scope_token = None
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
@@ -3898,7 +4258,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         )
 
         _scope_token = set_secret_scope(
-            build_profile_secret_scope(_get_hermes_home())
+            build_profile_secret_scope(
+                _get_hermes_home(), include_external=True
+            )
         )
         # Defer the cron agent's async-resource teardown until AFTER delivery.
         # run_job normally closes the agent (and reaps stale async clients) in
@@ -3921,8 +4283,6 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
             raise
-        finally:
-            reset_secret_scope(_scope_token)
 
         # Everything from here through delivery runs with the agent still live
         # (deferred teardown). Wrap it ALL in a try/finally so that if any step
@@ -3999,6 +4359,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             mark_job_run(job["id"], False, str(e))
         finish_execution(execution_id, success=False, error=str(e))
         return False
+    finally:
+        if _scope_token is not None:
+            reset_secret_scope(_scope_token)
 
 
 def _notify_provider_jobs_changed() -> None:

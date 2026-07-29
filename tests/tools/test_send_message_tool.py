@@ -320,6 +320,42 @@ class TestSendMessageTool:
             force_document=False,
         )
 
+    def test_email_subject_reaches_transport(self):
+        email_platform = Platform("email")
+        email_cfg = SimpleNamespace(enabled=True, token=None, extra={})
+        config = SimpleNamespace(
+            platforms={email_platform: email_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "email:andy@example.com",
+                        "message": "done",
+                        "subject": "[Hermes][Test] Subject",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            email_platform,
+            email_cfg,
+            "andy@example.com",
+            "done",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+            subject="[Hermes][Test] Subject",
+        )
+
     def test_cron_duplicate_target_is_skipped_and_explained(self):
         home = SimpleNamespace(chat_id="-1001")
         config, _telegram_cfg = _make_config()
@@ -683,6 +719,33 @@ class TestSendTelegramMediaDelivery:
         bot.send_audio.assert_awaited_once()
         bot.send_voice.assert_not_awaited()
 
+    def test_sends_m2a_as_document(self, tmp_path, monkeypatch):
+        audio_path = tmp_path / "clip.m2a"
+        audio_path.write_bytes(b"mpeg-audio")
+
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        bot.send_photo = AsyncMock()
+        bot.send_video = AsyncMock()
+        bot.send_voice = AsyncMock()
+        bot.send_audio = AsyncMock()
+        bot.send_document = AsyncMock(return_value=SimpleNamespace(message_id=9))
+        _install_telegram_mock(monkeypatch, bot)
+
+        result = asyncio.run(
+            _send_telegram(
+                "token",
+                "12345",
+                "",
+                media_files=[(str(audio_path), False)],
+            )
+        )
+
+        assert result["success"] is True
+        bot.send_document.assert_awaited_once()
+        bot.send_audio.assert_not_awaited()
+        bot.send_voice.assert_not_awaited()
+
     def test_missing_media_returns_error_without_leaking_raw_tag(self, monkeypatch):
         bot = MagicMock()
         bot.send_message = AsyncMock()
@@ -729,6 +792,31 @@ class TestSendToPlatformChunking:
         assert send.await_count >= 3
         for call in send.await_args_list:
             assert len(call.args[2]) <= 2020  # each chunk fits the limit
+
+    def test_long_forum_message_reuses_created_thread_for_followup_chunks(self):
+        """Standalone fallback must create one forum topic, not one per chunk."""
+        send = AsyncMock(side_effect=[
+            {"success": True, "message_id": "starter", "thread_id": "thread-123"},
+            {"success": True, "message_id": "followup-1"},
+            {"success": True, "message_id": "followup-2"},
+        ])
+        long_msg = "word " * 1000
+
+        with _patch_discord_sender(send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.DISCORD,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "forum-parent",
+                    long_msg,
+                )
+            )
+
+        assert result["success"] is True
+        assert send.await_count == 3
+        assert send.await_args_list[0].kwargs["thread_id"] is None
+        assert send.await_args_list[1].kwargs["thread_id"] == "thread-123"
+        assert send.await_args_list[2].kwargs["thread_id"] == "thread-123"
 
     def test_slack_messages_are_formatted_before_send(self, monkeypatch):
         _ensure_slack_mock(monkeypatch)

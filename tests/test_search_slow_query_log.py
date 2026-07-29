@@ -35,21 +35,19 @@ def test_no_log_under_threshold(db, monkeypatch, caplog):
 
 
 def test_path_attribution(db):
-    # Without the cjk tokenizer loaded, routing matches the pre-cjk shape.
-    assert db._describe_search_path("graphiti OR neo4j") == "fts5"
-    assert db._describe_search_path("우선순위 캘린더") == "trigram"
+    assert db._describe_search_path("graphiti OR neo4j") == "like_scan"
+    assert db._describe_search_path("우선순위 캘린더") == "like_scan"
     assert db._describe_search_path("일본 MCP") == "like_scan"
 
 
 def test_path_attribution_cjk_available(db):
-    # With the bigram index available, CJK queries (including 2-char terms)
-    # route to fts_cjk; lone 1-char CJK runs keep the LIKE route.
+    # Compatibility flags cannot reactivate retired live indexes.
     db._fts_cjk_available = True
     try:
-        assert db._describe_search_path("일본 MCP") == "fts_cjk"
-        assert db._describe_search_path("우선순위 캘린더") == "fts_cjk"
+        assert db._describe_search_path("일본 MCP") == "like_scan"
+        assert db._describe_search_path("우선순위 캘린더") == "like_scan"
         assert db._describe_search_path("가 alone") == "like_scan"
-        assert db._describe_search_path("graphiti OR neo4j") == "fts5"
+        assert db._describe_search_path("graphiti OR neo4j") == "like_scan"
     finally:
         db._fts_cjk_available = False
 

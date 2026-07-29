@@ -12,6 +12,7 @@ from gateway.session import (
     SessionEntry,
     SessionSource,
     SessionStore,
+    TranscriptQueueFullError,
     build_session_context,
     build_session_context_prompt,
     build_session_key,
@@ -2292,7 +2293,6 @@ class TestGatewaySessionDbRecovery:
         store._transcript_retry_lock = threading.Lock()
         store._dirty_transcripts = {}
         store._transcript_append_failures = {}
-        store._fts_rebuild_attempted = False
 
         store.append_to_transcript(
             "parent", {"role": "assistant", "content": "routed to child"}
@@ -2331,7 +2331,6 @@ class TestGatewaySessionDbRecovery:
             ]
         }
         store._transcript_append_failures = {"parent": 2}
-        store._fts_rebuild_attempted = True
         child_attempts = []
         failed_old_2 = False
 
@@ -2373,7 +2372,9 @@ class TestGatewaySessionDbRecovery:
         assert "parent" not in store._dirty_transcripts
         assert "child" not in store._dirty_transcripts
 
-    def test_transcript_append_rebuilds_fts_and_retries_dirty_rows_in_order(self):
+    def test_transcript_append_never_rebuilds_retired_fts_on_canonical_corruption(self):
+        """Canonical DB failures use the bounded dirty queue without attempting
+        the retired derived-index recovery path."""
         import threading
 
         class FakeDb:
@@ -2389,7 +2390,7 @@ class TestGatewaySessionDbRecovery:
             def append_message(self, **kwargs):
                 content = kwargs["content"]
                 self.attempts.append(content)
-                if len(self.attempts) <= 2:
+                if len(self.attempts) == 1:
                     raise RuntimeError("database disk image is malformed")
                 self.persisted.append(content)
 
@@ -2398,14 +2399,14 @@ class TestGatewaySessionDbRecovery:
         store._transcript_retry_lock = threading.Lock()
         store._dirty_transcripts = {}
         store._transcript_append_failures = {}
-        store._fts_rebuild_attempted = False
 
         store.append_to_transcript("s1", {"role": "user", "content": "first"})
         assert [m["content"] for m in store._dirty_transcripts["s1"]] == ["first"]
-        assert store._db.rebuild_calls == 1
+        assert store._db.rebuild_calls == 0
 
         store.append_to_transcript("s1", {"role": "assistant", "content": "second"})
 
+        assert store._db.attempts == ["first", "first", "second"]
         assert store._db.persisted == ["first", "second"]
         assert "s1" not in store._dirty_transcripts
 
@@ -2433,7 +2434,6 @@ class TestGatewaySessionDbRecovery:
         store._transcript_retry_lock = threading.Lock()
         store._dirty_transcripts = {}
         store._transcript_append_failures = {}
-        store._fts_rebuild_attempted = True  # prevent rebuild attempt
 
         # Queue a failed message
         store.append_to_transcript("s1", {"role": "user", "content": "stale"})
@@ -2470,7 +2470,6 @@ class TestGatewaySessionDbRecovery:
         store._transcript_retry_lock = threading.Lock()
         store._dirty_transcripts = {}
         store._transcript_append_failures = {}
-        store._fts_rebuild_attempted = True
 
         store.append_to_transcript("s1", {"role": "user", "content": "stale"})
         assert "s1" in store._dirty_transcripts
@@ -2478,25 +2477,8 @@ class TestGatewaySessionDbRecovery:
         store.rewind_session("s1", 1)
         assert "s1" not in store._dirty_transcripts
 
-    def test_fts_corruption_error_does_not_match_false_positives(self):
-        """_is_fts_corruption_error must not match unrelated error strings
-        containing 'fts' as a substring (e.g. 'shifts', 'gifts')."""
-        assert SessionStore._is_fts_corruption_error(
-            RuntimeError("database disk image is malformed")
-        )
-        assert SessionStore._is_fts_corruption_error(
-            RuntimeError("no such table: messages_fts")
-        )
-        assert not SessionStore._is_fts_corruption_error(
-            RuntimeError("shifts were applied")
-        )
-        assert not SessionStore._is_fts_corruption_error(
-            RuntimeError("gifts received")
-        )
-
-    def test_pending_queue_caps_at_max(self):
-        """Pending queue should drop oldest messages when exceeding the cap
-        to prevent unbounded memory growth on persistent DB failure."""
+    def test_pending_queue_applies_backpressure_without_evicting_old_messages(self):
+        """A full pending queue rejects new work without losing old messages."""
         import threading
 
         class FakeDb:
@@ -2515,14 +2497,19 @@ class TestGatewaySessionDbRecovery:
         store._transcript_retry_lock = threading.Lock()
         store._dirty_transcripts = {}
         store._transcript_append_failures = {}
-        store._fts_rebuild_attempted = True
 
-        # Fill beyond the cap
-        for i in range(store._MAX_PENDING_PER_SESSION + 10):
+        for i in range(store._MAX_PENDING_PER_SESSION):
             store.append_to_transcript("s1", {"role": "user", "content": f"msg{i}"})
 
-        pending = store._dirty_transcripts.get("s1", [])
-        assert len(pending) <= store._MAX_PENDING_PER_SESSION
+        with pytest.raises(TranscriptQueueFullError, match="pending queue full"):
+            store.append_to_transcript(
+                "s1", {"role": "user", "content": "must-not-evict"}
+            )
+
+        pending = store._dirty_transcripts["s1"]
+        assert len(pending) == store._MAX_PENDING_PER_SESSION
+        assert pending[0]["content"] == "msg0"
+        assert pending[-1]["content"] == f"msg{store._MAX_PENDING_PER_SESSION - 1}"
 
     def test_new_session_records_gateway_peer_fields(self, tmp_path):
         store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())

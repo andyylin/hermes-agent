@@ -437,6 +437,32 @@ def test_fetch_no_server_url_does_not_set_env(monkeypatch, tmp_path):
     assert "BWS_SERVER_URL" not in captured_env
 
 
+def test_bws_child_env_does_not_inherit_foreign_secrets(monkeypatch, tmp_path):
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    monkeypatch.setenv("FOREIGN_PROFILE_SECRET", "must-not-leak")
+    monkeypatch.setenv("OP_SESSION_foreign", "must-not-leak")
+    monkeypatch.setenv("BWS_SERVER_URL", "https://foreign.example")
+    captured_env = {}
+
+    def fake_run(cmd, **kwargs):
+        captured_env.update(kwargs["env"])
+        return mock.Mock(returncode=0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+    bw.fetch_bitwarden_secrets(
+        access_token="profile-token",
+        project_id="profile-project",
+        binary=fake_binary,
+        use_cache=False,
+    )
+
+    assert captured_env["BWS_ACCESS_TOKEN"] == "profile-token"
+    assert "FOREIGN_PROFILE_SECRET" not in captured_env
+    assert "OP_SESSION_foreign" not in captured_env
+    assert "BWS_SERVER_URL" not in captured_env
+
+
 def test_fetch_server_url_keyed_in_cache(monkeypatch, tmp_path):
     """Different server_url values must produce separate cache entries."""
     fake_binary = tmp_path / "bws"
@@ -516,6 +542,28 @@ def test_apply_missing_project_id(monkeypatch):
     )
     assert not result.ok
     assert "project_id" in result.error
+
+
+def test_encrypted_apply_purges_plaintext_before_binary_discovery_failure(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.t")
+    plaintext = bw._disk_cache_path(tmp_path)
+    plaintext.parent.mkdir(parents=True, exist_ok=True)
+    plaintext.write_text("legacy-plaintext")
+    monkeypatch.setattr(bw, "find_bws", lambda **_kwargs: None)
+
+    result = bw.apply_bitwarden_secrets(
+        enabled=True,
+        project_id="p",
+        auto_install=False,
+        encrypted_cache_enabled=True,
+        home_path=tmp_path,
+    )
+
+    assert not result.ok
+    assert "binary not available" in result.error
+    assert not plaintext.exists()
 
 
 def test_apply_does_not_override_existing(monkeypatch, tmp_path):
