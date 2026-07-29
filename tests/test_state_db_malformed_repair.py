@@ -434,6 +434,8 @@ def test_fts_read_probe_returns_none_when_trigram_missing(tmp_path, monkeypatch)
 # ── FTS write-corruption class (#50502) ──────────────────────────────────
 def test_repair_retires_corrupt_legacy_fts_without_losing_canonical_rows(tmp_path):
     """A readable DB with broken legacy FTS is repaired from canonical rows."""
+    from hermes_state import _db_opens_cleanly
+
     # A readable state.db can still reject every message write through legacy
     # messages_fts* triggers when the derived index is corrupt. Plain
     # `SELECT COUNT(*)` reads succeed, so repair must retire those artifacts.
