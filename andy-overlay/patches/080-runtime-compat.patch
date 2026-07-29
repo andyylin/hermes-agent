@@ -1,0 +1,221 @@
+diff --git a/agent/title_generator.py b/agent/title_generator.py
+index bb44da276ec3d300ec8ddf8d19f890dfdc2052aa..d5240235c309736d56ac88f55e38ca55340c1f16 100644
+--- a/agent/title_generator.py
++++ b/agent/title_generator.py
+@@ -242,6 +242,7 @@ def auto_title_session(
+     main_runtime: dict = None,
+     title_callback: Optional[TitleCallback] = None,
+     runtime_validator: Optional[RuntimeValidator] = None,
++    on_title: Optional[TitleCallback] = None,
+ ) -> None:
+     """Generate and set a session title if one doesn't already exist.
+ 
+@@ -252,6 +253,10 @@ def auto_title_session(
+     - title generation fails
+     - runtime_validator returns False (model was switched)
+ 
++    ``title_callback`` (or legacy alias ``on_title``) is invoked after the DB
++    title is stored. Gateway adapters use it for best-effort visible retitles
++    without coupling this module to any platform SDK.
++
+     Never lets an exception escape: this is a daemon-thread target, and an
+     escaping exception would spray a raw traceback into the user's terminal
+     via the default threading excepthook. The canonical trigger is the
+@@ -269,7 +274,7 @@ def auto_title_session(
+             assistant_response,
+             failure_callback=failure_callback,
+             main_runtime=main_runtime,
+-            title_callback=title_callback,
++            title_callback=title_callback or on_title,
+             runtime_validator=runtime_validator,
+         )
+     except Exception as e:
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index b6676337849b77240f3a55dbc0d89a75974e9356..1400bfcda392d4122e1e930237a76a1a280b60a9 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -2816,6 +2816,7 @@ DEFAULT_CONFIG = {
+         "require_mention": True,       # Require @mention to respond in rooms
+         "free_response_rooms": "",     # Comma-separated room IDs where bot responds without mention
+         "allowed_rooms": "",           # If set, bot ONLY responds in these room IDs (whitelist)
++        "auto_thread_rooms": "",       # Room IDs whose root messages always become Matrix threads
+     },
+ 
+     # Approval mode for dangerous commands:
+@@ -3438,34 +3439,14 @@ DEFAULT_CONFIG = {
+         # GBs of disk on heavy users.  Opt in only if you have an external
+         # tool that consumes the JSON files directly.
+         "write_json_snapshots": False,
+-        # Search-index (FTS) storage optimization — the compact v23 layout
+-        # that drops duplicate content copies and stops trigram-indexing tool
+-        # output (typically reclaims ~60%+ of state.db on heavy users). It is
+-        # OPT-IN: existing databases keep their working legacy index until the
+-        # user runs `hermes sessions optimize-storage`, because the rebuild is
+-        # disk-heavy and long on large DBs (see that command's disk preflight).
+-        #
+-        #   "advise" (default): `hermes update` prints a one-line notice with
+-        #     the reclaimable size and the command, when a legacy index is
+-        #     detected. Nothing is changed automatically.
+-        #   "require": the notice is shown as a REQUIRED upgrade (firmer copy),
+-        #     and future tooling may gate on it. Flip this default in a future
+-        #     release when we're ready to make the v23 layout mandatory — the
+-        #     command, progress bar, and resumability are already in place, so
+-        #     enforcement is a copy/gating change, not new migration code.
+-        #   "off": suppress the notice entirely.
+-        "fts_optimize_notice": "advise",
+-        # CJK-bigram search index (messages_fts_cjk, cjk_unicode61 loadable
+-        # tokenizer). When the extension is built (native/fts5_cjk/build.sh →
+-        # ~/.hermes/lib/libfts5_cjk.so), 1-2 char CJK terms (일본, 项目, ...)
+-        # get index-speed exact matching instead of LIKE full-table scans.
+-        # True (default): use the index when the extension is present; the
+-        # setting is inert when it isn't. False: never load the extension or
+-        # serve the cjk index. Bridged to HERMES_CJK_FTS (internal carrier).
+-        "cjk_fts": True,
++        # Compatibility keys for upstream config parsing. The custom runtime
++        # retires live FTS and therefore has no storage migration to advertise.
++        "fts_optimize_notice": "off",
++        # Compatibility no-op: canonical LIKE search owns Latin and CJK recall,
++        # and optional tokenizer extensions cannot reactivate live indexes.
++        "cjk_fts": False,
+         # Slow session-search log threshold in milliseconds: searches at or
+-        # above it log one INFO line with the routing path taken (fts_cjk /
+-        # fts5 / trigram / like_scan) so latency regressions stay
++        # above it log one INFO line with the canonical like_scan path.
+         # attributable per query shape. 0 logs every search. Bridged to
+         # HERMES_SEARCH_SLOW_MS (internal carrier).
+         "search_slow_ms": 1000,
+diff --git a/tests/agent/test_title_generator.py b/tests/agent/test_title_generator.py
+index 8f0af90ab31509ed4376c6edf1b28131db03c71c..fb811a65de7b0ae7ccb7c8e0d2dc99519535d689 100644
+--- a/tests/agent/test_title_generator.py
++++ b/tests/agent/test_title_generator.py
+@@ -377,6 +377,27 @@ class TestAutoTitleSession:
+         db.set_auto_title_if_empty.assert_called_once_with("sess-1", "Readable Session")
+         assert seen == ["Readable Session"]
+ 
++    def test_legacy_on_title_alias_survives_runtime_validator_wrapper(self):
++        db = MagicMock()
++        db.get_session_title.return_value = None
++        db.set_auto_title_if_empty.return_value = True
++        seen = []
++        validator = MagicMock(return_value=True)
++
++        with patch("agent.title_generator.generate_title", return_value="Combined Title") as generate:
++            auto_title_session(
++                db,
++                "sess-1",
++                "hello",
++                "hi there",
++                on_title=seen.append,
++                runtime_validator=validator,
++            )
++
++        assert generate.call_args.kwargs["runtime_validator"] is validator
++        db.set_auto_title_if_empty.assert_called_once_with("sess-1", "Combined Title")
++        assert seen == ["Combined Title"]
++
+     def test_skips_if_generation_fails(self):
+         db = MagicMock()
+         db.get_session_title.return_value = None
+diff --git a/tests/run_agent/test_in_place_compaction.py b/tests/run_agent/test_in_place_compaction.py
+index f9d5fdb3c4562a07198af75b08b75446bc93980e..0f4713b3bd856fd1458fb01efba7abda5797cee4 100644
+--- a/tests/run_agent/test_in_place_compaction.py
++++ b/tests/run_agent/test_in_place_compaction.py
+@@ -106,15 +106,21 @@ class TestInPlaceCompaction:
+             assert len(all_rows) == 10
+             archived = [m for m in all_rows if not m.get("active", 1)]
+             assert len(archived) == 8
+-            # The originals remain FTS-searchable (active=0 is a content-
+-            # preserving UPDATE; the fts triggers don't key on active).
+-            hit = db._conn.execute(
+-                "SELECT 1 FROM messages_fts f JOIN messages m ON m.id = f.rowid "
+-                "WHERE m.session_id = ? AND messages_fts MATCH 'msg' AND m.active = 0 "
+-                "LIMIT 1",
+-                (sid,),
++            # When SQLite FTS is available, the originals remain searchable
++            # (active=0 is a content-preserving UPDATE; the FTS triggers don't
++            # key on active). Some valid SQLite builds omit FTS5 entirely.
++            has_fts = db._conn.execute(
++                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
++                "AND name = 'messages_fts'"
+             ).fetchone()
+-            assert hit is not None
++            if has_fts:
++                hit = db._conn.execute(
++                    "SELECT 1 FROM messages_fts f JOIN messages m ON m.id = f.rowid "
++                    "WHERE m.session_id = ? AND messages_fts MATCH 'msg' AND m.active = 0 "
++                    "LIMIT 1",
++                    (sid,),
++                ).fetchone()
++                assert hit is not None
+             # Flush identity/cursor reset so next-turn appends diff against the
+             # compacted transcript (rebuilds the identity set on next flush).
+             assert agent._last_flushed_db_idx == 0
+diff --git a/tests/tui_gateway/test_protocol.py b/tests/tui_gateway/test_protocol.py
+index 2e64cc2605e227fccc8388ac4025758f3d6a6619..112146d2bf124c953598519bb0a13c938d69c220 100644
+--- a/tests/tui_gateway/test_protocol.py
++++ b/tests/tui_gateway/test_protocol.py
+@@ -72,6 +72,40 @@ def test_err_envelope(server):
+     }
+ 
+ 
++def test_session_list_exposes_generic_workspace_metadata(server, monkeypatch):
++    db = MagicMock()
++    db.list_sessions_rich.return_value = [
++        {
++            "id": "session-1",
++            "title": "Build the thing",
++            "preview": "Working",
++            "started_at": 10,
++            "last_active": 20,
++            "message_count": 3,
++            "source": "desktop",
++            "cwd": "/work/forge/apps/desktop",
++            "parent_session_id": "parent-1",
++            "profile_name": "default",
++        }
++    ]
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++
++    response = server._methods["session.list"]("workspace-metadata", {"limit": 20})
++
++    assert response["result"]["sessions"][0] == {
++        "id": "session-1",
++        "title": "Build the thing",
++        "preview": "Working",
++        "started_at": 10,
++        "last_active": 20,
++        "message_count": 3,
++        "source": "desktop",
++        "cwd": "/work/forge/apps/desktop",
++        "parent_session_id": "parent-1",
++        "profile_name": "default",
++    }
++
++
+ # ── write_json ───────────────────────────────────────────────────────
+ 
+ 
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index dda53c8c856f70ec017e150ace397493eae53dae..29d1aecc3214c6c8f422adac167f1b2819d172a9 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -5172,6 +5172,8 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
+ 
+ 
+ def _agent_cbs(sid: str) -> dict:
++    from tools.clarify_gateway import get_clarify_timeout
++
+     callbacks = {
+         "tool_start_callback": lambda tc_id, name, args: _on_tool_start(
+             sid, tc_id, name, args
+@@ -7298,6 +7300,10 @@ def _(rid, params: dict) -> dict:
+                             "started_at": s.get("started_at") or 0,
+                             "message_count": s.get("message_count") or 0,
+                             "source": s.get("source") or "",
++                            "last_active": s.get("last_active") or 0,
++                            "cwd": s.get("cwd") or "",
++                            "parent_session_id": s.get("parent_session_id"),
++                            "profile_name": s.get("profile_name"),
+                         }
+                         for s in rows
+                     ]

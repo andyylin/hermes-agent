@@ -1,0 +1,182 @@
+{
+  "schema_version": 1,
+  "control_path": "andy-overlay",
+  "frozen_upstream": {
+    "sha": "533d633ab9d18ce0f05bc44d4077576b69dc58e8"
+  },
+  "source_candidate": {
+    "sha": "da4d73940b8e0b9f8a74d0e98fb4ac12d20ba598",
+    "tree": "d134b90ba35f8501481f7be6cd4807d030415162"
+  },
+  "expected_payload_tree": "d134b90ba35f8501481f7be6cd4807d030415162",
+  "groups": [
+    {
+      "name": "010-metadata",
+      "subject": "docs(runtime): apply Andy overlay manifest and metadata",
+      "paths": [
+        "ANDY_MINIMAL_OVERLAY.md",
+        "ANDY_RUNTIME_PATCHES.md",
+        "contributors/emails/nousbot@nousresearch.com",
+        "contributors/emails/subhoya@gmail.com",
+        "website/docs/user-guide/features/tts.md",
+        "website/docs/user-guide/messaging/discord.md"
+      ],
+      "patch": "patches/010-metadata.patch",
+      "sha256": "6465a40965ad0d7288f31a9d542e506805489ab805f7a94865d4128c2fa798f4"
+    },
+    {
+      "name": "020-secrets",
+      "subject": "fix(secrets): apply profile-scoped secret isolation overlay",
+      "paths": [
+        "agent/secret_scope.py",
+        "agent/secret_sources/bitwarden.py",
+        "agent/secret_sources/onepassword.py",
+        "agent/secret_sources/registry.py",
+        "tests/secret_sources/test_secret_source_registry.py",
+        "tests/test_bitwarden_encrypted_cache_fail_closed.py",
+        "tests/test_bitwarden_secrets.py"
+      ],
+      "patch": "patches/020-secrets.patch",
+      "sha256": "e87b689320c25fc7be47565eef2d1bccf706598e7f33f594752545416afb67ae"
+    },
+    {
+      "name": "030-state",
+      "subject": "fix(state): apply canonical-state and no-live-FTS overlay",
+      "paths": [
+        "gateway/session.py",
+        "hermes_cli/doctor.py",
+        "hermes_cli/session_recovery.py",
+        "hermes_state.py",
+        "tests/gateway/test_cjk_fts_config_bridge.py",
+        "tests/gateway/test_session.py",
+        "tests/hermes_cli/test_session_recovery.py",
+        "tests/state/legacy_fts_ddl.py",
+        "tests/state/test_fts_concurrent_safety.py",
+        "tests/state/test_fts_runtime_rebuild.py",
+        "tests/test_fts_cjk_bigram.py",
+        "tests/test_fts_retirement_policy.py",
+        "tests/test_hermes_state.py",
+        "tests/test_search_slow_query_log.py",
+        "tests/test_state_db_malformed_repair.py",
+        "tests/test_wal_checkpoint_strategy.py",
+        "tools/session_search_tool.py"
+      ],
+      "patch": "patches/030-state.patch",
+      "sha256": "7049c05fb260e36242c2dc19e752c66eccfcd3a22cb35fa0e41567005fa512cc"
+    },
+    {
+      "name": "040-messaging",
+      "subject": "fix(gateway): apply messaging and profile-policy overlay",
+      "paths": [
+        "gateway/authz_mixin.py",
+        "gateway/config.py",
+        "gateway/pairing.py",
+        "gateway/run.py",
+        "plugins/platforms/buzz/adapter.py",
+        "plugins/platforms/discord/adapter.py",
+        "plugins/platforms/line/adapter.py",
+        "plugins/platforms/matrix/adapter.py",
+        "plugins/platforms/photon/adapter.py",
+        "tests/gateway/test_64674_multiplex_primary_token_scope.py",
+        "tests/gateway/test_discord_free_response.py",
+        "tests/gateway/test_discord_send.py",
+        "tests/gateway/test_discord_slash_commands.py",
+        "tests/gateway/test_line_group_authorization.py",
+        "tests/gateway/test_line_plugin.py",
+        "tests/gateway/test_matrix.py",
+        "tests/gateway/test_pairing.py",
+        "tests/gateway/test_profile_scoped_authz_seams.py",
+        "tests/gateway/test_unauthorized_dm_behavior.py",
+        "tests/plugins/platforms/photon/test_runtime_record.py",
+        "tests/tools/test_discord_tool.py",
+        "tools/discord_tool.py"
+      ],
+      "patch": "patches/040-messaging.patch",
+      "sha256": "ec19c6477834dfef5ba833d53ad836d988191456121d8c6b89f61f368b816531"
+    },
+    {
+      "name": "050-cron-email",
+      "subject": "fix(cron): apply per-target delivery and email overlay",
+      "paths": [
+        "cron/definitions_export.py",
+        "cron/jobs.py",
+        "cron/scheduler.py",
+        "hermes_cli/cron.py",
+        "hermes_cli/send_cmd.py",
+        "plugins/platforms/email/adapter.py",
+        "tests/cron/test_cron_delivery_secret_scope.py",
+        "tests/cron/test_discord_delivery_format.py",
+        "tests/cron/test_jobs.py",
+        "tests/cron/test_scheduler.py",
+        "tests/gateway/test_email.py",
+        "tests/gateway/test_email_html_rendering.py",
+        "tests/gateway/test_email_profile_scope.py",
+        "tests/hermes_cli/test_cron.py",
+        "tests/hermes_cli/test_send_cmd.py",
+        "tests/tools/test_send_message_tool.py",
+        "tools/email_rendering.py",
+        "tools/send_message_tool.py"
+      ],
+      "patch": "patches/050-cron-email.patch",
+      "sha256": "a54e3b93c22ebd3e5f8df333908c67b2809ab3cb30dba9913350e31879714770"
+    },
+    {
+      "name": "060-memory-tree",
+      "subject": "feat(memory-tree): apply private memory-tree overlay",
+      "paths": [
+        "agent/memory_tree_attention.py",
+        "agent/memory_tree_build.py",
+        "agent/memory_tree_lite.py",
+        "agent/memory_tree_privacy.py",
+        "agent/memory_tree_reconcile.py",
+        "hermes_cli/main.py",
+        "hermes_cli/memory_tree.py",
+        "tests/test_memory_tree_attention.py",
+        "tests/test_memory_tree_build.py",
+        "tests/test_memory_tree_cli_tool.py",
+        "tests/test_memory_tree_privacy.py",
+        "tests/test_memory_tree_reconcile_repair_verification.py",
+        "tests/test_tui_gateway_server.py",
+        "tools/memory_tree_tool.py",
+        "toolsets.py"
+      ],
+      "patch": "patches/060-memory-tree.patch",
+      "sha256": "2709dd7c2190f46ec7155715516f2ae7cac0c662dcb16cbd6bc3a077a20bf61d"
+    },
+    {
+      "name": "070-desktop",
+      "subject": "fix(desktop): apply local profile bridge and bootstrap overlay",
+      "paths": [
+        "apps/desktop/electron/main.ts",
+        "apps/desktop/electron/profile-bridge.test.ts",
+        "apps/desktop/electron/profile-bridge.ts",
+        "apps/desktop/src/app/settings/plugins-settings.tsx",
+        "apps/desktop/src/app/settings/toolset-config-panel.test.tsx",
+        "apps/desktop/src/contrib/plugin-path.test.ts",
+        "apps/desktop/src/contrib/plugin-path.ts",
+        "apps/desktop/src/contrib/runtime-loader.ts",
+        "apps/desktop/src/global.d.ts",
+        "hermes_cli/web_server.py",
+        "scripts/andy-desktop-update.sh",
+        "scripts/install-andy-desktop.sh",
+        "tests/hermes_cli/test_web_server.py"
+      ],
+      "patch": "patches/070-desktop.patch",
+      "sha256": "89648be478d2dac0f45fef59a4d82f61f339cdd4860072400a6ebd8913af7247"
+    },
+    {
+      "name": "080-runtime-compat",
+      "subject": "fix(runtime): apply retained compatibility overlay",
+      "paths": [
+        "agent/title_generator.py",
+        "hermes_cli/config.py",
+        "tests/agent/test_title_generator.py",
+        "tests/run_agent/test_in_place_compaction.py",
+        "tests/tui_gateway/test_protocol.py",
+        "tui_gateway/server.py"
+      ],
+      "patch": "patches/080-runtime-compat.patch",
+      "sha256": "4a5107dd4f0d508eccbed920b04ad4c1c9ca28bdd1298347dd8a7253dd2b3d7b"
+    }
+  ]
+}

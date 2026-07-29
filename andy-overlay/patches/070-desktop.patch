@@ -1,0 +1,661 @@
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 2d43eeb2a453b664feaf3e6b6d448bac2fb0baa0..3e2ab52d4fd7d0c173f93749fd9d2508f8d3f7fb 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -148,6 +148,7 @@ import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
+ import { createKeepAwake } from './power-save'
+ import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
+ import { rehomePrimaryConnection } from './primary-connection-rehome'
++import { buildProfileBridgePayload } from './profile-bridge'
+ import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
+ import { fetchPrimaryProfileSessions } from './profile-session-routing'
+ import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
+@@ -5052,12 +5053,12 @@ async function waitForHermes(baseUrl, token, signal?, authMode?) {
+   })
+ }
+ 
+-function getWindowButtonPosition() {
++function getWindowButtonPosition(win = mainWindow) {
+   if (!IS_MAC) {
+     return null
+   }
+ 
+-  return mainWindow?.getWindowButtonPosition?.() || WINDOW_BUTTON_POSITION
++  return win?.getWindowButtonPosition?.() || WINDOW_BUTTON_POSITION
+ }
+ 
+ function getNativeOverlayWidth() {
+@@ -5070,7 +5071,7 @@ function getWindowState(win = mainWindow) {
+     isMinimized: Boolean(win?.isMinimized?.()),
+     isVisible: Boolean(win?.isVisible?.()),
+     nativeOverlayWidth: getNativeOverlayWidth(),
+-    windowButtonPosition: getWindowButtonPosition()
++    windowButtonPosition: getWindowButtonPosition(win)
+   }
+ }
+ 
+@@ -9755,7 +9756,9 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
+   return sanitizeDesktopConnectionConfig(config, payload?.profile)
+ })
+ 
+-ipcMain.handle('hermes:profile:get', async () => ({ profile: readActiveDesktopProfile() }))
++ipcMain.handle('hermes:profile:get', async () => (
++  buildProfileBridgePayload(readActiveDesktopProfile(), HERMES_HOME)
++))
+ ipcMain.handle('hermes:profile:set', async (_event, name) => {
+   const next = writeActiveDesktopProfile(name)
+ 
+diff --git a/apps/desktop/electron/profile-bridge.test.ts b/apps/desktop/electron/profile-bridge.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..c41bb98b3e9651430d214d9c8fc7265e983d4f20
+--- /dev/null
++++ b/apps/desktop/electron/profile-bridge.test.ts
+@@ -0,0 +1,12 @@
++import { describe, expect, test } from 'vitest'
++
++import { buildProfileBridgePayload } from './profile-bridge'
++
++describe('buildProfileBridgePayload', () => {
++  test('returns the local Hermes home used by Desktop plugin discovery', () => {
++    expect(buildProfileBridgePayload('coder', '/Users/andy/.hermes')).toEqual({
++      profile: 'coder',
++      hermes_home: '/Users/andy/.hermes'
++    })
++  })
++})
+\ No newline at end of file
+diff --git a/apps/desktop/electron/profile-bridge.ts b/apps/desktop/electron/profile-bridge.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..2a2d4b14731754078a1f4c2012e2d85334b8fd4f
+--- /dev/null
++++ b/apps/desktop/electron/profile-bridge.ts
+@@ -0,0 +1,6 @@
++export function buildProfileBridgePayload(profile: string | null, hermesHome: string) {
++  return {
++    profile,
++    hermes_home: hermesHome
++  }
++}
+\ No newline at end of file
+diff --git a/apps/desktop/src/app/settings/plugins-settings.tsx b/apps/desktop/src/app/settings/plugins-settings.tsx
+index b5a63b08dde435885844c174e481567535ad79cb..7f4500e0ad2a704bcce61f029ea0a3c4e9e82afe 100644
+--- a/apps/desktop/src/app/settings/plugins-settings.tsx
++++ b/apps/desktop/src/app/settings/plugins-settings.tsx
+@@ -4,9 +4,9 @@ import { Button } from '@/components/ui/button'
+ import { Codicon } from '@/components/ui/codicon'
+ import { Switch } from '@/components/ui/switch'
+ import { Tip } from '@/components/ui/tooltip'
++import { getLocalDesktopPluginsDir } from '@/contrib/plugin-path'
+ import { $pluginRecords, type PluginRecord, setPluginEnabled } from '@/contrib/plugins-store'
+ import { discoverRuntimePlugins } from '@/contrib/runtime-loader'
+-import { getStatus } from '@/hermes'
+ import { useI18n } from '@/i18n'
+ import { triggerHaptic } from '@/lib/haptics'
+ import { Package } from '@/lib/icons'
+@@ -22,10 +22,10 @@ function reveal(file: string) {
+ 
+ async function revealPluginsDir() {
+   try {
+-    const { hermes_home } = await getStatus()
++    const pluginsDir = await getLocalDesktopPluginsDir()
+     // openDir (not reveal): the door often doesn't exist on first use, and
+     // showItemInFolder on a missing path silently no-ops (esp. Windows).
+-    const result = await window.hermesDesktop?.openDir?.(`${hermes_home}/desktop-plugins`)
++    const result = await window.hermesDesktop?.openDir?.(pluginsDir)
+ 
+     if (result && !result.ok) {
+       notifyError(result.error ?? 'unknown error', 'Could not open the plugins folder')
+diff --git a/apps/desktop/src/app/settings/toolset-config-panel.test.tsx b/apps/desktop/src/app/settings/toolset-config-panel.test.tsx
+index 6fd5d359087be2503bc94640578532f7dd2d2676..9b6f0a120161bb9755b66d42ea39e31e580f11fb 100644
+--- a/apps/desktop/src/app/settings/toolset-config-panel.test.tsx
++++ b/apps/desktop/src/app/settings/toolset-config-panel.test.tsx
+@@ -289,6 +289,14 @@ describe('ToolsetConfigPanel', () => {
+   })
+ 
+   it('saves an API key for a provider env var', async () => {
++    const keyedConfig = config()
++    keyedConfig.active_provider = 'ElevenLabs'
++    keyedConfig.providers = keyedConfig.providers.map(provider => ({
++      ...provider,
++      is_active: provider.name === 'ElevenLabs'
++    }))
++    getToolsetConfig.mockResolvedValue(keyedConfig)
++
+     const { ToolsetConfigPanel } = await import('./toolset-config-panel')
+     render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
+ 
+diff --git a/apps/desktop/src/contrib/plugin-path.test.ts b/apps/desktop/src/contrib/plugin-path.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4d1cf88ae9752ea2acb2389d288c41ef69ad80a
+--- /dev/null
++++ b/apps/desktop/src/contrib/plugin-path.test.ts
+@@ -0,0 +1,35 @@
++import { afterEach, expect, test, vi } from 'vitest'
++
++import { getLocalDesktopPluginsDir } from './plugin-path'
++
++const originalDesktop = window.hermesDesktop
++
++afterEach(() => {
++  Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: originalDesktop })
++})
++
++test('resolves the plugin directory from the Desktop-local Hermes home', async () => {
++  Object.defineProperty(window, 'hermesDesktop', {
++    configurable: true,
++    value: {
++      profile: {
++        get: vi.fn().mockResolvedValue({ profile: null, hermes_home: '/Users/andy/.hermes/' })
++      }
++    }
++  })
++
++  await expect(getLocalDesktopPluginsDir()).resolves.toBe('/Users/andy/.hermes/desktop-plugins')
++})
++
++test('fails closed when an older Desktop bridge omits the local Hermes home', async () => {
++  Object.defineProperty(window, 'hermesDesktop', {
++    configurable: true,
++    value: {
++      profile: {
++        get: vi.fn().mockResolvedValue({ profile: null })
++      }
++    }
++  })
++
++  await expect(getLocalDesktopPluginsDir()).rejects.toThrow('Desktop bridge did not provide a local Hermes home')
++})
+diff --git a/apps/desktop/src/contrib/plugin-path.ts b/apps/desktop/src/contrib/plugin-path.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..f912f549494f9284b6599ded6097a71ad7ef65f6
+--- /dev/null
++++ b/apps/desktop/src/contrib/plugin-path.ts
+@@ -0,0 +1,11 @@
++export async function getLocalDesktopPluginsDir() {
++  const { hermes_home } = await window.hermesDesktop.profile.get()
++
++  if (typeof hermes_home !== 'string' || !hermes_home.trim()) {
++    throw new Error('Desktop bridge did not provide a local Hermes home')
++  }
++
++  const home = hermes_home.replace(/[\\/]+$/, '')
++
++  return `${home}/desktop-plugins`
++}
+diff --git a/apps/desktop/src/contrib/runtime-loader.ts b/apps/desktop/src/contrib/runtime-loader.ts
+index 8ac7c60d63fd57aea99c354a8c07f960a340e700..2383c33b70570952c988abe8ba4ec12ec1b26354 100644
+--- a/apps/desktop/src/contrib/runtime-loader.ts
++++ b/apps/desktop/src/contrib/runtime-loader.ts
+@@ -27,11 +27,11 @@
+  * trust seam.
+  */
+ 
+-import { getStatus } from '@/hermes'
+ import { installPluginSdk, sdkImportMap } from '@/sdk/runtime'
+ import { notifyError } from '@/store/notifications'
+ 
+ import { createPluginContext, type HermesPlugin } from './plugin'
++import { getLocalDesktopPluginsDir } from './plugin-path'
+ import { dropPlugin, pluginActive, type PluginKind, publishPlugin } from './plugins-store'
+ 
+ interface LoadOptions {
+@@ -247,8 +247,8 @@ async function scanDiskPlugins(): Promise<void> {
+   scanning = true
+ 
+   try {
+-    const { hermes_home } = await getStatus()
+-    const { entries } = await desktop.readDir(`${hermes_home}/desktop-plugins`)
++    const pluginsDir = await getLocalDesktopPluginsDir()
++    const { entries } = await desktop.readDir(pluginsDir)
+     const seen = new Set<string>()
+ 
+     for (const dir of entries.filter(e => e.isDirectory)) {
+@@ -343,8 +343,8 @@ export function watchRuntimePlugins(): void {
+     }
+ 
+     try {
+-      const { hermes_home } = await getStatus()
+-      dirWatchId = (await desktop.watchDirectory(`${hermes_home}/desktop-plugins`)).id
++      const pluginsDir = await getLocalDesktopPluginsDir()
++      dirWatchId = (await desktop.watchDirectory(pluginsDir)).id
+ 
+       return true
+     } catch {
+diff --git a/apps/desktop/src/global.d.ts b/apps/desktop/src/global.d.ts
+index 336f95b54ae220b1b92f9c77dd8008c423a41274..7df38efcd1e341585a0c2d76d75d0aa0ce2deeb8 100644
+--- a/apps/desktop/src/global.d.ts
++++ b/apps/desktop/src/global.d.ts
+@@ -108,7 +108,7 @@ declare global {
+         // Persists the desktop's profile choice and relaunches the local
+         // backend under the new HERMES_HOME (reloads the window). Pass null to
+         // clear the preference.
+-        set: (name: string | null) => Promise<DesktopActiveProfile>
++        set: (name: string | null) => Promise<DesktopProfileSelection>
+       }
+       api: <T>(request: HermesApiRequest) => Promise<T>
+       notify: (payload: HermesNotification) => Promise<boolean>
+@@ -485,12 +485,18 @@ export interface HermesWindowState {
+   windowButtonPosition: { x: number; y: number } | null
+ }
+ 
+-export interface DesktopActiveProfile {
++export interface DesktopProfileSelection {
+   // The desktop's stored profile preference, or null when unset (legacy launch
+   // that defers to the sticky active_profile / default).
+   profile: string | null
+ }
+ 
++export interface DesktopActiveProfile extends DesktopProfileSelection {
++  // Machine-local Hermes home owned by Electron. Filesystem plugin discovery
++  // must use this path rather than a remote gateway's reported home.
++  hermes_home: string
++}
++
+ export interface DesktopConnectionConfig {
+   envOverride: boolean
+   // The saved connection mode. 'cloud' is a Hermes Cloud connection: it carries
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 8c81b21ba0621720804d4888378ab38c17edb206..e6cabf212e93db2c3a4fced8b675cbba56dfbe86 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -1018,6 +1018,30 @@ def _infer_type(value: Any) -> str:
+     return "string"
+ 
+ 
++_JS_MAX_SAFE_INTEGER = 9_007_199_254_740_991
++
++
++def _json_safe_config_value(value: Any) -> Any:
++    """Return a config value that can survive a JavaScript JSON round-trip.
++
++    The Desktop config editor receives `/api/config` as JSON and keeps a local
++    JavaScript object draft before autosaving it back. JSON itself permits
++    arbitrary-size integers, but JavaScript `Number` does not: Discord
++    snowflakes and similar IDs are rounded as soon as `JSON.parse()` sees them.
++    Stringify only integers outside JS's safe range so unchanged config values
++    preserve their exact scalar text across GET → PUT.
++    """
++    if isinstance(value, bool):
++        return value
++    if isinstance(value, int) and abs(value) > _JS_MAX_SAFE_INTEGER:
++        return str(value)
++    if isinstance(value, list):
++        return [_json_safe_config_value(item) for item in value]
++    if isinstance(value, dict):
++        return {key: _json_safe_config_value(item) for key, item in value.items()}
++    return value
++
++
+ def _build_schema_from_config(
+     config: Dict[str, Any],
+     prefix: str = "",
+@@ -5422,7 +5446,7 @@ def _normalize_config_for_web(config: Dict[str, Any]) -> Dict[str, Any]:
+         config["model_context_length"] = ctx_len if isinstance(ctx_len, int) else 0
+     else:
+         config["model_context_length"] = 0
+-    return config
++    return _json_safe_config_value(config)
+ 
+ 
+ # ── Memory provider config: one generic GET/PUT pair, dispatching on storage ──
+diff --git a/scripts/andy-desktop-update.sh b/scripts/andy-desktop-update.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..0f7e3eb7dcca40908987f3cd902e9dd213a03ec9
+--- /dev/null
++++ b/scripts/andy-desktop-update.sh
+@@ -0,0 +1,106 @@
++#!/usr/bin/env bash
++# Safely update and rebuild Andy's canonical Hermes Desktop runtime.
++set -Eeuo pipefail
++
++REMOTE="origin"
++BRANCH="andy-runtime"
++HERMES_HOME_VALUE="${HERMES_HOME:-$HOME/.hermes}"
++REPO=""
++
++while [ "$#" -gt 0 ]; do
++    case "$1" in
++        --repo)
++            [ "$#" -ge 2 ] || { printf '%s\n' '--repo requires a path' >&2; exit 2; }
++            REPO="$2"
++            shift 2
++            ;;
++        --hermes-home)
++            [ "$#" -ge 2 ] || { printf '%s\n' '--hermes-home requires a path' >&2; exit 2; }
++            HERMES_HOME_VALUE="$2"
++            shift 2
++            ;;
++        *)
++            printf 'Unknown option: %s\n' "$1" >&2
++            exit 2
++            ;;
++    esac
++done
++
++HERMES_HOME="$HERMES_HOME_VALUE"
++export HERMES_HOME
++REPO="${REPO:-$HERMES_HOME/hermes-agent}"
++export PATH="$HERMES_HOME/node/bin:$HOME/.local/bin:$PATH"
++
++cd "$REPO"
++
++if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
++    printf 'Refusing to update: tracked changes exist in %s\n' "$REPO" >&2
++    git status --short
++    exit 2
++fi
++
++expected="https://github.com/andyylin/hermes-agent.git"
++actual="$(git remote get-url "$REMOTE" 2>/dev/null || true)"
++if [ "$actual" != "$expected" ]; then
++    printf "Refusing to update: origin is '%s', expected '%s'\n" "$actual" "$expected" >&2
++    exit 3
++fi
++
++git config --replace-all remote.origin.fetch "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
++git fetch --prune "$REMOTE"
++git switch "$BRANCH"
++git branch --set-upstream-to="$REMOTE/$BRANCH" "$BRANCH" >/dev/null
++git merge --ff-only "$REMOTE/$BRANCH"
++
++case "$(uname -s)" in
++    Darwin|Linux) ;;
++    *) printf 'Unsupported operating system\n' >&2; exit 4 ;;
++esac
++
++desktop_binaries() {
++    case "$(uname -s)" in
++        Darwin)
++            printf '%s\n' \
++                "$REPO/apps/desktop/release/mac-arm64/Hermes.app/Contents/MacOS/Hermes" \
++                "$REPO/apps/desktop/release/mac-x64/Hermes.app/Contents/MacOS/Hermes" \
++                "$REPO/apps/desktop/release/mac/Hermes.app/Contents/MacOS/Hermes"
++            ;;
++        Linux)
++            for binary in "$REPO"/apps/desktop/release/*/[Hh]ermes; do
++                [ -e "$binary" ] && printf '%s\n' "$binary"
++            done
++            ;;
++    esac
++}
++running_desktop_pids() {
++    while IFS= read -r binary; do
++        ps -ww -axo pid=,command= | awk -v target="$binary" '
++            {
++                pid = $1
++                sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
++                if ($0 == target) print pid
++            }
++        '
++    done < <(desktop_binaries)
++}
++desktop_pids="$(running_desktop_pids)"
++if [ -n "$desktop_pids" ]; then
++    # Exact executable-path matching keeps another Hermes checkout untouched.
++    while IFS= read -r pid; do kill -TERM "$pid"; done <<< "$desktop_pids"
++fi
++
++for _ in {1..15}; do
++    [ -n "$(running_desktop_pids)" ] || break
++    sleep 1
++done
++if [ -n "$(running_desktop_pids)" ]; then
++    printf 'Hermes Desktop did not quit cleanly; refusing to overwrite the running bundle\n' >&2
++    exit 5
++fi
++
++./venv/bin/hermes desktop --force-build --build-only
++./venv/bin/hermes desktop --skip-build
++
++printf 'Hermes custom Desktop rebuilt and launched.\n'
++printf 'Branch: %s\n' "$(git branch --show-current)"
++printf 'Commit: %s\n' "$(git rev-parse HEAD)"
+diff --git a/scripts/install-andy-desktop.sh b/scripts/install-andy-desktop.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..1a8701f288dbadf4083bf5b929adbfa5028f9e88
+--- /dev/null
++++ b/scripts/install-andy-desktop.sh
+@@ -0,0 +1,218 @@
++#!/usr/bin/env bash
++# One-line bootstrap for Andy's canonical Hermes Desktop runtime.
++# Usage: curl -fsSL https://raw.githubusercontent.com/andyylin/hermes-agent/andy-runtime/scripts/install-andy-desktop.sh | bash
++set -Eeuo pipefail
++
++REPO_URL="https://github.com/andyylin/hermes-agent.git"
++BRANCH="andy-runtime"
++HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
++export HERMES_HOME
++INSTALL_DIR="$HERMES_HOME/hermes-agent"
++LAUNCH=true
++CHECKOUT_ONLY=false
++DRY_RUN=false
++
++log() { printf '\033[1;34m→\033[0m %s\n' "$*"; }
++ok() { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
++die() { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
++run() {
++    printf '+ '
++    printf '%q ' "$@"
++    printf '\n'
++    if [ "$DRY_RUN" = false ]; then "$@"; fi
++}
++
++usage() {
++    cat <<'EOF'
++Install Andy's canonical Hermes Desktop runtime.
++
++Options:
++  --no-launch          Build but do not launch Desktop
++  --checkout-only     Prepare the custom Git checkout, then stop
++  --dry-run           Print intended commands without changing anything
++  --install-dir PATH  Override the source checkout path
++  --repo-url URL      Override the Git repository (testing/recovery)
++  --branch NAME       Override the runtime branch (testing/recovery)
++  -h, --help          Show this help
++EOF
++}
++
++while [ "$#" -gt 0 ]; do
++    case "$1" in
++        --no-launch) LAUNCH=false; shift ;;
++        --checkout-only) CHECKOUT_ONLY=true; shift ;;
++        --dry-run) DRY_RUN=true; shift ;;
++        --install-dir) [ "$#" -ge 2 ] || die "--install-dir requires a path"; INSTALL_DIR="$2"; shift 2 ;;
++        --repo-url) [ "$#" -ge 2 ] || die "--repo-url requires a URL"; REPO_URL="$2"; shift 2 ;;
++        --branch) [ "$#" -ge 2 ] || die "--branch requires a name"; BRANCH="$2"; shift 2 ;;
++        -h|--help) usage; exit 0 ;;
++        *) die "Unknown option: $1" ;;
++    esac
++done
++
++case "$(uname -s)" in
++    Darwin|Linux) ;;
++    *) die "This bootstrap supports macOS and Linux. Use the Windows PowerShell installer on Windows." ;;
++esac
++
++command -v git >/dev/null 2>&1 || die "Git is required. Install Git, then rerun this command."
++
++if [ "$DRY_RUN" = true ]; then
++    log "Dry run for $REPO_URL ($BRANCH) at $INSTALL_DIR"
++fi
++
++if [ ! -e "$INSTALL_DIR" ]; then
++    run mkdir -p "$(dirname "$INSTALL_DIR")"
++    run git clone --single-branch --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
++elif [ ! -d "$INSTALL_DIR/.git" ]; then
++    die "$INSTALL_DIR exists but is not a Git checkout; move it aside and rerun"
++else
++    cd "$INSTALL_DIR"
++    tracked_changes="$(git status --porcelain --untracked-files=no 2>/dev/null || true)"
++    [ -z "$tracked_changes" ] || die "Tracked source changes exist in $INSTALL_DIR; commit or stash them before installing"
++
++    current_origin="$(git remote get-url origin 2>/dev/null || true)"
++    if [ -n "$current_origin" ] && [ "$current_origin" != "$REPO_URL" ]; then
++        current_upstream="$(git remote get-url upstream 2>/dev/null || true)"
++        if [ -n "$current_upstream" ] && [ "$current_upstream" != "$current_origin" ]; then
++            backup_remote="upstream-before-andy-bootstrap"
++            suffix=2
++            while git remote get-url "$backup_remote" >/dev/null 2>&1; do
++                backup_remote="upstream-before-andy-bootstrap-$suffix"
++                suffix=$((suffix + 1))
++            done
++            run git remote rename upstream "$backup_remote"
++        fi
++        if git remote get-url upstream >/dev/null 2>&1; then
++            run git remote set-url upstream "$current_origin"
++        else
++            run git remote add upstream "$current_origin"
++        fi
++        run git remote set-url origin "$REPO_URL"
++    elif [ -z "$current_origin" ]; then
++        run git remote add origin "$REPO_URL"
++    fi
++
++    run git config --replace-all remote.origin.fetch "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
++    run git fetch --prune origin
++    if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
++        run git switch "$BRANCH"
++    else
++        run git switch --create "$BRANCH" --track "origin/$BRANCH"
++    fi
++    run git branch --set-upstream-to="origin/$BRANCH" "$BRANCH"
++    run git merge --ff-only "origin/$BRANCH"
++fi
++
++if [ "$DRY_RUN" = true ]; then
++    if [ "$CHECKOUT_ONLY" = true ]; then exit 0; fi
++    log "Would run the custom installer, build Desktop, pin the update channel, and install hermes-custom-update"
++    exit 0
++fi
++
++cd "$INSTALL_DIR"
++head_sha="$(git rev-parse HEAD)"
++remote_sha="$(git rev-parse "origin/$BRANCH")"
++[ "$head_sha" = "$remote_sha" ] || die "Checkout does not match origin/$BRANCH"
++
++if [ "$CHECKOUT_ONLY" = true ]; then
++    ok "Custom checkout ready: $BRANCH@$head_sha"
++    exit 0
++fi
++
++log "Installing Hermes dependencies from $BRANCH"
++bash "$INSTALL_DIR/scripts/install.sh" --branch "$BRANCH" --dir "$INSTALL_DIR" --skip-setup
++
++export PATH="$HERMES_HOME/node/bin:$HOME/.local/bin:$PATH"
++HERMES_BIN="$INSTALL_DIR/venv/bin/hermes"
++[ -x "$HERMES_BIN" ] || die "Hermes executable was not created at $HERMES_BIN"
++
++log "Pinning Desktop updates to $BRANCH"
++case "$(uname -s)" in
++    Darwin) UPDATE_DIR="$HOME/Library/Application Support/Hermes" ;;
++    Linux) UPDATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/Hermes" ;;
++esac
++mkdir -p "$UPDATE_DIR"
++"$INSTALL_DIR/venv/bin/python" - "$UPDATE_DIR/updates.json" "$BRANCH" <<'PY'
++import json, os, sys, tempfile
++path, branch = sys.argv[1:3]
++try:
++    with open(path, "r", encoding="utf-8") as handle:
++        data = json.load(handle)
++    if not isinstance(data, dict):
++        data = {}
++except (FileNotFoundError, json.JSONDecodeError, OSError):
++    data = {}
++data["branch"] = branch
++fd, temporary = tempfile.mkstemp(prefix="updates.", suffix=".tmp", dir=os.path.dirname(path))
++try:
++    with os.fdopen(fd, "w", encoding="utf-8") as handle:
++        json.dump(data, handle, indent=2)
++        handle.write("\n")
++    os.replace(temporary, path)
++finally:
++    if os.path.exists(temporary):
++        os.unlink(temporary)
++PY
++
++log "Installing guarded update command"
++mkdir -p "$HOME/.local/bin"
++update_command="$HOME/.local/bin/hermes-custom-update"
++update_command_tmp="$update_command.tmp.$$"
++{
++    printf '%s\n' '#!/usr/bin/env bash' 'set -e'
++    printf 'exec %q --repo %q --hermes-home %q "$@"\n' \
++        "$INSTALL_DIR/scripts/andy-desktop-update.sh" "$INSTALL_DIR" "$HERMES_HOME"
++} > "$update_command_tmp"
++chmod 0755 "$update_command_tmp"
++mv "$update_command_tmp" "$update_command"
++
++log "Stopping a running source-built Desktop before replacing its bundle"
++desktop_binaries() {
++    case "$(uname -s)" in
++        Darwin)
++            printf '%s\n' \
++                "$INSTALL_DIR/apps/desktop/release/mac-arm64/Hermes.app/Contents/MacOS/Hermes" \
++                "$INSTALL_DIR/apps/desktop/release/mac-x64/Hermes.app/Contents/MacOS/Hermes" \
++                "$INSTALL_DIR/apps/desktop/release/mac/Hermes.app/Contents/MacOS/Hermes"
++            ;;
++        Linux)
++            for binary in "$INSTALL_DIR"/apps/desktop/release/*/[Hh]ermes; do
++                [ -e "$binary" ] && printf '%s\n' "$binary"
++            done
++            ;;
++    esac
++}
++running_desktop_pids() {
++    while IFS= read -r binary; do
++        ps -ww -axo pid=,command= | awk -v target="$binary" '
++            {
++                pid = $1
++                sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
++                if ($0 == target) print pid
++            }
++        '
++    done < <(desktop_binaries)
++}
++desktop_pids="$(running_desktop_pids)"
++if [ -n "$desktop_pids" ]; then
++    # Exact executable-path matching keeps another Hermes checkout untouched.
++    while IFS= read -r pid; do kill -TERM "$pid"; done <<< "$desktop_pids"
++fi
++for _ in {1..15}; do
++    [ -n "$(running_desktop_pids)" ] || break
++    sleep 1
++done
++if [ -n "$(running_desktop_pids)" ]; then
++    die "Hermes Desktop did not quit cleanly; refusing to overwrite the running bundle"
++fi
++
++log "Building native Hermes Desktop"
++if [ "$LAUNCH" = true ]; then
++    "$HERMES_BIN" desktop --force-build
++else
++    "$HERMES_BIN" desktop --force-build --build-only
++fi
++
++ok "Hermes Desktop installed from $BRANCH@$head_sha"
++ok "Future updates: use the in-app Update button or run hermes-custom-update"
+diff --git a/tests/hermes_cli/test_web_server.py b/tests/hermes_cli/test_web_server.py
+index 08c0bfc6f23838032360ec50efca47c352c48521..8d31a9d438a89a5a0066ac767feaf8a684fe4795 100644
+--- a/tests/hermes_cli/test_web_server.py
++++ b/tests/hermes_cli/test_web_server.py
+@@ -7275,6 +7275,20 @@ class TestModelContextLength:
+         result = _normalize_config_for_web(cfg)
+         assert result["model_context_length"] == 0
+ 
++    def test_normalize_stringifies_json_unsafe_integers(self):
++        """Desktop must not receive Discord snowflakes as JS-rounded numbers."""
++        from hermes_cli.web_server import _normalize_config_for_web
++
++        snowflake = 1495601377412513923
++        result = _normalize_config_for_web({
++            "discord": {
++                "free_response_channels": [snowflake],
++                "allowed_channels": [42],
++            }
++        })
++        assert result["discord"]["free_response_channels"] == [str(snowflake)]
++        assert result["discord"]["allowed_channels"] == [42]
++
+     def test_denormalize_writes_context_length_into_model_dict(self):
+         """denormalize should write model_context_length back into model dict."""
+         from hermes_cli.web_server import _denormalize_config_from_web

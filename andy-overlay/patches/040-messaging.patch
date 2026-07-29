@@ -1,0 +1,4009 @@
+diff --git a/gateway/authz_mixin.py b/gateway/authz_mixin.py
+index be57b3f03ef2175548f4b1cfd6502db2e51ba9dc..4f559e8e8994737ab2c7e4fb242ed3271ba345e6 100644
+--- a/gateway/authz_mixin.py
++++ b/gateway/authz_mixin.py
+@@ -29,18 +29,25 @@ from gateway.whatsapp_identity import (
+ 
+ 
+ def _auth_env(name: str, default: str = "") -> str:
+-    """Read allowlist/auth env; prefer profile secret_scope under multiplex."""
++    """Read auth policy from the installed profile scope, fail closed."""
+     if not name:
+         return default
+     try:
+-        from agent.secret_scope import get_secret
++        from agent.secret_scope import current_secret_scope, get_secret
++    except ImportError:
++        return (os.getenv(name) or default).strip()
+ 
+-        val = get_secret(name)
+-        if val is not None and str(val).strip():
+-            return str(val).strip()
+-    except Exception:
+-        pass
+-    return (os.getenv(name) or default).strip()
++    scope = current_secret_scope()
++    if scope is not None:
++        value = scope.get(name)
++        return (str(value) if value is not None else default).strip()
++    value = get_secret(name)
++    return (str(value) if value is not None else default).strip()
++
++
++def _line_auth_env(name: str, default: str = "") -> str:
++    """LINE authorization uses the same profile-scoped fail-closed policy."""
++    return _auth_env(name, default)
+ 
+ 
+ def _coerce_allow_set(raw) -> set[str]:
+@@ -340,18 +347,19 @@ class GatewayAuthorizationMixin:
+         return False
+ 
+     def _pairing_store_for(self, source: "SessionSource"):
+-        """Pick the per-profile PairingStore for a source, falling back to global.
++        """Pick the per-profile PairingStore for a source.
+ 
+-        In a multiplexing gateway, each profile owns its own pairing whitelist
+-        so isolation is preserved. When the source has no profile (single-
+-        profile gateway, or a path that hasn't stamped profile yet) or the
+-        profile isn't registered, fall back to ``self.pairing_store`` (the
+-        global default) so existing behavior is preserved.
++        In a multiplexing gateway, each profile owns its own pairing whitelist.
++        A stamped profile missing from the registry fails closed rather than
++        inheriting the default profile's pairing grants.
+         """
+         per_profile = getattr(self, "pairing_stores", None) or {}
+         profile = getattr(source, "profile", None)
+         if profile and profile in per_profile:
+             return per_profile[profile]
++        config = getattr(self, "config", None)
++        if profile and getattr(config, "multiplex_profiles", False):
++            return None
+         return getattr(self, "pairing_store", None)
+ 
+     def _is_user_authorized(self, source: SessionSource) -> bool:
+@@ -426,8 +434,13 @@ class GatewayAuthorizationMixin:
+                 Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
+                 Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
+             }.get(source.platform, "")
++            if not chat_allowlist_env and source.platform and source.platform.value == "line":
++                chat_allowlist_env = "LINE_ALLOWED_GROUPS"
+             if chat_allowlist_env:
+-                raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
++                if source.platform and source.platform.value == "line":
++                    raw_chat_allowlist = _line_auth_env(chat_allowlist_env)
++                else:
++                    raw_chat_allowlist = _auth_env(chat_allowlist_env)
+                 if raw_chat_allowlist:
+                     allowed_group_ids = {
+                         cid.strip()
+@@ -469,7 +482,7 @@ class GatewayAuthorizationMixin:
+         }
+         if getattr(source, "is_bot", False):
+             allow_bots_var = platform_allow_bots_map.get(source.platform)
+-            if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
++            if allow_bots_var and _auth_env(allow_bots_var, "none").lower() in {"mentions", "all"}:
+                 return True
+ 
+         if not user_id:
+@@ -574,7 +587,10 @@ class GatewayAuthorizationMixin:
+         group_chat_allowlist = ""
+         if source.chat_type in {"group", "forum"}:
+             group_user_allowlist = _auth_env(platform_group_user_env_map.get(source.platform, ""))
+-            group_chat_allowlist = _auth_env(platform_group_chat_env_map.get(source.platform, ""))
++            if source.platform and source.platform.value == "line":
++                group_chat_allowlist = _line_auth_env("LINE_ALLOWED_GROUPS")
++            else:
++                group_chat_allowlist = _auth_env(platform_group_chat_env_map.get(source.platform, ""))
+         global_allowlist = _auth_env("GATEWAY_ALLOWED_USERS")
+ 
+         if not platform_allowlist and not group_user_allowlist and not group_chat_allowlist and not global_allowlist:
+@@ -826,13 +842,19 @@ class GatewayAuthorizationMixin:
+                 ),
+                 Platform.QQBOT: ("QQ_GROUP_ALLOWED_USERS",),
+             }
+-            if os.getenv(platform_env_map.get(platform, ""), "").strip():
++            if platform and platform.value == "line":
++                platform_group_env_map[platform] = ("LINE_ALLOWED_GROUPS",)
++            if _auth_env(platform_env_map.get(platform, "")):
+                 return "ignore"
+             for env_key in platform_group_env_map.get(platform, ()):
+-                if os.getenv(env_key, "").strip():
++                if platform and platform.value == "line":
++                    configured = _line_auth_env(env_key)
++                else:
++                    configured = _auth_env(env_key)
++                if configured:
+                     return "ignore"
+ 
+-        if os.getenv("GATEWAY_ALLOWED_USERS", "").strip():
++        if _auth_env("GATEWAY_ALLOWED_USERS"):
+             return "ignore"
+ 
+         return "pair"
+diff --git a/gateway/config.py b/gateway/config.py
+index 3c6a631f95ca289cde68f80f7d201404dc6b8f12..a4dfc1acee8064afc40934ec02d47b16741ddf4f 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -1682,6 +1682,7 @@ def load_gateway_config() -> GatewayConfig:
+             # adapter.py::_apply_yaml_config), dispatched in the
+             # ``apply_yaml_config_fn`` loop above. #41112 / #3823.
+ 
++
+             # Bridge top-level require_mention to Telegram when the telegram: section
+             # does not already provide one.  Users often write "require_mention: true"
+             # at the top level alongside group_sessions_per_user, expecting it to work
+diff --git a/gateway/pairing.py b/gateway/pairing.py
+index bf6212f97f3f92e543aab61227db322f0e4d6e31..cfce8d39ef23b2a1191965d81d5fd43ea048adf1 100644
+--- a/gateway/pairing.py
++++ b/gateway/pairing.py
+@@ -39,6 +39,16 @@ from utils import atomic_replace
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _pairing_env(name: str, default: str = "") -> str:
++    """Read pairing policy from the active profile scope."""
++    try:
++        from agent.secret_scope import get_secret
++    except ImportError:
++        return os.getenv(name, default)
++    value = get_secret(name, default)
++    return str(value or default).strip()
++
++
+ # Unambiguous alphabet -- excludes 0/O, 1/I to prevent confusion
+ ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+ CODE_LENGTH = 8
+@@ -121,7 +131,7 @@ def _sync_allowlist_add(platform: str, user_id: str) -> None:
+     env_var = _allowlist_env_for_platform(platform)
+     if not env_var:
+         return
+-    current = os.getenv(env_var, "").strip()
++    current = _pairing_env(env_var)
+     if not current:
+         return  # No allowlist configured — leave the gateway open (option i).
+     ids = _split_allowlist(current)
+@@ -143,7 +153,7 @@ def _sync_allowlist_remove(platform: str, user_id: str) -> None:
+     env_var = _allowlist_env_for_platform(platform)
+     if not env_var:
+         return
+-    current = os.getenv(env_var, "").strip()
++    current = _pairing_env(env_var)
+     if not current:
+         return
+     ids = _split_allowlist(current)
+@@ -248,16 +258,23 @@ class PairingStore:
+     directory (backward-compat for the ``hermes pairing`` CLI).
+     """
+ 
+-    def __init__(self, profile: Optional[str] = None):
+-        # Resolve storage directory lazily — tests use a temp HERMES_HOME
+-        # and PairingStore may be constructed before the env is set.
+-        if profile:
++    def __init__(
++        self,
++        profile: Optional[str] = None,
++        *,
++        pairing_dir: Optional[Path] = None,
++    ):
++        # Explicit directories avoid resolving a profile twice when this is
++        # constructed inside an already profile-scoped HERMES_HOME.
++        if pairing_dir is not None:
++            self._dir = Path(pairing_dir)
++        elif profile:
+             from hermes_constants import get_hermes_home
+             self._dir = get_hermes_home() / "profiles" / profile / "pairing"
+         else:
+             self._dir = PAIRING_DIR
+         self._dir.mkdir(parents=True, exist_ok=True)
+-        if not profile:
++        if not profile and pairing_dir is None:
+             # Heal installs whose global pairing data ended up split across
+             # the legacy and new directories (per-profile stores never had
+             # the legacy/new split).
+diff --git a/gateway/run.py b/gateway/run.py
+index bad550857e5057f99032f1d12195860629c0086d..64e555e7cbd4ee89d8c0d350c3b2b8bb05e47824 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -324,26 +324,30 @@ def _non_conversational_metadata(
+     return merged
+ 
+ 
++def _silent_progress_metadata(
++    metadata: Optional[Dict[str, Any]] = None,
++    *,
++    platform: Any = None,
++) -> Optional[Dict[str, Any]]:
++    """Mark Matrix progress/status events as visible, non-pushing notices."""
++    merged = _non_conversational_metadata(metadata, platform=platform)
++    if _gateway_platform_value(platform) != "matrix":
++        return merged
++    merged = dict(merged or {})
++    merged["silent_notification"] = True
++    return merged
++
++
+ def _seed_hygiene_system_prompt(
+     agent: Any,
+     session_row: Optional[Dict[str, Any]],
+ ) -> bool:
+-    """Keep gateway hygiene from rebuilding a live session's system prompt.
+-
+-    The hygiene helper intentionally skips memory-provider initialization.
+-    Compression is allowed to persist a system prompt, so letting that helper
+-    rebuild one would strip external provider blocks from the live session.
+-    Seed the exact persisted prompt instead.  When no usable prompt can be
+-    restored, seed an empty cache entry.  Compression either preserves that
+-    unusable value or rebuilds with the hygiene-only platform marker; the real
+-    turn will rebuild either form with its fully initialized providers.
+-    """
++    """Seed hygiene with the exact persisted prompt, never a rebuilt variant."""
+     stored_prompt = ""
+     if isinstance(session_row, dict):
+         raw_prompt = session_row.get("system_prompt")
+         if isinstance(raw_prompt, str) and raw_prompt.strip():
+             stored_prompt = raw_prompt
+-
+     agent._cached_system_prompt = stored_prompt
+     return bool(stored_prompt)
+ 
+@@ -1846,10 +1850,11 @@ def load_gateway_config_for_runner() -> "GatewayConfig":
+ 
+ 
+ def _platform_has_bot_credential(platform: "Platform", platform_config: "PlatformConfig") -> bool:
+-    """Return True when a token-authenticated platform has a usable bot credential.
++    """Return True when a token-authenticated platform has a usable credential.
+ 
+     Platforms that do not use ``PlatformConfig.token`` always return True so we
+     never skip them here (Signal session paths, port-binding HTTP adapters, etc.).
++    Matrix also supports password auth when no access token is configured.
+     """
+     from gateway.config import PLATFORM_TOKEN_ENV_NAMES
+ 
+@@ -1862,6 +1867,13 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
+     api_key = getattr(platform_config, "api_key", None) or ""
+     if isinstance(api_key, str) and api_key.strip():
+         return True
++    if platform.value == "matrix":
++        extra = getattr(platform_config, "extra", None) or {}
++        from agent.secret_scope import get_secret
++
++        password = extra.get("password", "") or get_secret("MATRIX_PASSWORD", "")
++        if isinstance(password, str) and password.strip():
++            return True
+     return False
+ 
+ 
+@@ -8412,6 +8424,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 _set_reaction(self._handle_reaction_event)
+             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+             adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
++            adapter._pairing_store = getattr(self, "pairing_store", None)
+             adapter._busy_text_mode = self._busy_text_mode
+             
+             # Try to connect
+@@ -9494,6 +9507,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                         _set_reaction(self._handle_reaction_event)
+                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+                     adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
++                    adapter._pairing_store = getattr(self, "pairing_store", None)
+                     adapter._busy_text_mode = self._busy_text_mode
+ 
+                     # Reconnect after an outage: preserve the platform's
+@@ -10351,7 +10365,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     continue
+                 claimed[(platform, fp)] = profile_name
+ 
+-            self._configure_profile_adapter(adapter, profile_name, platform)
++            self._configure_profile_adapter(
++                adapter, profile_name, platform, profile_home=profile_home
++            )
+ 
+             try:
+                 with _profile_runtime_scope(profile_home):
+@@ -10375,6 +10391,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         adapter: BasePlatformAdapter,
+         profile_name: str,
+         platform: Platform,
++        *,
++        profile_home: "Path",
+     ) -> None:
+         """Install the profile-scoped handlers shared by startup and reconnect."""
+         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
+@@ -10390,6 +10408,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         adapter.set_authorization_check(
+             self._make_adapter_auth_check(platform, profile_name=profile_name)
+         )
++        from gateway.pairing import PairingStore
++
++        stores = getattr(self, "pairing_stores", None)
++        if stores is None:
++            # Partial/test runners may omit the registry. Keep authorization
++            # fail-closed instead of creating storage in an unknown home.
++            stores = {}
++            self.pairing_stores = stores
++            store = None
++        else:
++            store = stores.get(profile_name)
++            if store is None:
++                store = PairingStore(
++                    profile=profile_name,
++                    pairing_dir=Path(profile_home) / "pairing",
++                )
++                stores[profile_name] = store
++        adapter._pairing_store = store
+         adapter._busy_text_mode = self._busy_text_mode
+ 
+     async def _run_secondary_profile_reconnect(
+@@ -10419,7 +10455,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                             )
+                             return
+                         self._configure_profile_adapter(
+-                            adapter, profile_name, platform
++                            adapter, profile_name, platform, profile_home=profile_home
+                         )
+                         success = await self._connect_adapter_with_timeout(
+                             adapter, platform, is_reconnect=True
+@@ -11134,9 +11170,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 # Rate-limit ALL pairing responses (code or rejection) to
+                 # prevent spamming the user with repeated messages when
+                 # multiple DMs arrive in quick succession.
+-                if self.pairing_store._is_rate_limited(platform_name, source.user_id):
++                pairing_store = self._pairing_store_for(source)
++                if pairing_store is None:
++                    logger.warning(
++                        "No pairing store for profile %r; denying pairing request",
++                        source.profile,
++                    )
+                     return None
+-                code = self.pairing_store.generate_code(
++                if pairing_store._is_rate_limited(platform_name, source.user_id):
++                    return None
++                code = pairing_store.generate_code(
+                     platform_name, source.user_id, source.user_name or ""
+                 )
+                 if code:
+@@ -11158,7 +11201,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                             "Please try again later!"
+                         )
+                     # Record rate limit so subsequent messages are silently ignored
+-                    self.pairing_store._record_rate_limit(platform_name, source.user_id)
++                    pairing_store._record_rate_limit(platform_name, source.user_id)
+             return None
+         
+         # Intercept messages that are responses to a pending /update prompt.
+@@ -17681,6 +17724,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 )
+                 return None
+ 
++            if not await self._wait_for_lifecycle_delivery_ready(transport.adapter, platform):
++                return None
++
+             metadata = self._thread_metadata_for_target(
+                 platform,
+                 chat_id,
+@@ -17726,6 +17772,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         finally:
+             notify_path.unlink(missing_ok=True)
+ 
++    @staticmethod
++    async def _wait_for_lifecycle_delivery_ready(adapter, platform: Platform) -> bool:
++        """Give adapters with explicit health gating time to become send-ready."""
++        # Resolve on the class so permissive mocks do not manufacture a waiter.
++        waiter = getattr(type(adapter), "wait_until_send_ready", None)
++        if not callable(waiter):
++            return True
++        try:
++            ready = await waiter(adapter)
++        except Exception as exc:
++            logger.warning(
++                "Lifecycle delivery readiness check failed for %s: %s",
++                platform.value,
++                exc,
++            )
++            return False
++        if not ready:
++            logger.warning(
++                "Lifecycle delivery path did not become ready for %s before timeout",
++                platform.value,
++            )
++        return bool(ready)
++
+     async def _send_home_channel_startup_notifications(
+         self,
+         *,
+@@ -17762,6 +17831,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 continue
+ 
+             try:
++                if not await self._wait_for_lifecycle_delivery_ready(transport.adapter, platform):
++                    continue
+                 metadata = self._thread_metadata_for_target(
+                     platform,
+                     home.chat_id,
+@@ -18925,7 +18996,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                             await adapter.send(
+                                 chat_id,
+                                 message_text,
+-                                metadata=_non_conversational_metadata(send_meta, platform=platform_name),
++                                metadata=_silent_progress_metadata(send_meta, platform=platform_name),
+                             )
+                         except Exception as e:
+                             logger.error("Watcher delivery error: %s", e)
+@@ -18955,7 +19026,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                         await adapter.send(
+                             chat_id,
+                             message_text,
+-                            metadata=_non_conversational_metadata(send_meta, platform=platform_name),
++                            metadata=_silent_progress_metadata(send_meta, platform=platform_name),
+                         )
+                     except Exception as e:
+                         logger.error("Watcher delivery error: %s", e)
+@@ -21181,7 +21252,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 reply_to_message_id=event_message_id,
+             )
+         ) if _progress_thread_id else None
+-        _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
++        _progress_metadata = _silent_progress_metadata(_progress_metadata, platform=source.platform)
+         _progress_reply_to = (
+             event_message_id
+             if source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id
+@@ -21653,17 +21724,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 "reply_to_message_id": event_message_id,
+             }
+         else:
+-            _status_thread_metadata = (
+-                self._thread_metadata_for_source(source, event_message_id)
+-                if _progress_thread_id == source.thread_id
+-                else self._thread_metadata_for_target(
+-                    source.platform,
+-                    source.chat_id,
+-                    _progress_thread_id,
+-                    chat_type=getattr(source, "chat_type", None),
+-                    reply_to_message_id=event_message_id,
+-                )
+-            ) if _progress_thread_id else None
++            _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
++        _silent_status_metadata = _silent_progress_metadata(
++            _status_thread_metadata,
++            platform=source.platform,
++        )
+ 
+         def _status_callback_sync(event_type: str, message: str) -> None:
+             if not _status_adapter or not _run_still_current():
+@@ -21682,7 +21747,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 )
+                 return
+             _fut = safe_schedule_threadsafe(
+-                _send_or_update_status_coro(_status_adapter, _status_chat_id, event_type, prepared_message, _status_thread_metadata),
++                _send_or_update_status_coro(_status_adapter, _status_chat_id, event_type, prepared_message, _silent_status_metadata),
+                 _loop_for_step,
+                 logger=logger,
+                 log_message=f"status_callback ({event_type}) scheduling error",
+@@ -21847,7 +21912,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                             adapter=_adapter,
+                             chat_id=source.chat_id,
+                             config=_consumer_cfg,
+-                            metadata=_status_thread_metadata,
++                            metadata=_silent_status_metadata,
+                             on_new_message=(
+                                 (lambda: progress_queue.put(("__reset__",)))
+                                 if progress_queue is not None
+@@ -21881,7 +21946,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     _status_adapter.send(
+                         _status_chat_id,
+                         display_text,
+-                        metadata=_status_thread_metadata,
++                        metadata=_silent_status_metadata,
+                     ),
+                     _loop_for_step,
+                     logger=logger,
+@@ -22233,7 +22298,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     _status_adapter.send(
+                         _status_chat_id,
+                         message,
+-                        metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
++                        metadata=_silent_status_metadata,
+                     ),
+                     _loop_for_step,
+                     logger=logger,
+diff --git a/plugins/platforms/buzz/adapter.py b/plugins/platforms/buzz/adapter.py
+index 55e2c50fef4f29157abf102ee105dff7beb03621..a2afc367b597a42eb418b65c80f9e131cffd80a9 100644
+--- a/plugins/platforms/buzz/adapter.py
++++ b/plugins/platforms/buzz/adapter.py
+@@ -969,7 +969,7 @@ class BuzzAdapter(BasePlatformAdapter):
+         )
+ 
+         await self.handle_message(event)
+-        
++
+         # Add a "seen" reaction after dispatching — signals to the user that
+         # their message was received and is being processed.
+         try:
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index 8fcbcf3b8ce2fae2d4e7dd0d705f9f8be85f9656..3e056cf2cb0764b7c5f17a699ae22ee154dc386f 100644
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -13,6 +13,7 @@ import asyncio
+ import datetime as dt
+ import hashlib
+ import inspect
++import io
+ import json
+ import logging
+ import math
+@@ -35,6 +36,41 @@ from agent.async_utils import (
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _discord_env(name: str, default: str = "") -> str:
++    """Read Discord policy from the active profile scope when one exists."""
++    try:
++        from agent.secret_scope import current_secret_scope, get_secret
++    except ImportError:
++        return os.getenv(name, default)
++    if current_secret_scope() is None:
++        return os.getenv(name, default)
++    value = get_secret(name, default)
++    return str(value or default).strip()
++
++
++def _set_discord_env_default(name: str, value: object) -> None:
++    """Seed YAML policy in the current profile scope, or legacy global env."""
++    try:
++        from agent.secret_scope import current_secret_scope
++        scope = current_secret_scope()
++    except ImportError:
++        scope = None
++    if isinstance(scope, dict):
++        if not scope.get(name):
++            scope[name] = str(value)
++    elif not os.getenv(name):
++        os.environ[name] = str(value)
++
++
++def _discord_config_env(config, key: str, env_name: str, default: str = "") -> str:
++    raw = (getattr(config, "extra", {}) or {}).get(key)
++    if isinstance(raw, list):
++        return ",".join(str(value) for value in raw)
++    if raw is not None:
++        return str(raw)
++    return _discord_env(env_name, default)
++
++
+ class _Snowflake:
+     """Minimal object exposing ``.id`` — satisfies discord.py's Snowflake
+     protocol for ``channel.history(before=...)`` without constructing a
+@@ -48,6 +84,7 @@ class _Snowflake:
+         self.id = id
+ 
+ VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
++DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES = 10080
+ _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
+ _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
+ _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
+@@ -345,6 +382,23 @@ def _clean_discord_id(entry: str) -> str:
+     return entry.strip()
+ 
+ 
++def _discord_thread_auto_archive_minutes() -> int:
++    """Return the configured Discord thread auto-archive duration."""
++    raw = _discord_env("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", "").strip()
++    try:
++        value = int(raw) if raw else DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES
++    except ValueError:
++        value = DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES
++    if value not in VALID_THREAD_AUTO_ARCHIVE_MINUTES:
++        logger.warning(
++            "Invalid DISCORD_THREAD_AUTO_ARCHIVE_MINUTES=%r; using %s",
++            raw,
++            DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
++        )
++        return DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES
++    return value
++
++
+ def check_discord_requirements() -> bool:
+     """Check if Discord dependencies are available.
+ 
+@@ -397,7 +451,7 @@ def _build_allowed_mentions():
+         return None
+ 
+     def _b(name: str, default: bool) -> bool:
+-        raw = os.getenv(name, "").strip().lower()
++        raw = _discord_env(name, "").strip().lower()
+         if not raw:
+             return default
+         return raw in {"true", "1", "yes", "on"}
+@@ -1155,7 +1209,12 @@ class DiscordAdapter(BasePlatformAdapter):
+                 return False
+ 
+             # Parse allowed user entries (may contain usernames or IDs)
+-            allowed_env = os.getenv("DISCORD_ALLOWED_USERS", "")
++            allowed_env = self.config.extra.get("allow_from")
++            if allowed_env is None:
++                allowed_env = self.config.extra.get("allowed_users")
++            if isinstance(allowed_env, list):
++                allowed_env = ",".join(str(v) for v in allowed_env)
++            allowed_env = str(allowed_env or _discord_env("DISCORD_ALLOWED_USERS"))
+             if allowed_env:
+                 self._allowed_user_ids = {
+                     _clean_discord_id(uid) for uid in allowed_env.split(",")
+@@ -1164,7 +1223,10 @@ class DiscordAdapter(BasePlatformAdapter):
+ 
+             # Parse DISCORD_ALLOWED_ROLES — comma-separated role IDs.
+             # Users with ANY of these roles can interact with the bot.
+-            roles_env = os.getenv("DISCORD_ALLOWED_ROLES", "")
++            roles_env = self.config.extra.get("allowed_roles")
++            if isinstance(roles_env, list):
++                roles_env = ",".join(str(v) for v in roles_env)
++            roles_env = str(roles_env or _discord_env("DISCORD_ALLOWED_ROLES"))
+             if roles_env:
+                 self._allowed_role_ids = {
+                     int(rid.strip()) for rid in roles_env.split(",")
+@@ -1225,6 +1287,7 @@ class DiscordAdapter(BasePlatformAdapter):
+                 allowed_mentions=_build_allowed_mentions(),
+                 **proxy_kwargs_for_bot(proxy_url),
+             )
++            self._client._hermes_pairing_store = getattr(self, "_pairing_store", None)
+             adapter_self = self  # capture for closure
+ 
+             # Register event handlers
+@@ -1341,7 +1404,7 @@ class DiscordAdapter(BasePlatformAdapter):
+ 
+         role_authorized = False
+         if getattr(message.author, "bot", False):
+-            allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
++            allow_bots = _discord_env("DISCORD_ALLOW_BOTS", "none").lower()
+             if allow_bots == "none":
+                 return False, False
+             if allow_bots == "mentions" and not self._self_is_explicitly_mentioned(message):
+@@ -1381,7 +1444,7 @@ class DiscordAdapter(BasePlatformAdapter):
+             )
+             if other_bots_mentioned and not raw_self_mention:
+                 return False, False
+-            ignore_no_mention = os.getenv(
++            ignore_no_mention = _discord_env(
+                 "DISCORD_IGNORE_NO_MENTION", "true"
+             ).lower() in {"true", "1", "yes"}
+             if ignore_no_mention and not raw_self_mention and not other_bots_mentioned:
+@@ -1991,7 +2054,7 @@ class DiscordAdapter(BasePlatformAdapter):
+             if isinstance(value, str):
+                 return value.strip().lower() in ("true", "1", "yes", "on")
+             return bool(value)
+-        raw = os.getenv("DISCORD_MISSED_MESSAGE_BACKFILL", "false")
++        raw = _discord_env("DISCORD_MISSED_MESSAGE_BACKFILL", "false")
+         return str(raw).strip().lower() in ("true", "1", "yes", "on")
+ 
+     def _missed_message_backfill_channels(self) -> set[str]:
+@@ -2010,11 +2073,11 @@ class DiscordAdapter(BasePlatformAdapter):
+             raw = str(raw or "")
+             if raw.strip():
+                 return {item.strip() for item in raw.split(",") if item.strip()}
+-        raw = os.getenv("DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS", "")
++        raw = _discord_env("DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS", "")
+         if not raw.strip():
+             allowed = {
+                 item.strip()
+-                for item in os.getenv("DISCORD_ALLOWED_CHANNELS", "").split(",")
++                for item in _discord_env("DISCORD_ALLOWED_CHANNELS", "").split(",")
+                 if item.strip()
+             }
+             return allowed | self._discord_free_response_channels()
+@@ -2025,7 +2088,7 @@ class DiscordAdapter(BasePlatformAdapter):
+         raw = (
+             configured.get("window_seconds", 21600)
+             if isinstance(configured, dict)
+-            else os.getenv("DISCORD_MISSED_MESSAGE_BACKFILL_WINDOW_SECONDS", "21600")
++            else _discord_env("DISCORD_MISSED_MESSAGE_BACKFILL_WINDOW_SECONDS", "21600")
+         )
+         try:
+             value = float(raw)
+@@ -2038,7 +2101,7 @@ class DiscordAdapter(BasePlatformAdapter):
+         raw = (
+             configured.get("limit", 100)
+             if isinstance(configured, dict)
+-            else os.getenv("DISCORD_MISSED_MESSAGE_BACKFILL_LIMIT", "100")
++            else _discord_env("DISCORD_MISSED_MESSAGE_BACKFILL_LIMIT", "100")
+         )
+         try:
+             value = int(raw)
+@@ -2051,7 +2114,7 @@ class DiscordAdapter(BasePlatformAdapter):
+         raw = (
+             configured.get("max_dispatches", 10)
+             if isinstance(configured, dict)
+-            else os.getenv("DISCORD_MISSED_MESSAGE_BACKFILL_MAX_DISPATCHES", "10")
++            else _discord_env("DISCORD_MISSED_MESSAGE_BACKFILL_MAX_DISPATCHES", "10")
+         )
+         try:
+             value = int(raw)
+@@ -2639,7 +2702,7 @@ class DiscordAdapter(BasePlatformAdapter):
+         self._with_discord_recovery_db(_op)
+ 
+     def _get_discord_command_sync_policy(self) -> str:
+-        raw = str(os.getenv("DISCORD_COMMAND_SYNC_POLICY", "safe") or "").strip().lower()
++        raw = str(_discord_env("DISCORD_COMMAND_SYNC_POLICY", "safe") or "").strip().lower()
+         if raw in _DISCORD_COMMAND_SYNC_POLICIES:
+             return raw
+         if raw:
+@@ -2857,7 +2920,7 @@ class DiscordAdapter(BasePlatformAdapter):
+ 
+     def _reactions_enabled(self) -> bool:
+         """Check if message reactions are enabled via config/env."""
+-        return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
++        return _discord_env("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
+ 
+     async def on_processing_start(self, event: MessageEvent) -> None:
+         """Add an in-progress reaction and record durable handling state."""
+@@ -2888,6 +2951,79 @@ class DiscordAdapter(BasePlatformAdapter):
+             elif outcome == ProcessingOutcome.FAILURE:
+                 await self._add_reaction(message, "❌")
+ 
++    @staticmethod
++    def _strip_copy_fence_markers(content: str) -> str:
++        """Remove valid internal copy hints without touching ordinary comments."""
++        return re.sub(
++            r"(?m)^[ \t]*<!--\s*hermes:copy\s*-->[ \t]*\n(?=```)",
++            "",
++            content,
++        )
++
++    def _standalone_fenced_chunks(self, content: str) -> List[str]:
++        """Split only explicitly copy-marked fences into standalone messages.
++
++        ``<!-- hermes:copy -->`` immediately before a triple-backtick fence is
++        an internal delivery hint: Discord mobile exposes a convenient copy
++        action when that fence is its own message.  The marker is removed before
++        delivery.  Unmarked fences stay with the surrounding prose so examples,
++        status output, and illustrative lists do not shatter a coherent answer.
++        Every resulting segment still passes through the normal length-aware
++        splitter, so Discord never receives an oversized text payload.
++        """
++        formatted = self.format_message(content)
++        fence_re = re.compile(
++            r"^[ \t]*<!--\s*hermes:copy\s*-->[ \t]*\n"
++            r"(?P<fence>^```[^\n]*(?:\n|$).*?^```[ \t]*(?=\n|$))",
++            re.MULTILINE | re.DOTALL,
++        )
++        segments: List[str] = []
++        cursor = 0
++        for match in fence_re.finditer(formatted):
++            prose = formatted[cursor:match.start()].strip()
++            if prose:
++                segments.extend(
++                    self.truncate_message(prose, self.MAX_MESSAGE_LENGTH)
++                )
++            fence = match.group("fence").strip("\n")
++            if fence:
++                segments.extend(
++                    self.truncate_message(fence, self.MAX_MESSAGE_LENGTH)
++                )
++            cursor = match.end()
++
++        tail = formatted[cursor:].strip()
++        if tail:
++            segments.extend(self.truncate_message(tail, self.MAX_MESSAGE_LENGTH))
++
++        if segments:
++            return segments
++        return self.truncate_message(
++            self._strip_copy_fence_markers(formatted),
++            self.MAX_MESSAGE_LENGTH,
++        )
++
++    def _oversized_fence_file(self, content: str) -> Optional[Any]:
++        """Return a TXT attachment when the response is one oversized fence."""
++        formatted = self._strip_copy_fence_markers(
++            self.format_message(content).strip()
++        )
++        match = re.fullmatch(
++            r"```[^\n]*(?:\n|$).*\n```[ \t]*",
++            formatted,
++            re.DOTALL,
++        )
++        if not match or len(formatted) <= self.MAX_MESSAGE_LENGTH:
++            return None
++        # Strip only the Markdown fence; preserve the code payload exactly.
++        first_newline = formatted.find("\n")
++        payload = formatted[first_newline + 1:] if first_newline >= 0 else ""
++        payload = re.sub(r"\n```[ \t]*$", "", payload)
++        return discord.File(
++            io.BytesIO(payload.encode("utf-8")),
++            filename="hermes-code-block.txt",
++        )
++
+     async def send(
+         self,
+         chat_id: str,
+@@ -2929,6 +3065,20 @@ class DiscordAdapter(BasePlatformAdapter):
+                 if not channel:
+                     return SendResult(success=False, error=f"Channel {chat_id} not found")
+ 
++            oversized_fence = self._oversized_fence_file(content)
++            if oversized_fence is not None:
++                if self._is_forum_parent(channel):
++                    return await self._forum_post_file(
++                        channel,
++                        content="Code attached as TXT.",
++                        file=oversized_fence,
++                    )
++                msg = await channel.send(
++                    content="Code attached as TXT.",
++                    file=oversized_fence,
++                )
++                return SendResult(success=True, message_id=str(msg.id))
++
+             # Forum channels reject channel.send() — create a thread post instead.
+             if self._is_forum_parent(channel):
+                 result = await self._send_to_forum(channel, content)
+@@ -2941,9 +3091,9 @@ class DiscordAdapter(BasePlatformAdapter):
+                 )
+                 return result
+ 
+-            # Format and split message if needed
+-            formatted = self.format_message(content)
+-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
++            # Keep only explicitly copy-marked fences in standalone Discord
++            # messages. Ordinary fences remain with their surrounding prose.
++            chunks = self._standalone_fenced_chunks(content)
+ 
+             message_ids = []
+             reference = None
+@@ -3041,8 +3191,7 @@ class DiscordAdapter(BasePlatformAdapter):
+         # _derive_forum_thread_name is defined further down in this same
+         # module — no cross-module import needed.
+ 
+-        formatted = self.format_message(content)
+-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
++        chunks = self._standalone_fenced_chunks(content)
+ 
+         thread_name = _derive_forum_thread_name(content)
+ 
+@@ -3198,7 +3347,35 @@ class DiscordAdapter(BasePlatformAdapter):
+             if not channel:
+                 channel = await self._client.fetch_channel(int(chat_id))
+             msg = await channel.fetch_message(int(message_id))
+-            formatted = self.format_message(content)
++            formatted = self._strip_copy_fence_markers(
++                self.format_message(content)
++            )
++
++            # On the final streaming edit, isolate explicitly copy-marked fences
++            # and send any remaining segments as continuations. Mid-stream
++            # previews stay in one editable message.
++            if finalize:
++                oversized_fence = self._oversized_fence_file(content)
++                if oversized_fence is not None:
++                    await msg.edit(content="Code attached as TXT.")
++                    sent = await channel.send(file=oversized_fence)
++                    sent_id = str(sent.id)
++                    self._last_self_message_id[str(channel.id)] = sent_id
++                    return SendResult(
++                        success=True,
++                        message_id=sent_id,
++                        continuation_message_ids=(sent_id,),
++                    )
++
++                final_chunks = self._standalone_fenced_chunks(content)
++                if len(final_chunks) > 1:
++                    return await self._edit_overflow_split(
++                        channel,
++                        msg,
++                        message_id,
++                        content,
++                        chunks=final_chunks,
++                    )
+ 
+             _preview_key = (str(chat_id), str(message_id))
+             _saturated_preview = False
+@@ -3290,11 +3467,13 @@ class DiscordAdapter(BasePlatformAdapter):
+         msg: Any,
+         message_id: str,
+         content: str,
++        *,
++        chunks: Optional[List[str]] = None,
+     ) -> SendResult:
+-        """Deliver an oversized final edit across message + continuations.
++        """Deliver a segmented final edit across message + continuations.
+ 
+-        Edit the original ``message_id`` with chunk 1 (fence-aware, with the
+-        usual ``(1/N)`` indicator), then send chunks 2..N as new messages each
++        Edit the original ``message_id`` with chunk 1, then send chunks 2..N
++        as new messages each
+         threaded as a reply to the previous chunk so Discord groups them
+         visually.  Returns ``SendResult(success=True, message_id=<last-id>,
+         continuation_message_ids=(...))`` so the stream consumer keeps editing
+@@ -3308,8 +3487,11 @@ class DiscordAdapter(BasePlatformAdapter):
+         saw would be the worse outcome.  Only a first-chunk edit failure
+         returns ``success=False`` (a real adapter problem, not overflow).
+         """
+-        formatted = self.format_message(content)
+-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
++        formatted = self._strip_copy_fence_markers(
++            self.format_message(content)
++        )
++        if chunks is None:
++            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+         if len(chunks) <= 1:
+             # Defensive: caller's pre-flight should guarantee >1 chunk, but if
+             # not, just edit normally.
+@@ -4409,7 +4591,7 @@ class DiscordAdapter(BasePlatformAdapter):
+         """True when *channel_ids* intersect ``DISCORD_ALLOWED_CHANNELS``."""
+         if not channel_ids:
+             return False
+-        allowed_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "").strip()
++        allowed_raw = _discord_env("DISCORD_ALLOWED_CHANNELS")
+         if not allowed_raw:
+             return False
+         allowed = {c.strip() for c in allowed_raw.split(",") if c.strip()}
+@@ -4422,10 +4604,19 @@ class DiscordAdapter(BasePlatformAdapter):
+         user_id = str(user_id or "").strip()
+         if not user_id:
+             return False
++        store = getattr(self, "_pairing_store", None)
++        if store is None:
++            try:
++                from agent.secret_scope import is_multiplex_active
++                if not is_multiplex_active():
++                    from gateway.pairing import PairingStore
++                    store = PairingStore()
++            except ImportError:
++                store = None
++        if store is None:
++            return False
+         try:
+-            from gateway.pairing import PairingStore
+-
+-            return bool(PairingStore().is_approved("discord", user_id))
++            return bool(store.is_approved("discord", user_id))
+         except Exception:
+             return False
+ 
+@@ -4478,9 +4669,9 @@ class DiscordAdapter(BasePlatformAdapter):
+             return True
+ 
+         if not has_users and not has_roles:
+-            if os.getenv("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
++            if _discord_env("DISCORD_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
+                 return True
+-            if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
++            if _discord_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
+                 return True
+             # Channel-scoped guild access requires validated channel context.
+             # Do not treat DISCORD_ALLOWED_CHANNELS alone as a user-wide bypass
+@@ -4553,11 +4744,11 @@ class DiscordAdapter(BasePlatformAdapter):
+         allowed_roles = getattr(self, "_allowed_role_ids", set()) or set()
+         if allowed_users or allowed_roles:
+             return
+-        if os.getenv("DISCORD_ALLOWED_CHANNELS", "").strip():
++        if _discord_config_env(getattr(self, "config", None), "allowed_channels", "DISCORD_ALLOWED_CHANNELS", "").strip():
+             return
+-        if os.getenv("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
++        if _discord_config_env(getattr(self, "config", None), "allow_all_users", "DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+             return
+-        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
++        if _discord_env("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+             return
+         self._warned_fail_closed_default = True
+         logger.warning(
+@@ -4636,7 +4827,9 @@ class DiscordAdapter(BasePlatformAdapter):
+                 else None,
+             )
+ 
+-            allowed_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "")
++            allowed_raw = _discord_config_env(
++                getattr(self, "config", None), "allowed_channels", "DISCORD_ALLOWED_CHANNELS", ""
++            )
+             if allowed_raw:
+                 allowed = {c.strip() for c in allowed_raw.split(",") if c.strip()}
+                 if "*" not in allowed:
+@@ -4653,7 +4846,9 @@ class DiscordAdapter(BasePlatformAdapter):
+             # Ignored beats allowed: even when a thread's parent channel
+             # is on the allowlist, an explicit DISCORD_IGNORED_CHANNELS
+             # entry on the thread or its parent rejects the interaction.
+-            ignored_raw = os.getenv("DISCORD_IGNORED_CHANNELS", "")
++            ignored_raw = _discord_config_env(
++                getattr(self, "config", None), "ignored_channels", "DISCORD_IGNORED_CHANNELS", ""
++            )
+             if ignored_raw and channel_ids:
+                 ignored = {c.strip() for c in ignored_raw.split(",") if c.strip()}
+                 if "*" in ignored or (channel_keys & ignored):
+@@ -5184,7 +5379,7 @@ class DiscordAdapter(BasePlatformAdapter):
+ 
+         # Update internal set and env var so gateway auth checks use IDs
+         self._allowed_user_ids = numeric_ids
+-        os.environ["DISCORD_ALLOWED_USERS"] = ",".join(sorted(numeric_ids))
++        _set_discord_env_default("DISCORD_ALLOWED_USERS", ",".join(sorted(numeric_ids)))
+         if resolved_count:
+             print(f"[{self.name}] Updated DISCORD_ALLOWED_USERS with {resolved_count} resolved ID(s)")
+ 
+@@ -5413,7 +5608,7 @@ class DiscordAdapter(BasePlatformAdapter):
+             interaction: discord.Interaction,
+             name: str,
+             message: str = "",
+-            auto_archive_duration: int = 1440,
++            auto_archive_duration: int = DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
+         ):
+             # defer() is performed inside the handler *after* the auth gate
+             # so a rejected invoker can receive an ephemeral rejection.
+@@ -5568,7 +5763,7 @@ class DiscordAdapter(BasePlatformAdapter):
+         # UX so users don't see commands they can't invoke. Off by default
+         # to preserve the slash UX for deployments that intentionally allow
+         # everyone in the guild.
+-        if os.getenv("DISCORD_HIDE_SLASH_COMMANDS", "false").strip().lower() in {
++        if _discord_env("DISCORD_HIDE_SLASH_COMMANDS", "false").strip().lower() in {
+             "true", "1", "yes", "on",
+         }:
+             self._apply_owner_only_visibility(tree)
+@@ -5859,7 +6054,7 @@ class DiscordAdapter(BasePlatformAdapter):
+         interaction: discord.Interaction,
+         name: str,
+         message: str = "",
+-        auto_archive_duration: int = 1440,
++        auto_archive_duration: int = DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
+     ) -> None:
+         """Create a Discord thread from a slash command and start a session in it."""
+         if not await self._check_slash_authorization(interaction, "/thread"):
+@@ -5971,7 +6166,7 @@ class DiscordAdapter(BasePlatformAdapter):
+             if isinstance(configured, str):
+                 return configured.lower() not in {"false", "0", "no", "off"}
+             return bool(configured)
+-        return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
++        return _discord_env("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
+ 
+     def _discord_allow_any_attachment(self) -> bool:
+         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.
+@@ -5986,7 +6181,7 @@ class DiscordAdapter(BasePlatformAdapter):
+             if isinstance(configured, str):
+                 return configured.lower() not in {"false", "0", "no", "off", ""}
+             return bool(configured)
+-        return os.getenv("DISCORD_ALLOW_ANY_ATTACHMENT", "false").lower() in {"true", "1", "yes", "on"}
++        return _discord_env("DISCORD_ALLOW_ANY_ATTACHMENT", "false").lower() in {"true", "1", "yes", "on"}
+ 
+     def _discord_max_attachment_bytes(self) -> int:
+         """Return the per-attachment byte cap. 0 means unlimited.
+@@ -5997,7 +6192,7 @@ class DiscordAdapter(BasePlatformAdapter):
+         """
+         configured = self.config.extra.get("max_attachment_bytes")
+         if configured is None:
+-            configured = os.getenv("DISCORD_MAX_ATTACHMENT_BYTES")
++            configured = _discord_env("DISCORD_MAX_ATTACHMENT_BYTES")
+         if configured is None or configured == "":
+             return 32 * 1024 * 1024
+         try:
+@@ -6037,7 +6232,7 @@ class DiscordAdapter(BasePlatformAdapter):
+         """
+         raw = self.config.extra.get("free_response_channels")
+         if raw is None:
+-            raw = os.getenv("DISCORD_FREE_RESPONSE_CHANNELS", "")
++            raw = _discord_env("DISCORD_FREE_RESPONSE_CHANNELS", "")
+         if isinstance(raw, list):
+             return {str(part).strip() for part in raw if str(part).strip()}
+         # Coerce non-list scalars (str/int/float) to str before splitting.
+@@ -6106,7 +6301,7 @@ class DiscordAdapter(BasePlatformAdapter):
+             if isinstance(configured, str):
+                 return configured.lower() in {"true", "1", "yes", "on"}
+             return bool(configured)
+-        return os.getenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION", "false").lower() in {
++        return _discord_env("DISCORD_BOTS_REQUIRE_INLINE_MENTION", "false").lower() in {
+             "true",
+             "1",
+             "yes",
+@@ -6174,7 +6369,7 @@ class DiscordAdapter(BasePlatformAdapter):
+             if isinstance(configured, str):
+                 return configured.lower() not in {"false", "0", "no", "off"}
+             return bool(configured)
+-        return os.getenv("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
++        return _discord_env("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
+ 
+     def _discord_history_backfill(self) -> bool:
+         """Return whether history backfill is enabled for shared sessions."""
+@@ -6183,7 +6378,7 @@ class DiscordAdapter(BasePlatformAdapter):
+             if isinstance(configured, str):
+                 return configured.lower() not in {"false", "0", "no", "off"}
+             return bool(configured)
+-        return os.getenv("DISCORD_HISTORY_BACKFILL", "true").lower() in {"true", "1", "yes"}
++        return _discord_env("DISCORD_HISTORY_BACKFILL", "true").lower() in {"true", "1", "yes"}
+ 
+     def _discord_history_backfill_limit(self) -> int:
+         """Return the max number of messages to scan backwards for context.
+@@ -6199,7 +6394,7 @@ class DiscordAdapter(BasePlatformAdapter):
+                 return int(configured)
+             except (ValueError, TypeError):
+                 pass
+-        raw = os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT", "50")
++        raw = _discord_env("DISCORD_HISTORY_BACKFILL_LIMIT", "50")
+         try:
+             return int(raw)
+         except (ValueError, TypeError):
+@@ -6237,7 +6432,7 @@ class DiscordAdapter(BasePlatformAdapter):
+             return ""
+ 
+         # Determine which bot messages to include in context
+-        allow_bots_raw = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
++        allow_bots_raw = _discord_env("DISCORD_ALLOW_BOTS", "none").lower().strip()
+         include_other_bots = allow_bots_raw != "none"
+ 
+         # Use the in-memory cache to narrow the fetch window on hot paths.
+@@ -6458,7 +6653,7 @@ class DiscordAdapter(BasePlatformAdapter):
+         *,
+         name: str,
+         message: str = "",
+-        auto_archive_duration: int = 1440,
++        auto_archive_duration: int = DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
+     ) -> Dict[str, Any]:
+         """Create a thread in the current Discord channel.
+ 
+@@ -6565,7 +6760,10 @@ class DiscordAdapter(BasePlatformAdapter):
+ 
+         for attempt in range(2):
+             try:
+-                thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
++                thread = await message.create_thread(
++                    name=thread_name,
++                    auto_archive_duration=_discord_thread_auto_archive_minutes(),
++                )
+                 try:
+                     setattr(thread, "_hermes_auto_thread_initial_name", thread_name)
+                 except Exception:
+@@ -6579,7 +6777,7 @@ class DiscordAdapter(BasePlatformAdapter):
+                     )
+                     thread = await seed_msg.create_thread(
+                         name=thread_name,
+-                        auto_archive_duration=1440,
++                        auto_archive_duration=_discord_thread_auto_archive_minutes(),
+                         reason=reason,
+                     )
+                     try:
+@@ -6714,7 +6912,7 @@ class DiscordAdapter(BasePlatformAdapter):
+             if create is not None:
+                 thread = await create(
+                     name=thread_name,
+-                    auto_archive_duration=1440,
++                    auto_archive_duration=_discord_thread_auto_archive_minutes(),
+                     reason=reason,
+                 )
+                 return str(thread.id)
+@@ -6732,7 +6930,7 @@ class DiscordAdapter(BasePlatformAdapter):
+             seed_msg = await send(f"\U0001f9f5 Hermes handoff: **{thread_name}**")
+             thread = await seed_msg.create_thread(
+                 name=thread_name,
+-                auto_archive_duration=1440,
++                auto_archive_duration=_discord_thread_auto_archive_minutes(),
+                 reason=reason,
+             )
+             return str(thread.id)
+@@ -7445,7 +7643,9 @@ class DiscordAdapter(BasePlatformAdapter):
+             channel_keys = self._discord_channel_keys(message, parent_channel_id)
+ 
+             # Check allowed channels - if set, only respond in these channels
+-            allowed_channels_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "")
++            allowed_channels_raw = _discord_config_env(
++                getattr(self, "config", None), "allowed_channels", "DISCORD_ALLOWED_CHANNELS", ""
++            )
+             if allowed_channels_raw:
+                 allowed_channels = {ch.strip() for ch in allowed_channels_raw.split(",") if ch.strip()}
+                 if "*" not in allowed_channels and not (channel_keys & allowed_channels):
+@@ -7453,7 +7653,9 @@ class DiscordAdapter(BasePlatformAdapter):
+                     return False
+ 
+             # Check ignored channels - never respond even when mentioned
+-            ignored_channels_raw = os.getenv("DISCORD_IGNORED_CHANNELS", "")
++            ignored_channels_raw = _discord_config_env(
++                getattr(self, "config", None), "ignored_channels", "DISCORD_IGNORED_CHANNELS", ""
++            )
+             ignored_channels = {ch.strip() for ch in ignored_channels_raw.split(",") if ch.strip()}
+             if "*" in ignored_channels or (channel_keys & ignored_channels):
+                 logger.debug("[%s] Ignoring message in ignored channel: %s", self.name, channel_keys)
+@@ -7487,15 +7689,18 @@ class DiscordAdapter(BasePlatformAdapter):
+             if require_mention and not is_free_channel and not in_bot_thread:
+                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
+                     return False
+-        # Auto-thread: when enabled, automatically create a thread for every
+-        # @mention in a text channel so each conversation is isolated (like Slack).
+-        # Messages already inside threads or DMs are unaffected.
+-        # no_thread_channels: channels where bot responds directly without thread.
++        # Auto-thread: when enabled, create a thread for each accepted top-level
++        # message in a text channel. Normally that means an @mention; configured
++        # free-response channels accept unmentioned messages too. Messages already
++        # inside threads or DMs are unaffected. no_thread_channels is the explicit
++        # inline-response override.
+         auto_threaded_channel = None
+         if not is_thread and not isinstance(message.channel, discord.DMChannel):
+-            no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
++            no_thread_channels_raw = _discord_config_env(
++                getattr(self, "config", None), "no_thread_channels", "DISCORD_NO_THREAD_CHANNELS", ""
++            )
+             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
+-            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
++            skip_thread = bool(channel_keys & no_thread_channels)
+             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
+             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
+             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
+@@ -8004,15 +8209,15 @@ def _component_check_auth(
+     if user is None or getattr(user, "id", None) is None:
+         return False
+ 
+-    if os.getenv("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
++    if _discord_env("DISCORD_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
+         return True
+-    if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
++    if _discord_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
+         return True
+ 
+     user_set = {str(uid).strip() for uid in (allowed_user_ids or set()) if str(uid).strip()}
+     global_allowed = {
+         uid.strip()
+-        for uid in os.getenv("GATEWAY_ALLOWED_USERS", "").split(",")
++        for uid in _discord_env("GATEWAY_ALLOWED_USERS").split(",")
+         if uid.strip()
+     }
+     user_set.update(global_allowed)
+@@ -8050,11 +8255,16 @@ def _component_check_auth(
+     # component buttons even without DISCORD_ALLOWED_USERS set.
+     if uid:
+         try:
+-            from gateway.pairing import PairingStore
+-            store = PairingStore()
+-            if store.is_approved("discord", uid):
++            client = getattr(interaction, "client", None)
++            store = getattr(client, "_hermes_pairing_store", None)
++            if store is None:
++                from agent.secret_scope import is_multiplex_active
++                if not is_multiplex_active():
++                    from gateway.pairing import PairingStore
++                    store = PairingStore()
++            if store is not None and store.is_approved("discord", uid):
+                 return True
+-        except Exception:
++        except (AttributeError, TypeError, ImportError):
+             pass
+ 
+     return False
+@@ -9301,7 +9511,7 @@ async def _standalone_send(
+     except ImportError:
+         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+ 
+-    token = (getattr(pconfig, "token", None) or os.getenv("DISCORD_BOT_TOKEN", "")).strip()
++    token = (getattr(pconfig, "token", None) or _discord_env("DISCORD_BOT_TOKEN", "")).strip()
+     if not token:
+         return {"error": "Discord standalone send: DISCORD_BOT_TOKEN is not set"}
+ 
+@@ -9651,12 +9861,24 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
+     remains only for existing callers that construct adapters without config
+     extras. Returns canonical WebSocket liveness settings to seed that extra.
+     """
+-    if "require_mention" in discord_cfg and not os.getenv("DISCORD_REQUIRE_MENTION"):
+-        os.environ["DISCORD_REQUIRE_MENTION"] = str(discord_cfg["require_mention"]).lower()
+-    if "thread_require_mention" in discord_cfg and not os.getenv("DISCORD_THREAD_REQUIRE_MENTION"):
+-        os.environ["DISCORD_THREAD_REQUIRE_MENTION"] = str(discord_cfg["thread_require_mention"]).lower()
+-    if "bots_require_inline_mention" in discord_cfg and not os.getenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION"):
+-        os.environ["DISCORD_BOTS_REQUIRE_INLINE_MENTION"] = str(discord_cfg["bots_require_inline_mention"]).lower()
++    seeded_extra = dict(discord_cfg.get("extra") or {})
++    for key in (
++        "require_mention", "thread_require_mention", "bots_require_inline_mention",
++        "allow_from", "allowed_users", "allowed_roles", "allowed_channels",
++        "ignored_channels", "allow_all_users", "free_response_channels",
++        "auto_thread", "thread_auto_archive_minutes", "reactions",
++        "no_thread_channels", "history_backfill", "history_backfill_limit",
++        "approval_mentions", "allow_mentions", "reply_to_mode",
++        "missed_message_backfill",
++    ):
++        if key in discord_cfg:
++            seeded_extra.setdefault(key, discord_cfg[key])
++    if "require_mention" in discord_cfg and not _discord_env("DISCORD_REQUIRE_MENTION"):
++        _set_discord_env_default("DISCORD_REQUIRE_MENTION", str(discord_cfg["require_mention"]).lower())
++    if "thread_require_mention" in discord_cfg and not _discord_env("DISCORD_THREAD_REQUIRE_MENTION"):
++        _set_discord_env_default("DISCORD_THREAD_REQUIRE_MENTION", str(discord_cfg["thread_require_mention"]).lower())
++    if "bots_require_inline_mention" in discord_cfg and not _discord_env("DISCORD_BOTS_REQUIRE_INLINE_MENTION"):
++        _set_discord_env_default("DISCORD_BOTS_REQUIRE_INLINE_MENTION", str(discord_cfg["bots_require_inline_mention"]).lower())
+     platforms_cfg = yaml_cfg.get("platforms")
+     platform_extra_cfg = {}
+     if isinstance(platforms_cfg, dict):
+@@ -9669,55 +9891,56 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
+         discord_cfg["allow_from"] if "allow_from" in discord_cfg
+         else platform_extra_cfg.get("allow_from")
+     )
+-    if allowed_users_cfg is not None and not os.getenv("DISCORD_ALLOWED_USERS"):
++    if allowed_users_cfg is not None and not _discord_env("DISCORD_ALLOWED_USERS"):
+         if isinstance(allowed_users_cfg, list):
+             allowed_users_cfg = ",".join(str(v) for v in allowed_users_cfg)
+-        os.environ["DISCORD_ALLOWED_USERS"] = str(allowed_users_cfg)
++        _set_discord_env_default("DISCORD_ALLOWED_USERS", allowed_users_cfg)
+     approval_mentions_cfg = (
+         discord_cfg["approval_mentions"] if "approval_mentions" in discord_cfg
+         else platform_extra_cfg.get("approval_mentions")
+     )
+-    if approval_mentions_cfg is not None and not os.getenv("DISCORD_APPROVAL_MENTIONS"):
+-        os.environ["DISCORD_APPROVAL_MENTIONS"] = str(approval_mentions_cfg).lower()
++    if approval_mentions_cfg is not None and not _discord_env("DISCORD_APPROVAL_MENTIONS"):
++        _set_discord_env_default("DISCORD_APPROVAL_MENTIONS", str(approval_mentions_cfg).lower())
+     frc = discord_cfg.get("free_response_channels")
+-    if frc is not None and not os.getenv("DISCORD_FREE_RESPONSE_CHANNELS"):
++    if frc is not None and not _discord_env("DISCORD_FREE_RESPONSE_CHANNELS"):
+         if isinstance(frc, list):
+             frc = ",".join(str(v) for v in frc)
+-        os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
+-    if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
+-        os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
+-    if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
+-        os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
+-    seeded_extra = {}
++        _set_discord_env_default("DISCORD_FREE_RESPONSE_CHANNELS", frc)
++    if "auto_thread" in discord_cfg and not _discord_env("DISCORD_AUTO_THREAD"):
++        _set_discord_env_default("DISCORD_AUTO_THREAD", str(discord_cfg["auto_thread"]).lower())
++    if "thread_auto_archive_minutes" in discord_cfg and not _discord_env("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES"):
++        _set_discord_env_default("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", discord_cfg["thread_auto_archive_minutes"])
++    if "reactions" in discord_cfg and not _discord_env("DISCORD_REACTIONS"):
++        _set_discord_env_default("DISCORD_REACTIONS", str(discord_cfg["reactions"]).lower())
+     backfill_cfg = discord_cfg.get("missed_message_backfill")
+     if isinstance(backfill_cfg, dict):
+         seeded_extra["missed_message_backfill"] = dict(backfill_cfg)
+     # ignored_channels: channels where bot never responds (even when mentioned)
+     ic = discord_cfg.get("ignored_channels")
+-    if ic is not None and not os.getenv("DISCORD_IGNORED_CHANNELS"):
++    if ic is not None and not _discord_env("DISCORD_IGNORED_CHANNELS"):
+         if isinstance(ic, list):
+             ic = ",".join(str(v) for v in ic)
+-        os.environ["DISCORD_IGNORED_CHANNELS"] = str(ic)
++        _set_discord_env_default("DISCORD_IGNORED_CHANNELS", ic)
+     # allowed_channels: if set, bot ONLY responds in these channels (whitelist)
+     ac = discord_cfg.get("allowed_channels")
+-    if ac is not None and not os.getenv("DISCORD_ALLOWED_CHANNELS"):
++    if ac is not None and not _discord_env("DISCORD_ALLOWED_CHANNELS"):
+         if isinstance(ac, list):
+             ac = ",".join(str(v) for v in ac)
+-        os.environ["DISCORD_ALLOWED_CHANNELS"] = str(ac)
++        _set_discord_env_default("DISCORD_ALLOWED_CHANNELS", ac)
+     # no_thread_channels: channels where bot responds directly without creating thread
+     ntc = discord_cfg.get("no_thread_channels")
+-    if ntc is not None and not os.getenv("DISCORD_NO_THREAD_CHANNELS"):
++    if ntc is not None and not _discord_env("DISCORD_NO_THREAD_CHANNELS"):
+         if isinstance(ntc, list):
+             ntc = ",".join(str(v) for v in ntc)
+-        os.environ["DISCORD_NO_THREAD_CHANNELS"] = str(ntc)
++        _set_discord_env_default("DISCORD_NO_THREAD_CHANNELS", ntc)
+     # history_backfill: recover missed channel messages for shared sessions
+     # when require_mention is active.  Fetches messages between bot turns
+     # and prepends them to the user message for context.
+-    if "history_backfill" in discord_cfg and not os.getenv("DISCORD_HISTORY_BACKFILL"):
+-        os.environ["DISCORD_HISTORY_BACKFILL"] = str(discord_cfg["history_backfill"]).lower()
++    if "history_backfill" in discord_cfg and not _discord_env("DISCORD_HISTORY_BACKFILL"):
++        _set_discord_env_default("DISCORD_HISTORY_BACKFILL", str(discord_cfg["history_backfill"]).lower())
+     hbl = discord_cfg.get("history_backfill_limit")
+-    if hbl is not None and not os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT"):
+-        os.environ["DISCORD_HISTORY_BACKFILL_LIMIT"] = str(hbl)
++    if hbl is not None and not _discord_env("DISCORD_HISTORY_BACKFILL_LIMIT"):
++        _set_discord_env_default("DISCORD_HISTORY_BACKFILL_LIMIT", hbl)
+     # allow_mentions: granular control over what the bot can ping.
+     # Safe defaults (no @everyone/roles) are applied in the adapter;
+     # these YAML keys only override when set and let users opt back
+@@ -9730,8 +9953,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
+             ("users", "DISCORD_ALLOW_MENTION_USERS"),
+             ("replied_user", "DISCORD_ALLOW_MENTION_REPLIED_USER"),
+         ):
+-            if yaml_key in allow_mentions_cfg and not os.getenv(env_key):
+-                os.environ[env_key] = str(allow_mentions_cfg[yaml_key]).lower()
++            if yaml_key in allow_mentions_cfg and not _discord_env(env_key):
++                _set_discord_env_default(env_key, str(allow_mentions_cfg[yaml_key]).lower())
+     # reply_to_mode: top-level preferred, falls back to extra.reply_to_mode.
+     # YAML 1.1 parses bare 'off' as boolean False — coerce to string "off".
+     _discord_extra = discord_cfg.get("extra") if isinstance(discord_cfg.get("extra"), dict) else {}
+@@ -9739,9 +9962,9 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
+         discord_cfg["reply_to_mode"] if "reply_to_mode" in discord_cfg
+         else _discord_extra.get("reply_to_mode")
+     )
+-    if _discord_rtm is not None and not os.getenv("DISCORD_REPLY_TO_MODE"):
++    if _discord_rtm is not None and not _discord_env("DISCORD_REPLY_TO_MODE"):
+         _rtm_str = "off" if _discord_rtm is False else str(_discord_rtm).lower()
+-        os.environ["DISCORD_REPLY_TO_MODE"] = _rtm_str
++        _set_discord_env_default("DISCORD_REPLY_TO_MODE", _rtm_str)
+     _websocket_extra_cfg = discord_cfg.get("extra")
+     if not isinstance(_websocket_extra_cfg, dict):
+         _websocket_extra_cfg = {}
+@@ -9774,8 +9997,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
+             value = _websocket_liveness_cfg.get(legacy_key)
+         if value is not None:
+             seeded_extra[primary_key] = value
+-            if env_key and not os.getenv(env_key):
+-                os.environ[env_key] = str(value)
++            if env_key and not _discord_env(env_key):
++                _set_discord_env_default(env_key, value)
+     return seeded_extra or None
+ 
+ 
+diff --git a/plugins/platforms/line/adapter.py b/plugins/platforms/line/adapter.py
+index 615841923278410e7c3ca411e335db892828ac76..f5e6f3350cb2b61450af930abf5ec3c2b1fe26cf 100644
+--- a/plugins/platforms/line/adapter.py
++++ b/plugins/platforms/line/adapter.py
+@@ -23,7 +23,9 @@ button and always Push-fallback instead.
+ 
+ **Three-allowlist gating.** Separate allowlists for users (U-prefixed),
+ groups (C-prefixed), and rooms (R-prefixed). ``LINE_ALLOW_ALL_USERS=true``
+-is a dev-only escape hatch.
++is a dev-only escape hatch. ``LINE_READ_ONLY_GROUPS`` archives selected
++groups without dispatching, while ``LINE_ARCHIVE_GROUPS`` archives selected
++groups while preserving normal reply/prefix behavior.
+ 
+ **Media via public HTTPS.** LINE's Messaging API does *not* accept
+ binary uploads — images, audio, and video must be reachable HTTPS URLs.
+@@ -393,6 +395,10 @@ class _MessageDeduplicator:
+             self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
+         self._seen[event_id] = time.time()
+         return False
++    def forget(self, event_id: str) -> None:
++        """Allow a failed webhook event to be retried."""
++        if event_id:
++            self._seen.pop(event_id, None)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -629,11 +635,28 @@ def _csv_set(value: str) -> Set[str]:
+     return {x.strip() for x in value.split(",") if x.strip()}
+ 
+ 
++def _csv_list(value: str) -> List[str]:
++    if not value:
++        return []
++    return [x.strip() for x in value.split(",") if x.strip()]
++
++
++def _profile_env(name: str, default: str = "") -> str:
++    """Read a LINE setting without crossing profile scopes in multiplex mode."""
++    try:
++        from agent.secret_scope import get_secret
++    except ImportError:
++        return os.getenv(name, default)
++
++    value = get_secret(name)
++    return str(value) if value is not None else default
++
++
+ def _truthy_env(name: str, default: bool = False) -> bool:
+-    v = os.getenv(name)
+-    if v is None:
++    value = _profile_env(name)
++    if not value:
+         return default
+-    return v.strip().lower() in {"1", "true", "yes", "on"}
++    return value.strip().lower() in {"1", "true", "yes", "on"}
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -654,19 +677,19 @@ class LineAdapter(BasePlatformAdapter):
+ 
+         # Credentials
+         self.channel_access_token = (
+-            os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
++            _profile_env("LINE_CHANNEL_ACCESS_TOKEN")
+             or extra.get("channel_access_token", "")
+         )
+         self.channel_secret = (
+-            os.getenv("LINE_CHANNEL_SECRET")
++            _profile_env("LINE_CHANNEL_SECRET")
+             or extra.get("channel_secret", "")
+         )
+ 
+         # Webhook server
+-        self.webhook_host = os.getenv("LINE_HOST") or extra.get("host", "0.0.0.0")
++        self.webhook_host = _profile_env("LINE_HOST") or extra.get("host", "0.0.0.0")
+         try:
+             self.webhook_port = int(
+-                os.getenv("LINE_PORT") or extra.get("port", DEFAULT_WEBHOOK_PORT)
++                _profile_env("LINE_PORT") or extra.get("port", DEFAULT_WEBHOOK_PORT)
+             )
+         except (TypeError, ValueError):
+             self.webhook_port = DEFAULT_WEBHOOK_PORT
+@@ -675,7 +698,7 @@ class LineAdapter(BasePlatformAdapter):
+         # Public base URL — required for media sending when bind isn't
+         # publicly reachable.
+         self.public_base_url = (
+-            os.getenv("LINE_PUBLIC_URL")
++            _profile_env("LINE_PUBLIC_URL")
+             or extra.get("public_url", "")
+             or ""
+         ).rstrip("/")
+@@ -685,19 +708,31 @@ class LineAdapter(BasePlatformAdapter):
+             "LINE_ALLOW_ALL_USERS", bool(extra.get("allow_all_users", False))
+         )
+         self.allowed_users = _csv_set(
+-            os.getenv("LINE_ALLOWED_USERS", "")
++            _profile_env("LINE_ALLOWED_USERS")
+         ) | set(extra.get("allowed_users", []))
+         self.allowed_groups = _csv_set(
+-            os.getenv("LINE_ALLOWED_GROUPS", "")
++            _profile_env("LINE_ALLOWED_GROUPS")
+         ) | set(extra.get("allowed_groups", []))
++        self.read_only_groups = _csv_set(
++            _profile_env("LINE_READ_ONLY_GROUPS")
++        ) | set(extra.get("read_only_groups", []))
++        self.archive_groups = _csv_set(
++            _profile_env("LINE_ARCHIVE_GROUPS")
++        ) | set(extra.get("archive_groups", []))
++        self.require_prefix_groups = _csv_set(
++            _profile_env("LINE_REQUIRE_PREFIX_GROUPS")
++        ) | set(extra.get("require_prefix_groups", []))
++        self.group_prefixes = _csv_list(
++            _profile_env("LINE_GROUP_PREFIXES")
++        ) or list(extra.get("group_prefixes", [])) or ["Hermes:"]
+         self.allowed_rooms = _csv_set(
+-            os.getenv("LINE_ALLOWED_ROOMS", "")
++            _profile_env("LINE_ALLOWED_ROOMS")
+         ) | set(extra.get("allowed_rooms", []))
+ 
+         # Slow-LLM postback button threshold
+         try:
+             self.slow_response_threshold = float(
+-                os.getenv("LINE_SLOW_RESPONSE_THRESHOLD")
++                _profile_env("LINE_SLOW_RESPONSE_THRESHOLD")
+                 or extra.get("slow_response_threshold", DEFAULT_SLOW_RESPONSE_THRESHOLD)
+             )
+         except (TypeError, ValueError):
+@@ -705,19 +740,19 @@ class LineAdapter(BasePlatformAdapter):
+ 
+         # User-overridable copy
+         self.pending_text = (
+-            os.getenv("LINE_PENDING_TEXT")
++            _profile_env("LINE_PENDING_TEXT")
+             or extra.get("pending_text", DEFAULT_PENDING_REPLY_TEXT)
+         )
+         self.button_label = (
+-            os.getenv("LINE_BUTTON_LABEL")
++            _profile_env("LINE_BUTTON_LABEL")
+             or extra.get("button_label", DEFAULT_BUTTON_LABEL)
+         )
+         self.delivered_text = (
+-            os.getenv("LINE_DELIVERED_TEXT")
++            _profile_env("LINE_DELIVERED_TEXT")
+             or extra.get("delivered_text", DEFAULT_DELIVERED_TEXT)
+         )
+         self.interrupted_text = (
+-            os.getenv("LINE_INTERRUPTED_TEXT")
++            _profile_env("LINE_INTERRUPTED_TEXT")
+             or extra.get("interrupted_text", DEFAULT_INTERRUPTED_TEXT)
+         )
+ 
+@@ -891,12 +926,17 @@ class LineAdapter(BasePlatformAdapter):
+             return web.Response(status=400, text="bad json")
+ 
+         events = payload.get("events", []) or []
++        had_dispatch_error = False
+         for event in events:
+             try:
+                 await self._dispatch_event(event)
+             except Exception:
++                self._dedup.forget(event.get("webhookEventId", "") or "")
++                had_dispatch_error = True
+                 logger.exception("LINE: dispatch_event failed")
+ 
++        if had_dispatch_error:
++            return web.Response(status=500, text="event processing failed")
+         return web.Response(status=200, text="ok")
+ 
+     async def _dispatch_event(self, event: Dict[str, Any]) -> None:
+@@ -914,12 +954,14 @@ class LineAdapter(BasePlatformAdapter):
+         if self._bot_user_id and sender_user_id == self._bot_user_id:
+             return
+ 
+-        # Allowlist gate.
++        # Allowlist gate. Read-only/archive groups are intentionally admitted
++        # here, then short-circuited in _handle_message_event before agent
++        # dispatch when appropriate.
+         if not _allowed_for_source(
+             source,
+             allow_all=self.allow_all,
+             user_ids=self.allowed_users,
+-            group_ids=self.allowed_groups,
++            group_ids=self.allowed_groups | self.read_only_groups | self.archive_groups,
+             room_ids=self.allowed_rooms,
+         ):
+             logger.info("LINE: rejecting unauthorized source %s", source)
+@@ -934,6 +976,91 @@ class LineAdapter(BasePlatformAdapter):
+         else:
+             logger.debug("LINE: ignoring event type %r", event_type)
+ 
++    def _archive_read_only_message(
++        self,
++        event: Dict[str, Any],
++        *,
++        text: str,
++        msg_type: str,
++        media_urls: List[str],
++        media_types: List[str],
++    ) -> None:
++        """Persist a LINE group message without necessarily dispatching it.
++
++        Media messages are downloaded before read-only dispatch is short-circuited;
++        keep their local cache paths so downstream digest jobs can run OCR/vision
++        instead of seeing only opaque ``[image]`` placeholders.
++        """
++        source = event.get("source") or {}
++        chat_id, chat_type = _resolve_chat(source)
++        try:
++            from hermes_constants import get_hermes_home
++
++            hermes_home = Path(get_hermes_home()).resolve()
++        except Exception:
++            hermes_home = Path.home().joinpath(".hermes").resolve()
++
++        archive_dir = hermes_home / "data" / "line-read-only"
++        archive_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
++        archive_dir.chmod(0o700)
++        safe_chat_id = re.sub(r"[^A-Za-z0-9_.-]", "_", chat_id or "unknown")
++        message = event.get("message") or {}
++        webhook_event_id = event.get("webhookEventId", "") or ""
++        message_id = message.get("id", "") or ""
++        if webhook_event_id:
++            event_key = f"webhook:{webhook_event_id}"
++        elif message_id:
++            event_key = f"message:{chat_id}:{message_id}"
++        else:
++            identity = json.dumps(
++                {
++                    "timestamp": event.get("timestamp"),
++                    "source": source,
++                    "message": message,
++                },
++                ensure_ascii=False,
++                sort_keys=True,
++                separators=(",", ":"),
++            )
++            event_key = f"sha256:{hashlib.sha256(identity.encode()).hexdigest()}"
++        record = {
++            "received_at": time.time(),
++            "event_key": event_key,
++            "event_timestamp": event.get("timestamp"),
++            "webhook_event_id": webhook_event_id,
++            "chat_id": chat_id,
++            "chat_type": chat_type,
++            "user_id": source.get("userId", ""),
++            "message_id": message_id,
++            "message_type": msg_type,
++            "text": text,
++            "media_urls": media_urls,
++            "media_types": media_types,
++        }
++        archive_path = archive_dir / f"{safe_chat_id}.jsonl"
++        fd = os.open(archive_path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
++        os.chmod(archive_path, 0o600)
++        with os.fdopen(fd, "a+", encoding="utf-8") as fh:
++            fh.seek(0)
++            for line in fh:
++                try:
++                    existing = json.loads(line)
++                except (TypeError, json.JSONDecodeError):
++                    continue
++                if existing.get("event_key") == event_key:
++                    return
++                if webhook_event_id and existing.get("webhook_event_id") == webhook_event_id:
++                    return
++                if (
++                    message_id
++                    and existing.get("chat_id") == chat_id
++                    and existing.get("message_id") == message_id
++                ):
++                    return
++            fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
++            fh.flush()
++            os.fsync(fh.fileno())
++
+     async def _handle_message_event(self, event: Dict[str, Any]) -> None:
+         msg = event.get("message") or {}
+         msg_type = msg.get("type", "")
+@@ -978,6 +1105,74 @@ class LineAdapter(BasePlatformAdapter):
+         else:
+             text = f"[unsupported message type: {msg_type}]"
+ 
++        if (
++            chat_type == "group"
++            and chat_id in self.archive_groups
++            and chat_id not in self.read_only_groups
++        ):
++            self._archive_read_only_message(
++                event,
++                text=text,
++                msg_type=msg_type,
++                media_urls=media_urls,
++                media_types=media_types,
++            )
++            logger.info(
++                "LINE: archived group message chat=%s user=%s type=%s",
++                chat_id,
++                user_id,
++                msg_type,
++            )
++
++        if chat_type == "group" and chat_id in self.read_only_groups:
++            self._reply_tokens.pop(chat_id, None)
++            self._archive_read_only_message(
++                event,
++                text=text,
++                msg_type=msg_type,
++                media_urls=media_urls,
++                media_types=media_types,
++            )
++            logger.info(
++                "LINE: archived read-only group message chat=%s user=%s type=%s",
++                chat_id,
++                user_id,
++                msg_type,
++            )
++            return
++
++        if chat_type == "group" and chat_id in self.require_prefix_groups:
++            if msg_type != "text":
++                self._reply_tokens.pop(chat_id, None)
++                logger.info(
++                    "LINE: ignoring non-text group message without prefix chat=%s user=%s type=%s",
++                    chat_id,
++                    user_id,
++                    msg_type,
++                )
++                return
++            matched_prefix = next(
++                (prefix for prefix in self.group_prefixes if text.startswith(prefix)),
++                "",
++            )
++            if not matched_prefix:
++                self._reply_tokens.pop(chat_id, None)
++                logger.info(
++                    "LINE: ignoring group message without required prefix chat=%s user=%s",
++                    chat_id,
++                    user_id,
++                )
++                return
++            text = text[len(matched_prefix):].lstrip()
++            if not text:
++                self._reply_tokens.pop(chat_id, None)
++                logger.info(
++                    "LINE: ignoring empty group message after required prefix chat=%s user=%s",
++                    chat_id,
++                    user_id,
++                )
++                return
++
+         # Best-effort typing indicator (DM only).
+         if chat_type == "dm" and self._client:
+             asyncio.create_task(self._client.loading(chat_id))
+@@ -1506,9 +1701,9 @@ def _is_relative_to(child: Path, parent: Path) -> bool:
+ 
+ def check_requirements() -> bool:
+     """Plugin gate: require credentials AND aiohttp at runtime."""
+-    if not os.getenv("LINE_CHANNEL_ACCESS_TOKEN"):
++    if not _profile_env("LINE_CHANNEL_ACCESS_TOKEN"):
+         return False
+-    if not os.getenv("LINE_CHANNEL_SECRET"):
++    if not _profile_env("LINE_CHANNEL_SECRET"):
+         return False
+     try:
+         import aiohttp  # noqa: F401
+@@ -1520,10 +1715,10 @@ def check_requirements() -> bool:
+ def validate_config(config) -> bool:
+     extra = getattr(config, "extra", {}) or {}
+     has_token = bool(
+-        os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or extra.get("channel_access_token")
++        _profile_env("LINE_CHANNEL_ACCESS_TOKEN") or extra.get("channel_access_token")
+     )
+     has_secret = bool(
+-        os.getenv("LINE_CHANNEL_SECRET") or extra.get("channel_secret")
++        _profile_env("LINE_CHANNEL_SECRET") or extra.get("channel_secret")
+     )
+     return has_token and has_secret
+ 
+@@ -1540,20 +1735,24 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
+     in ``.env`` without a ``platforms.line`` block in ``config.yaml``.
+     Mirrors the IRC plugin's pattern.
+     """
+-    if not (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") and os.getenv("LINE_CHANNEL_SECRET")):
++    if not (_profile_env("LINE_CHANNEL_ACCESS_TOKEN") and _profile_env("LINE_CHANNEL_SECRET")):
+         return None
+     seeded: Dict[str, Any] = {}
+-    if os.getenv("LINE_PORT"):
++    line_port = _profile_env("LINE_PORT")
++    if line_port:
+         try:
+-            seeded["port"] = int(os.environ["LINE_PORT"])
++            seeded["port"] = int(line_port)
+         except ValueError:
+             pass
+-    if os.getenv("LINE_HOST"):
+-        seeded["host"] = os.environ["LINE_HOST"]
+-    if os.getenv("LINE_PUBLIC_URL"):
+-        seeded["public_url"] = os.environ["LINE_PUBLIC_URL"]
+-    if os.getenv("LINE_HOME_CHANNEL"):
+-        seeded["home_channel"] = os.environ["LINE_HOME_CHANNEL"]
++    line_host = _profile_env("LINE_HOST")
++    if line_host:
++        seeded["host"] = line_host
++    public_url = _profile_env("LINE_PUBLIC_URL")
++    if public_url:
++        seeded["public_url"] = public_url
++    home_channel = _profile_env("LINE_HOME_CHANNEL")
++    if home_channel:
++        seeded["home_channel"] = home_channel
+     return seeded or {}
+ 
+ 
+@@ -1580,7 +1779,7 @@ async def _standalone_send(
+     """
+     extra = getattr(pconfig, "extra", {}) or {}
+     token = (
+-        os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
++        _profile_env("LINE_CHANNEL_ACCESS_TOKEN")
+         or extra.get("channel_access_token", "")
+     )
+     if not token or not chat_id:
+diff --git a/plugins/platforms/matrix/adapter.py b/plugins/platforms/matrix/adapter.py
+index c6b2dcdd6151b1fc71d29eb4929376a0612e6608..5880dd7c0a711efa6da2549503149a7631a5ad53 100644
+--- a/plugins/platforms/matrix/adapter.py
++++ b/plugins/platforms/matrix/adapter.py
+@@ -37,6 +37,8 @@ Environment variables:
+     MATRIX_TOOLS_ALLOW_ROOM_CREATE
+                               Allow Matrix room creation tool execution (default: false)
+     MATRIX_AUTO_THREAD          Auto-create threads for room messages (default: true)
++    MATRIX_AUTO_THREAD_ROOMS    Comma-separated room IDs whose root messages always
++                                become thread roots, even with session_scope=room
+     MATRIX_DM_AUTO_THREAD       Auto-create threads for DM messages (default: false)
+     MATRIX_RECOVERY_KEY         Recovery key for cross-signing verification after device key rotation
+     MATRIX_DM_MENTION_THREADS   Create a thread when bot is @mentioned in a DM (default: false)
+@@ -58,6 +60,7 @@ import logging
+ import mimetypes
+ import os
+ import re
++import sqlite3
+ import shutil
+ import subprocess
+ import sys
+@@ -139,6 +142,31 @@ from gateway.platforms.helpers import ThreadParticipationTracker
+ 
+ logger = logging.getLogger(__name__)
+ 
++
++def _matrix_env(name: str, default: str = "") -> str:
++    """Read Matrix policy from the active profile scope when one exists."""
++    try:
++        from agent.secret_scope import current_secret_scope, get_secret
++    except ImportError:
++        return os.getenv(name, default)
++    if current_secret_scope() is None:
++        return os.getenv(name, default)
++    value = get_secret(name, default)
++    return str(value or default).strip()
++
++
++def _set_matrix_env_default(name: str, value: object) -> None:
++    """Seed YAML policy in the current profile scope, or legacy global env."""
++    try:
++        from agent.secret_scope import current_secret_scope
++        scope = current_secret_scope()
++    except ImportError:
++        scope = None
++    if isinstance(scope, dict):
++        if not scope.get(name):
++            scope[name] = str(value)
++    elif not os.getenv(name):
++        os.environ[name] = str(value)
+ _MATRIX_VOICE_WAVEFORM_BINS = 30
+ 
+ 
+@@ -503,7 +531,7 @@ def _resolve_max_message_length(config) -> int:
+     extra = getattr(config, "extra", {}) or {}
+     raw = extra.get("max_message_length")
+     if raw is None:
+-        raw = os.getenv("MATRIX_MAX_MESSAGE_LENGTH")
++        raw = _matrix_env("MATRIX_MAX_MESSAGE_LENGTH")
+     if raw is None:
+         try:
+             from gateway.platform_registry import platform_registry
+@@ -525,12 +553,66 @@ def _resolve_max_message_length(config) -> int:
+ # Back-compat alias for callers/tests that import the module constant.
+ MAX_MESSAGE_LENGTH = DEFAULT_MAX_MESSAGE_LENGTH
+ 
+-# Store directory for E2EE keys and sync state.
+-# Uses get_hermes_home() so each profile gets its own Matrix store.
++# Store directory for E2EE keys and sync state. Resolve it lazily so importing
++# the plugin before a profile scope selects HERMES_HOME cannot pin another
++# profile's encrypted state for the lifetime of the process.
+ from hermes_constants import get_hermes_dir as _get_hermes_dir
+ 
+-_STORE_DIR = _get_hermes_dir("platforms/matrix/store", "matrix/store")
+-_CRYPTO_DB_PATH = _STORE_DIR / "crypto.db"
++
++def _get_matrix_store_dir() -> Path:
++    return _get_hermes_dir("platforms/matrix/store", "matrix/store")
++
++
++def _get_matrix_crypto_db_path(store_dir: Optional[Path] = None) -> Path:
++    return (store_dir or _get_matrix_store_dir()) / "crypto.db"
++
++def _read_crypto_store_device_id(db_path: Path, account_id: str) -> Optional[str]:
++    """Read the persisted Matrix device ID without opening the encrypted account.
++
++    This is a restart/rotation guard: PgCryptoStore encrypts the account pickle
++    with a key derived from the configured device ID, so opening a store under a
++    different ID otherwise fails later with the opaque ``BAD_ACCOUNT_KEY``.
++    """
++    if not db_path.exists():
++        return None
++    try:
++        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
++        try:
++            row = conn.execute(
++                "SELECT device_id FROM crypto_account WHERE account_id = ? LIMIT 1",
++                (account_id,),
++            ).fetchone()
++        finally:
++            conn.close()
++    except sqlite3.Error:
++        return None
++    return str(row[0]) if row and row[0] else None
++
++
++async def _matrix_initial_sync_kwargs(sync_store: Any) -> Dict[str, Any]:
++    """Build initial sync arguments using the durable crypto-store token."""
++    next_batch = await sync_store.get_next_batch()
++    return {
++        "since": next_batch or None,
++        "timeout": 10000,
++        "full_state": True,
++    }
++
++
++def _secure_matrix_store_permissions(store_dir: Optional[Path] = None) -> None:
++    """Keep the E2EE store owner-only, including SQLite WAL sidecars."""
++    store_dir = store_dir or _get_matrix_store_dir()
++    try:
++        store_dir.chmod(0o700)
++    except OSError:
++        return
++    for name in ("crypto.db", "crypto.db-wal", "crypto.db-shm"):
++        path = store_dir / name
++        try:
++            if path.exists():
++                path.chmod(0o600)
++        except OSError:
++            logger.warning("Matrix: could not tighten permissions on %s", path)
+ 
+ # Grace period: ignore messages older than this many seconds before startup.
+ _STARTUP_GRACE_SECONDS = 5
+@@ -714,12 +796,12 @@ def _normalize_e2ee_mode(value: Any) -> str:
+ def _resolve_e2ee_mode(extra: Optional[Dict[str, Any]] = None) -> str:
+     """Resolve E2EE mode with MATRIX_ENCRYPTION backwards compatibility."""
+     extra = extra or {}
+-    explicit = extra.get("e2ee_mode") or os.getenv("MATRIX_E2EE_MODE", "")
++    explicit = extra.get("e2ee_mode") or _matrix_env("MATRIX_E2EE_MODE", "")
+     if explicit:
+         return _normalize_e2ee_mode(explicit)
+     legacy_enabled = extra.get(
+         "encryption",
+-        os.getenv("MATRIX_ENCRYPTION", "").lower() in ("true", "1", "yes"),
++        _matrix_env("MATRIX_ENCRYPTION", "").lower() in ("true", "1", "yes"),
+     )
+     return "required" if legacy_enabled else "off"
+ 
+@@ -738,7 +820,7 @@ def _write_matrix_recovery_key_output_file(recovery_key: str) -> Optional[Path]:
+     The file is created with mode 0600 and never overwritten. Returns the path
+     when written, otherwise None.
+     """
+-    output_file = os.getenv("MATRIX_RECOVERY_KEY_OUTPUT_FILE", "").strip()
++    output_file = _matrix_env("MATRIX_RECOVERY_KEY_OUTPUT_FILE", "").strip()
+     if not output_file:
+         return None
+     path = Path(output_file).expanduser()
+@@ -760,7 +842,7 @@ def _write_matrix_recovery_key_output_file(recovery_key: str) -> Optional[Path]:
+ 
+ def _get_matrix_recovery_key_output_target() -> tuple[Optional[Path], str]:
+     """Return a usable one-time recovery-key output path, or a redacted reason."""
+-    output_file = os.getenv("MATRIX_RECOVERY_KEY_OUTPUT_FILE", "").strip()
++    output_file = _matrix_env("MATRIX_RECOVERY_KEY_OUTPUT_FILE", "").strip()
+     if not output_file:
+         return None, "not_configured"
+     path = Path(output_file).expanduser()
+@@ -865,9 +947,9 @@ def check_matrix_requirements() -> bool:
+     forever and broke E2EE connect with ``No module named 'asyncpg'``
+     (#31116).  Rebinds module-level type globals on success.
+     """
+-    token = os.getenv("MATRIX_ACCESS_TOKEN", "")
+-    password = os.getenv("MATRIX_PASSWORD", "")
+-    homeserver = os.getenv("MATRIX_HOMESERVER", "")
++    token = _matrix_env("MATRIX_ACCESS_TOKEN", "")
++    password = _matrix_env("MATRIX_PASSWORD", "")
++    homeserver = _matrix_env("MATRIX_HOMESERVER", "")
+ 
+     if not token and not password:
+         logger.debug("Matrix: neither MATRIX_ACCESS_TOKEN nor MATRIX_PASSWORD set")
+@@ -991,24 +1073,26 @@ class MatrixAdapter(BasePlatformAdapter):
+         self._split_threshold = max(100, self.max_message_length - 100)
+ 
+         self._homeserver: str = (
+-            config.extra.get("homeserver", "") or os.getenv("MATRIX_HOMESERVER", "")
++            config.extra.get("homeserver", "") or _matrix_env("MATRIX_HOMESERVER", "")
+         ).rstrip("/")
+-        self._access_token: str = config.token or os.getenv("MATRIX_ACCESS_TOKEN", "")
+-        self._user_id: str = config.extra.get("user_id", "") or os.getenv(
++        self._access_token: str = config.token or _matrix_env("MATRIX_ACCESS_TOKEN", "")
++        self._user_id: str = config.extra.get("user_id", "") or _matrix_env(
+             "MATRIX_USER_ID", ""
+         )
+-        self._password: str = config.extra.get("password", "") or os.getenv(
++        self._password: str = config.extra.get("password", "") or _matrix_env(
+             "MATRIX_PASSWORD", ""
+         )
+         self._e2ee_mode: str = _resolve_e2ee_mode(config.extra)
+         self._encryption: bool = self._e2ee_mode != "off"
+-        self._device_id: str = config.extra.get("device_id", "") or os.getenv(
++        self._device_id: str = config.extra.get("device_id", "") or _matrix_env(
+             "MATRIX_DEVICE_ID", ""
+         )
+         self._device_id_unverified: bool = False
+ 
+         self._client: Any = None  # mautrix.client.Client
+         self._crypto_db: Any = None  # mautrix.util.async_db.Database
++        self._store_dir: Optional[Path] = None
++        self._crypto_db_path: Optional[Path] = None
+         self._sync_task: Optional[asyncio.Task] = None
+         self._invite_join_tasks: Dict[str, asyncio.Task] = {}
+         self._closing = False
+@@ -1032,7 +1116,7 @@ class MatrixAdapter(BasePlatformAdapter):
+         self._room_identity_cached_at: Dict[str, float] = {}
+         try:
+             self._room_identity_ttl_seconds = float(
+-                os.getenv("MATRIX_ROOM_IDENTITY_TTL_SECONDS", "60")
++                _matrix_env("MATRIX_ROOM_IDENTITY_TTL_SECONDS", "60")
+             )
+         except ValueError:
+             self._room_identity_ttl_seconds = 60.0
+@@ -1056,7 +1140,7 @@ class MatrixAdapter(BasePlatformAdapter):
+         self._thread_require_mention: bool = self._parse_thread_require_mention(config)
+         free_rooms_raw = config.extra.get("free_response_rooms")
+         if free_rooms_raw is None:
+-            free_rooms_raw = os.getenv("MATRIX_FREE_RESPONSE_ROOMS", "")
++            free_rooms_raw = _matrix_env("MATRIX_FREE_RESPONSE_ROOMS", "")
+         if isinstance(free_rooms_raw, list):
+             self._free_rooms: Set[str] = {
+                 str(r).strip() for r in free_rooms_raw if str(r).strip()
+@@ -1068,7 +1152,7 @@ class MatrixAdapter(BasePlatformAdapter):
+         # If non-empty, bot ONLY responds in these rooms (whitelist); DMs exempt.
+         allowed_rooms_raw = config.extra.get("allowed_rooms")
+         if allowed_rooms_raw is None:
+-            allowed_rooms_raw = os.getenv("MATRIX_ALLOWED_ROOMS", "")
++            allowed_rooms_raw = _matrix_env("MATRIX_ALLOWED_ROOMS", "")
+         if isinstance(allowed_rooms_raw, list):
+             self._allowed_rooms: Set[str] = {
+                 str(r).strip() for r in allowed_rooms_raw if str(r).strip()
+@@ -1077,30 +1161,45 @@ class MatrixAdapter(BasePlatformAdapter):
+             self._allowed_rooms: Set[str] = {
+                 r.strip() for r in str(allowed_rooms_raw).split(",") if r.strip()
+             }
+-        self._allow_room_mentions: bool = os.getenv(
++        self._allow_room_mentions: bool = _matrix_env(
+             "MATRIX_ALLOW_ROOM_MENTIONS", "false"
+         ).lower() in ("true", "1", "yes")
+-        self._auto_thread: bool = os.getenv("MATRIX_AUTO_THREAD", "true").lower() in (
++        self._auto_thread: bool = _matrix_env("MATRIX_AUTO_THREAD", "true").lower() in (
+             "true",
+             "1",
+             "yes",
+         )
+-        self._dm_auto_thread: bool = os.getenv(
++        auto_thread_rooms_raw = config.extra.get("auto_thread_rooms")
++        if auto_thread_rooms_raw is None:
++            auto_thread_rooms_raw = _matrix_env("MATRIX_AUTO_THREAD_ROOMS", "")
++        if isinstance(auto_thread_rooms_raw, list):
++            self._auto_thread_rooms: Set[str] = {
++                str(room).strip()
++                for room in auto_thread_rooms_raw
++                if str(room).strip()
++            }
++        else:
++            self._auto_thread_rooms = {
++                room.strip()
++                for room in str(auto_thread_rooms_raw).split(",")
++                if room.strip()
++            }
++        self._dm_auto_thread: bool = _matrix_env(
+             "MATRIX_DM_AUTO_THREAD", "false"
+         ).lower() in {"true", "1", "yes"}
+-        self._dm_mention_threads: bool = os.getenv(
++        self._dm_mention_threads: bool = _matrix_env(
+             "MATRIX_DM_MENTION_THREADS", "false"
+         ).lower() in ("true", "1", "yes")
+-        raw_session_scope = os.getenv("MATRIX_SESSION_SCOPE", "auto").strip().lower()
++        raw_session_scope = _matrix_env("MATRIX_SESSION_SCOPE", "auto").strip().lower()
+         self._matrix_session_scope = (
+             raw_session_scope if raw_session_scope in {"auto", "room", "thread"} else "auto"
+         )
+-        self._process_notices: bool = os.getenv(
++        self._process_notices: bool = _matrix_env(
+             "MATRIX_PROCESS_NOTICES", "false"
+         ).lower() in ("true", "1", "yes")
+ 
+         # Reactions: configurable via MATRIX_REACTIONS (default: true).
+-        self._reactions_enabled: bool = os.getenv(
++        self._reactions_enabled: bool = _matrix_env(
+             "MATRIX_REACTIONS", "true"
+         ).lower() not in {"false", "0", "no"}
+         self._pending_reactions: dict[tuple[str, str], str] = {}
+@@ -1116,17 +1215,17 @@ class MatrixAdapter(BasePlatformAdapter):
+         if self._proxy_url:
+             logger.info("Matrix: proxy configured — %s", self._proxy_url)
+         try:
+-            self._max_media_bytes = int(os.getenv("MATRIX_MAX_MEDIA_BYTES", str(100 * 1024 * 1024)))
++            self._max_media_bytes = int(_matrix_env("MATRIX_MAX_MEDIA_BYTES", str(100 * 1024 * 1024)))
+         except ValueError:
+             self._max_media_bytes = 100 * 1024 * 1024
+ 
+         # Text batching: merge rapid successive messages (Telegram-style).
+         # Matrix clients split long messages around 4000 chars.
+         self._text_batch_delay_seconds = float(
+-            os.getenv("HERMES_MATRIX_TEXT_BATCH_DELAY_SECONDS", "0.6")
++            _matrix_env("HERMES_MATRIX_TEXT_BATCH_DELAY_SECONDS", "0.6")
+         )
+         self._text_batch_split_delay_seconds = float(
+-            os.getenv("HERMES_MATRIX_TEXT_BATCH_SPLIT_DELAY_SECONDS", "2.0")
++            _matrix_env("HERMES_MATRIX_TEXT_BATCH_SPLIT_DELAY_SECONDS", "2.0")
+         )
+         self._pending_text_batches: Dict[str, MessageEvent] = {}
+         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+@@ -1144,23 +1243,31 @@ class MatrixAdapter(BasePlatformAdapter):
+         }
+         self._approval_prompts_by_event: Dict[str, _MatrixApprovalPrompt] = {}
+         self._approval_prompt_by_session: Dict[str, str] = {}
+-        self._approval_require_sender: bool = os.getenv(
++        self._approval_require_sender: bool = _matrix_env(
+             "MATRIX_APPROVAL_REQUIRE_SENDER", "true"
+         ).lower() in ("true", "1", "yes")
+         try:
+             self._approval_timeout_seconds = int(
+-                os.getenv("MATRIX_APPROVAL_TIMEOUT_SECONDS", "300")
++                _matrix_env("MATRIX_APPROVAL_TIMEOUT_SECONDS", "300")
+             )
+         except ValueError:
+             self._approval_timeout_seconds = 300
+         self._model_picker_prompts_by_event: Dict[str, _MatrixModelPickerPrompt] = {}
+         self._choice_picker_prompts_by_event: Dict[str, _MatrixChoicePickerPrompt] = {}
+-        allowed_users_raw = os.getenv("MATRIX_ALLOWED_USERS", "")
++        allowed_users_raw = config.extra.get("allowed_users")
++        if isinstance(allowed_users_raw, list):
++            allowed_users_raw = ",".join(str(v) for v in allowed_users_raw)
++        allowed_users_raw = str(allowed_users_raw or _matrix_env("MATRIX_ALLOWED_USERS", ""))
+         self._allowed_user_ids: Set[str] = {
+             u.strip() for u in allowed_users_raw.split(",") if u.strip()
+         }
+         self._allowed_room_ids: Set[str] = set(self._allowed_rooms)
+-        ignore_patterns_raw = os.getenv("MATRIX_IGNORE_USER_PATTERNS", "")
++        ignore_patterns_raw = config.extra.get("ignore_user_patterns")
++        if isinstance(ignore_patterns_raw, list):
++            ignore_patterns_raw = ",".join(str(v) for v in ignore_patterns_raw)
++        ignore_patterns_raw = str(
++            ignore_patterns_raw or _matrix_env("MATRIX_IGNORE_USER_PATTERNS", "")
++        )
+         self._ignored_user_patterns: list[re.Pattern[str]] = []
+         for pattern in (p.strip() for p in ignore_patterns_raw.split(",") if p.strip()):
+             try:
+@@ -1200,7 +1307,7 @@ class MatrixAdapter(BasePlatformAdapter):
+             if isinstance(configured, str):
+                 return configured.lower() not in {"false", "0", "no", "off"}
+             return bool(configured)
+-        return os.getenv(
++        return _matrix_env(
+             "MATRIX_REQUIRE_MENTION", "true"
+         ).lower() not in {"false", "0", "no", "off"}
+ 
+@@ -1221,7 +1328,7 @@ class MatrixAdapter(BasePlatformAdapter):
+                 return configured.lower() not in {"false", "0", "no", "off"}
+             # int, float, etc. — truthiness fallback
+             return bool(configured)
+-        return os.getenv(
++        return _matrix_env(
+             "MATRIX_THREAD_REQUIRE_MENTION", "false"
+         ).lower() in {"true", "1", "yes", "on"}
+ 
+@@ -1312,7 +1419,7 @@ class MatrixAdapter(BasePlatformAdapter):
+                     "Matrix: server has different identity keys for device %s — "
+                     "local crypto state is stale. Delete %s and restart.",
+                     client.device_id,
+-                    _CRYPTO_DB_PATH,
++                    self._crypto_db_path or _get_matrix_crypto_db_path(),
+                 )
+                 return False
+ 
+@@ -1369,7 +1476,12 @@ class MatrixAdapter(BasePlatformAdapter):
+             return False
+ 
+         # Ensure store dir exists for E2EE key persistence.
+-        _STORE_DIR.mkdir(parents=True, exist_ok=True)
++        store_dir = _get_matrix_store_dir()
++        crypto_db_path = _get_matrix_crypto_db_path(store_dir)
++        self._store_dir = store_dir
++        self._crypto_db_path = crypto_db_path
++        store_dir.mkdir(parents=True, exist_ok=True)
++        _secure_matrix_store_permissions(store_dir)
+ 
+         # Create the HTTP API layer.
+         client_session = _create_matrix_session(self._proxy_url)
+@@ -1501,7 +1613,7 @@ class MatrixAdapter(BasePlatformAdapter):
+                     from mautrix.crypto.store.asyncpg import PgCryptoStore
+                     from mautrix.util.async_db import Database
+ 
+-                    _STORE_DIR.mkdir(parents=True, exist_ok=True)
++                    store_dir.mkdir(parents=True, exist_ok=True)
+                 except Exception as exc:
+                     if self._e2ee_mode == "optional":
+                         logger.warning(
+@@ -1521,8 +1633,29 @@ class MatrixAdapter(BasePlatformAdapter):
+                         return False
+             if self._encryption:
+                 try:
++                    persisted_device_id = _read_crypto_store_device_id(
++                        crypto_db_path,
++                        self._user_id or "hermes",
++                    )
++                    effective_device_id = str(client.device_id or "")
++                    if (
++                        persisted_device_id
++                        and effective_device_id
++                        and persisted_device_id != effective_device_id
++                    ):
++                        logger.error(
++                            "Matrix: crypto store belongs to device %s but config/login "
++                            "resolved device %s. Refusing to open it under the wrong "
++                            "pickle key. Preserve and move the whole store directory "
++                            "before an intentional device rotation.",
++                            persisted_device_id,
++                            effective_device_id,
++                        )
++                        await api.session.close()
++                        return False
++
+                     # Remove legacy pickle file from pre-SQLite era.
+-                    legacy_pickle = _STORE_DIR / "crypto_store.pickle"
++                    legacy_pickle = store_dir / "crypto_store.pickle"
+                     if legacy_pickle.exists():
+                         logger.info(
+                             "Matrix: removing legacy crypto_store.pickle (migrated to SQLite)"
+@@ -1530,7 +1663,7 @@ class MatrixAdapter(BasePlatformAdapter):
+                         legacy_pickle.unlink()
+ 
+                     crypto_db = Database.create(
+-                        f"sqlite:///{_CRYPTO_DB_PATH}",
++                        f"sqlite:///{crypto_db_path}",
+                         upgrade_table=PgCryptoStore.upgrade_table,
+                     )
+                     await crypto_db.start()
+@@ -1548,6 +1681,12 @@ class MatrixAdapter(BasePlatformAdapter):
+                     if client.device_id:
+                         await crypto_store.put_device_id(client.device_id)
+ 
++                    # PgCryptoStore persists next_batch in crypto_account. Reuse
++                    # it across gateway restarts instead of replaying the entire
++                    # room timeline through a fresh MemorySyncStore each time.
++                    client.sync_store = crypto_store
++                    _secure_matrix_store_permissions(store_dir)
++
+                     crypto_state = _CryptoStateStore(state_store, self._joined_rooms)
+                     olm = OlmMachine(client, crypto_store, crypto_state)
+                     olm.share_keys_min_trust = TrustState.UNVERIFIED
+@@ -1577,7 +1716,7 @@ class MatrixAdapter(BasePlatformAdapter):
+                             return False
+                         logger.warning("Matrix: share_keys() warning during startup: %s", exc)
+ 
+-                    recovery_key = os.getenv("MATRIX_RECOVERY_KEY", "").strip()
++                    recovery_key = _matrix_env("MATRIX_RECOVERY_KEY", "").strip()
+                     if recovery_key:
+                         try:
+                             await olm.verify_with_recovery_key(recovery_key)
+@@ -1632,7 +1771,7 @@ class MatrixAdapter(BasePlatformAdapter):
+                     client.crypto = olm
+                     logger.info(
+                         "Matrix: E2EE enabled (store: %s%s)",
+-                        str(_CRYPTO_DB_PATH),
++                        str(crypto_db_path),
+                         f", device_id={client.device_id}" if client.device_id else "",
+                     )
+                 except Exception as exc:
+@@ -1686,7 +1825,8 @@ class MatrixAdapter(BasePlatformAdapter):
+         self._closing = False
+ 
+         try:
+-            sync_data = await client.sync(timeout=10000, full_state=True)
++            initial_sync_kwargs = await _matrix_initial_sync_kwargs(client.sync_store)
++            sync_data = await client.sync(**initial_sync_kwargs)
+             if isinstance(sync_data, dict):
+                 self._last_sync_ts = time.time()
+                 rooms_join = sync_data.get("rooms", {}).get("join", {})
+@@ -1766,6 +1906,8 @@ class MatrixAdapter(BasePlatformAdapter):
+                 await self._crypto_db.stop()
+             except Exception as exc:
+                 logger.debug("Matrix: could not close crypto DB on disconnect: %s", exc)
++            self._crypto_db = None
++            _secure_matrix_store_permissions(self._store_dir)
+ 
+         if self._client:
+             try:
+@@ -1793,7 +1935,8 @@ class MatrixAdapter(BasePlatformAdapter):
+ 
+         last_event_id = None
+         for i, chunk in enumerate(chunks):
+-            msg_content = self._build_text_message_content(chunk)
++            msgtype = "m.notice" if (metadata or {}).get("silent_notification") else "m.text"
++            msg_content = self._build_text_message_content(chunk, msgtype=msgtype)
+ 
+             self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
+ 
+@@ -1874,8 +2017,10 @@ class MatrixAdapter(BasePlatformAdapter):
+                 "mode": self._e2ee_mode,
+                 "enabled": bool(self._encryption),
+                 "deps_available": _check_e2ee_deps(),
+-                "crypto_store_path": str(_CRYPTO_DB_PATH),
+-                "recovery_key_configured": bool(os.getenv("MATRIX_RECOVERY_KEY", "").strip()),
++                "crypto_store_path": str(
++                    self._crypto_db_path or _get_matrix_crypto_db_path()
++                ),
++                "recovery_key_configured": bool(_matrix_env("MATRIX_RECOVERY_KEY", "").strip()),
+             },
+             "policy": {
+                 "allowed_user_count": len(self._allowed_user_ids),
+@@ -1885,7 +2030,7 @@ class MatrixAdapter(BasePlatformAdapter):
+                 "free_response_room_count": len(self._free_rooms),
+                 "allow_room_mentions": self._allow_room_mentions,
+                 "process_notices": self._process_notices,
+-                "allow_public_rooms": os.getenv("MATRIX_ALLOW_PUBLIC_ROOMS", "").lower()
++                "allow_public_rooms": _matrix_env("MATRIX_ALLOW_PUBLIC_ROOMS", "").lower()
+                 in ("true", "1", "yes"),
+             },
+             "media": {
+@@ -1917,14 +2062,21 @@ class MatrixAdapter(BasePlatformAdapter):
+ 
+ 
+     async def edit_message(
+-        self, chat_id: str, message_id: str, content: str, *, finalize: bool = False
++        self,
++        chat_id: str,
++        message_id: str,
++        content: str,
++        *,
++        finalize: bool = False,
++        metadata: Optional[Dict[str, Any]] = None,
+     ) -> SendResult:
+         """Edit an existing message (via m.replace)."""
+ 
+         formatted = self.format_message(content)
+-        new_content = self._build_text_message_content(formatted)
++        msgtype = "m.notice" if (metadata or {}).get("silent_notification") else "m.text"
++        new_content = self._build_text_message_content(formatted, msgtype=msgtype)
+         msg_content: Dict[str, Any] = {
+-            "msgtype": "m.text",
++            "msgtype": msgtype,
+             "body": f"* {formatted}",
+             "m.new_content": new_content,
+         }
+@@ -3018,6 +3170,9 @@ class MatrixAdapter(BasePlatformAdapter):
+                 if self._dm_auto_thread:
+                     thread_id = event_id
+                     self._threads.mark(thread_id)
++            elif room_id in self._auto_thread_rooms:
++                thread_id = event_id
++                self._threads.mark(thread_id)
+             elif self._matrix_session_scope == "room":
+                 thread_id = None
+             elif self._matrix_session_scope == "thread":
+@@ -3336,7 +3491,7 @@ class MatrixAdapter(BasePlatformAdapter):
+         # federated Matrix user could invite the bot into arbitrary rooms,
+         # exposing its presence and metadata. Mirrors the allow-list gate
+         # used on the message/reaction paths.
+-        allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {
++        allow_all = _matrix_env("GATEWAY_ALLOW_ALL_USERS").lower() in {
+             "true",
+             "1",
+             "yes",
+@@ -3707,7 +3862,7 @@ class MatrixAdapter(BasePlatformAdapter):
+         prompt: Any,
+         prompt_label: str,
+     ) -> bool:
+-        allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {
++        allow_all = _matrix_env("GATEWAY_ALLOW_ALL_USERS").lower() in {
+             "true",
+             "1",
+             "yes",
+@@ -3955,7 +4110,7 @@ class MatrixAdapter(BasePlatformAdapter):
+         """Create a new Matrix room."""
+         if not self._client:
+             return None
+-        if preset == "public_chat" and os.getenv("MATRIX_ALLOW_PUBLIC_ROOMS", "").lower() not in (
++        if preset == "public_chat" and _matrix_env("MATRIX_ALLOW_PUBLIC_ROOMS", "").lower() not in (
+             "true",
+             "1",
+             "yes",
+@@ -4771,8 +4926,8 @@ async def _standalone_send(
+     except ImportError:
+         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+     try:
+-        homeserver = (extra.get("homeserver") or os.getenv("MATRIX_HOMESERVER", "")).rstrip("/")
+-        token = token or os.getenv("MATRIX_ACCESS_TOKEN", "")
++        homeserver = (extra.get("homeserver") or _matrix_env("MATRIX_HOMESERVER", "")).rstrip("/")
++        token = token or _matrix_env("MATRIX_ACCESS_TOKEN", "")
+         if not homeserver or not token:
+             return {"error": "Matrix not configured (MATRIX_HOMESERVER, MATRIX_ACCESS_TOKEN required)"}
+         txn_id = f"hermes_{int(time.time() * 1000)}_{os.urandom(4).hex()}"
+@@ -4913,39 +5068,50 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
+     matrix_cfg block from gateway/config.py::load_gateway_config(). Env vars
+     take precedence over YAML. Returns None — everything flows through env.
+     """
+-    if "require_mention" in matrix_cfg and not os.getenv("MATRIX_REQUIRE_MENTION"):
+-        os.environ["MATRIX_REQUIRE_MENTION"] = str(matrix_cfg["require_mention"]).lower()
++    seeded_extra = dict(matrix_cfg.get("extra") or {})
++    for key, value in matrix_cfg.items():
++        if key != "extra":
++            seeded_extra.setdefault(key, value)
++    if "require_mention" in matrix_cfg and not _matrix_env("MATRIX_REQUIRE_MENTION"):
++        _set_matrix_env_default("MATRIX_REQUIRE_MENTION", str(matrix_cfg["require_mention"]).lower())
+     au = matrix_cfg.get("allowed_users")
+-    if au is not None and not os.getenv("MATRIX_ALLOWED_USERS"):
++    if au is not None and not _matrix_env("MATRIX_ALLOWED_USERS"):
+         if isinstance(au, list):
+             au = ",".join(str(v) for v in au)
+-        os.environ["MATRIX_ALLOWED_USERS"] = str(au)
++        _set_matrix_env_default("MATRIX_ALLOWED_USERS", au)
+     frc = matrix_cfg.get("free_response_rooms")
+-    if frc is not None and not os.getenv("MATRIX_FREE_RESPONSE_ROOMS"):
++    if frc is not None and not _matrix_env("MATRIX_FREE_RESPONSE_ROOMS"):
+         if isinstance(frc, list):
+             frc = ",".join(str(v) for v in frc)
+-        os.environ["MATRIX_FREE_RESPONSE_ROOMS"] = str(frc)
++        _set_matrix_env_default("MATRIX_FREE_RESPONSE_ROOMS", frc)
+     ar = matrix_cfg.get("allowed_rooms")
+-    if ar is not None and not os.getenv("MATRIX_ALLOWED_ROOMS"):
++    if ar is not None and not _matrix_env("MATRIX_ALLOWED_ROOMS"):
+         if isinstance(ar, list):
+             ar = ",".join(str(v) for v in ar)
+-        os.environ["MATRIX_ALLOWED_ROOMS"] = str(ar)
++        _set_matrix_env_default("MATRIX_ALLOWED_ROOMS", ar)
+     ignore_patterns = matrix_cfg.get("ignore_user_patterns")
+-    if ignore_patterns is not None and not os.getenv("MATRIX_IGNORE_USER_PATTERNS"):
++    if ignore_patterns is not None and not _matrix_env("MATRIX_IGNORE_USER_PATTERNS"):
+         if isinstance(ignore_patterns, list):
+             ignore_patterns = ",".join(str(v) for v in ignore_patterns)
+-        os.environ["MATRIX_IGNORE_USER_PATTERNS"] = str(ignore_patterns)
+-    if "process_notices" in matrix_cfg and not os.getenv("MATRIX_PROCESS_NOTICES"):
+-        os.environ["MATRIX_PROCESS_NOTICES"] = str(matrix_cfg["process_notices"]).lower()
+-    if "session_scope" in matrix_cfg and not os.getenv("MATRIX_SESSION_SCOPE"):
+-        os.environ["MATRIX_SESSION_SCOPE"] = str(matrix_cfg["session_scope"]).lower()
+-    if "auto_thread" in matrix_cfg and not os.getenv("MATRIX_AUTO_THREAD"):
+-        os.environ["MATRIX_AUTO_THREAD"] = str(matrix_cfg["auto_thread"]).lower()
+-    if "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):
+-        os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
+-    if "max_message_length" in matrix_cfg and not os.getenv("MATRIX_MAX_MESSAGE_LENGTH"):
+-        os.environ["MATRIX_MAX_MESSAGE_LENGTH"] = str(matrix_cfg["max_message_length"])
+-    return None
++        _set_matrix_env_default("MATRIX_IGNORE_USER_PATTERNS", ignore_patterns)
++    if "process_notices" in matrix_cfg and not _matrix_env("MATRIX_PROCESS_NOTICES"):
++        _set_matrix_env_default("MATRIX_PROCESS_NOTICES", str(matrix_cfg["process_notices"]).lower())
++    if "session_scope" in matrix_cfg and not _matrix_env("MATRIX_SESSION_SCOPE"):
++        _set_matrix_env_default("MATRIX_SESSION_SCOPE", str(matrix_cfg["session_scope"]).lower())
++    if "auto_thread" in matrix_cfg and not _matrix_env("MATRIX_AUTO_THREAD"):
++        _set_matrix_env_default("MATRIX_AUTO_THREAD", str(matrix_cfg["auto_thread"]).lower())
++    if "dm_auto_thread" in matrix_cfg and not _matrix_env("MATRIX_DM_AUTO_THREAD"):
++        _set_matrix_env_default("MATRIX_DM_AUTO_THREAD", str(matrix_cfg["dm_auto_thread"]).lower())
++    auto_thread_rooms = matrix_cfg.get("auto_thread_rooms")
++    if auto_thread_rooms is not None and not _matrix_env("MATRIX_AUTO_THREAD_ROOMS"):
++        if isinstance(auto_thread_rooms, list):
++            auto_thread_rooms = ",".join(str(v) for v in auto_thread_rooms)
++        _set_matrix_env_default("MATRIX_AUTO_THREAD_ROOMS", auto_thread_rooms)
++    if "dm_mention_threads" in matrix_cfg and not _matrix_env("MATRIX_DM_MENTION_THREADS"):
++        _set_matrix_env_default("MATRIX_DM_MENTION_THREADS", str(matrix_cfg["dm_mention_threads"]).lower())
++    if "max_message_length" in matrix_cfg and not _matrix_env("MATRIX_MAX_MESSAGE_LENGTH"):
++        _set_matrix_env_default("MATRIX_MAX_MESSAGE_LENGTH", matrix_cfg["max_message_length"])
++    return seeded_extra or None
+ 
+ 
+ def _is_connected(config) -> bool:
+diff --git a/plugins/platforms/photon/adapter.py b/plugins/platforms/photon/adapter.py
+index 60d74de41e2ad6689269aae3d03808d853ab1852..7ab2d5bce3908c882f4306bd4c55c142f8c07952 100644
+--- a/plugins/platforms/photon/adapter.py
++++ b/plugins/platforms/photon/adapter.py
+@@ -883,11 +883,28 @@ class PhotonAdapter(BasePlatformAdapter):
+             # afterwards with a different message id. If we dispatch the
+             # placeholder as a standalone text turn, the subsequent media event
+             # arrives while that turn is active and the gateway sends a bogus
+-            # "Interrupting current task" busy ack. Drop placeholder-only text
+-            # at the platform boundary; the real media event carries the bytes.
++            # "Interrupting current task" busy ack. Hold a bounded pending task
++            # so the following attachment can cancel it; no text turn is ever
++            # dispatched for the placeholder itself.
+             if raw_text.strip() == "\ufffc":
+-                logger.debug("[photon] ignoring iMessage object-placeholder text event")
++                prior = self._pending_fffc.pop(space_id, None)
++                if prior is not None and not prior[1].done():
++                    prior[1].cancel()
++                task = asyncio.create_task(
++                    self._fffc_timeout_handler(
++                        space_id, str(event.get("messageId") or "unknown")
++                    )
++                )
++                self._pending_fffc[space_id] = (time.time(), task)
++                logger.debug(
++                    "[photon] waiting for attachment after iMessage object placeholder"
++                )
+                 return
++        elif ctype in {"attachment", "voice"}:
++            pending = self._pending_fffc.pop(space_id, None)
++            if pending is not None and not pending[1].done():
++                pending[1].cancel()
++
+         if ctype == "reaction":
+             # Route only tapbacks on messages WE sent — those are implicitly
+             # addressed to the bot (feishu precedent: synthetic text event).
+diff --git a/tests/gateway/test_64674_multiplex_primary_token_scope.py b/tests/gateway/test_64674_multiplex_primary_token_scope.py
+index 9d01b33791cfefc1489779859d396c675b074cb7..08fabff1b84b8d3c504e7813109678a35b1b87e4 100644
+--- a/tests/gateway/test_64674_multiplex_primary_token_scope.py
++++ b/tests/gateway/test_64674_multiplex_primary_token_scope.py
+@@ -97,6 +97,46 @@ class TestPlatformHasBotCredential:
+             Platform.TELEGRAM, PlatformConfig(enabled=True, token="123:abc")
+         ) is True
+ 
++    def test_matrix_password_auth_true(self, monkeypatch):
++        from gateway.run import _platform_has_bot_credential
++
++        monkeypatch.setenv("MATRIX_PASSWORD", "password-auth-is-valid")
++        assert _platform_has_bot_credential(
++            Platform.MATRIX, PlatformConfig(enabled=True, token="")
++        ) is True
++        monkeypatch.delenv("MATRIX_PASSWORD")
++        assert _platform_has_bot_credential(
++            Platform.MATRIX,
++            PlatformConfig(
++                enabled=True,
++                token="",
++                extra={"password": "config-password-is-valid"},
++            ),
++        ) is True
++
++    def test_matrix_without_token_or_password_false(self, monkeypatch):
++        from gateway.run import _platform_has_bot_credential
++
++        monkeypatch.delenv("MATRIX_PASSWORD", raising=False)
++        assert _platform_has_bot_credential(
++            Platform.MATRIX, PlatformConfig(enabled=True, token="")
++        ) is False
++
++    def test_matrix_password_ignores_poisoned_global_in_profile_scope(self, monkeypatch):
++        from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
++        from gateway.run import _platform_has_bot_credential
++
++        monkeypatch.setenv("MATRIX_PASSWORD", "foreign-profile-password")
++        set_multiplex_active(True)
++        token = set_secret_scope({})
++        try:
++            assert _platform_has_bot_credential(
++                Platform.MATRIX, PlatformConfig(enabled=True, token="")
++            ) is False
++        finally:
++            reset_secret_scope(token)
++            set_multiplex_active(False)
++
+     def test_non_token_platform_always_true(self):
+         from gateway.run import _platform_has_bot_credential
+ 
+diff --git a/tests/gateway/test_discord_free_response.py b/tests/gateway/test_discord_free_response.py
+index 6b0c4c32753dd0e0e49519ea98b5dfb115abafe8..b84e22262ba67a2b76a33eaf5dbb01fe35bbd06a 100644
+--- a/tests/gateway/test_discord_free_response.py
++++ b/tests/gateway/test_discord_free_response.py
+@@ -272,6 +272,7 @@ async def test_discord_can_still_require_mentions_when_enabled(adapter, monkeypa
+ async def test_discord_free_response_channel_overrides_mention_requirement(adapter, monkeypatch):
+     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+     monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "789,999")
++    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+ 
+     message = make_message(channel=FakeTextChannel(channel_id=789), content="allowed without mention")
+ 
+@@ -286,6 +287,7 @@ async def test_discord_free_response_channel_overrides_mention_requirement(adapt
+ async def test_discord_free_response_channel_can_come_from_config_extra(adapter, monkeypatch):
+     monkeypatch.delenv("DISCORD_REQUIRE_MENTION", raising=False)
+     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
++    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+     adapter.config.extra["free_response_channels"] = ["789", "999"]
+ 
+     message = make_message(channel=FakeTextChannel(channel_id=789), content="allowed from config")
+@@ -452,6 +454,30 @@ async def test_discord_auto_thread_enabled_by_default(adapter, monkeypatch):
+     assert event.source.thread_id == "999"
+ 
+ 
++@pytest.mark.asyncio
++async def test_discord_free_response_channel_still_auto_threads(adapter, monkeypatch):
++    """Free-response controls mention gating, not thread creation."""
++    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
++    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
++    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "123")
++
++    fake_thread = FakeThread(channel_id=999, name="auto-thread")
++    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
++
++    message = make_message(
++        channel=FakeTextChannel(channel_id=123),
++        content="allowed without mention",
++    )
++
++    await adapter._handle_message(message)
++
++    adapter._auto_create_thread.assert_awaited_once()
++    adapter.handle_message.assert_awaited_once()
++    event = adapter.handle_message.await_args.args[0]
++    assert event.source.chat_type == "thread"
++    assert event.source.thread_id == "999"
++
++
+ @pytest.mark.asyncio
+ async def test_discord_reply_message_skips_auto_thread(adapter, monkeypatch):
+     """Quote-replies should stay in-channel instead of trying to create a thread."""
+@@ -655,18 +681,11 @@ async def test_discord_voice_linked_channel_skips_mention_requirement_and_auto_t
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_discord_free_response_channel_skips_auto_thread(adapter, monkeypatch):
+-    """Free-response channels should reply inline, never spawn a new thread.
+-
+-    Without this, every message in a free-response channel would auto-create
+-    a fresh thread (since the channel bypasses the @mention gate, every
+-    message looks like a fresh trigger).  That turns a "lightweight chat"
+-    channel into a thread-spawning machine — see the docs at
+-    website/docs/user-guide/messaging/discord.md which already describe
+-    this as the intended behavior.
+-    """
++async def test_discord_free_response_channel_honors_no_thread_override(adapter, monkeypatch):
++    """An explicit no-thread channel wins over free-response auto-threading."""
+     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+     monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "789")
++    monkeypatch.setenv("DISCORD_NO_THREAD_CHANNELS", "789")
+     monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)  # default true
+ 
+     adapter._auto_create_thread = AsyncMock()
+diff --git a/tests/gateway/test_discord_send.py b/tests/gateway/test_discord_send.py
+index 9db579f11e42b358c5e119ab653c89db4dea373e..6bdc152211125b892f9952ec596264c444fa8512 100644
+--- a/tests/gateway/test_discord_send.py
++++ b/tests/gateway/test_discord_send.py
+@@ -520,6 +520,266 @@ async def test_forum_post_file_fails_when_starter_has_no_attachments():
+     forum_channel.create_thread.assert_awaited_once()
+ 
+ 
++# ---------------------------------------------------------------------------
++# Selectively standalone fenced-code messages
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.asyncio
++async def test_send_keeps_ordinary_fenced_code_with_surrounding_prose():
++    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
++    channel = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(id=1)))
++    adapter._client = SimpleNamespace(
++        get_channel=lambda _chat_id: channel,
++        fetch_channel=AsyncMock(),
++    )
++    content = "Explain this:\n\n```text\nillustrative output\n```\n\nThen continue."
++
++    result = await adapter.send("555", content)
++
++    assert result.success is True
++    channel.send.assert_awaited_once()
++    assert channel.send.await_args.kwargs["content"] == content
++
++
++@pytest.mark.asyncio
++async def test_send_puts_copy_marked_fenced_code_block_in_standalone_message():
++    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
++    channel = SimpleNamespace(
++        send=AsyncMock(side_effect=[
++            SimpleNamespace(id=1), SimpleNamespace(id=2), SimpleNamespace(id=3),
++        ]),
++    )
++    adapter._client = SimpleNamespace(
++        get_channel=lambda _chat_id: channel,
++        fetch_channel=AsyncMock(),
++    )
++
++    result = await adapter.send(
++        "555",
++        "Run this: `inline`\n\n<!-- hermes:copy -->\n"
++        "```python\nprint('copy me')\n```\n\nThen continue.",
++    )
++
++    assert result.success is True
++    assert [call.kwargs["content"] for call in channel.send.await_args_list] == [
++        "Run this: `inline`",
++        "```python\nprint('copy me')\n```",
++        "Then continue.",
++    ]
++
++
++@pytest.mark.asyncio
++async def test_send_only_isolates_copy_marked_fence_among_multiple_fences():
++    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
++    channel = SimpleNamespace(
++        send=AsyncMock(side_effect=[SimpleNamespace(id=1), SimpleNamespace(id=2)]),
++    )
++    adapter._client = SimpleNamespace(
++        get_channel=lambda _chat_id: channel,
++        fetch_channel=AsyncMock(),
++    )
++    content = (
++        "Example:\n```text\nnot independently copyable\n```\n\n"
++        "Paste this:\n<!-- hermes:copy -->\n```bash\nrun-me --now\n```"
++    )
++
++    result = await adapter.send("555", content)
++
++    assert result.success is True
++    assert [call.kwargs["content"] for call in channel.send.await_args_list] == [
++        "Example:\n```text\nnot independently copyable\n```\n\nPaste this:",
++        "```bash\nrun-me --now\n```",
++    ]
++    assert all(
++        "hermes:copy" not in call.kwargs["content"]
++        for call in channel.send.await_args_list
++    )
++
++
++@pytest.mark.asyncio
++async def test_send_to_forum_puts_copy_marked_fenced_code_in_standalone_message():
++    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
++    thread_ch = SimpleNamespace(
++        id=555,
++        send=AsyncMock(side_effect=[SimpleNamespace(id=501), SimpleNamespace(id=502)]),
++    )
++    thread = SimpleNamespace(
++        id=555,
++        message=SimpleNamespace(id=500),
++        thread=thread_ch,
++    )
++    forum_channel = _discord_mod.ForumChannel()
++    forum_channel.id = 999
++    forum_channel.name = "ideas"
++    forum_channel.create_thread = AsyncMock(return_value=thread)
++    adapter._client = SimpleNamespace(
++        get_channel=lambda _chat_id: forum_channel,
++        fetch_channel=AsyncMock(),
++    )
++
++    result = await adapter.send(
++        "999", "Intro\n\n<!-- hermes:copy -->\n```text\ncopy me\n```\n\nOutro",
++    )
++
++    assert result.success is True
++    assert forum_channel.create_thread.await_args.kwargs["content"] == "Intro"
++    assert [call.kwargs["content"] for call in thread_ch.send.await_args_list] == [
++        "```text\ncopy me\n```",
++        "Outro",
++    ]
++
++
++@pytest.mark.asyncio
++async def test_finalize_edit_puts_copy_marked_fenced_code_in_standalone_message():
++    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
++    original = SimpleNamespace(
++        id=10,
++        edit=AsyncMock(),
++        to_reference=MagicMock(return_value=None),
++    )
++    channel = SimpleNamespace(
++        id=555,
++        fetch_message=AsyncMock(return_value=original),
++        send=AsyncMock(side_effect=[SimpleNamespace(id=11), SimpleNamespace(id=12)]),
++    )
++    adapter._client = SimpleNamespace(
++        get_channel=lambda _chat_id: channel,
++        fetch_channel=AsyncMock(),
++    )
++
++    result = await adapter.edit_message(
++        "555",
++        "10",
++        "Intro\n\n<!-- hermes:copy -->\n```text\ncopy me\n```\n\nOutro",
++        finalize=True,
++    )
++
++    assert result.success is True
++    original.edit.assert_awaited_once_with(content="Intro")
++    assert [call.kwargs["content"] for call in channel.send.await_args_list] == [
++        "```text\ncopy me\n```",
++        "Outro",
++    ]
++    assert result.message_id == "12"
++
++
++@pytest.mark.asyncio
++async def test_finalize_single_copy_marked_fence_strips_internal_marker():
++    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
++    original = SimpleNamespace(id=10, edit=AsyncMock())
++    channel = SimpleNamespace(
++        id=555,
++        fetch_message=AsyncMock(return_value=original),
++        send=AsyncMock(),
++    )
++    adapter._client = SimpleNamespace(
++        get_channel=lambda _chat_id: channel,
++        fetch_channel=AsyncMock(),
++    )
++
++    result = await adapter.edit_message(
++        "555",
++        "10",
++        "<!-- hermes:copy -->\n```bash\nrun-me --now\n```",
++        finalize=True,
++    )
++
++    assert result.success is True
++    original.edit.assert_awaited_once_with(content="```bash\nrun-me --now\n```")
++    channel.send.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_streaming_preview_strips_internal_copy_marker():
++    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
++    original = SimpleNamespace(id=10, edit=AsyncMock())
++    channel = SimpleNamespace(
++        id=555,
++        fetch_message=AsyncMock(return_value=original),
++        send=AsyncMock(),
++    )
++    adapter._client = SimpleNamespace(
++        get_channel=lambda _chat_id: channel,
++        fetch_channel=AsyncMock(),
++    )
++
++    result = await adapter.edit_message(
++        "555",
++        "10",
++        "Intro\n\n<!-- hermes:copy -->\n```bash\nrun-me",
++        finalize=False,
++    )
++
++    assert result.success is True
++    original.edit.assert_awaited_once_with(content="Intro\n\n```bash\nrun-me")
++
++
++@pytest.mark.asyncio
++async def test_send_attaches_oversized_fenced_block_as_txt():
++    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
++    channel = SimpleNamespace(
++        id=555,
++        send=AsyncMock(return_value=SimpleNamespace(id=20)),
++    )
++    adapter._client = SimpleNamespace(
++        get_channel=lambda _chat_id: channel,
++        fetch_channel=AsyncMock(),
++    )
++    content = "```python\n" + ("x = 1\n" * 400) + "```"
++
++    result = await adapter.send("555", content)
++
++    assert result.success is True
++    kwargs = channel.send.await_args.kwargs
++    assert kwargs["content"] == "Code attached as TXT."
++    assert kwargs["file"].filename == "hermes-code-block.txt"
++
++
++@pytest.mark.asyncio
++async def test_send_attaches_copy_marked_oversized_fenced_block_as_txt():
++    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
++    channel = SimpleNamespace(
++        id=555,
++        send=AsyncMock(return_value=SimpleNamespace(id=20)),
++    )
++    adapter._client = SimpleNamespace(
++        get_channel=lambda _chat_id: channel,
++        fetch_channel=AsyncMock(),
++    )
++    content = "<!-- hermes:copy -->\n```python\n" + ("x = 1\n" * 400) + "```"
++
++    result = await adapter.send("555", content)
++
++    assert result.success is True
++    kwargs = channel.send.await_args.kwargs
++    assert kwargs["content"] == "Code attached as TXT."
++    assert kwargs["file"].filename == "hermes-code-block.txt"
++
++
++@pytest.mark.asyncio
++async def test_finalize_edit_attaches_oversized_fenced_block_as_txt():
++    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
++    original = SimpleNamespace(id=10, edit=AsyncMock())
++    channel = SimpleNamespace(
++        id=555,
++        fetch_message=AsyncMock(return_value=original),
++        send=AsyncMock(return_value=SimpleNamespace(id=21)),
++    )
++    adapter._client = SimpleNamespace(
++        get_channel=lambda _chat_id: channel,
++        fetch_channel=AsyncMock(),
++    )
++    content = "```text\n" + ("copy me\n" * 300) + "```"
++
++    result = await adapter.edit_message("555", "10", content, finalize=True)
++
++    assert result.success is True
++    original.edit.assert_awaited_once_with(content="Code attached as TXT.")
++    assert channel.send.await_args.kwargs["file"].filename == "hermes-code-block.txt"
++    assert result.message_id == "21"
++
++
+ # ---------------------------------------------------------------------------
+ # Typing indicator task lifecycle
+ # ---------------------------------------------------------------------------
+diff --git a/tests/gateway/test_discord_slash_commands.py b/tests/gateway/test_discord_slash_commands.py
+index f35ca2fa94549d8c47f694270f3c9fa983af5e88..8b1faa4e01590823ee7f4f72f0eec67b5b7bbde3 100644
+--- a/tests/gateway/test_discord_slash_commands.py
++++ b/tests/gateway/test_discord_slash_commands.py
+@@ -589,7 +589,7 @@ async def test_auto_create_thread_uses_message_content_as_name(adapter):
+     message.create_thread.assert_awaited_once()
+     call_kwargs = message.create_thread.await_args[1]
+     assert call_kwargs["name"] == "Hello world, how are you?"
+-    assert call_kwargs["auto_archive_duration"] == 1440
++    assert call_kwargs["auto_archive_duration"] == 10080
+     assert thread._hermes_auto_thread_initial_name == "Hello world, how are you?"
+ 
+ 
+@@ -670,7 +670,7 @@ async def test_auto_create_thread_falls_back_to_seed_message(adapter):
+     message.channel.send.assert_awaited_once_with("🧵 Thread created by Hermes: **Hello**")
+     seed_message.create_thread.assert_awaited_once_with(
+         name="Hello",
+-        auto_archive_duration=1440,
++        auto_archive_duration=10080,
+         reason="Auto-threaded from mention by Jezza",
+     )
+ 
+@@ -930,10 +930,14 @@ def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
+     hermes_dir.mkdir()
+     config_path = hermes_dir / "config.yaml"
+     config_path.write_text(yaml.dump({
+-        "discord": {"auto_thread": True},
++        "discord": {
++            "auto_thread": True,
++            "thread_auto_archive_minutes": 10080,
++        },
+     }))
+ 
+     monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
++    monkeypatch.delenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", raising=False)
+     monkeypatch.setenv("HERMES_HOME", str(hermes_dir))
+     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+ 
+@@ -942,6 +946,7 @@ def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
+ 
+     import os
+     assert os.getenv("DISCORD_AUTO_THREAD") == "true"
++    assert os.getenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES") == "10080"
+ 
+ 
+ # ------------------------------------------------------------------
+diff --git a/tests/gateway/test_line_group_authorization.py b/tests/gateway/test_line_group_authorization.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..43be61e6f56e61613d4fceed096cda2f7cd444d2
+--- /dev/null
++++ b/tests/gateway/test_line_group_authorization.py
+@@ -0,0 +1,76 @@
++from __future__ import annotations
++
++from unittest.mock import MagicMock
++
++from gateway.config import Platform
++from gateway.run import GatewayRunner
++from gateway.session import SessionSource
++
++# Import the plugin module so Platform("line") is accepted as a dynamic platform.
++from tests.gateway._plugin_adapter_loader import load_plugin_adapter
++
++load_plugin_adapter("line")
++
++
++def _runner() -> GatewayRunner:
++    runner = object.__new__(GatewayRunner)
++    runner.pairing_store = MagicMock()
++    runner.pairing_store.is_approved.return_value = False
++    runner.adapters = {}
++    return runner
++
++
++def test_line_group_authorized_by_allowed_group_chat_id(monkeypatch):
++    monkeypatch.setenv("LINE_ALLOWED_GROUPS", "Callowed")
++    monkeypatch.setenv("LINE_ALLOWED_USERS", "Uandy")
++    monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
++    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
++
++    source = SessionSource(
++        platform=Platform("line"),
++        chat_id="Callowed",
++        chat_type="group",
++        user_id="Uother",
++        user_name="Uother",
++    )
++
++    assert _runner()._is_user_authorized(source) is True
++
++
++def test_line_dm_not_authorized_by_allowed_group(monkeypatch):
++    monkeypatch.setenv("LINE_ALLOWED_GROUPS", "Callowed")
++    monkeypatch.setenv("LINE_ALLOWED_USERS", "Uandy")
++    monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
++    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
++
++    source = SessionSource(
++        platform=Platform("line"),
++        chat_id="Uother",
++        chat_type="dm",
++        user_id="Uother",
++        user_name="Uother",
++    )
++
++    assert _runner()._is_user_authorized(source) is False
++
++
++def test_line_group_policy_does_not_fall_back_to_process_global_in_profile_scope(monkeypatch):
++    from agent.secret_scope import reset_secret_scope, set_secret_scope
++
++    monkeypatch.setenv("LINE_ALLOWED_GROUPS", "Cglobal")
++    monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
++    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
++    source = SessionSource(
++        platform=Platform("line"),
++        chat_id="Cglobal",
++        chat_type="group",
++        user_id="Uother",
++        user_name="Uother",
++        profile="wife",
++    )
++
++    token = set_secret_scope({})
++    try:
++        assert _runner()._is_user_authorized(source) is False
++    finally:
++        reset_secret_scope(token)
+diff --git a/tests/gateway/test_line_plugin.py b/tests/gateway/test_line_plugin.py
+index befcc1d0e1d5568ccd481df042c7bee937e8c479..4b003cedbcc34b389ee845355e3bae20648efff7 100644
+--- a/tests/gateway/test_line_plugin.py
++++ b/tests/gateway/test_line_plugin.py
+@@ -20,6 +20,7 @@ import hashlib
+ import hmac
+ import base64
+ import json
++import stat
+ from unittest.mock import AsyncMock, MagicMock, patch
+ 
+ import pytest
+@@ -298,7 +299,70 @@ class TestMarkdownAndChunking:
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# 7. Inbound media normalization
++# 7. Group archive/read-only/prefix dispatch gates
++# ---------------------------------------------------------------------------
++
++class TestGroupDispatchGates:
++    @pytest.fixture
++    def adapter(self, monkeypatch):
++        monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
++        monkeypatch.delenv("LINE_CHANNEL_SECRET", raising=False)
++        from gateway.config import PlatformConfig
++
++        cfg = PlatformConfig(enabled=True, extra={
++            "channel_access_token": "tok",
++            "channel_secret": "sec",
++            "allowed_groups": ["Callowed"],
++            "archive_groups": ["Callowed"],
++            "read_only_groups": ["Creadonly"],
++            "require_prefix_groups": ["Callowed"],
++            "group_prefixes": ["Hermes:"],
++        })
++        ad = LineAdapter(cfg)
++        ad.handle_message = AsyncMock()
++        return ad
++
++    def _event(self, *, chat_id="Callowed", user_id="Uother", text="hello", msg_type="text"):
++        message = {"id": "m1", "type": msg_type}
++        if msg_type == "text":
++            message["text"] = text
++        return {
++            "type": "message",
++            "timestamp": 123,
++            "webhookEventId": "evt1",
++            "replyToken": "reply-token",
++            "source": {"type": "group", "groupId": chat_id, "userId": user_id},
++            "message": message,
++        }
++
++    def test_prefix_required_group_ignores_unprefixed_text(self, adapter):
++        asyncio.run(adapter._handle_message_event(self._event(text="not for hermes")))
++        adapter.handle_message.assert_not_called()
++        assert "Callowed" not in adapter._reply_tokens
++
++    def test_prefix_required_group_strips_prefix_and_dispatches(self, adapter):
++        asyncio.run(adapter._handle_message_event(self._event(text="Hermes: summarize this")))
++        adapter.handle_message.assert_called_once()
++        event = adapter.handle_message.call_args.args[0]
++        assert event.text == "summarize this"
++        assert event.source.chat_id == "Callowed"
++        assert event.source.user_id == "Uother"
++
++    def test_read_only_group_archives_without_dispatch(self, adapter, tmp_path, monkeypatch):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        asyncio.run(adapter._handle_message_event(
++            self._event(chat_id="Creadonly", text="archive me")
++        ))
++        adapter.handle_message.assert_not_called()
++        archive = tmp_path / "data" / "line-read-only" / "Creadonly.jsonl"
++        assert archive.exists()
++        row = json.loads(archive.read_text().splitlines()[-1])
++        assert row["text"] == "archive me"
++        assert row["chat_id"] == "Creadonly"
++
++
++# ---------------------------------------------------------------------------
++# 8. Inbound media normalization
+ # ---------------------------------------------------------------------------
+ 
+ class TestInboundMedia:
+@@ -375,7 +439,7 @@ class TestInboundMedia:
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# 8. Send routing (reply -> push fallback, batching, system-bypass)
++# 9. Send routing (reply -> push fallback, batching, system-bypass)
+ # ---------------------------------------------------------------------------
+ 
+ class TestSendRouting:
+@@ -546,23 +610,31 @@ class TestRegister:
+ 
+ class TestEnvEnablement:
+ 
++    def _clear_optional_env(self, monkeypatch):
++        for k in ("LINE_PORT", "LINE_PUBLIC_URL", "LINE_HOME_CHANNEL", "LINE_HOME_CHANNEL_THREAD_ID"):
++            monkeypatch.delenv(k, raising=False)
++
+     def test_returns_none_without_credentials(self, monkeypatch):
+         monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
+         monkeypatch.delenv("LINE_CHANNEL_SECRET", raising=False)
++        self._clear_optional_env(monkeypatch)
+         assert _env_enablement() is None
+ 
+     def test_returns_dict_with_credentials(self, monkeypatch):
+         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "tok")
+         monkeypatch.setenv("LINE_CHANNEL_SECRET", "sec")
++        self._clear_optional_env(monkeypatch)
+         assert _env_enablement() == {}
+ 
+     def test_seeds_port_from_env(self, monkeypatch):
++        self._clear_optional_env(monkeypatch)
+         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "tok")
+         monkeypatch.setenv("LINE_CHANNEL_SECRET", "sec")
+         monkeypatch.setenv("LINE_PORT", "8080")
+         assert _env_enablement() == {"port": 8080}
+ 
+     def test_seeds_public_url(self, monkeypatch):
++        self._clear_optional_env(monkeypatch)
+         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "tok")
+         monkeypatch.setenv("LINE_CHANNEL_SECRET", "sec")
+         monkeypatch.setenv("LINE_PUBLIC_URL", "https://my-tunnel.example.com")
+@@ -669,7 +741,19 @@ class TestValidateConfig:
+ class TestAdapterInit:
+ 
+     def test_init_from_config_extra(self, monkeypatch):
+-        for k in ("LINE_CHANNEL_ACCESS_TOKEN", "LINE_CHANNEL_SECRET", "LINE_PORT"):
++        for k in (
++            "LINE_CHANNEL_ACCESS_TOKEN",
++            "LINE_CHANNEL_SECRET",
++            "LINE_PORT",
++            "LINE_PUBLIC_URL",
++            "LINE_ALLOWED_USERS",
++            "LINE_ALLOWED_GROUPS",
++            "LINE_ALLOWED_ROOMS",
++            "LINE_READ_ONLY_GROUPS",
++            "LINE_ARCHIVE_GROUPS",
++            "LINE_REQUIRE_PREFIX_GROUPS",
++            "LINE_GROUP_PREFIXES",
++        ):
+             monkeypatch.delenv(k, raising=False)
+         from gateway.config import PlatformConfig
+         cfg = PlatformConfig(
+@@ -701,15 +785,239 @@ class TestAdapterInit:
+         assert ad.channel_access_token == "env-tok"
+         assert ad.webhook_port == 1234
+ 
++    def test_multiplex_scope_overrides_poisoned_process_credentials(self, monkeypatch):
++        from agent.secret_scope import (
++            reset_secret_scope,
++            set_multiplex_active,
++            set_secret_scope,
++        )
++        from gateway.config import PlatformConfig
++
++        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "foreign-token")
++        monkeypatch.setenv("LINE_CHANNEL_SECRET", "foreign-secret")
++        set_multiplex_active(True)
++        token = set_secret_scope({
++            "LINE_CHANNEL_ACCESS_TOKEN": "profile-token",
++            "LINE_CHANNEL_SECRET": "profile-secret",
++        })
++        try:
++            ad = LineAdapter(PlatformConfig(enabled=True, extra={}))
++            assert ad.channel_access_token == "profile-token"
++            assert ad.channel_secret == "profile-secret"
++        finally:
++            reset_secret_scope(token)
++            set_multiplex_active(False)
++
+     def test_csv_allowlist_parsed(self, monkeypatch):
+         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
+         monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
+         monkeypatch.setenv("LINE_ALLOWED_USERS", "U1, U2,U3")
+         monkeypatch.setenv("LINE_ALLOWED_GROUPS", "C1")
++        monkeypatch.setenv("LINE_READ_ONLY_GROUPS", "C2")
++        monkeypatch.setenv("LINE_ARCHIVE_GROUPS", "C4")
++        monkeypatch.setenv("LINE_REQUIRE_PREFIX_GROUPS", "C3")
++        monkeypatch.setenv("LINE_GROUP_PREFIXES", "Hermes:, Joi:")
+         from gateway.config import PlatformConfig
+         ad = LineAdapter(PlatformConfig(enabled=True))
+         assert ad.allowed_users == {"U1", "U2", "U3"}
+         assert ad.allowed_groups == {"C1"}
++        assert ad.read_only_groups == {"C2"}
++        assert ad.archive_groups == {"C4"}
++        assert ad.require_prefix_groups == {"C3"}
++        assert ad.group_prefixes == ["Hermes:", "Joi:"]
++
++    def test_profile_scope_does_not_union_process_global_group_policy(self, monkeypatch):
++        from agent.secret_scope import reset_secret_scope, set_secret_scope
++        from gateway.config import PlatformConfig
++
++        monkeypatch.setenv("LINE_ALLOWED_GROUPS", "Cglobal")
++        monkeypatch.setenv("LINE_READ_ONLY_GROUPS", "Cglobal-read")
++        token = set_secret_scope(
++            {
++                "LINE_ALLOWED_GROUPS": "Cprofile",
++                "LINE_READ_ONLY_GROUPS": "Cprofile-read",
++            }
++        )
++        try:
++            ad = LineAdapter(PlatformConfig(enabled=True))
++        finally:
++            reset_secret_scope(token)
++
++        assert ad.allowed_groups == {"Cprofile"}
++        assert ad.read_only_groups == {"Cprofile-read"}
++
++    def test_read_only_group_message_is_archived_without_agent_dispatch(
++        self, monkeypatch, tmp_path
++    ):
++        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
++        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
++        monkeypatch.setenv("LINE_READ_ONLY_GROUPS", "Cread")
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
++        from gateway.config import PlatformConfig
++
++        ad = LineAdapter(PlatformConfig(enabled=True))
++        captured = []
++
++        async def _capture(event):
++            captured.append(event)
++
++        ad.handle_message = _capture
++        event = {
++            "type": "message",
++            "webhookEventId": "evt-1",
++            "timestamp": 1234567890,
++            "replyToken": "reply-token",
++            "source": {"type": "group", "groupId": "Cread", "userId": "U123"},
++            "message": {"type": "text", "id": "m1", "text": "大家好"},
++        }
++
++        asyncio.run(ad._dispatch_event(event))
++
++        assert captured == []
++        assert "Cread" not in ad._reply_tokens
++        archive = tmp_path / ".hermes" / "data" / "line-read-only" / "Cread.jsonl"
++        rows = [json.loads(line) for line in archive.read_text().splitlines()]
++        assert rows[-1]["chat_id"] == "Cread"
++        assert rows[-1]["user_id"] == "U123"
++        assert rows[-1]["text"] == "大家好"
++        assert rows[-1]["media_urls"] == []
++        assert rows[-1]["media_types"] == []
++        assert stat.S_IMODE(archive.parent.stat().st_mode) == 0o700
++        assert stat.S_IMODE(archive.stat().st_mode) == 0o600
++
++    def test_archive_deduplicates_message_id_across_adapter_restart(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
++        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
++        monkeypatch.setenv("LINE_READ_ONLY_GROUPS", "Cread")
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
++        from gateway.config import PlatformConfig
++
++        event = {
++            "type": "message",
++            "timestamp": 1234567890,
++            "source": {"type": "group", "groupId": "Cread", "userId": "U123"},
++            "message": {"type": "text", "id": "stable-message-id", "text": "once"},
++        }
++        asyncio.run(LineAdapter(PlatformConfig(enabled=True))._dispatch_event(event))
++        asyncio.run(LineAdapter(PlatformConfig(enabled=True))._dispatch_event(event))
++
++        archive = tmp_path / ".hermes" / "data" / "line-read-only" / "Cread.jsonl"
++        assert len(archive.read_text().splitlines()) == 1
++
++    def test_archive_write_failure_returns_retryable_webhook_error(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
++        monkeypatch.setenv("LINE_CHANNEL_SECRET", "secret")
++        monkeypatch.setenv("LINE_READ_ONLY_GROUPS", "Cread")
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
++        from gateway.config import PlatformConfig
++
++        ad = LineAdapter(PlatformConfig(enabled=True))
++        ad._archive_read_only_message = MagicMock(side_effect=OSError("disk full"))
++        event = {
++            "type": "message",
++            "webhookEventId": "evt-write-failure",
++            "source": {"type": "group", "groupId": "Cread", "userId": "U123"},
++            "message": {"type": "text", "id": "m1", "text": "keep me"},
++        }
++        body = json.dumps({"events": [event]}).encode()
++        signature = base64.b64encode(
++            hmac.new(b"secret", body, hashlib.sha256).digest()
++        ).decode()
++        request = MagicMock(headers={"X-Line-Signature": signature})
++        request.read = AsyncMock(return_value=body)
++
++        response = asyncio.run(ad._handle_webhook(request))
++
++        assert response.status == 500
++        assert not ad._dedup.is_duplicate("evt-write-failure")
++
++    def test_archive_group_preserves_prefix_dispatch(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
++        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
++        monkeypatch.setenv("LINE_ALLOWED_GROUPS", "Carchive")
++        monkeypatch.setenv("LINE_ARCHIVE_GROUPS", "Carchive")
++        monkeypatch.setenv("LINE_REQUIRE_PREFIX_GROUPS", "Carchive")
++        monkeypatch.setenv("LINE_GROUP_PREFIXES", "Hermes:")
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
++        from gateway.config import PlatformConfig
++
++        ad = LineAdapter(PlatformConfig(enabled=True))
++        captured = []
++
++        async def _capture(event):
++            captured.append(event)
++
++        ad.handle_message = _capture
++        event = {
++            "type": "message",
++            "webhookEventId": "evt-archive-prefix",
++            "source": {"type": "group", "groupId": "Carchive", "userId": "U123"},
++            "message": {"type": "text", "id": "m-archive", "text": "Hermes: hello"},
++        }
++
++        asyncio.run(ad._handle_message_event(event))
++
++        archive = tmp_path / ".hermes" / "data" / "line-read-only" / "Carchive.jsonl"
++        rows = [json.loads(line) for line in archive.read_text().splitlines()]
++        assert rows[-1]["text"] == "Hermes: hello"
++        assert len(captured) == 1
++        assert captured[0].text == "hello"
++        assert captured[0].source.chat_id == "Carchive"
++
++    def test_prefix_required_group_ignores_unprefixed_message(self, monkeypatch):
++        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
++        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
++        monkeypatch.setenv("LINE_ALLOWED_GROUPS", "Cprefix")
++        monkeypatch.setenv("LINE_REQUIRE_PREFIX_GROUPS", "Cprefix")
++        from gateway.config import PlatformConfig
++
++        ad = LineAdapter(PlatformConfig(enabled=True))
++        captured = []
++
++        async def _capture(event):
++            captured.append(event)
++
++        ad.handle_message = _capture
++        event = {
++            "type": "message",
++            "webhookEventId": "evt-prefix-ignore",
++            "replyToken": "reply-token",
++            "source": {"type": "group", "groupId": "Cprefix", "userId": "U123"},
++            "message": {"type": "text", "id": "m1", "text": "hello"},
++        }
++
++        asyncio.run(ad._dispatch_event(event))
++
++        assert captured == []
++        assert "Cprefix" not in ad._reply_tokens
++
++    def test_prefix_required_group_dispatches_prefixed_message_without_prefix(self, monkeypatch):
++        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
++        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
++        monkeypatch.setenv("LINE_ALLOWED_GROUPS", "Cprefix")
++        monkeypatch.setenv("LINE_REQUIRE_PREFIX_GROUPS", "Cprefix")
++        from gateway.config import PlatformConfig
++
++        ad = LineAdapter(PlatformConfig(enabled=True))
++        captured = []
++
++        async def _capture(event):
++            captured.append(event)
++
++        ad.handle_message = _capture
++        event = {
++            "type": "message",
++            "webhookEventId": "evt-prefix-dispatch",
++            "replyToken": "reply-token",
++            "source": {"type": "group", "groupId": "Cprefix", "userId": "U123"},
++            "message": {"type": "text", "id": "m1", "text": "Hermes: hello"},
++        }
++
++        asyncio.run(ad._dispatch_event(event))
++
++        assert len(captured) == 1
++        assert captured[0].text == "hello"
++        assert captured[0].source.chat_id == "Cprefix"
+ 
+     def test_get_chat_info_infers_type_from_prefix(self, monkeypatch):
+         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
+diff --git a/tests/gateway/test_matrix.py b/tests/gateway/test_matrix.py
+index 75bb826332e3f6e5ca049b5105b081bc7e27c7fe..62119bf1d55c244a533c1b675f0608236cc99ac7 100644
+--- a/tests/gateway/test_matrix.py
++++ b/tests/gateway/test_matrix.py
+@@ -1,5 +1,6 @@
+ """Tests for Matrix platform adapter (mautrix-python backend)."""
+ import asyncio
++import os
+ import re
+ import stat
+ import sys
+@@ -12,6 +13,15 @@ from gateway.config import Platform, PlatformConfig
+ from gateway.platforms.base import MessageType
+ 
+ 
++@pytest.fixture(autouse=True)
++def _isolate_matrix_environment(monkeypatch, tmp_path):
++    """Keep host Matrix credentials and policy out of adapter unit tests."""
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
++    for key in list(os.environ):
++        if key.startswith("MATRIX_") or key.startswith("HERMES_MATRIX_"):
++            monkeypatch.delenv(key, raising=False)
++
++
+ def _make_fake_mautrix():
+     """Create a lightweight set of fake ``mautrix`` modules.
+ 
+@@ -983,6 +993,17 @@ class TestMatrixRenderingPayloads:
+         assert content["format"] == "org.matrix.custom.html"
+         assert "<strong>Bold</strong>" in content["formatted_body"]
+ 
++    @pytest.mark.asyncio
++    async def test_silent_notification_metadata_sends_notice(self):
++        result = await self.adapter.send(
++            "!room:example.org",
++            "🔧 Running a tool",
++            metadata={"silent_notification": True},
++        )
++
++        assert result.success is True
++        assert self._sent_contents()[0]["msgtype"] == "m.notice"
++
+     @pytest.mark.asyncio
+     async def test_thread_payload_uses_m_thread_with_reply_fallback(self):
+         result = await self.adapter.send(
+@@ -1031,6 +1052,35 @@ class TestMatrixRenderingPayloads:
+         assert content["m.new_content"]["body"] == "edited **body**"
+         assert content["body"] == "* edited **body**"
+ 
++    @pytest.mark.asyncio
++    async def test_silent_notification_edit_stays_notice(self):
++        result = await self.adapter.edit_message(
++            "!room:example.org",
++            "$original",
++            "🔧 Tool finished",
++            metadata={"silent_notification": True},
++        )
++
++        assert result.success is True
++        content = self._sent_contents()[0]
++        assert content["msgtype"] == "m.notice"
++        assert content["m.new_content"]["msgtype"] == "m.notice"
++
++
++    def test_matrix_silent_progress_metadata_preserves_thread_context(self):
++        from gateway.config import Platform
++        from gateway.run import _silent_progress_metadata
++
++        metadata = _silent_progress_metadata(
++            {"thread_id": "$root"},
++            platform=Platform.MATRIX,
++        )
++
++        assert metadata == {
++            "thread_id": "$root",
++            "silent_notification": True,
++        }
++
+     @pytest.mark.asyncio
+     async def test_long_response_split_preserves_thread_context(self):
+         # Build a payload guaranteed to exceed the adapter's outbound chunk
+@@ -1193,6 +1243,16 @@ class TestMatrixDisplayName:
+ # ---------------------------------------------------------------------------
+ 
+ class TestMatrixModuleImport:
++    def test_store_path_follows_hermes_home_set_after_import(
++        self, tmp_path, monkeypatch
++    ):
++        import plugins.platforms.matrix.adapter as matrix_mod
++
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++
++        expected = tmp_path.resolve() / "platforms" / "matrix" / "store"
++        assert matrix_mod._get_matrix_store_dir() == expected
++
+     def test_module_importable_without_mautrix(self):
+         """plugins.platforms.matrix.adapter must be importable even when mautrix is
+         not installed — otherwise the gateway crashes for ALL platforms.
+@@ -1471,6 +1531,7 @@ class TestMatrixAccessTokenAuth:
+         mock_client.device_id = None
+         mock_client.state_store = MagicMock()
+         mock_client.sync_store = MagicMock()
++        mock_client.sync_store.get_next_batch = AsyncMock(return_value=None)
+         mock_client.sync_store.put_next_batch = AsyncMock()
+         mock_client.crypto = None
+         mock_client.whoami = AsyncMock(
+@@ -1629,6 +1690,11 @@ class TestMatrixE2EEHardFail:
+ 
+         assert result is True
+         assert adapter._encryption is False
++        mock_client.sync.assert_awaited_once_with(
++            since=None,
++            timeout=10000,
++            full_state=True,
++        )
+         await adapter.disconnect()
+ 
+     @pytest.mark.asyncio
+@@ -1857,6 +1923,21 @@ class TestMatrixDeviceIdConfig:
+         assert "device_id" not in mc.extra
+ 
+ 
++class TestMatrixInitialSync:
++    @pytest.mark.asyncio
++    async def test_initial_sync_resumes_from_durable_next_batch(self):
++        from plugins.platforms.matrix.adapter import _matrix_initial_sync_kwargs
++
++        sync_store = MagicMock()
++        sync_store.get_next_batch = AsyncMock(return_value="persisted-since-token")
++
++        assert await _matrix_initial_sync_kwargs(sync_store) == {
++            "since": "persisted-since-token",
++            "timeout": 10000,
++            "full_state": True,
++        }
++
++
+ class TestMatrixSyncLoop:
+     @pytest.mark.asyncio
+     async def test_sync_loop_dispatches_events_and_stores_token(self):
+@@ -4530,6 +4611,78 @@ class TestMatrixClockSkewWarning:
+         )
+ 
+ 
++# ---------------------------------------------------------------------------
++# Room auto-thread allowlist
++# ---------------------------------------------------------------------------
++
++class TestMatrixRoomAutoThreadAllowlist:
++    def setup_method(self):
++        self.adapter = _make_adapter()
++        self.adapter._is_dm_room = AsyncMock(return_value=False)
++        self.adapter._get_display_name = AsyncMock(return_value="Alice")
++        self.adapter._background_read_receipt = MagicMock()
++        self.adapter._require_mention = False
++        self.adapter._matrix_session_scope = "room"
++        self.adapter._auto_thread = False
++        self.adapter._auto_thread_rooms = {"!threaded:ex"}
++
++    async def _context(self, room_id: str, event_id: str):
++        return await self.adapter._resolve_message_context(
++            room_id=room_id,
++            sender="@alice:ex",
++            event_id=event_id,
++            body="hello",
++            source_content={"body": "hello"},
++            relates_to={},
++        )
++
++    @pytest.mark.asyncio
++    async def test_selected_room_creates_thread_despite_room_session_scope(self):
++        ctx = await self._context("!threaded:ex", "$thread-root")
++
++        assert ctx is not None
++        _body, _is_dm, _chat_type, thread_id, _display, source = ctx
++        assert thread_id == "$thread-root"
++        assert source.thread_id == "$thread-root"
++
++    @pytest.mark.asyncio
++    async def test_unselected_room_remains_room_scoped(self):
++        ctx = await self._context("!plain:ex", "$plain-message")
++
++        assert ctx is not None
++        _body, _is_dm, _chat_type, thread_id, _display, source = ctx
++        assert thread_id is None
++        assert source.thread_id is None
++
++    def test_yaml_room_list_bridges_to_matrix_environment(self, monkeypatch):
++        from plugins.platforms.matrix.adapter import _apply_yaml_config
++
++        monkeypatch.delenv("MATRIX_AUTO_THREAD_ROOMS", raising=False)
++        _apply_yaml_config(
++            {},
++            {"auto_thread_rooms": ["!one:ex", "!two:ex"]},
++        )
++
++        assert os.environ["MATRIX_AUTO_THREAD_ROOMS"] == "!one:ex,!two:ex"
++
++    def test_adapter_reads_room_list_from_platform_config(self):
++        from plugins.platforms.matrix.adapter import MatrixAdapter
++
++        adapter = MatrixAdapter(
++            PlatformConfig(
++                enabled=True,
++                token="syt_test_token",
++                extra={
++                    "homeserver": "https://matrix.example.org",
++                    "user_id": "@bot:example.org",
++                    "auto_thread_rooms": ["!one:ex", "!two:ex"],
++                },
++            )
++        )
++
++        assert adapter._auto_thread_rooms == {"!one:ex", "!two:ex"}
++
++
+ # ---------------------------------------------------------------------------
+ # DM auto-thread
+ # ---------------------------------------------------------------------------
+@@ -4543,6 +4696,14 @@ class TestMatrixDmAutoThread:
+         # Disable require_mention so DMs pass gating
+         self.adapter._require_mention = False
+ 
++    def test_yaml_dm_auto_thread_bridges_to_matrix_environment(self, monkeypatch):
++        from plugins.platforms.matrix.adapter import _apply_yaml_config
++
++        monkeypatch.delenv("MATRIX_DM_AUTO_THREAD", raising=False)
++        _apply_yaml_config({}, {"dm_auto_thread": True})
++
++        assert os.environ["MATRIX_DM_AUTO_THREAD"] == "true"
++
+     @pytest.mark.asyncio
+     async def test_dm_auto_thread_enabled_creates_thread(self):
+         """When dm_auto_thread is True, DM messages get auto-threaded."""
+@@ -5312,3 +5473,22 @@ class TestMatrixDispatchSyncIsolation:
+ 
+         assert ran["ok"] is True  # the sibling handler still ran
+         assert "event handler failed" in caplog.text  # failure surfaced, not swallowed
++
++
++def test_read_crypto_store_device_id_from_real_sqlite(tmp_path):
++    """The restart guard must read the persisted device ID from crypto.db."""
++    import sqlite3
++
++    from plugins.platforms.matrix.adapter import _read_crypto_store_device_id
++
++    db_path = tmp_path / "crypto.db"
++    with sqlite3.connect(db_path) as conn:
++        conn.execute(
++            "CREATE TABLE crypto_account (account_id TEXT PRIMARY KEY, device_id TEXT)"
++        )
++        conn.execute(
++            "INSERT INTO crypto_account (account_id, device_id) VALUES (?, ?)",
++            ("@wife:example.org", "WIFE_DEVICE"),
++        )
++
++    assert _read_crypto_store_device_id(db_path, "@wife:example.org") == "WIFE_DEVICE"
+diff --git a/tests/gateway/test_pairing.py b/tests/gateway/test_pairing.py
+index ef1037692e6b04ea99c160376f97057f901ff52d..3167fc5b978c8b72ffad8ecde4ba5dec47310a31 100644
+--- a/tests/gateway/test_pairing.py
++++ b/tests/gateway/test_pairing.py
+@@ -27,6 +27,15 @@ def _make_store(tmp_path):
+         return PairingStore()
+ 
+ 
++def test_explicit_pairing_directory_does_not_double_nest_profile(tmp_path):
++    profile_home = tmp_path / "profiles" / "reviewer"
++    store = PairingStore(
++        profile="reviewer", pairing_dir=profile_home / "pairing"
++    )
++    assert store._dir == profile_home / "pairing"
++    assert "profiles/reviewer/profiles/reviewer" not in str(store._dir)
++
++
+ class TestSplitPairingDirMigration:
+     def test_merges_new_approved_into_active_legacy_dir(self, tmp_path):
+         home = tmp_path / "home"
+diff --git a/tests/gateway/test_profile_scoped_authz_seams.py b/tests/gateway/test_profile_scoped_authz_seams.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..686ea34382ad82023b5dc49aeb2fbcd4a55e4e27
+--- /dev/null
++++ b/tests/gateway/test_profile_scoped_authz_seams.py
+@@ -0,0 +1,158 @@
++"""End-to-end profile-scope regression tests for shared gateway authorization."""
++
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++
++from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
++from gateway.config import GatewayConfig, Platform
++from gateway.run import GatewayRunner
++from gateway.session import SessionSource
++
++
++@pytest.fixture
++def scoped_multiplex(monkeypatch):
++    for key in (
++        "DISCORD_ALLOW_BOTS",
++        "TELEGRAM_GROUP_ALLOWED_CHATS",
++        "DISCORD_ALLOWED_USERS",
++        "GATEWAY_ALLOWED_USERS",
++    ):
++        monkeypatch.delenv(key, raising=False)
++    set_multiplex_active(True)
++    scope = {}
++    token = set_secret_scope(scope)
++    try:
++        yield scope
++    finally:
++        reset_secret_scope(token)
++        set_multiplex_active(False)
++
++
++def _runner() -> GatewayRunner:
++    runner = object.__new__(GatewayRunner)
++    runner.config = GatewayConfig(multiplex_profiles=True)
++    runner.adapters = {}
++    runner._profile_adapters = {}
++    runner.pairing_store = MagicMock()
++    runner.pairing_store.is_approved.return_value = False
++    return runner
++
++
++def test_bot_admission_ignores_poisoned_process_env(monkeypatch, scoped_multiplex):
++    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
++    source = SessionSource(
++        platform=Platform.DISCORD,
++        user_id=None,
++        chat_id="discord-channel",
++        user_name="foreign-bot",
++        chat_type="group",
++        is_bot=True,
++        profile="coder",
++    )
++    assert _runner()._is_user_authorized(source) is False
++
++
++def test_group_allowlist_ignores_poisoned_process_env(monkeypatch, scoped_multiplex):
++    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "foreign-chat")
++    source = SessionSource(
++        platform=Platform.TELEGRAM,
++        user_id=None,
++        chat_id="foreign-chat",
++        user_name="anonymous-admin",
++        chat_type="group",
++        profile="coder",
++    )
++    assert _runner()._is_user_authorized(source) is False
++
++
++def test_pairing_behavior_ignores_poisoned_process_env(monkeypatch, scoped_multiplex):
++    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "foreign-user")
++    monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "foreign-user")
++    assert _runner()._get_unauthorized_dm_behavior(
++        Platform.DISCORD,
++        profile="coder",
++    ) == "pair"
++
++
++def test_missing_profile_pairing_store_fails_closed(scoped_multiplex):
++    runner = _runner()
++    runner.pairing_store.is_approved.return_value = True
++    runner.pairing_stores = {}
++    source = SessionSource(
++        platform=Platform.DISCORD, user_id="paired-on-default", chat_id="dm",
++        user_name="user", chat_type="dm", profile="coder",
++    )
++    assert runner._pairing_store_for(source) is None
++    assert runner._is_user_authorized(source) is False
++
++
++def test_authority_helpers_ignore_poisoned_process_env(monkeypatch, scoped_multiplex):
++    from gateway import pairing
++    from plugins.platforms.discord.adapter import _component_check_auth
++    from plugins.platforms.matrix.adapter import _matrix_env
++
++    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "foreign")
++    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
++    interaction = SimpleNamespace(
++        user=SimpleNamespace(id="foreign", roles=[]),
++        client=SimpleNamespace(_hermes_pairing_store=None),
++    )
++    assert pairing._pairing_env("DISCORD_ALLOWED_USERS") == ""
++    assert _component_check_auth(interaction, set(), set()) is False
++    assert _matrix_env("GATEWAY_ALLOW_ALL_USERS") == ""
++
++
++def test_platform_yaml_policy_stays_in_profile_scope(monkeypatch, scoped_multiplex):
++    from plugins.platforms.discord.adapter import _apply_yaml_config as apply_discord
++    from plugins.platforms.matrix.adapter import _apply_yaml_config as apply_matrix
++
++    monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
++    monkeypatch.delenv("MATRIX_ALLOWED_USERS", raising=False)
++    discord_seeded = apply_discord(
++        {"discord": {"allowed_channels": ["profile-channel"]}},
++        {"allowed_channels": ["profile-channel"]},
++    )
++    matrix_seeded = apply_matrix(
++        {"matrix": {"allowed_users": ["@profile:example.org"]}},
++        {"allowed_users": ["@profile:example.org"]},
++    )
++
++    assert "DISCORD_ALLOWED_CHANNELS" not in __import__("os").environ
++    assert "MATRIX_ALLOWED_USERS" not in __import__("os").environ
++    assert scoped_multiplex["DISCORD_ALLOWED_CHANNELS"] == "profile-channel"
++    assert scoped_multiplex["MATRIX_ALLOWED_USERS"] == "@profile:example.org"
++    assert discord_seeded["allowed_channels"] == ["profile-channel"]
++    assert matrix_seeded["allowed_users"] == ["@profile:example.org"]
++
++
++def test_platform_policy_helpers_ignore_poisoned_global_env(monkeypatch, scoped_multiplex):
++    from plugins.platforms.discord.adapter import _discord_env
++    from plugins.platforms.matrix.adapter import _matrix_env
++
++    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "foreign-channel")
++    monkeypatch.setenv("MATRIX_ALLOWED_USERS", "@foreign:example.org")
++    scoped_multiplex["DISCORD_ALLOWED_CHANNELS"] = "profile-channel"
++    scoped_multiplex["MATRIX_ALLOWED_USERS"] = "@profile:example.org"
++
++    assert _discord_env("DISCORD_ALLOWED_CHANNELS") == "profile-channel"
++    assert _matrix_env("MATRIX_ALLOWED_USERS") == "@profile:example.org"
++
++
++def test_discord_allowed_mentions_uses_profile_scope(monkeypatch, scoped_multiplex):
++    from plugins.platforms.discord import adapter as discord_adapter
++
++    monkeypatch.setenv("DISCORD_ALLOW_MENTION_EVERYONE", "true")
++    scoped_multiplex["DISCORD_ALLOW_MENTION_EVERYONE"] = "false"
++    fake_discord = SimpleNamespace(AllowedMentions=MagicMock(return_value="mentions"))
++    monkeypatch.setattr(discord_adapter, "DISCORD_AVAILABLE", True)
++    monkeypatch.setattr(discord_adapter, "discord", fake_discord)
++
++    assert discord_adapter._build_allowed_mentions() == "mentions"
++    fake_discord.AllowedMentions.assert_called_once_with(
++        everyone=False,
++        roles=False,
++        users=True,
++        replied_user=True,
++    )
+diff --git a/tests/gateway/test_unauthorized_dm_behavior.py b/tests/gateway/test_unauthorized_dm_behavior.py
+index ad0c274b2f7212f44dac7f0531055999aa3db2b9..237418b1d41c85f3d3ee8dc2fc914174492c1210 100644
+--- a/tests/gateway/test_unauthorized_dm_behavior.py
++++ b/tests/gateway/test_unauthorized_dm_behavior.py
+@@ -647,6 +647,35 @@ async def test_unauthorized_dm_pairs_by_default(monkeypatch):
+     assert "ABC12DEF" in adapter.send.await_args.args[1]
+ 
+ 
++@pytest.mark.asyncio
++async def test_secondary_profile_dm_uses_secondary_pairing_store(monkeypatch):
++    _clear_auth_env(monkeypatch)
++    config = GatewayConfig(
++        multiplex_profiles=True,
++        platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
++    )
++    runner, adapter = _make_runner(Platform.WHATSAPP, config)
++    secondary_store = MagicMock()
++    secondary_store.is_approved.return_value = False
++    secondary_store._is_rate_limited.return_value = False
++    secondary_store.generate_code.return_value = "SECOND12"
++    runner.pairing_stores = {"coder": secondary_store}
++    runner._profile_adapters = {"coder": {Platform.WHATSAPP: adapter}}
++    event = _make_event(
++        Platform.WHATSAPP,
++        "15551234567@s.whatsapp.net",
++        "15551234567@s.whatsapp.net",
++    )
++    event.source.profile = "coder"
++
++    assert await runner._handle_message(event) is None
++    secondary_store.generate_code.assert_called_once_with(
++        "whatsapp", "15551234567@s.whatsapp.net", "tester"
++    )
++    runner.pairing_store.generate_code.assert_not_called()
++    adapter.send.assert_awaited_once()
++
++
+ @pytest.mark.asyncio
+ async def test_unauthorized_whatsapp_dm_can_be_ignored(monkeypatch):
+     _clear_auth_env(monkeypatch)
+diff --git a/tests/plugins/platforms/photon/test_runtime_record.py b/tests/plugins/platforms/photon/test_runtime_record.py
+index 1b1e650cfc5e8933805176aecb50f4acc8ff7a5e..16e92c24dc8a81915884721028763f2d8c427180 100644
+--- a/tests/plugins/platforms/photon/test_runtime_record.py
++++ b/tests/plugins/platforms/photon/test_runtime_record.py
+@@ -120,7 +120,7 @@ def _patch_spawn(
+ ) -> None:
+     """Stub everything _start_sidecar touches before the healthz loop."""
+     sidecar_dir = tmp_path / "sidecar"
+-    (sidecar_dir / "node_modules").mkdir(parents=True)
++    (sidecar_dir / "node_modules" / "spectrum-ts").mkdir(parents=True)
+     monkeypatch.setattr(photon_adapter, "_SIDECAR_DIR", sidecar_dir)
+     monkeypatch.setattr(photon_adapter, "_sidecar_deps_stale", lambda: False)
+ 
+diff --git a/tests/tools/test_discord_tool.py b/tests/tools/test_discord_tool.py
+index 2fe22c032238c47e39de3996be6591a1bde6c9e0..93c0d934b605227e704ef368cb5ea1fbd584100f 100644
+--- a/tests/tools/test_discord_tool.py
++++ b/tests/tools/test_discord_tool.py
+@@ -491,7 +491,7 @@ class TestCreateThread:
+         # Verify the API call
+         mock_req.assert_called_once_with(
+             "POST", "/channels/11/threads", "test-token",
+-            body={"name": "New Thread", "auto_archive_duration": 1440, "type": 11},
++            body={"name": "New Thread", "auto_archive_duration": 10080, "type": 11},
+         )
+ 
+     @patch("tools.discord_tool._discord_request")
+@@ -504,7 +504,7 @@ class TestCreateThread:
+         assert result["success"] is True
+         mock_req.assert_called_once_with(
+             "POST", "/channels/11/messages/1001/threads", "test-token",
+-            body={"name": "Discussion", "auto_archive_duration": 1440},
++            body={"name": "Discussion", "auto_archive_duration": 10080},
+         )
+ 
+ 
+diff --git a/tools/discord_tool.py b/tools/discord_tool.py
+index 34d60d86dbef25de0140578b816c0e629f9e41bd..d885d68e62874898f6809556810b815681da6e09 100644
+--- a/tools/discord_tool.py
++++ b/tools/discord_tool.py
+@@ -42,6 +42,7 @@ if TYPE_CHECKING:
+ logger = logging.getLogger(__name__)
+ 
+ DISCORD_API_BASE = "https://discord.com/api/v10"
++DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES = 10080
+ _DISCORD_RESPONSE_BODY_MAX_BYTES = 4 * 1024 * 1024
+ _DISCORD_ERROR_BODY_MAX_BYTES = 64 * 1024
+ 
+@@ -587,7 +588,7 @@ def _delete_message(token: str, channel_id: str, message_id: str, **_kwargs: Any
+ def _create_thread(
+     token: str, channel_id: str, name: str,
+     message_id: Optional[str] = None,
+-    auto_archive_duration: int = 1440,
++    auto_archive_duration: int = DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
+     **_kwargs: Any,
+ ) -> str:
+     """Create a thread in a channel."""
+@@ -870,7 +871,7 @@ def _build_schema(
+         "auto_archive_duration": {
+             "type": "integer",
+             "enum": [60, 1440, 4320, 10080],
+-            "description": "Thread archive duration in minutes (create_thread, default 1440).",
++            "description": "Thread archive duration in minutes (create_thread, default 10080).",
+         },
+     }
+ 
+@@ -998,7 +999,7 @@ def _run_discord_action(
+     limit: int = 50,
+     before: str = "",
+     after: str = "",
+-    auto_archive_duration: int = 1440,
++    auto_archive_duration: int = DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
+ ) -> str:
+     """Shared handler logic for both discord tools."""
+     token = _get_bot_token()
+@@ -1082,7 +1083,7 @@ def discord_admin_handler(action: str, **kwargs) -> str:
+ _HANDLER_DEFAULTS = {
+     "action": "", "guild_id": "", "channel_id": "", "user_id": "",
+     "role_id": "", "message_id": "", "query": "", "name": "",
+-    "limit": 50, "before": "", "after": "", "auto_archive_duration": 1440,
++    "limit": 50, "before": "", "after": "", "auto_archive_duration": DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
+ }
+ 
+ 

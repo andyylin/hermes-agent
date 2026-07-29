@@ -1,0 +1,2758 @@
+diff --git a/cron/definitions_export.py b/cron/definitions_export.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3db9efe48cc7b3e727fb9c23f654cc6121990b73
+--- /dev/null
++++ b/cron/definitions_export.py
+@@ -0,0 +1,149 @@
++"""Deterministic cron definition export.
++
++Hermes' live ``cron/jobs.json`` intentionally mixes durable job definitions with
++scheduler runtime state (last/next run timestamps, counters, delivery errors).
++This module writes a stable backup projection that keeps only the recoverable job
++configuration so git backups do not churn on every scheduler tick.
++"""
++
++from __future__ import annotations
++
++import copy
++import json
++from pathlib import Path
++from typing import Any, Dict, Iterable, List, Mapping, Optional
++
++DEFINITIONS_FILENAME = "jobs.definitions.json"
++EXPORT_VERSION = 1
++
++# Keep field order explicit so exports are reviewable and stable.
++_DEFINITION_FIELDS = (
++    "id",
++    "name",
++    "enabled",
++    "state",
++    "paused_reason",
++    "prompt",
++    "skills",
++    "skill",
++    "model",
++    "provider",
++    "base_url",
++    "script",
++    "no_agent",
++    "context_from",
++    "schedule",
++    "schedule_display",
++    "repeat",
++    "deliver",
++    "email_subject_template",
++    "email_thread_key",
++    "delivery_subject_template",
++    "origin",
++    "enabled_toolsets",
++    "workdir",
++    "profile",
++    "created_at",
++)
++
++_VOLATILE_JOB_FIELDS = {
++    "next_run_at",
++    "last_run_at",
++    "last_status",
++    "last_error",
++    "last_delivery_error",
++    "paused_at",
++}
++
++
++def definitions_path_for_jobs_file(jobs_file: Path) -> Path:
++    """Return the default deterministic export path next to ``jobs_file``."""
++
++    return Path(jobs_file).with_name(DEFINITIONS_FILENAME)
++
++
++def _normalize_repeat(value: Any) -> Optional[Dict[str, Any]]:
++    if value is None:
++        return None
++    if isinstance(value, Mapping):
++        return {"times": value.get("times")}
++    return {"times": value}
++
++
++def normalize_job_definition(job: Mapping[str, Any]) -> Dict[str, Any]:
++    """Return the deterministic, non-runtime definition for one cron job."""
++
++    source = dict(job)
++    definition: Dict[str, Any] = {}
++
++    for field in _DEFINITION_FIELDS:
++        if field not in source:
++            continue
++        value = source[field]
++
++        if field == "repeat":
++            value = _normalize_repeat(value)
++        elif field == "state":
++            # ``scheduled`` and ``error`` are scheduler/runtime states. Preserve
++            # paused because it is a user-facing durable lifecycle choice.
++            if value != "paused":
++                continue
++        elif field == "paused_reason":
++            if not value:
++                continue
++        else:
++            value = copy.deepcopy(value)
++
++        definition[field] = value
++
++    # Future-proofing: never allow known volatile fields to leak even if the
++    # ordered allow-list changes later.
++    for field in _VOLATILE_JOB_FIELDS:
++        definition.pop(field, None)
++
++    return definition
++
++
++def build_cron_definitions(jobs: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
++    """Build the stable export document for a collection of cron jobs."""
++
++    normalized: List[Dict[str, Any]] = [normalize_job_definition(job) for job in jobs]
++    normalized.sort(key=lambda item: (str(item.get("id") or ""), str(item.get("name") or "")))
++    return {
++        "version": EXPORT_VERSION,
++        "source": "cron/jobs.json",
++        "jobs": normalized,
++    }
++
++
++def render_cron_definitions(jobs: Iterable[Mapping[str, Any]]) -> str:
++    """Render the deterministic export JSON."""
++
++    return json.dumps(
++        build_cron_definitions(jobs),
++        ensure_ascii=False,
++        indent=2,
++        sort_keys=True,
++    ) + "\n"
++
++
++def export_cron_definitions(
++    jobs: Iterable[Mapping[str, Any]],
++    output_path: Path,
++    *,
++    write_if_changed: bool = True,
++) -> bool:
++    """Write deterministic cron definitions.
++
++    Returns ``True`` when the file was written and ``False`` when the existing
++    file already matched and ``write_if_changed`` avoided a no-op rewrite.
++    """
++
++    path = Path(output_path)
++    rendered = render_cron_definitions(jobs)
++    if write_if_changed and path.exists() and path.read_text(encoding="utf-8") == rendered:
++        return False
++
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(rendered, encoding="utf-8")
++    return True
+diff --git a/cron/jobs.py b/cron/jobs.py
+index 7d3860997ffc9741b87d7679efbe95e820747aae..4a72ee48abb64c84f1bbcc8006050b10f449f4b9 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -78,6 +78,8 @@ TICKER_HEARTBEAT_FILE = CRON_DIR / "ticker_heartbeat"
+ # Last tick that completed WITHOUT raising. Distinguishing this from the plain
+ # heartbeat lets status detect a ticker that is alive but failing every tick.
+ TICKER_SUCCESS_FILE = CRON_DIR / "ticker_last_success"
++_IMPORT_TICKER_HEARTBEAT_FILE = TICKER_HEARTBEAT_FILE
++_IMPORT_TICKER_SUCCESS_FILE = TICKER_SUCCESS_FILE
+ # Default ticker loop interval (seconds). The single source of truth shared by
+ # the in-process ticker (cron/scheduler_provider.py) and the staleness
+ # threshold in `hermes cron status` (hermes_cli/cron.py), so the two never
+@@ -175,6 +177,34 @@ def get_cron_output_dir() -> Path:
+     return _current_cron_store().output_dir
+ 
+ 
++def get_cron_definitions_file() -> Path:
++    """Return the deterministic export path for the active cron store."""
++    from cron.definitions_export import definitions_path_for_jobs_file
++
++    return definitions_path_for_jobs_file(_current_cron_store().jobs_file)
++
++
++def export_definitions_file(
++    jobs: Optional[List[Dict[str, Any]]] = None,
++    output_path: Optional[Path] = None,
++) -> bool:
++    """Export deterministic cron definitions and return True if file changed."""
++    from cron.definitions_export import export_cron_definitions
++
++    ensure_dirs()
++    if jobs is None:
++        jobs = load_jobs()
++    path = output_path or get_cron_definitions_file()
++    return export_cron_definitions(jobs, path)
++
++
++def _current_ticker_file(path: Path, import_path: Path, filename: str) -> Path:
++    """Resolve a ticker marker without breaking patched compatibility constants."""
++    if path != import_path:
++        return path
++    return _current_cron_store().cron_dir / filename
++
++
+ # Fallback stale-recovery window for a one-shot's running-claim (#59229) when
+ # the cron inactivity timeout is disabled (HERMES_CRON_TIMEOUT=0 → unlimited),
+ # in which case no finite run bound exists to derive from. Also acts as the
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 2428d500a73e59181c4367e3e7056e1353ae5f61..973c153e839d90c75182f243876314d28002dca8 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -1308,6 +1308,284 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
+     return targets[0] if targets else None
+ 
+ 
++def _job_delivers_to_discord(job: dict) -> bool:
++    """Return True when this job's resolved delivery includes Discord."""
++    try:
++        return any(
++            str(target.get("platform", "")).lower() == "discord"
++            for target in _resolve_delivery_targets(job)
++        )
++    except Exception:
++        return False
++
++
++def _markdown_tables_to_bullets(markdown_text: str) -> str:
++    """Best-effort conversion of simple Markdown tables into bullet lists.
++
++    Discord's Markdown table rendering is inconsistent and hard to read in
++    alert channels. This keeps cron alerts Discord-friendly even when a
++    no-agent script or LLM slips a table into the body.
++    """
++    lines = markdown_text.splitlines()
++    output: list[str] = []
++    i = 0
++
++    def _table_cells(line: str) -> list[str]:
++        stripped = line.strip().strip("|")
++        return [cell.strip() for cell in stripped.split("|")]
++
++    def _is_separator(line: str) -> bool:
++        cells = _table_cells(line)
++        if not cells:
++            return False
++        return all(cell and set(cell.replace(":", "").replace("-", "")) == set() and "-" in cell for cell in cells)
++
++    while i < len(lines):
++        if "|" in lines[i] and i + 1 < len(lines) and _is_separator(lines[i + 1]):
++            headers = _table_cells(lines[i])
++            rows: list[list[str]] = []
++            i += 2
++            while i < len(lines) and "|" in lines[i] and lines[i].strip():
++                rows.append(_table_cells(lines[i]))
++                i += 1
++            if output and output[-1].strip():
++                output.append("")
++            for row in rows:
++                pairs = []
++                for idx, value in enumerate(row):
++                    header = headers[idx] if idx < len(headers) and headers[idx] else f"Column {idx + 1}"
++                    if value:
++                        pairs.append(f"**{header}:** {value}")
++                if pairs:
++                    output.append(f"- {'; '.join(pairs)}")
++            if i < len(lines) and lines[i].strip():
++                output.append("")
++            continue
++        output.append(lines[i])
++        i += 1
++
++    return "\n".join(output)
++
++
++def _format_cron_email_subject(job: dict) -> Optional[str]:
++    """Return an explicit email subject for cron delivery when a job asks for one.
++
++    Supports ``{date}`` / ``{date_compact}`` / ``{job_name}`` / ``{job_id}``
++    templates. Dates are evaluated at delivery time in Hermes' configured
++    timezone, so daily email automations do not thread into one endless chain.
++    """
++    template = job.get("email_subject_template") or job.get("delivery_subject_template")
++    if not template:
++        return None
++    now = _hermes_now()
++    return str(template).format(
++        date=now.strftime("%Y-%m-%d"),
++        date_compact=now.strftime("%Y%m%d"),
++        job_name=job.get("name", job.get("id", "")),
++        job_id=job.get("id", ""),
++    )
++
++
++def _format_cron_email_subject_payload(job: dict):
++    """Return the subject payload for email delivery.
++
++    Most jobs get a plain subject string. Jobs with ``email_thread_key`` opt
++    into explicit RFC 5322 threading headers so mail clients that do not rely
++    on Gmail-style same-subject heuristics (notably Apple Mail) can keep a
++    recurring stream in one conversation.
++    """
++    subject = _format_cron_email_subject(job)
++    if not subject:
++        return None
++    thread_key = str(job.get("email_thread_key") or "").strip()
++    if not thread_key:
++        return subject
++    return {"subject": subject, "thread_anchor_key": thread_key}
++
++
++def _is_one_shot_job(job: dict) -> bool:
++    """Return True when a cron job is configured to run only once."""
++    repeat = job.get("repeat")
++    if isinstance(repeat, dict) and repeat.get("times") == 1:
++        return True
++    if repeat == 1:
++        return True
++
++    schedule = job.get("schedule")
++    if isinstance(schedule, dict) and schedule.get("kind") == "once":
++        return True
++    return False
++
++
++def _one_shot_delivery_footer(job: dict) -> str:
++    """Human-facing footer for one-shot deliveries.
++
++    One-off reminders should not imply there is a recurring job to stop.
++    """
++    label_source = " ".join(
++        str(job.get(field) or "")
++        for field in ("name", "prompt")
++    ).lower()
++    noun = "reminder" if "remind" in label_source or "reminder" in label_source else "job"
++    return f"This was a one-off {noun}; it will not repeat."
++
++
++def _append_cron_email_reference_footer(job: dict, body: str) -> str:
++    """Add a copy/paste reference code to cron email notifications."""
++    from tools.email_rendering import append_notification_reference_footer, make_notification_ref
++
++    job_id = str(job.get("id") or "")
++    task_name = str(job.get("name") or job_id or "cron-job")
++    script = str(job.get("script") or "")
++    source = f"/home/pi/.hermes/scripts/{script}" if script else "Hermes cron job definition"
++    return append_notification_reference_footer(
++        body,
++        ref=make_notification_ref("cron", task_name, job_id),
++        job_id=job_id,
++        script=script or None,
++        source=source,
++        ask="investigate this REF",
++    )
++
++
++
++
++def _cron_repair_gate_alert_routing_enabled() -> bool:
++    """Whether source cron alerts should be held for the repair gate.
++
++    When enabled, ordinary automations still record failed/warning output and
++    ``last_status`` normally, but the source job does not immediately notify the
++    user. The universal automation repairer scans that state, attempts one
++    bounded repair, and reports only repaired/blocked/escalated outcomes.
++    """
++    env = os.getenv("HERMES_CRON_ROUTE_ALERTS_THROUGH_REPAIR_GATE", "").strip().lower()
++    if env in {"1", "true", "yes", "on"}:
++        return True
++    if env in {"0", "false", "no", "off"}:
++        return False
++    try:
++        cfg = load_config() or {}
++        cron_cfg = cfg.get("cron") or {} if isinstance(cfg, dict) else {}
++        return bool(cron_cfg.get("route_alerts_through_repair_gate", False))
++    except Exception as exc:
++        logger.debug("Could not read cron repair-gate alert routing config: %s", exc)
++        return False
++
++
++def _is_repair_gate_job(job: dict) -> bool:
++    return (
++        job.get("script") == "automation_failure_repair_gate.py"
++        or job.get("name") == "automation-failure-first-pass-repairer"
++    )
++
++
++def _looks_like_cron_warning_or_error_alert(content: str) -> bool:
++    """Best-effort guard for successful jobs that emitted an alert payload.
++
++    This is intentionally conservative so routine reports that merely contain a
++    risks/caveats section still deliver. It catches deterministic watchdog
++    outputs and short alert-style LLM responses whose leading line/status says
++    warning/error/attention/report.
++    """
++    text = (content or "").strip()
++    if not text:
++        return False
++    head = "\n".join(line.strip() for line in text.splitlines()[:8] if line.strip())
++    if re.search(r'(?is)^\s*\{.*"status"\s*:\s*"(REPORT|WARNING|FAILURE|ERROR)"', text[:2000]):
++        return True
++    return bool(re.search(
++        r"(?im)^(?:[#*_\s>`-]*)?(?:⚠|⚠️|warning[:：]|error[:：]|alert[:：]|attention needed\b|action required\b|.+\bfailed\b)",
++        head,
++    ))
++
++def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool, for_email: bool = False) -> str:
++    """Apply the cron wrapper, using native formatting for delivery surfaces."""
++    task_name = job.get("name", job["id"])
++    job_id = job.get("id", "")
++    body = _markdown_tables_to_bullets(content) if for_discord else content
++    if for_email and re.search(r"</?(?:html|body|h[1-6]|p|ul|ol|li|br|strong|em|table|tr|td|div|span|blockquote)\b", body or "", re.IGNORECASE):
++        from html import escape
++
++        body_match = re.search(r"<body[^>]*>(.*?)</body>", body, flags=re.IGNORECASE | re.DOTALL)
++        body_html = body_match.group(1) if body_match else body
++        manage = (
++            f'To stop or manage this job, send me a new message '
++            f'(e.g. &quot;stop reminder {escape(str(task_name))}&quot;).'
++        )
++        if _is_one_shot_job(job):
++            manage = escape(_one_shot_delivery_footer(job))
++        html_body = (
++            '<!doctype html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'
++            "'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.45; color:#24292f; "
++            'font-size:15px; max-width:860px; margin:0 auto; padding:16px;">'
++            '<style>a{color:#0969da} code{background:#f6f8fa; padding:2px 4px; border-radius:4px; '
++            'font-family:SFMono-Regular,Consolas,monospace} table{border-collapse:collapse; width:100%;} '
++            'th,td{border:1px solid #d0d7de; padding:6px; vertical-align:top;} '
++            'th{background:#f6f8fa; text-align:left;} blockquote{border-left:4px solid #d0d7de; '
++            'margin:16px 0; padding:8px 12px; color:#57606a; background:#f6f8fa;}</style>'
++            f"<h2>Cron Alert: {escape(str(task_name))}</h2>"
++            f"<p><strong>Job ID:</strong> <code>{escape(str(job_id))}</code></p>"
++            "<hr>"
++            f"{body_html}"
++            "<hr>"
++            f"<p>{manage}</p>"
++            "</body></html>"
++        )
++        return _append_cron_email_reference_footer(job, html_body)
++    if _is_one_shot_job(job):
++        footer = _one_shot_delivery_footer(job)
++        if for_email:
++            return _append_cron_email_reference_footer(job, (
++                f"## Cron Alert: {task_name}\n\n"
++                f"**Job ID:** `{job_id}`\n\n"
++                f"### Report\n\n"
++                f"{body}\n\n"
++                f"### One-off\n\n"
++                f"{footer}"
++            ))
++        if for_discord:
++            return (
++                f"# Cron Alert: {task_name}\n\n"
++                f"**Job ID:** `{job_id}`\n\n"
++                f"## Report\n\n"
++                f"{body}\n\n"
++                f"## One-off\n\n"
++                f"{footer}"
++            )
++        return (
++            f"Cronjob Response: {task_name}\n"
++            f"(job_id: {job_id})\n"
++            f"-------------\n\n"
++            f"{body}\n\n"
++            f"{footer}"
++        )
++    if for_email:
++        return _append_cron_email_reference_footer(job, (
++            f"## Cron Alert: {task_name}\n\n"
++            f"**Job ID:** `{job_id}`\n\n"
++            f"### Report\n\n"
++            f"{body}\n\n"
++            f"### Manage\n\n"
++            f"To stop or manage this job, send me a new message (e.g. `stop reminder {task_name}`)."
++        ))
++    if for_discord:
++        return (
++            f"# Cron Alert: {task_name}\n\n"
++            f"**Job ID:** `{job_id}`\n\n"
++            f"## Report\n\n"
++            f"{body}\n\n"
++            f"## Manage\n\n"
++            f"To stop or manage this job, send me a new message, e.g. `stop reminder {task_name}`."
++        )
++    return (
++        f"Cronjob Response: {task_name}\n"
++        f"(job_id: {job_id})\n"
++        f"-------------\n\n"
++        f"{body}\n\n"
++        f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
++    )
++
++
+ # Media extension sets — audio routing is centralized in gateway.platforms.base
+ # via should_send_media_as_audio() so Telegram-specific rules stay in one place.
+ _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
+@@ -1494,23 +1772,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
+     except Exception:
+         pass
+ 
+-    if wrap_response:
+-        task_name = job.get("name", job["id"])
+-        job_id = job.get("id", "")
+-        delivery_content = (
+-            f"Cronjob Response: {task_name}\n"
+-            f"(job_id: {job_id})\n"
+-            f"-------------\n\n"
+-            f"{content}\n\n"
+-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+-        )
+-    else:
+-        delivery_content = content
+-
+-    # Extract MEDIA: tags so attachments are forwarded as files, not raw text
++    # Extracting and platform-specific formatting happen per target below.
++    # A fan-out may include Discord plus email/Telegram, and one shared payload
++    # would leak Discord's table-to-bullet rendering into every sibling target.
+     from gateway.platforms.base import BasePlatformAdapter
+-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+ 
+     # Resolve the delivery-mirror gate ONCE (default off). When on, each
+     # successful delivery is also appended to the target chat's gateway session
+@@ -1538,6 +1803,21 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
+         platform_name = target["platform"]
+         chat_id = target["chat_id"]
+         thread_id = target.get("thread_id")
++        email_subject = _format_cron_email_subject_payload(job) if str(platform_name).lower() == "email" else None
++
++        for_discord = str(platform_name).lower() == "discord"
++        for_email = str(platform_name).lower() == "email"
++        if wrap_response:
++            delivery_content = _format_cron_delivery_content(
++                job,
++                content,
++                for_discord=for_discord,
++                for_email=for_email,
++            )
++        else:
++            delivery_content = _markdown_tables_to_bullets(content) if for_discord else content
++        media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
++        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+ 
+         # Diagnostic: log thread_id for topic-aware delivery debugging
+         origin = _resolve_origin(job) or {}
+@@ -1592,16 +1872,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
+             delivery_errors.append(msg)
+             continue
+ 
++        target_content = cleaned_delivery_content
++
+         # Prefer the resolved live transport when the gateway is running. This
+         # supports E2EE native adapters and relay-fronted logical platforms.
+-        # The live-send path (which SEEDS the flat in_channel continuation
+-        # session via _seed_cron_channel_session) needs not just a live adapter
+-        # but a running event loop to schedule the async send onto. Compute that
+-        # gate ONCE so the in_channel thread_id clear below stays in lockstep
+-        # with the live-send/seed block further down (they used to drift): an
+-        # adapter can be present while the loop is absent/not-running, in which
+-        # case the live-send block is skipped and delivery falls through to the
+-        # standalone path — which cannot seed the flat session (r3609147550).
+         live_adapter_ready = (
+             runtime_adapter is not None
+             and loop is not None
+@@ -1772,6 +2046,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
+                     route_metadata["thread_id"] = route_thread_id
+                 media_metadata = {"thread_id": thread_id} if thread_id else None
+ 
++            if email_subject and platform_name.lower() == "email":
++                route_metadata = dict(route_metadata or {})
++                if isinstance(email_subject, dict):
++                    route_metadata.update(email_subject)
++                else:
++                    route_metadata["subject"] = email_subject
++                    route_metadata["suppress_threading"] = True
++
+             try:
+                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
+                 # Route through the gateway's DeliveryRouter so the live send
+@@ -1780,7 +2062,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
+                 # standalone cron path lacked this, so DM-topic cron deliveries
+                 # landed in the General topic or were rejected by Bot API 10.0
+                 # (#22773).
+-                text_to_send = cleaned_delivery_content.strip()
++                text_to_send = target_content.strip()
+                 adapter_ok = True
+                 timed_out = False
+                 if text_to_send:
+@@ -2020,7 +2302,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
+                 delivery_errors.extend(target_errors)
+                 continue
+             # Standalone path: run the async send in a fresh event loop (safe from any thread)
+-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
++            send_subject = email_subject if platform_name.lower() == "email" else None
++            coro = _send_to_platform(
++                platform,
++                pconfig,
++                chat_id,
++                target_content,
++                thread_id=thread_id,
++                media_files=media_files,
++                subject=send_subject,
++            )
+             try:
+                 result = asyncio.run(coro)
+             except RuntimeError as run_err:
+@@ -2049,7 +2340,27 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
+                 try:
+                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                     try:
+-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
++                        # ContextVars do not propagate into fresh executor
++                        # threads automatically. Preserve the profile secret
++                        # scope used by this cron delivery.
++                        from contextvars import copy_context
++
++                        def _run_standalone_send():
++                            return asyncio.run(
++                                _send_to_platform(
++                                    platform,
++                                    pconfig,
++                                    chat_id,
++                                    target_content,
++                                    thread_id=thread_id,
++                                    media_files=media_files,
++                                    subject=send_subject,
++                                )
++                            )
++
++                        future = pool.submit(
++                            copy_context().run, _run_standalone_send
++                        )
+                         result = future.result(timeout=30)
+                     finally:
+                         pool.shutdown(wait=False)
+@@ -2541,6 +2852,12 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
+         "Never combine [SILENT] with content — either report your "
+         "findings normally, or say [SILENT] and nothing more.]\n\n"
+     )
++    if _job_delivers_to_discord(job):
++        cron_hint += (
++            "[DISCORD FORMAT: This cron output is delivered to Discord. "
++            "Use Markdown headings (`#`/`##`) and short bullets. "
++            "Do not use Markdown tables or pipe-table formatting; convert tabular data into grouped bullets instead.]\n\n"
++        )
+     prompt = cron_hint + prompt
+     if skills is None:
+         legacy = job.get("skill")
+@@ -3133,12 +3450,19 @@ def run_job(
+         # is set (mirrors startup), and the Bitwarden value-cache keeps the
+         # forced re-pull off the network. load_hermes_dotenv also handles the
+         # utf-8/latin-1 encoding fallback internally.
+-        from hermes_cli.env_loader import (
+-            load_hermes_dotenv,
+-            reset_secret_source_cache,
+-        )
+-        reset_secret_source_cache()
+-        load_hermes_dotenv(hermes_home=_get_hermes_home())
++        from agent.secret_scope import current_secret_scope
++        if current_secret_scope() is None:
++            from hermes_cli.env_loader import (
++                load_hermes_dotenv,
++                reset_secret_source_cache,
++            )
++            reset_secret_source_cache()
++            load_hermes_dotenv(hermes_home=_get_hermes_home())
++        else:
++            logger.debug(
++                "Job '%s': isolated profile scope already refreshed; skipping global dotenv reload",
++                job_id,
++            )
+ 
+         delivery_target = _resolve_delivery_target(job)
+         if delivery_target:
+@@ -3892,6 +4216,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
+     Returns True if the job was processed (even if the job itself failed —
+     failure is recorded via ``mark_job_run``), False only if processing raised.
+     """
++    _scope_token = None
+     execution_id = job.get("execution_id")
+     if not execution_id:
+         execution_id = create_execution(job["id"], source="direct")["id"]
+@@ -3933,7 +4258,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
+         )
+ 
+         _scope_token = set_secret_scope(
+-            build_profile_secret_scope(_get_hermes_home())
++            build_profile_secret_scope(
++                _get_hermes_home(), include_external=True
++            )
+         )
+         # Defer the cron agent's async-resource teardown until AFTER delivery.
+         # run_job normally closes the agent (and reaps stale async clients) in
+@@ -3956,8 +4283,6 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
+             for _deferred_agent in _deferred_agents:
+                 _teardown_cron_agent(_deferred_agent, job["id"])
+             raise
+-        finally:
+-            reset_secret_scope(_scope_token)
+ 
+         # Everything from here through delivery runs with the agent still live
+         # (deferred teardown). Wrap it ALL in a try/finally so that if any step
+@@ -4034,6 +4359,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
+             mark_job_run(job["id"], False, str(e))
+         finish_execution(execution_id, success=False, error=str(e))
+         return False
++    finally:
++        if _scope_token is not None:
++            reset_secret_scope(_scope_token)
+ 
+ 
+ def _notify_provider_jobs_changed() -> None:
+diff --git a/hermes_cli/cron.py b/hermes_cli/cron.py
+index c5be7681c936e45e626760afa53f728ad93be66a..789d1abcad57243bbe0a2d5cc83319f7e6366b34 100644
+--- a/hermes_cli/cron.py
++++ b/hermes_cli/cron.py
+@@ -331,6 +331,18 @@ def _print_active_jobs_summary(jobs) -> None:
+         print("  No active jobs")
+ 
+ 
++def cron_export_definitions(args):
++    """Export deterministic cron job definitions."""
++    from cron.jobs import export_definitions_file, get_cron_definitions_file
++
++    output = getattr(args, "output", None)
++    path = Path(output).expanduser() if output else get_cron_definitions_file()
++    changed = export_definitions_file(output_path=path)
++    print(color(f"Exported cron definitions: {path}", Colors.GREEN))
++    print(f"  Changed: {'yes' if changed else 'no'}")
++    return 0
++
++
+ def cron_create(args):
+     # The gateway-lifecycle guard lives in cron.jobs.create_job so it fires on
+     # every job-creation path (this CLI subcommand AND the agent's `cronjob`
+diff --git a/hermes_cli/send_cmd.py b/hermes_cli/send_cmd.py
+index 81babfe2aca5c933c7cdceb0c474b4665ef1b565..0bdab4532fbb034beff0cef19bfc6a3d7220e0cf 100644
+--- a/hermes_cli/send_cmd.py
++++ b/hermes_cli/send_cmd.py
+@@ -335,10 +335,12 @@ def cmd_send(args: argparse.Namespace) -> None:
+         )
+         sys.exit(_USAGE_EXIT)
+ 
+-    # Optional: prepend a subject line. Useful for alerting scripts that
+-    # want a consistent header without inlining it into every call.
++    # Optional: pass a transport-native subject when the platform supports it
++    # (email), while preserving the historical header-prepend behavior for
++    # chat platforms that do not have a subject field.
+     subject = getattr(args, "subject", None)
+-    if subject:
++    target_platform = target.split(":", 1)[0].strip().lower()
++    if subject and target_platform != "email":
+         message = f"{subject}\n\n{message.lstrip()}"
+ 
+     # Import lazily so `hermes send --help` stays fast and does not pull in
+@@ -355,6 +357,8 @@ def cmd_send(args: argparse.Namespace) -> None:
+         "target": target,
+         "message": message,
+     }
++    if subject and target_platform == "email":
++        tool_args["subject"] = subject
+ 
+     result = send_message_tool(tool_args)
+     exit_code = _emit_result(
+diff --git a/plugins/platforms/email/adapter.py b/plugins/platforms/email/adapter.py
+index 572b5c11455d396e3d23d44b7bf724130ebce385..4f49ea7aa5a5e31888bf2d6f0e1124724867a72a 100644
+--- a/plugins/platforms/email/adapter.py
++++ b/plugins/platforms/email/adapter.py
+@@ -31,6 +31,7 @@ from email.mime.text import MIMEText
+ from email.mime.base import MIMEBase
+ from email.utils import formatdate
+ from email import encoders
++from html import unescape
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional, Tuple
+ 
+@@ -43,7 +44,6 @@ from gateway.platforms.base import (
+     cache_image_from_bytes,
+ )
+ from gateway.config import Platform, PlatformConfig
+-from utils import env_int, env_bool
+ 
+ logger = logging.getLogger(__name__)
+ # Automated sender patterns — emails from these are silently ignored
+@@ -158,16 +158,39 @@ def _is_automated_sender(address: str, headers: dict) -> bool:
+             return True
+     return False
+     
++def _email_env(name: str, default: str = "") -> str:
++    """Read EMAIL/GATEWAY settings from the active profile secret scope."""
++    try:
++        from agent.secret_scope import get_secret
++    except ImportError:
++        return (os.getenv(name) or default).strip()
++
++    value = get_secret(name, default)
++    return (str(value) if value is not None else default).strip()
++
++
++def _email_env_int(name: str, default: int) -> int:
++    try:
++        return int(_email_env(name, str(default)))
++    except (TypeError, ValueError):
++        return default
++
++
++def _email_env_bool(name: str, default: bool = False) -> bool:
++    raw = _email_env(name, "true" if default else "false").lower()
++    return raw in {"true", "1", "yes", "on"}
++
++
+ def check_email_requirements() -> bool:
+     """Check if email platform settings are available and non-blank.
+ 
+     Treats blank/whitespace-only values as missing so an abandoned setup that
+     left empty ``EMAIL_*`` keys in ``.env`` does not enable the platform (#40715).
+     """
+-    addr = os.getenv("EMAIL_ADDRESS", "").strip()
+-    pwd = os.getenv("EMAIL_PASSWORD", "").strip()
+-    imap = os.getenv("EMAIL_IMAP_HOST", "").strip()
+-    smtp = os.getenv("EMAIL_SMTP_HOST", "").strip()
++    addr = _email_env("EMAIL_ADDRESS")
++    pwd = _email_env("EMAIL_PASSWORD")
++    imap = _email_env("EMAIL_IMAP_HOST")
++    smtp = _email_env("EMAIL_SMTP_HOST")
+     return all([addr, pwd, imap, smtp])
+ 
+ 
+@@ -183,6 +206,41 @@ def _decode_header_value(raw: str) -> str:
+     return " ".join(decoded)
+ 
+ 
++def _standalone_looks_like_html(body: str) -> bool:
++    """Detect an HTML document or fragment in standalone delivery content."""
++    return bool(
++        re.search(
++            r"<(?:!doctype|html|body|div|p|h[1-6]|strong|em|ul|ol|li|table|br)\b",
++            body or "",
++            flags=re.IGNORECASE,
++        )
++    )
++
++
++def _standalone_html_to_plain_text(body: str) -> str:
++    """Build a readable plain-text fallback without external dependencies."""
++    from html import unescape
++
++    text = re.sub(r"<\s*br\s*/?\s*>", "\n", body or "", flags=re.IGNORECASE)
++    text = re.sub(
++        r"</\s*(?:p|div|h[1-6]|li|tr)\s*>",
++        "\n",
++        text,
++        flags=re.IGNORECASE,
++    )
++    text = re.sub(r"<[^>]+>", "", text)
++    lines = [line.strip() for line in unescape(text).splitlines()]
++    return "\n".join(line for line in lines if line).strip()
++
++
++def _standalone_plain_text_to_html(body: str) -> str:
++    """Escape plain text into a compact HTML alternative."""
++    from html import escape
++
++    escaped = escape(body or "").replace("\n", "<br>\n")
++    return f"<html><body><p>{escaped}</p></body></html>"
++
++
+ def _extract_text_body(msg: email_lib.message.Message) -> str:
+     """Extract the plain-text body from a potentially multipart email."""
+     if msg.is_multipart():
+@@ -419,14 +477,28 @@ def _extract_attachments(
+     return attachments
+ 
+ 
++def _stable_thread_message_id(key: str, domain: str) -> Optional[str]:
++    """Build a deterministic Message-ID-like anchor for recurring notifications."""
++    key = str(key or "").strip().lower()
++    domain = str(domain or "").strip().lower()
++    if not key or not domain:
++        return None
++    safe_key = re.sub(r"[^a-z0-9._-]+", "-", key).strip(".-_")[:80]
++    safe_domain = re.sub(r"[^a-z0-9.-]+", "", domain).strip(".")
++    if not safe_key or not safe_domain:
++        return None
++    return f"<hermes-thread-{safe_key}@{safe_domain}>"
++
++
+ class EmailAdapter(BasePlatformAdapter):
+-    """Email gateway adapter using IMAP (receive) and SMTP (send)."""
++    """Email platform adapter."""
+ 
+     def __init__(self, config: PlatformConfig):
+         super().__init__(config, Platform.EMAIL)
+ 
+-        # Resolve connection settings from the env vars first, then fall back to
+-        # PlatformConfig.extra (address/imap_host/smtp_host) — the canonical dict
++        # Resolve connection settings from profile-owned PlatformConfig first,
++        # then the active profile secret scope — never process-global env under
++        # multiplex. PlatformConfig.extra is the canonical dict
+         # gateway.config populates and that the "connected" check, the
+         # send-helper, and `hermes config show` already read. Without the
+         # fallback a config.yaml-only setup left these empty. Host/address values
+@@ -434,13 +506,13 @@ class EmailAdapter(BasePlatformAdapter):
+         # misleading ``[Errno 8] nodename nor servname`` (an unresolvable name)
+         # instead of an obvious "host not set" error.
+         extra = config.extra or {}
+-        self._address = (os.getenv("EMAIL_ADDRESS", "") or extra.get("address", "")).strip()
+-        self._password = os.getenv("EMAIL_PASSWORD", "")
+-        self._imap_host = (os.getenv("EMAIL_IMAP_HOST", "") or extra.get("imap_host", "")).strip()
+-        self._imap_port = env_int("EMAIL_IMAP_PORT", 993)
+-        self._smtp_host = (os.getenv("EMAIL_SMTP_HOST", "") or extra.get("smtp_host", "")).strip()
+-        self._smtp_port = env_int("EMAIL_SMTP_PORT", 587)
+-        self._poll_interval = env_int("EMAIL_POLL_INTERVAL", 15)
++        self._address = (extra.get("address", "") or _email_env("EMAIL_ADDRESS")).strip()
++        self._password = _email_env("EMAIL_PASSWORD")
++        self._imap_host = (extra.get("imap_host", "") or _email_env("EMAIL_IMAP_HOST")).strip()
++        self._imap_port = int(extra.get("imap_port") or _email_env_int("EMAIL_IMAP_PORT", 993))
++        self._smtp_host = (extra.get("smtp_host", "") or _email_env("EMAIL_SMTP_HOST")).strip()
++        self._smtp_port = int(extra.get("smtp_port") or _email_env_int("EMAIL_SMTP_PORT", 587))
++        self._poll_interval = int(extra.get("poll_interval") or _email_env_int("EMAIL_POLL_INTERVAL", 15))
+ 
+         # Skip attachments — configured via config.yaml:
+         #   platforms:
+@@ -464,7 +536,7 @@ class EmailAdapter(BasePlatformAdapter):
+         # gate below is skipped.
+         if "require_authenticated_sender" in extra:
+             self._require_authenticated_sender = bool(extra["require_authenticated_sender"])
+-        elif env_bool("EMAIL_TRUST_FROM_HEADER", False):
++        elif _email_env_bool("EMAIL_TRUST_FROM_HEADER", False):
+             self._require_authenticated_sender = False
+         else:
+             self._require_authenticated_sender = True
+@@ -473,7 +545,7 @@ class EmailAdapter(BasePlatformAdapter):
+         # own receiving server (defends against an injected header that sorts
+         # first). Defaults to the From-domain of the agent's own address.
+         self._authserv_id = (
+-            extra.get("authserv_id", "") or os.getenv("EMAIL_AUTHSERV_ID", "")
++            extra.get("authserv_id", "") or _email_env("EMAIL_AUTHSERV_ID")
+         ).strip().lower()
+ 
+         # Track message IDs we've already processed to avoid duplicates
+@@ -756,8 +828,8 @@ class EmailAdapter(BasePlatformAdapter):
+         """
+         truthy = {"true", "1", "yes"}
+         return (
+-            os.getenv("EMAIL_ALLOW_ALL_USERS", "").strip().lower() in truthy
+-            or os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in truthy
++            _email_env("EMAIL_ALLOW_ALL_USERS").lower() in truthy
++            or _email_env("GATEWAY_ALLOW_ALL_USERS").lower() in truthy
+         )
+ 
+     @staticmethod
+@@ -771,8 +843,8 @@ class EmailAdapter(BasePlatformAdapter):
+         and the authentication gate is unnecessary.
+         """
+         return bool(
+-            os.getenv("EMAIL_ALLOWED_USERS", "").strip()
+-            or os.getenv("GATEWAY_ALLOWED_USERS", "").strip()
++            _email_env("EMAIL_ALLOWED_USERS")
++            or _email_env("GATEWAY_ALLOWED_USERS")
+         )
+ 
+     async def _dispatch_message(self, msg_data: Dict[str, Any]) -> None:
+@@ -793,10 +865,10 @@ class EmailAdapter(BasePlatformAdapter):
+         # that the gateway will never authorize.  Without this early guard,
+         # a race between dispatch and authorization can result in the adapter
+         # sending a reply even though the handler returned None.
+-        allowed_raw = os.getenv("EMAIL_ALLOWED_USERS", "").strip()
++        allowed_raw = _email_env("EMAIL_ALLOWED_USERS")
+         if not allowed_raw:
+-            if os.getenv("EMAIL_ALLOW_ALL_USERS", "").strip().lower() not in {"true", "1", "yes"} and (
+-                os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() not in {"true", "1", "yes"}
++            if _email_env("EMAIL_ALLOW_ALL_USERS").lower() not in {"true", "1", "yes"} and (
++                _email_env("GATEWAY_ALLOW_ALL_USERS").lower() not in {"true", "1", "yes"}
+             ):
+                 logger.debug(
+                     "[Email] Dropping sender at dispatch — EMAIL_ALLOWED_USERS is unset "
+@@ -900,8 +972,23 @@ class EmailAdapter(BasePlatformAdapter):
+         """Send an email reply to the given address."""
+         try:
+             loop = asyncio.get_running_loop()
++            meta = metadata or {}
++            subject = meta.get("subject")
++            suppress_threading = bool(meta.get("suppress_threading"))
++            thread_key = (
++                meta.get("thread_anchor_key")
++                or meta.get("email_thread_key")
++                or meta.get("thread_key")
++            )
+             message_id = await loop.run_in_executor(
+-                None, self._send_email, chat_id, content, reply_to
++                None,
++                self._send_email,
++                chat_id,
++                content,
++                reply_to,
++                subject,
++                suppress_threading,
++                thread_key,
+             )
+             return SendResult(success=True, message_id=message_id)
+         except Exception as e:
+@@ -923,21 +1010,35 @@ class EmailAdapter(BasePlatformAdapter):
+         to_addr: str,
+         body: str,
+         reply_to_msg_id: Optional[str] = None,
++        subject_override: Optional[str | Dict[str, Any]] = None,
++        suppress_threading: bool = False,
++        thread_anchor_key: Optional[str] = None,
+     ) -> str:
++
+         """Send an email via SMTP. Runs in executor thread."""
+         msg = MIMEMultipart()
+         msg["From"] = self._address
+         msg["To"] = to_addr
+ 
+-        # Thread context for reply
++        # Thread context for reply, unless the caller supplies a fresh subject.
++        if isinstance(subject_override, dict):
++            suppress_threading = bool(subject_override.get("suppress_threading"))
++            thread_anchor_key = subject_override.get("thread_anchor_key") or thread_anchor_key
++            subject_override = subject_override.get("subject")
++        notification_like = bool(subject_override) or suppress_threading
+         ctx = self._thread_context.get(to_addr, {})
+-        subject = ctx.get("subject", "Hermes Agent")
+-        if not subject.startswith("Re:"):
+-            subject = f"Re: {subject}"
++        if subject_override:
++            subject = str(subject_override)
++        else:
++            subject = ctx.get("subject", "Hermes Agent")
++            if not subject.startswith("Re:"):
++                subject = f"Re: {subject}"
+         msg["Subject"] = subject
+ 
+         # Threading headers
+-        original_msg_id = reply_to_msg_id or ctx.get("message_id")
++        domain = self._address.split("@", 1)[1] if "@" in self._address else ""
++        thread_anchor_msg_id = _stable_thread_message_id(str(thread_anchor_key or ""), domain)
++        original_msg_id = thread_anchor_msg_id or (None if suppress_threading else (reply_to_msg_id or ctx.get("message_id")))
+         if original_msg_id:
+             msg["In-Reply-To"] = original_msg_id
+             msg["References"] = original_msg_id
+@@ -946,7 +1047,15 @@ class EmailAdapter(BasePlatformAdapter):
+         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
+         msg["Message-ID"] = msg_id
+ 
+-        msg.attach(MIMEText(body, "plain", "utf-8"))
++        if notification_like:
++            from tools.email_rendering import append_notification_reference_footer
++
++            body = append_notification_reference_footer(
++                body,
++                subject=subject,
++                ask="investigate this REF",
++            )
++        self._attach_body(msg, body)
+ 
+         smtp = self._connect_smtp()
+         try:
+@@ -961,6 +1070,46 @@ class EmailAdapter(BasePlatformAdapter):
+         logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, subject)
+         return msg_id
+ 
++    @staticmethod
++    def _looks_like_html(body: str) -> bool:
++        """Return True for complete or fragment HTML bodies worth sending as text/html."""
++        return bool(re.search(r"</?(?:html|body|h[1-6]|p|ul|ol|li|br|strong|em|table|tr|td|div|span)\b", body, re.IGNORECASE))
++
++    @staticmethod
++    def _html_to_plain_text(html: str) -> str:
++        """Best-effort plain-text fallback for multipart/alternative HTML email."""
++        text = re.sub(r"<\s*br\s*/?>", "\n", html, flags=re.IGNORECASE)
++        text = re.sub(r"<\s*/\s*(?:p|div|h[1-6]|li|tr)\s*>", "\n", text, flags=re.IGNORECASE)
++        text = re.sub(r"<\s*li\b[^>]*>", "- ", text, flags=re.IGNORECASE)
++        text = re.sub(r"<[^>]+>", "", text)
++        text = unescape(text)
++        text = re.sub(r"[ \t]+\n", "\n", text)
++        text = re.sub(r"\n{3,}", "\n\n", text)
++        return text.strip()
++
++    @staticmethod
++    def _plain_text_to_html(body: str) -> str:
++        """Render Markdown-ish notification text as safe email HTML."""
++        from tools.email_rendering import plain_text_to_html
++
++        return plain_text_to_html(body)
++
++    def _attach_body(self, msg: MIMEMultipart, body: str) -> None:
++        """Attach email body as HTML when content is HTML, with a plain fallback."""
++        if self._looks_like_html(body):
++            from tools.email_rendering import sanitize_email_html
++
++            body = sanitize_email_html(body)
++            alt = MIMEMultipart("alternative")
++            alt.attach(MIMEText(self._html_to_plain_text(body), "plain", "utf-8"))
++            alt.attach(MIMEText(body, "html", "utf-8"))
++            msg.attach(alt)
++        else:
++            alt = MIMEMultipart("alternative")
++            alt.attach(MIMEText(body, "plain", "utf-8"))
++            alt.attach(MIMEText(self._plain_text_to_html(body), "html", "utf-8"))
++            msg.attach(alt)
++
+     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+         """Email has no typing indicator — no-op."""
+ 
+@@ -1060,7 +1209,7 @@ class EmailAdapter(BasePlatformAdapter):
+         msg["Message-ID"] = msg_id
+ 
+         if body:
+-            msg.attach(MIMEText(body, "plain", "utf-8"))
++            self._attach_body(msg, body)
+ 
+         for file_path in file_paths:
+             p = Path(file_path)
+@@ -1195,20 +1344,20 @@ async def _standalone_send(
+     thread_id=None,
+     media_files=None,
+     force_document=False,
++    subject=None,
+ ):
+     """Out-of-process Email delivery via SMTP (one-shot). Implements the
+     standalone_sender_fn contract; replaces the legacy _send_email helper."""
+     import smtplib
+     import ssl as _ssl
+-    from email.mime.text import MIMEText
+-    from email.utils import formatdate
++    from agent.secret_scope import get_secret
+ 
+     extra = getattr(pconfig, "extra", {}) or {}
+-    address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
+-    password = os.getenv("EMAIL_PASSWORD", "")
+-    smtp_host = extra.get("smtp_host") or os.getenv("EMAIL_SMTP_HOST", "")
++    address = extra.get("address") or get_secret("EMAIL_ADDRESS", "") or ""
++    password = get_secret("EMAIL_PASSWORD", "") or ""
++    smtp_host = extra.get("smtp_host") or get_secret("EMAIL_SMTP_HOST", "") or ""
+     try:
+-        smtp_port = int(os.getenv("EMAIL_SMTP_PORT", "587"))
++        smtp_port = int(extra.get("smtp_port") or get_secret("EMAIL_SMTP_PORT", "587") or "587")
+     except (ValueError, TypeError):
+         smtp_port = 587
+ 
+@@ -1216,18 +1365,59 @@ async def _standalone_send(
+         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
+ 
+     try:
+-        msg = MIMEText(message, "plain", "utf-8")
++        msg = MIMEMultipart("alternative")
+         msg["From"] = address
+         msg["To"] = chat_id
+-        msg["Subject"] = "Hermes Agent"
++        thread_anchor_key = None
++        if isinstance(subject, dict):
++            suppress_threading = bool(subject.get("suppress_threading"))
++            thread_anchor_key = subject.get("thread_anchor_key")
++            subject = subject.get("subject")
++        msg["Subject"] = subject or "Hermes Agent"
+         msg["Date"] = formatdate(localtime=True)
++        domain = address.split("@", 1)[1] if "@" in address else ""
++        thread_anchor_msg_id = _stable_thread_message_id(str(thread_anchor_key or ""), domain)
++        if thread_anchor_msg_id:
++            msg["In-Reply-To"] = thread_anchor_msg_id
++            msg["References"] = thread_anchor_msg_id
++        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{domain or 'localhost'}>"
++        msg["Message-ID"] = msg_id
++
++        if subject:
++            from tools.email_rendering import append_notification_reference_footer
++
++            message = append_notification_reference_footer(
++                message or "",
++                subject=str(subject),
++                ask="investigate this REF",
++            )
++
++        if _standalone_looks_like_html(message or ""):
++            from tools.email_rendering import sanitize_email_html
++
++            html_body = sanitize_email_html(message or "")
++            plain_body = _standalone_html_to_plain_text(html_body)
++        else:
++            plain_body = message or ""
++            html_body = _standalone_plain_text_to_html(plain_body)
++        msg.attach(MIMEText(plain_body, "plain", "utf-8"))
++        msg.attach(MIMEText(html_body, "html", "utf-8"))
++
++        if _standalone_looks_like_html(message or ""):
++            plain_body = _standalone_html_to_plain_text(message or "")
++            html_body = message or ""
++        else:
++            plain_body = message or ""
++            html_body = _standalone_plain_text_to_html(plain_body)
++        msg.attach(MIMEText(plain_body, "plain", "utf-8"))
++        msg.attach(MIMEText(html_body, "html", "utf-8"))
+ 
+         server = smtplib.SMTP(smtp_host, smtp_port)
+         server.starttls(context=_ssl.create_default_context())
+         server.login(address, password)
+         server.send_message(msg)
+         server.quit()
+-        return {"success": True, "platform": "email", "chat_id": chat_id}
++        return {"success": True, "platform": "email", "chat_id": chat_id, "message_id": msg_id}
+     except Exception as e:
+         try:
+             from tools.send_message_tool import _error as _e
+@@ -1243,8 +1433,7 @@ def _is_connected(config) -> bool:
+     extra = getattr(config, "extra", {}) or {}
+     if extra.get("address"):
+         return True
+-    import hermes_cli.gateway as gateway_mod
+-    return bool((gateway_mod.get_env_value("EMAIL_ADDRESS") or "").strip())
++    return bool(_email_env("EMAIL_ADDRESS"))
+ 
+ 
+ def _build_adapter(config):
+diff --git a/tests/cron/test_cron_delivery_secret_scope.py b/tests/cron/test_cron_delivery_secret_scope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b7d94050f6f6008b9f2d7e333cd1b37bc6b3bcaa
+--- /dev/null
++++ b/tests/cron/test_cron_delivery_secret_scope.py
+@@ -0,0 +1,45 @@
++"""Cron delivery must remain inside the job's profile secret scope."""
++
++import pytest
++
++from agent.secret_scope import UnscopedSecretError, get_secret, set_multiplex_active
++import cron.scheduler as scheduler
++
++
++def test_run_one_job_keeps_profile_scope_through_delivery(monkeypatch, tmp_path):
++    set_multiplex_active(True)
++    monkeypatch.setattr(
++        "agent.secret_scope.build_profile_secret_scope",
++        lambda _home, **_kwargs: {"EMAIL_PASSWORD": "scoped-password"},
++    )
++    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
++    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
++    monkeypatch.setattr(scheduler, "mark_execution_running", lambda _execution_id: None)
++    monkeypatch.setattr(
++        scheduler,
++        "run_job",
++        lambda job, defer_agent_teardown: (True, "output", "deliver me", None),
++    )
++    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: tmp_path / "output.md")
++    monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id: False)
++    monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id: False)
++    monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
++    monkeypatch.setattr(scheduler, "finish_execution", lambda *_args, **_kwargs: None)
++
++    seen = {}
++
++    def fake_deliver(*_args, **_kwargs):
++        seen["password"] = get_secret("EMAIL_PASSWORD")
++        return None
++
++    monkeypatch.setattr(scheduler, "_deliver_result", fake_deliver)
++
++    try:
++        assert scheduler.run_one_job(
++            {"id": "job-1", "name": "Scoped job", "execution_id": "exec-1"}
++        ) is True
++        assert seen["password"] == "scoped-password"
++        with pytest.raises(UnscopedSecretError):
++            get_secret("EMAIL_PASSWORD")
++    finally:
++        set_multiplex_active(False)
+diff --git a/tests/cron/test_discord_delivery_format.py b/tests/cron/test_discord_delivery_format.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0f3e849fb2558a2b1628f7a221fb4aaa49237821
+--- /dev/null
++++ b/tests/cron/test_discord_delivery_format.py
+@@ -0,0 +1,75 @@
++"""Discord-specific cron delivery formatting regression tests."""
++
++from unittest.mock import AsyncMock, MagicMock, patch
++
++from cron import scheduler
++from gateway.config import Platform
++
++
++def test_discord_cron_delivery_uses_headings_and_converts_tables():
++    job = {"id": "weekly-report", "name": "Weekly report"}
++    content = """Bottom line\n\n| Item | Status |\n| --- | --- |\n| Backup | Healthy |\n| Queue | Empty |"""
++
++    rendered = scheduler._format_cron_delivery_content(
++        job,
++        content,
++        for_discord=True,
++    )
++
++    assert rendered.startswith("# Cron Alert: Weekly report")
++    assert "## Report" in rendered
++    assert "- **Item:** Backup; **Status:** Healthy" in rendered
++    assert "- **Item:** Queue; **Status:** Empty" in rendered
++    assert "| Item | Status |" not in rendered
++
++
++def test_non_discord_cron_delivery_preserves_existing_wrapper_and_table():
++    job = {"id": "weekly-report", "name": "Weekly report"}
++    content = "| Item | Status |\n| --- | --- |\n| Backup | Healthy |"
++
++    rendered = scheduler._format_cron_delivery_content(
++        job,
++        content,
++        for_discord=False,
++    )
++
++    assert rendered.startswith("Cronjob Response: Weekly report")
++    assert "| Item | Status |" in rendered
++
++
++def test_mixed_target_fanout_formats_each_platform_independently():
++    job = {"id": "weekly-report", "name": "Weekly report", "deliver": "all"}
++    content = "| Item | Status |\n| --- | --- |\n| Backup | Healthy |"
++    targets = [
++        {"platform": "discord", "chat_id": "discord-room"},
++        {"platform": "email", "chat_id": "andy@example.com"},
++    ]
++
++    discord_cfg = MagicMock(enabled=True, extra={})
++    email_cfg = MagicMock(enabled=True, extra={})
++    gateway_cfg = MagicMock(
++        platforms={
++            Platform.DISCORD: discord_cfg,
++            Platform("email"): email_cfg,
++        }
++    )
++    send_mock = AsyncMock(return_value={"success": True})
++
++    with (
++        patch.object(scheduler, "_resolve_delivery_targets", return_value=targets),
++        patch.object(scheduler, "_resolve_origin", return_value=None),
++        patch.object(scheduler, "load_config", return_value={"cron": {"wrap_response": True}}),
++        patch("gateway.config.load_gateway_config", return_value=gateway_cfg),
++        patch("tools.send_message_tool._send_to_platform", new=send_mock),
++    ):
++        assert scheduler._deliver_result(job, content) is None
++
++    sent_by_platform = {
++        call.args[0].value: call.args[3]
++        for call in send_mock.await_args_list
++    }
++    assert sent_by_platform["discord"].startswith("# Cron Alert: Weekly report")
++    assert "| Item | Status |" not in sent_by_platform["discord"]
++    assert sent_by_platform["email"].startswith("## Cron Alert: Weekly report")
++    assert "| Item | Status |" in sent_by_platform["email"]
++    assert "HERMES-NOTIFY:cron:" in sent_by_platform["email"]
+diff --git a/tests/cron/test_jobs.py b/tests/cron/test_jobs.py
+index 09fc7d2faab32b53c957887b1dc881126edd8d36..50852073550f576a0e5ccb33ef58104ac3fa9918 100644
+--- a/tests/cron/test_jobs.py
++++ b/tests/cron/test_jobs.py
+@@ -1,5 +1,6 @@
+ """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
+ 
++import json
+ import threading
+ import pytest
+ from datetime import datetime, timedelta, timezone
+@@ -1964,6 +1965,29 @@ class TestLateEnvRepointScopesStore:
+         # the import-time compatibility constants are untouched
+         assert jobs.JOBS_FILE != store.jobs_file
+ 
++    def test_late_env_repoint_scopes_ticker_files(self, tmp_path, monkeypatch):
++        import cron.jobs as jobs
++
++        written = []
++        read = []
++        monkeypatch.setattr(jobs, "_atomic_write_epoch", written.append)
++        monkeypatch.setattr(jobs, "_epoch_file_age", lambda path: read.append(path) or 0.0)
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++
++        jobs.record_ticker_heartbeat(success=True)
++        assert jobs.get_ticker_heartbeat_age() == 0.0
++        assert jobs.get_ticker_success_age() == 0.0
++
++        cron_dir = tmp_path.resolve() / "cron"
++        assert written == [
++            cron_dir / "ticker_heartbeat",
++            cron_dir / "ticker_last_success",
++        ]
++        assert read == [
++            cron_dir / "ticker_heartbeat",
++            cron_dir / "ticker_last_success",
++        ]
++
+     def test_unchanged_home_returns_import_time_constants(self, monkeypatch):
+         import cron.jobs as jobs
+ 
+@@ -2163,3 +2187,25 @@ class TestJobsJsonUtf8Bom:
+         loaded = load_jobs()
+         assert [j["id"] for j in loaded] == ["ctrlbom01"]
+         assert "newline" in loaded[0]["name"]
++
++
++class TestCronDefinitionsExport:
++    def test_email_subject_template_is_preserved_in_definition_export(self):
++        from cron.definitions_export import render_cron_definitions
++
++        rendered = render_cron_definitions([
++            {
++                "id": "brief",
++                "name": "brief",
++                "enabled": True,
++                "schedule": {"kind": "interval", "minutes": 30},
++                "prompt": "Brief",
++                "email_subject_template": "Joi Morning Briefing - {date}",
++                "email_thread_key": "joi-morning-briefing",
++                "next_run_at": "2026-01-01T00:30:00+00:00",
++            }
++        ])
++        job = json.loads(rendered)["jobs"][0]
++        assert job["email_subject_template"] == "Joi Morning Briefing - {date}"
++        assert job["email_thread_key"] == "joi-morning-briefing"
++        assert "next_run_at" not in job
+diff --git a/tests/cron/test_scheduler.py b/tests/cron/test_scheduler.py
+index 7df136484a9ddd438bc4f66a0e215e79c096d9a1..fad46ab5498ae082c84575b24eb8e810202ba676 100644
+--- a/tests/cron/test_scheduler.py
++++ b/tests/cron/test_scheduler.py
+@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
+ 
+ import pytest
+ 
+-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
++from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _looks_like_cron_warning_or_error_alert
+ from tools.env_passthrough import clear_env_passthrough
+ from tools.credential_files import clear_credential_files
+ 
+@@ -77,6 +77,33 @@ class TestPerJobToolsetMcpMerge:
+         assert m_platform.call_args[0][1] == "cron"
+         assert set(result) == set(sentinel)
+ 
++class TestCronRepairGateAlertClassifier:
++    def test_bilingual_mattermost_fetch_failure_is_alert_shaped(self):
++        content = """Mattermost 讀取失敗：3 個可見頻道/DM 的 posts API 都逾時或被重置，這次沒有拿到可編輯候選，未做任何修改。
++
++Mattermost fetch failed: the posts API timed out or was reset on 3 visible channels/DMs, so no editable candidates were returned and no edits were made.
++"""
++
++        assert _looks_like_cron_warning_or_error_alert(content)
++
++    def test_memory_tree_attention_report_is_alert_shaped(self):
++        content = """Attention needed: Memory Tree attention: 1 item(s)
++
++1. [failure] Backup monitor
++   kind: failed_automation
++"""
++
++        assert _looks_like_cron_warning_or_error_alert(content)
++
++    def test_routine_report_with_risk_section_is_not_alert_shaped(self):
++        content = """# Weekly Report
++
++## Risks / caveats
++- One item may need review later.
++"""
++
++        assert not _looks_like_cron_warning_or_error_alert(content)
++
+ 
+ class TestResolveOrigin:
+     def test_full_origin(self):
+@@ -582,20 +609,13 @@ class TestRoutingIntents:
+             _resolve_home_env_var,
+         )
+ 
+-        # Derive the quarantine from the same registry used by delivery
+-        # resolution.  A newly registered platform must not require another
+-        # hard-coded test list update.
+-        env_vars = {
+-            _resolve_home_env_var(platform)
+-            for platform in _iter_home_target_platforms()
+-        }
+-        env_vars.discard("")
+-        env_vars.update(
+-            legacy
+-            for current, legacy in _LEGACY_HOME_TARGET_ENV_VARS.items()
+-            if current in env_vars
++        # Scope discovery so real plugin home-channel configuration cannot leak
++        # into this routing-unit test.
++        monkeypatch.setattr(
++            "cron.scheduler._iter_home_target_platforms",
++            lambda: iter(("telegram", "discord")),
+         )
+-        for var in env_vars:
++        for var in ("TELEGRAM_HOME_CHANNEL", "DISCORD_HOME_CHANNEL"):
+             monkeypatch.delenv(var, raising=False)
+ 
+         assert _resolve_delivery_targets({"deliver": "all", "origin": None}) == []
+@@ -625,6 +645,10 @@ class TestRoutingIntents:
+         """'ALL' / 'All' / 'all' are all recognized."""
+         from cron.scheduler import _resolve_delivery_targets
+ 
++        monkeypatch.setattr(
++            "cron.scheduler._iter_home_target_platforms",
++            lambda: iter(("telegram", "discord")),
++        )
+         monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
+         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "-222")
+ 
+@@ -696,6 +720,114 @@ class TestDeliverResultWrapping:
+         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+         assert "Cronjob Response: abc-123" in sent_content
+ 
++    def test_email_delivery_passes_subject_template(self):
++        """Email cron delivery can pass a date-specific subject to avoid mail threading."""
++        from gateway.config import Platform
++        from datetime import datetime
++        from zoneinfo import ZoneInfo
++
++        pconfig = MagicMock()
++        pconfig.enabled = True
++        mock_cfg = MagicMock()
++        mock_cfg.platforms = {Platform.EMAIL: pconfig}
++
++        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
++             patch("cron.scheduler._hermes_now", return_value=datetime(2026, 6, 2, 7, 15, tzinfo=ZoneInfo("Asia/Taipei"))), \
++             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
++            job = {
++                "id": "brief-job",
++                "name": "joi-morning-briefing-hermes-owner",
++                "deliver": "email:andy@example.com",
++                "email_subject_template": "Joi Morning Briefing — {date}",
++            }
++            _deliver_result(job, "Brief body.")
++
++        send_mock.assert_called_once()
++        assert send_mock.call_args.kwargs["subject"] == "Joi Morning Briefing — 2026-06-02"
++        sent_content = send_mock.call_args[0][3]
++        assert "Brief body." in sent_content
++        assert "REF: `HERMES-NOTIFY:cron:joi-morning-briefing-hermes-owner:brief-job:" in sent_content
++
++    def test_email_delivery_passes_stable_thread_key_when_configured(self):
++        """Recurring email cron jobs can opt into explicit reply headers for Apple Mail threading."""
++        from gateway.config import Platform
++
++        pconfig = MagicMock()
++        pconfig.enabled = True
++        mock_cfg = MagicMock()
++        mock_cfg.platforms = {Platform.EMAIL: pconfig}
++
++        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
++             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
++            job = {
++                "id": "217e74bd5079",
++                "name": "workday-mattermost-brief-email",
++                "deliver": "email:andy@example.com",
++                "email_subject_template": "[Hermes][Mattermost Brief] Workday",
++                "email_thread_key": "mattermost-brief-workday",
++            }
++            _deliver_result(job, "Brief body.")
++
++        send_mock.assert_called_once()
++        assert send_mock.call_args.kwargs["subject"] == {
++            "subject": "[Hermes][Mattermost Brief] Workday",
++            "thread_anchor_key": "mattermost-brief-workday",
++        }
++
++    def test_email_delivery_wraps_html_output_as_html(self):
++        """HTML cron output should keep a rich HTML wrapper instead of plain-text chrome."""
++        from gateway.config import Platform
++
++        pconfig = MagicMock()
++        pconfig.enabled = True
++        mock_cfg = MagicMock()
++        mock_cfg.platforms = {Platform.EMAIL: pconfig}
++
++        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
++             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
++            job = {
++                "id": "privacy-job",
++                "name": "memory-tree-privacy-scan",
++                "deliver": "email:andy@example.com",
++                "email_subject_template": "[Hermes][Memory Tree] Privacy scan",
++            }
++            _deliver_result(job, "<!doctype html><html><body><h2>Privacy</h2><table><tr><td>x</td></tr></table></body></html>")
++
++        sent_content = send_mock.call_args[0][3]
++        assert sent_content.startswith("<!doctype html><html><body")
++        assert "<h2>Cron Alert: memory-tree-privacy-scan</h2>" in sent_content
++        assert "<h2>Privacy</h2>" in sent_content
++        assert "<table" in sent_content
++        assert "<h3>Reference</h3>" in sent_content
++        assert "HERMES-NOTIFY:cron:memory-tree-privacy-scan:privacy-job:" in sent_content
++        assert "Cronjob Response:" not in sent_content
++
++    def test_email_delivery_wraps_plain_output_as_markdown_for_html_rendering(self):
++        """Plain cron output should be sent as Markdown-ish structure for rich email rendering."""
++        from gateway.config import Platform
++
++        pconfig = MagicMock()
++        pconfig.enabled = True
++        mock_cfg = MagicMock()
++        mock_cfg.platforms = {Platform.EMAIL: pconfig}
++
++        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
++             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
++            job = {
++                "id": "29b4bd5a6186",
++                "name": "memory-tree-reconcile-scan",
++                "deliver": "email:andy@example.com",
++                "email_subject_template": "[Hermes][Memory Tree] Reconcile scan",
++            }
++            _deliver_result(job, "Memory Tree reconcile attention\n\nactive_verified: 39\n\n- Item [runtime_attention]\n  source_id: abc\n  next: Inspect it.")
++
++        sent_content = send_mock.call_args[0][3]
++        assert "## Cron Alert: memory-tree-reconcile-scan" in sent_content
++        assert "### Report" in sent_content
++        assert "**Job ID:** `29b4bd5a6186`" in sent_content
++        assert "REF: `HERMES-NOTIFY:cron:memory-tree-reconcile-scan:29b4bd5a6186:" in sent_content
++        assert "Cronjob Response:" not in sent_content
++
+     def test_delivery_skips_wrapping_when_config_disabled(self):
+         """When cron.wrap_response is false, deliver raw content without header/footer."""
+         from gateway.config import Platform
+@@ -722,6 +854,33 @@ class TestDeliverResultWrapping:
+         assert "Cronjob Response" not in sent_content
+         assert "The agent cannot see" not in sent_content
+ 
++    def test_email_delivery_passes_templated_subject(self):
++        """Email cron jobs can start a fresh dated thread via subject template."""
++        from gateway.config import Platform
++
++        pconfig = MagicMock()
++        pconfig.enabled = True
++        mock_cfg = MagicMock()
++        mock_cfg.platforms = {Platform.EMAIL: pconfig}
++
++        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
++             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
++             patch("cron.scheduler._hermes_now") as now_mock:
++            now_mock.return_value.strftime.side_effect = lambda fmt: {
++                "%Y-%m-%d": "2026-06-02",
++                "%Y%m%d": "20260602",
++            }[fmt]
++            job = {
++                "id": "brief-job",
++                "name": "joi-morning-briefing-hermes-owner",
++                "deliver": "email:andy@example.com",
++                "email_subject_template": "Andy Morning Brief — {date}",
++            }
++            _deliver_result(job, "Brief body")
++
++        send_mock.assert_called_once()
++        assert send_mock.call_args.kwargs["subject"] == "Andy Morning Brief — 2026-06-02"
++
+     def test_delivery_extracts_media_tags_before_send(self, tmp_path, monkeypatch):
+         """Cron delivery should pass MEDIA attachments separately to the send helper."""
+         from gateway.config import Platform
+diff --git a/tests/gateway/test_email.py b/tests/gateway/test_email.py
+index 0e6bbc96b237b34873133da220f6f47912ded5c2..7059909aee880261bacba0eb0edaa01747cd68a1 100644
+--- a/tests/gateway/test_email.py
++++ b/tests/gateway/test_email.py
+@@ -856,6 +856,192 @@ class TestThreadContext(unittest.TestCase):
+             self.assertEqual(send_call["Subject"], "Re: Hermes Agent")
+             self.assertIn("Date", send_call)
+ 
++    def test_html_body_sends_multipart_alternative(self):
++        """HTML replies should include a text/html part instead of raw tags as plain text only."""
++        adapter = self._make_adapter()
++
++        with patch("smtplib.SMTP") as mock_smtp:
++            mock_server = MagicMock()
++            mock_smtp.return_value = mock_server
++
++            adapter._send_email("newuser@test.com", "<h2>Brief</h2><p><strong>Done</strong></p>", None)
++
++            msg = mock_server.send_message.call_args[0][0]
++            parts = list(msg.walk())
++            content_types = [part.get_content_type() for part in parts]
++            self.assertIn("multipart/alternative", content_types)
++            self.assertIn("text/plain", content_types)
++            self.assertIn("text/html", content_types)
++            html_part = next(part for part in parts if part.get_content_type() == "text/html")
++            self.assertIn("<h2>Brief</h2>", html_part.get_payload(decode=True).decode("utf-8"))
++
++    def test_explicit_subject_suppresses_reply_threading(self):
++        """Cron-style email sends can start a fresh subject/thread."""
++        adapter = self._make_adapter()
++        adapter._thread_context["user@test.com"] = {
++            "subject": "Old thread",
++            "message_id": "<old@test.com>",
++        }
++
++        with patch("smtplib.SMTP") as mock_smtp:
++            mock_server = MagicMock()
++            mock_smtp.return_value = mock_server
++
++            adapter._send_email(
++                "user@test.com",
++                "Fresh briefing",
++                None,
++                {"subject": "Andy Morning Brief — 2026-06-02", "suppress_threading": True},
++            )
++
++            msg = mock_server.send_message.call_args[0][0]
++            self.assertEqual(msg["Subject"], "Andy Morning Brief — 2026-06-02")
++            self.assertNotIn("In-Reply-To", msg)
++            self.assertNotIn("References", msg)
++            plain_part = next(part for part in msg.walk() if part.get_content_type() == "text/plain")
++            self.assertIn("REF: HERMES-NOTIFY:andy-morning-brief-2026-06-02:", plain_part.get_payload(decode=True).decode("utf-8"))
++
++    def test_explicit_subject_can_use_stable_cron_thread_anchor(self):
++        """Recurring cron emails can thread together without hijacking the last human email."""
++        adapter = self._make_adapter()
++        adapter._thread_context["user@test.com"] = {
++            "subject": "Old thread",
++            "message_id": "<old@test.com>",
++        }
++
++        with patch("smtplib.SMTP") as mock_smtp:
++            mock_server = MagicMock()
++            mock_smtp.return_value = mock_server
++
++            adapter._send_email(
++                "user@test.com",
++                "Mattermost briefing",
++                None,
++                {
++                    "subject": "[Hermes][Mattermost Brief] Workday",
++                    "thread_anchor_key": "mattermost-brief-workday",
++                },
++            )
++
++            msg = mock_server.send_message.call_args[0][0]
++            self.assertEqual(msg["Subject"], "[Hermes][Mattermost Brief] Workday")
++            self.assertEqual(msg["In-Reply-To"], "<hermes-thread-mattermost-brief-workday@test.com>")
++            self.assertEqual(msg["References"], "<hermes-thread-mattermost-brief-workday@test.com>")
++            self.assertNotEqual(msg["References"], "<old@test.com>")
++
++
++class TestStandaloneEmailSend(unittest.TestCase):
++    """Test send_message_tool's standalone email path used by cron without a live gateway adapter."""
++
++    @patch.dict(os.environ, {
++        "EMAIL_ADDRESS": "hermes@test.com",
++        "EMAIL_PASSWORD": "secret",
++        "EMAIL_SMTP_HOST": "smtp.test.com",
++        "EMAIL_SMTP_PORT": "587",
++    }, clear=False)
++    def test_standalone_email_sends_html_as_multipart_alternative(self):
++        """Cron fallback email delivery must not send HTML tags as text/plain only."""
++        import asyncio
++        from gateway.config import PlatformConfig
++        from plugins.platforms.email.adapter import _standalone_send
++
++        with patch("smtplib.SMTP") as mock_smtp:
++            mock_server = MagicMock()
++            mock_smtp.return_value = mock_server
++
++            result = asyncio.run(_standalone_send(
++                PlatformConfig(enabled=True, extra={"address": "hermes@test.com", "smtp_host": "smtp.test.com"}),
++                "user@test.com",
++                "<h2>Bottom line</h2><p><strong>Done</strong></p>",
++                subject="2026-06-20 Morning Briefing",
++            ))
++
++            self.assertEqual(result["success"], True)
++            msg = mock_server.send_message.call_args[0][0]
++            self.assertEqual(msg["Subject"], "2026-06-20 Morning Briefing")
++            content_types = [part.get_content_type() for part in msg.walk()]
++            self.assertIn("multipart/alternative", content_types)
++            self.assertIn("text/plain", content_types)
++            self.assertIn("text/html", content_types)
++            plain_part = next(part for part in msg.walk() if part.get_content_type() == "text/plain")
++            html_part = next(part for part in msg.walk() if part.get_content_type() == "text/html")
++            self.assertIn("Bottom line", plain_part.get_payload(decode=True).decode("utf-8"))
++            self.assertIn("REF: HERMES-NOTIFY:2026-06-20-morning-briefing:", plain_part.get_payload(decode=True).decode("utf-8"))
++            self.assertNotIn("<h2>", plain_part.get_payload(decode=True).decode("utf-8"))
++            self.assertIn("<h2>Bottom line</h2>", html_part.get_payload(decode=True).decode("utf-8"))
++            self.assertIn("<h3>Reference</h3>", html_part.get_payload(decode=True).decode("utf-8"))
++            self.assertIn("Message-ID", msg)
++
++    def test_standalone_email_uses_profile_scoped_smtp_credentials(self):
++        """Multiplex standalone delivery must not consume another profile's env."""
++        import asyncio
++        from types import SimpleNamespace
++
++        from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
++        from plugins.platforms.email.adapter import _standalone_send
++
++        with patch.dict(os.environ, {
++            "EMAIL_ADDRESS": "wrong@example.com",
++            "EMAIL_PASSWORD": "wrong-password",
++            "EMAIL_SMTP_HOST": "wrong.smtp.example.com",
++            "EMAIL_SMTP_PORT": "2525",
++        }, clear=False), patch("smtplib.SMTP") as mock_smtp:
++            mock_server = MagicMock()
++            mock_smtp.return_value = mock_server
++            set_multiplex_active(True)
++            token = set_secret_scope({
++                "EMAIL_ADDRESS": "scoped@example.com",
++                "EMAIL_PASSWORD": "scoped-password",
++                "EMAIL_SMTP_HOST": "scoped.smtp.example.com",
++                "EMAIL_SMTP_PORT": "587",
++            })
++            try:
++                result = asyncio.run(_standalone_send(
++                    SimpleNamespace(extra={}),
++                    "user@example.com",
++                    "Scoped body",
++                ))
++            finally:
++                reset_secret_scope(token)
++                set_multiplex_active(False)
++
++        self.assertTrue(result["success"])
++        mock_smtp.assert_called_once_with("scoped.smtp.example.com", 587)
++        mock_server.login.assert_called_once_with("scoped@example.com", "scoped-password")
++
++    @patch.dict(os.environ, {
++        "EMAIL_ADDRESS": "hermes@test.com",
++        "EMAIL_PASSWORD": "secret",
++        "EMAIL_SMTP_HOST": "smtp.test.com",
++        "EMAIL_SMTP_PORT": "587",
++    }, clear=False)
++    def test_standalone_email_can_use_stable_cron_thread_anchor(self):
++        """Cron fallback email delivery can emit RFC threading headers for Apple Mail."""
++        import asyncio
++        from plugins.platforms.email.adapter import _standalone_send
++        from types import SimpleNamespace
++
++        with patch("smtplib.SMTP") as mock_smtp:
++            mock_server = MagicMock()
++            mock_smtp.return_value = mock_server
++
++            result = asyncio.run(_standalone_send(
++                SimpleNamespace(extra={"address": "hermes@test.com", "smtp_host": "smtp.test.com"}),
++                "user@test.com",
++                "Mattermost body",
++                subject={
++                    "subject": "[Hermes][Mattermost Brief] Workday",
++                    "thread_anchor_key": "mattermost-brief-workday",
++                },
++            ))
++
++            self.assertEqual(result["success"], True)
++            msg = mock_server.send_message.call_args[0][0]
++            self.assertEqual(msg["Subject"], "[Hermes][Mattermost Brief] Workday")
++            self.assertEqual(msg["In-Reply-To"], "<hermes-thread-mattermost-brief-workday@test.com>")
++            self.assertEqual(msg["References"], "<hermes-thread-mattermost-brief-workday@test.com>")
++            self.assertIn("Message-ID", msg)
++
+ 
+ class TestSendMethods(unittest.TestCase):
+     """Test email send methods."""
+@@ -891,6 +1077,31 @@ class TestSendMethods(unittest.TestCase):
+             mock_server.send_message.assert_called_once()
+             mock_server.quit.assert_called_once()
+ 
++    def test_metadata_subject_sends_fresh_subject_without_threading_headers(self):
++        """A caller can send a fresh email subject and suppress reply threading."""
++        import asyncio
++        adapter = self._make_adapter()
++        adapter._thread_context["user@test.com"] = {
++            "subject": "Old chain",
++            "message_id": "<old@test.com>",
++        }
++
++        with patch("smtplib.SMTP") as mock_smtp:
++            mock_server = MagicMock()
++            mock_smtp.return_value = mock_server
++
++            result = asyncio.run(adapter.send(
++                "user@test.com",
++                "Fresh body.",
++                metadata={"subject": "Joi Morning Briefing — 2026-06-02", "suppress_threading": True},
++            ))
++
++            self.assertTrue(result.success)
++            msg = mock_server.send_message.call_args[0][0]
++            self.assertEqual(msg["Subject"], "Joi Morning Briefing — 2026-06-02")
++            self.assertNotIn("In-Reply-To", msg)
++            self.assertNotIn("References", msg)
++
+     def test_send_failure_returns_error(self):
+         """SMTP failure should return SendResult with error."""
+         import asyncio
+@@ -1233,6 +1444,55 @@ class TestSendEmailStandalone(unittest.TestCase):
+             self.assertEqual(send_call["To"], "user@test.com")
+             self.assertEqual(send_call["From"], "hermes@test.com")
+ 
++    @patch.dict(os.environ, {
++        "EMAIL_ADDRESS": "hermes@test.com",
++        "EMAIL_PASSWORD": "secret",
++        "EMAIL_SMTP_HOST": "smtp.test.com",
++        "EMAIL_SMTP_PORT": "587",
++    })
++    def test_send_email_tool_sends_html_as_multipart_alternative(self):
++        """Standalone cron email must not expose HTML tags as plain text."""
++        import asyncio
++        from types import SimpleNamespace
++        from plugins.platforms.email.adapter import _standalone_send
++
++        with patch("smtplib.SMTP") as mock_smtp:
++            mock_server = MagicMock()
++            mock_smtp.return_value = mock_server
++
++            result = asyncio.run(
++                _standalone_send(
++                    SimpleNamespace(
++                        token=None,
++                        api_key=None,
++                        extra={
++                            "address": "hermes@test.com",
++                            "smtp_host": "smtp.test.com",
++                        },
++                    ),
++                    "user@test.com",
++                    "<h2>Bottom line</h2><p><strong>Done</strong></p>",
++                )
++            )
++
++        self.assertTrue(result["success"])
++        msg = mock_server.send_message.call_args.args[0]
++        content_types = [part.get_content_type() for part in msg.walk()]
++        self.assertIn("multipart/alternative", content_types)
++        self.assertIn("text/plain", content_types)
++        self.assertIn("text/html", content_types)
++        plain_part = next(
++            part for part in msg.walk() if part.get_content_type() == "text/plain"
++        )
++        html_part = next(
++            part for part in msg.walk() if part.get_content_type() == "text/html"
++        )
++        plain = plain_part.get_payload(decode=True).decode("utf-8")
++        html = html_part.get_payload(decode=True).decode("utf-8")
++        self.assertIn("Bottom line", plain)
++        self.assertNotIn("<h2>", plain)
++        self.assertIn("<h2>Bottom line</h2>", html)
++
+     @patch.dict(os.environ, {
+         "EMAIL_ADDRESS": "hermes@test.com",
+         "EMAIL_PASSWORD": "secret",
+diff --git a/tests/gateway/test_email_html_rendering.py b/tests/gateway/test_email_html_rendering.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..096c0aa75d92361fcc97f9d3853dc43d09729460
+--- /dev/null
++++ b/tests/gateway/test_email_html_rendering.py
+@@ -0,0 +1,75 @@
++from plugins.platforms.email.adapter import EmailAdapter
++from tools.email_rendering import (
++    append_notification_reference_footer,
++    plain_text_to_html,
++    sanitize_email_html,
++)
++
++
++BODY = (
++    "## Digest\n\n"
++    "> Bottom line: **act now**\n\n"
++    "- **Kelly:** see [details](https://example.com?a=1&b=2)\n"
++    "- [ ] Reply to `Alice`\n\n"
++    "<script>alert(1)</script>"
++)
++
++
++def assert_rich_safe_html(html: str) -> None:
++    assert "<!doctype html>" in html
++    assert "<h2>Digest</h2>" in html
++    assert "<blockquote" in html
++    assert "<strong>act now</strong>" in html
++    assert '<a href="https://example.com?a=1&amp;b=2">details</a>' in html
++    assert "☐ Reply to <code>Alice</code>" in html
++    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
++    assert "<script>alert(1)</script>" not in html
++
++
++def test_email_adapter_plain_text_to_html_renders_rich_markdown_safely():
++    assert_rich_safe_html(EmailAdapter._plain_text_to_html(BODY))
++
++
++def test_shared_email_plain_text_to_html_renders_rich_markdown_safely():
++    assert_rich_safe_html(plain_text_to_html(BODY))
++
++
++def test_raw_html_is_sanitized_before_email_delivery():
++    raw = (
++        '<h2 onclick="steal()" style="background:url(https://evil.example)">Safe</h2>'
++        '<script>alert("owned")</script>'
++        '<a href="javascript:alert(1)">bad link</a>'
++        '<a href="https://example.com/path?a=1&b=2">good link</a>'
++    )
++
++    safe = sanitize_email_html(raw)
++
++    assert "<h2>Safe</h2>" in safe
++    assert "onclick" not in safe
++    assert "style=" not in safe
++    assert "<script" not in safe
++    assert "owned" not in safe
++    assert "javascript:" not in safe
++    assert '<a>bad link</a>' in safe
++    assert '<a href="https://example.com/path?a=1&amp;b=2">good link</a>' in safe
++
++
++def test_notification_reference_footer_is_copyable_in_plain_and_html():
++    plain = append_notification_reference_footer(
++        "## Alert\n\nBody",
++        ref="HERMES-NOTIFY:test-alert:abc123:2026-06-22T08:10+08:00",
++        job_id="abc123",
++        source="/home/pi/.hermes/scripts/test.py",
++    )
++    assert "REF: `HERMES-NOTIFY:test-alert:abc123:2026-06-22T08:10+08:00`" in plain
++    assert "Ask Hermes: `investigate this REF: HERMES-NOTIFY:test-alert:abc123:2026-06-22T08:10+08:00`" in plain
++
++    html = append_notification_reference_footer(
++        "<!doctype html><html><body><h2>Alert</h2></body></html>",
++        ref="HERMES-NOTIFY:test-alert:abc123:2026-06-22T08:10+08:00",
++        job_id="abc123",
++        source="/home/pi/.hermes/scripts/test.py",
++    )
++    assert "<h3>Reference</h3>" in html
++    assert "<code>HERMES-NOTIFY:test-alert:abc123:2026-06-22T08:10+08:00</code>" in html
++    assert html.endswith("</body></html>")
+diff --git a/tests/gateway/test_email_profile_scope.py b/tests/gateway/test_email_profile_scope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..44fd87a1bc46ed818537ec0d9ef403f35fe9141d
+--- /dev/null
++++ b/tests/gateway/test_email_profile_scope.py
+@@ -0,0 +1,71 @@
++"""Profile-scope regression tests for live email configuration."""
++
++from unittest.mock import patch
++
++from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
++from gateway.config import PlatformConfig
++from plugins.platforms.email.adapter import EmailAdapter, check_email_requirements
++
++
++def _install_scope(values):
++    set_multiplex_active(True)
++    return set_secret_scope(values)
++
++
++def _reset_scope(token):
++    reset_secret_scope(token)
++    set_multiplex_active(False)
++
++
++def test_requirements_use_profile_scope_not_process_env():
++    with patch.dict(
++        "os.environ",
++        {
++            "EMAIL_ADDRESS": "wrong@example.com",
++            "EMAIL_PASSWORD": "wrong-password",
++            "EMAIL_IMAP_HOST": "wrong.imap.example.com",
++            "EMAIL_SMTP_HOST": "wrong.smtp.example.com",
++        },
++        clear=False,
++    ):
++        token = _install_scope({})
++        try:
++            assert check_email_requirements() is False
++        finally:
++            _reset_scope(token)
++
++
++def test_live_adapter_uses_profile_scoped_connection_settings():
++    with patch.dict(
++        "os.environ",
++        {
++            "EMAIL_ADDRESS": "wrong@example.com",
++            "EMAIL_PASSWORD": "wrong-password",
++            "EMAIL_IMAP_HOST": "wrong.imap.example.com",
++            "EMAIL_IMAP_PORT": "1993",
++            "EMAIL_SMTP_HOST": "wrong.smtp.example.com",
++            "EMAIL_SMTP_PORT": "1587",
++        },
++        clear=False,
++    ):
++        token = _install_scope({
++            "EMAIL_ADDRESS": "scoped@example.com",
++            "EMAIL_PASSWORD": "scoped-password",
++            "EMAIL_IMAP_HOST": "scoped.imap.example.com",
++            "EMAIL_IMAP_PORT": "993",
++            "EMAIL_SMTP_HOST": "scoped.smtp.example.com",
++            "EMAIL_SMTP_PORT": "587",
++            "EMAIL_ALLOWED_USERS": "allowed@example.com",
++        })
++        try:
++            adapter = EmailAdapter(PlatformConfig(enabled=True, extra={}))
++            assert adapter._address == "scoped@example.com"
++            assert adapter._password == "scoped-password"
++            assert adapter._imap_host == "scoped.imap.example.com"
++            assert adapter._imap_port == 993
++            assert adapter._smtp_host == "scoped.smtp.example.com"
++            assert adapter._smtp_port == 587
++            assert adapter._allowlist_in_effect() is True
++            assert adapter._allow_all_senders() is False
++        finally:
++            _reset_scope(token)
+diff --git a/tests/hermes_cli/test_cron.py b/tests/hermes_cli/test_cron.py
+index 1ce36a1740d264bc2ab2c2aec4a6f69147cbdd8c..e5ead368d50d3465d19ad3e9d3a16402fbd544d6 100644
+--- a/tests/hermes_cli/test_cron.py
++++ b/tests/hermes_cli/test_cron.py
+@@ -39,6 +39,19 @@ class TestCronCommandLifecycle:
+         assert "Resumed job" in out
+         assert "Triggered job" in out
+ 
++    def test_export_definitions_follows_late_hermes_home(
++        self, tmp_path, monkeypatch
++    ):
++        captured = []
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        monkeypatch.setattr(
++            "cron.jobs.export_definitions_file",
++            lambda *, output_path: captured.append(output_path) or True,
++        )
++
++        assert cron_cli.cron_export_definitions(SimpleNamespace(output=None)) == 0
++        assert captured == [tmp_path.resolve() / "cron" / "jobs.definitions.json"]
++
+     def test_edit_can_replace_and_clear_skills(self, tmp_cron_dir, capsys):
+         job = create_job(
+             prompt="Combine skill outputs",
+diff --git a/tests/hermes_cli/test_send_cmd.py b/tests/hermes_cli/test_send_cmd.py
+index f668807672740d34be4d3749fe963fb5cd590802..9e9ac2a11a26b3a0e71736c7d61be1c54d0f1df1 100644
+--- a/tests/hermes_cli/test_send_cmd.py
++++ b/tests/hermes_cli/test_send_cmd.py
+@@ -116,6 +116,25 @@ def test_subject_prepends_header(fake_tool):
+     assert fake_tool.calls[0]["message"] == "[CI]\n\nbody text"
+ 
+ 
++def test_email_subject_uses_transport_subject_not_body_header(fake_tool):
++    args = _parse([
++        "--to",
++        "email:andy@example.com",
++        "--subject",
++        "[Hermes][Test] Subject",
++        "body text",
++    ])
++    with pytest.raises(SystemExit) as exc:
++        send_cmd.cmd_send(args)
++    assert exc.value.code == 0
++    assert fake_tool.calls[0] == {
++        "action": "send",
++        "target": "email:andy@example.com",
++        "message": "body text",
++        "subject": "[Hermes][Test] Subject",
++    }
++
++
+ def test_json_mode_emits_payload(fake_tool, capsys):
+     args = _parse(["--to", "telegram", "--json", "hi"])
+     with pytest.raises(SystemExit) as exc:
+diff --git a/tests/tools/test_send_message_tool.py b/tests/tools/test_send_message_tool.py
+index a05bed71b257e4df7b57491e89b6e979bf183967..5886bbbfb68309169c5e3b6d1627e35d8e1e0e2f 100644
+--- a/tests/tools/test_send_message_tool.py
++++ b/tests/tools/test_send_message_tool.py
+@@ -320,6 +320,42 @@ class TestSendMessageTool:
+             force_document=False,
+         )
+ 
++    def test_email_subject_reaches_transport(self):
++        email_platform = Platform("email")
++        email_cfg = SimpleNamespace(enabled=True, token=None, extra={})
++        config = SimpleNamespace(
++            platforms={email_platform: email_cfg},
++            get_home_channel=lambda _platform: None,
++        )
++
++        with patch("gateway.config.load_gateway_config", return_value=config), \
++             patch("tools.interrupt.is_interrupted", return_value=False), \
++             patch("model_tools._run_async", side_effect=_run_async_immediately), \
++             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
++             patch("gateway.mirror.mirror_to_session", return_value=True):
++            result = json.loads(
++                send_message_tool(
++                    {
++                        "action": "send",
++                        "target": "email:andy@example.com",
++                        "message": "done",
++                        "subject": "[Hermes][Test] Subject",
++                    }
++                )
++            )
++
++        assert result["success"] is True
++        send_mock.assert_awaited_once_with(
++            email_platform,
++            email_cfg,
++            "andy@example.com",
++            "done",
++            thread_id=None,
++            media_files=[],
++            force_document=False,
++            subject="[Hermes][Test] Subject",
++        )
++
+     def test_cron_duplicate_target_is_skipped_and_explained(self):
+         home = SimpleNamespace(chat_id="-1001")
+         config, _telegram_cfg = _make_config()
+@@ -757,6 +793,31 @@ class TestSendToPlatformChunking:
+         for call in send.await_args_list:
+             assert len(call.args[2]) <= 2020  # each chunk fits the limit
+ 
++    def test_long_forum_message_reuses_created_thread_for_followup_chunks(self):
++        """Standalone fallback must create one forum topic, not one per chunk."""
++        send = AsyncMock(side_effect=[
++            {"success": True, "message_id": "starter", "thread_id": "thread-123"},
++            {"success": True, "message_id": "followup-1"},
++            {"success": True, "message_id": "followup-2"},
++        ])
++        long_msg = "word " * 1000
++
++        with _patch_discord_sender(send):
++            result = asyncio.run(
++                _send_to_platform(
++                    Platform.DISCORD,
++                    SimpleNamespace(enabled=True, token="***", extra={}),
++                    "forum-parent",
++                    long_msg,
++                )
++            )
++
++        assert result["success"] is True
++        assert send.await_count == 3
++        assert send.await_args_list[0].kwargs["thread_id"] is None
++        assert send.await_args_list[1].kwargs["thread_id"] == "thread-123"
++        assert send.await_args_list[2].kwargs["thread_id"] == "thread-123"
++
+     def test_slack_messages_are_formatted_before_send(self, monkeypatch):
+         _ensure_slack_mock(monkeypatch)
+ 
+diff --git a/tools/email_rendering.py b/tools/email_rendering.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..965ff48874cabe29bbe75b8cdadc408b77652545
+--- /dev/null
++++ b/tools/email_rendering.py
+@@ -0,0 +1,426 @@
++"""Shared rich HTML rendering helpers for outbound Hermes email.
++
++The renderer accepts the Markdown-ish text Hermes automations normally emit and
++turns it into email-safe HTML. It intentionally supports a compact subset rather
++than arbitrary Markdown: headings, bullets/checklists, key/value lines, block
++quotes, fenced code, inline emphasis/code/links, and simple tables.
++"""
++from __future__ import annotations
++
++import re
++from datetime import datetime
++from html import escape, unescape
++from html.parser import HTMLParser
++from urllib.parse import urlsplit
++
++_HTML_TAG_RE = re.compile(
++    r"</?(?:html|body|h[1-6]|p|ul|ol|li|br|strong|em|table|thead|tbody|tr|th|td|div|span|blockquote|pre|code)\b",
++    re.IGNORECASE,
++)
++_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
++_BARE_URL_RE = re.compile(r"(?<![\"'=])(https?://[^\s<>)]+)")
++_KEY_VALUE_RE = re.compile(r"^([A-Za-z][\w /().-]{0,60}?):\s+(.+)$")
++_ORDERED_RE = re.compile(r"^\d+[.)]\s+(.+)$")
++_BULLET_RE = re.compile(r"^[-*]\s+(?:\[([ xX])\]\s+)?(.+)$")
++_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
++_REF_RE = re.compile(r"\bREF:\s*HERMES-NOTIFY:", re.IGNORECASE)
++
++
++def notification_ref_slug(value: str, *, fallback: str = "notification") -> str:
++    """Return a compact copy/paste-safe slug for notification reference codes."""
++    slug = re.sub(r"[^A-Za-z0-9]+", "-", value or "").strip("-").lower()
++    return slug[:64] or fallback
++
++
++def make_notification_ref(*parts: str, now: datetime | None = None) -> str:
++    """Build a stable-enough reference token for outbound notification email."""
++    timestamp = (now or datetime.now().astimezone()).isoformat(timespec="minutes")
++    safe_parts = [notification_ref_slug(part) for part in parts if str(part or "").strip()]
++    if not safe_parts:
++        safe_parts = ["email"]
++    return "HERMES-NOTIFY:" + ":".join(safe_parts + [timestamp])
++
++
++def append_notification_reference_footer(
++    body: str,
++    *,
++    ref: str | None = None,
++    subject: str | None = None,
++    source: str | None = None,
++    state: str | None = None,
++    logs: str | None = None,
++    job_id: str | None = None,
++    script: str | None = None,
++    ask: str = "investigate this REF",
++) -> str:
++    """Append a copy/paste resume reference to notification email bodies.
++
++    The footer is added to both plain/Markdown-ish bodies and existing HTML
++    bodies. If a body already has a HERMES-NOTIFY reference, it is left alone
++    to avoid duplicated footers when cron wraps and then sends through the
++    generic email transport.
++    """
++    content = body or ""
++    if _REF_RE.search(content):
++        return content
++    ref = ref or make_notification_ref(subject or "email")
++    rows = [("REF", ref)]
++    if job_id:
++        rows.append(("Job ID", job_id))
++    if script:
++        rows.append(("Script", script))
++    if source:
++        rows.append(("Source", source))
++    if state:
++        rows.append(("State", state))
++    if logs:
++        rows.append(("Logs", logs))
++    rows.append(("Ask Hermes", f"{ask}: {ref}"))
++
++    if message_looks_like_html(content):
++        html_rows = "".join(
++            f"<tr><th>{escape(label)}</th><td><code>{escape(value)}</code></td></tr>"
++            for label, value in rows
++        )
++        footer = (
++            "<hr>"
++            "<h3>Reference</h3>"
++            '<table class="notification-reference"><tbody>'
++            f"{html_rows}"
++            "</tbody></table>"
++        )
++        if re.search(r"</body>\s*</html>\s*$", content, flags=re.IGNORECASE):
++            return re.sub(r"</body>\s*</html>\s*$", footer + "</body></html>", content, flags=re.IGNORECASE)
++        return content + footer
++
++    lines = ["", "### Reference"]
++    lines.extend(f"{label}: `{value}`" for label, value in rows)
++    return content.rstrip() + "\n\n" + "\n".join(lines)
++
++
++def message_looks_like_html(body: str) -> bool:
++    """Return True when an outgoing body contains renderable HTML."""
++    return bool(_HTML_TAG_RE.search(body or ""))
++
++
++_SAFE_EMAIL_TAGS = frozenset({
++    "html", "body", "h1", "h2", "h3", "h4", "h5", "h6", "p", "ul",
++    "ol", "li", "br", "strong", "em", "table", "thead", "tbody", "tr",
++    "th", "td", "div", "span", "blockquote", "pre", "code", "a", "hr",
++})
++_VOID_EMAIL_TAGS = frozenset({"br", "hr"})
++_DROP_EMAIL_TAGS = frozenset({
++    "script", "style", "iframe", "object", "embed", "form", "input",
++    "button", "meta", "link", "svg", "math",
++})
++
++
++class _EmailHTMLSanitizer(HTMLParser):
++    """Small allowlist sanitizer for model- or automation-supplied HTML."""
++
++    def __init__(self) -> None:
++        super().__init__(convert_charrefs=True)
++        self.output: list[str] = []
++        self.blocked_depth = 0
++
++    def handle_starttag(self, tag: str, attrs) -> None:
++        tag = tag.lower()
++        if self.blocked_depth:
++            if tag in _DROP_EMAIL_TAGS:
++                self.blocked_depth += 1
++            return
++        if tag in _DROP_EMAIL_TAGS:
++            self.blocked_depth = 1
++            return
++        if tag not in _SAFE_EMAIL_TAGS:
++            return
++
++        safe_attrs: list[tuple[str, str]] = []
++        for raw_name, raw_value in attrs:
++            name = (raw_name or "").lower()
++            value = raw_value or ""
++            if name == "class":
++                safe_attrs.append((name, value))
++            elif name in {"colspan", "rowspan"} and value.isdigit():
++                safe_attrs.append((name, value))
++            elif tag == "a" and name == "href":
++                scheme = urlsplit(value.strip()).scheme.lower()
++                if scheme in {"http", "https", "mailto"}:
++                    safe_attrs.append((name, value.strip()))
++            elif name == "title":
++                safe_attrs.append((name, value))
++
++        rendered_attrs = "".join(
++            f' {name}="{escape(value, quote=True)}"'
++            for name, value in safe_attrs
++        )
++        self.output.append(f"<{tag}{rendered_attrs}>")
++
++    def handle_startendtag(self, tag: str, attrs) -> None:
++        self.handle_starttag(tag, attrs)
++        if not self.blocked_depth and tag.lower() in _SAFE_EMAIL_TAGS - _VOID_EMAIL_TAGS:
++            self.output.append(f"</{tag.lower()}>")
++
++    def handle_endtag(self, tag: str) -> None:
++        tag = tag.lower()
++        if self.blocked_depth:
++            if tag in _DROP_EMAIL_TAGS:
++                self.blocked_depth -= 1
++            return
++        if tag in _SAFE_EMAIL_TAGS and tag not in _VOID_EMAIL_TAGS:
++            self.output.append(f"</{tag}>")
++
++    def handle_data(self, data: str) -> None:
++        if not self.blocked_depth:
++            self.output.append(escape(data))
++
++
++def sanitize_email_html(html: str) -> str:
++    """Strip executable/remote-loading HTML while preserving safe structure."""
++    sanitizer = _EmailHTMLSanitizer()
++    sanitizer.feed(html or "")
++    sanitizer.close()
++    return "".join(sanitizer.output)
++
++
++def html_to_plain_text(html: str) -> str:
++    """Best-effort plain-text alternative for multipart/alternative email."""
++    text = re.sub(r"<\s*br\s*/?>", "\n", html or "", flags=re.IGNORECASE)
++    text = re.sub(r"<\s*/\s*(?:p|div|h[1-6]|li|tr|blockquote|pre)\s*>", "\n", text, flags=re.IGNORECASE)
++    text = re.sub(r"<\s*li\b[^>]*>", "- ", text, flags=re.IGNORECASE)
++    text = re.sub(r"<\s*t[hd]\b[^>]*>", " ", text, flags=re.IGNORECASE)
++    text = re.sub(r"<[^>]+>", "", text)
++    text = unescape(text)
++    text = re.sub(r"[ \t]+\n", "\n", text)
++    text = re.sub(r"\n{3,}", "\n\n", text)
++    return text.strip()
++
++
++def render_inline_markdown(text: str) -> str:
++    """Render a small escaped inline Markdown subset for email HTML."""
++    rendered = escape(text or "")
++    rendered = re.sub(
++        r"`([^`]+)`",
++        lambda m: f"<code>{m.group(1)}</code>",
++        rendered,
++    )
++    rendered = _LINK_RE.sub(
++        lambda m: f'<a href="{escape(unescape(m.group(2)), quote=True)}">{m.group(1)}</a>',
++        rendered,
++    )
++    rendered = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", rendered)
++    rendered = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<em>\1</em>", rendered)
++    rendered = _BARE_URL_RE.sub(
++        lambda m: f'<a href="{escape(unescape(m.group(1)), quote=True)}">{m.group(1)}</a>',
++        rendered,
++    )
++    return rendered
++
++
++def _looks_like_title(line: str, *, is_first_content: bool, next_line_blank: bool) -> bool:
++    stripped = line.strip()
++    if not is_first_content or not next_line_blank:
++        return False
++    if len(stripped) > 90:
++        return False
++    if _HEADING_RE.match(stripped) or _BULLET_RE.match(stripped) or _ORDERED_RE.match(stripped):
++        return False
++    if _KEY_VALUE_RE.match(stripped):
++        return False
++    if stripped.startswith((">", "```", "{")):
++        return False
++    return bool(re.search(r"[A-Za-z]", stripped))
++
++
++def plain_text_to_html(body: str) -> str:
++    """Render Hermes Markdown-ish/plain notification text as rich email HTML."""
++    source = (body or "").strip()
++    if not source:
++        return "<html><body><p></p></body></html>"
++
++    html_blocks: list[str] = []
++    list_items: list[str] = []
++    ordered_items: list[str] = []
++    quote_lines: list[str] = []
++    para_lines: list[str] = []
++    code_lines: list[str] = []
++    kv_rows: list[tuple[str, str]] = []
++    in_code_fence = False
++    current_list = None  # "ul" or "ol"
++    saw_content = False
++
++    def flush_para() -> None:
++        nonlocal para_lines
++        if para_lines:
++            html_blocks.append("<p>" + "<br>\n".join(para_lines) + "</p>")
++            para_lines = []
++
++    def flush_quote() -> None:
++        nonlocal quote_lines
++        if quote_lines:
++            html_blocks.append(
++                '<blockquote style="border-left:4px solid #d0d7de; margin:16px 0; '
++                'padding:8px 12px; color:#57606a; background:#f6f8fa;">'
++                + "<br>\n".join(quote_lines)
++                + "</blockquote>"
++            )
++            quote_lines = []
++
++    def flush_kv() -> None:
++        nonlocal kv_rows
++        if kv_rows:
++            rows = "".join(
++                f"<tr><th>{render_inline_markdown(k)}</th><td>{render_inline_markdown(v)}</td></tr>"
++                for k, v in kv_rows
++            )
++            html_blocks.append(f'<table class="kv"><tbody>{rows}</tbody></table>')
++            kv_rows = []
++
++    def flush_list() -> None:
++        nonlocal list_items, ordered_items, current_list
++        if list_items:
++            html_blocks.append("<ul>" + "".join(list_items) + "</ul>")
++            list_items = []
++        if ordered_items:
++            html_blocks.append("<ol>" + "".join(ordered_items) + "</ol>")
++            ordered_items = []
++        current_list = None
++
++    def flush_code() -> None:
++        nonlocal code_lines
++        if code_lines:
++            html_blocks.append(
++                '<pre style="background:#f6f8fa; padding:12px; border-radius:6px; '
++                'overflow:auto; font-family:SFMono-Regular,Consolas,monospace; '
++                'font-size:13px; line-height:1.4;"><code>'
++                + escape("\n".join(code_lines))
++                + "</code></pre>"
++            )
++            code_lines = []
++
++    def flush_all() -> None:
++        flush_para()
++        flush_quote()
++        flush_kv()
++        flush_list()
++        flush_code()
++
++    lines = source.splitlines()
++    total = len(lines)
++    i = 0
++    while i < total:
++        raw_line = lines[i].rstrip()
++        stripped = raw_line.strip()
++        next_line_blank = i + 1 < total and not lines[i + 1].strip()
++
++        if stripped.startswith("```"):
++            if in_code_fence:
++                flush_code()
++                in_code_fence = False
++            else:
++                flush_all()
++                in_code_fence = True
++            saw_content = True
++            i += 1
++            continue
++        if in_code_fence:
++            code_lines.append(raw_line)
++            i += 1
++            continue
++        if not stripped:
++            flush_all()
++            i += 1
++            continue
++
++        if _looks_like_title(stripped, is_first_content=not saw_content, next_line_blank=next_line_blank):
++            flush_all()
++            html_blocks.append(f"<h2>{render_inline_markdown(stripped)}</h2>")
++            saw_content = True
++            i += 1
++            continue
++
++        heading = _HEADING_RE.match(stripped)
++        if heading:
++            flush_all()
++            level = min(len(heading.group(1)), 3)
++            html_blocks.append(f"<h{level}>{render_inline_markdown(heading.group(2))}</h{level}>")
++            saw_content = True
++            i += 1
++            continue
++
++        quote = re.match(r"^>\s?(.*)$", stripped)
++        if quote:
++            flush_para(); flush_kv(); flush_list()
++            quote_lines.append(render_inline_markdown(quote.group(1)))
++            saw_content = True
++            i += 1
++            continue
++
++        bullet = _BULLET_RE.match(stripped)
++        if bullet:
++            flush_para(); flush_quote(); flush_kv()
++            if current_list == "ol":
++                flush_list()
++            current_list = "ul"
++            checked, item = bullet.groups()
++            marker = "☑ " if checked and checked.lower() == "x" else "☐ " if checked else ""
++            list_items.append(f"<li>{marker}{render_inline_markdown(item)}</li>")
++            saw_content = True
++            i += 1
++            continue
++
++        ordered = _ORDERED_RE.match(stripped)
++        if ordered:
++            flush_para(); flush_quote(); flush_kv()
++            if current_list == "ul":
++                flush_list()
++            current_list = "ol"
++            ordered_items.append(f"<li>{render_inline_markdown(ordered.group(1))}</li>")
++            saw_content = True
++            i += 1
++            continue
++
++        # Indented continuation under the previous list item: keep source_id /
++        # evidence / next lines visually attached to the bullet instead of
++        # spilling into sad little paragraphs.
++        if raw_line.startswith(("  ", "\t")) and current_list == "ul" and list_items:
++            continuation = render_inline_markdown(stripped)
++            list_items[-1] = list_items[-1].removesuffix("</li>") + f"<br><span class=\"subline\">{continuation}</span></li>"
++            saw_content = True
++            i += 1
++            continue
++        if raw_line.startswith(("  ", "\t")) and current_list == "ol" and ordered_items:
++            continuation = render_inline_markdown(stripped)
++            ordered_items[-1] = ordered_items[-1].removesuffix("</li>") + f"<br><span class=\"subline\">{continuation}</span></li>"
++            saw_content = True
++            i += 1
++            continue
++
++        kv = _KEY_VALUE_RE.match(stripped)
++        if kv:
++            flush_para(); flush_quote(); flush_list()
++            kv_rows.append((kv.group(1), kv.group(2)))
++            saw_content = True
++            i += 1
++            continue
++
++        flush_quote(); flush_kv(); flush_list()
++        para_lines.append(render_inline_markdown(stripped))
++        saw_content = True
++        i += 1
++
++    flush_all()
++    body_html = "\n".join(html_blocks)
++    return (
++        '<!doctype html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'
++        "'Segoe UI',Roboto,Helvetica,Arial,sans-serif; line-height:1.45; color:#24292f; "
++        'font-size:15px; max-width:860px; margin:0 auto; padding:16px;">'
++        '<style>a{color:#0969da} code{background:#f6f8fa; padding:2px 4px; '
++        'border-radius:4px; font-family:SFMono-Regular,Consolas,monospace} '
++        'h1,h2,h3{line-height:1.25; margin:20px 0 8px} '
++        'ul,ol{padding-left:24px} li{margin:6px 0} '
++        '.subline{color:#57606a} table{border-collapse:collapse; margin:12px 0; width:100%;} '
++        'th,td{border:1px solid #d0d7de; padding:6px 8px; vertical-align:top;} '
++        'th{background:#f6f8fa; text-align:left; white-space:nowrap; width:1%;}</style>'
++        f"{body_html}</body></html>"
++    )
+diff --git a/tools/send_message_tool.py b/tools/send_message_tool.py
+index f6b7dc37d97200d4abcf2031e28d6a5a5bf2686e..43007f60ffff9ee122281178527feb8f55f95dab 100644
+--- a/tools/send_message_tool.py
++++ b/tools/send_message_tool.py
+@@ -226,6 +226,10 @@ SEND_MESSAGE_SCHEMA = {
+                 "type": "string",
+                 "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/report.pdf') in the message — the platform will deliver it as a native media attachment."
+             },
++            "subject": {
++                "type": "string",
++                "description": "Optional email subject. Honored for target='email:...' and ignored by chat-style platforms."
++            },
+             "emoji": {
+                 "type": "string",
+                 "description": "For action='react': the emoji to react with (e.g. '❤️'). On iMessage, ❤️👍👎😂‼️❓ render as native tapbacks; other emoji use custom-emoji reactions."
+@@ -487,17 +491,24 @@ def _handle_send(args):
+                 return json.dumps(_resolve_err)
+             chat_id = _resolved
+ 
++    subject = args.get("subject") if platform_name == "email" else None
++
+     try:
+         from model_tools import _run_async
++        send_kwargs = {
++            "thread_id": thread_id,
++            "media_files": media_files,
++            "force_document": force_document_attachments,
++        }
++        if subject:
++            send_kwargs["subject"] = subject
+         result = _run_async(
+             _send_to_platform(
+                 platform,
+                 pconfig,
+                 chat_id,
+                 cleaned_message,
+-                thread_id=thread_id,
+-                media_files=media_files,
+-                force_document=force_document_attachments,
++                **send_kwargs,
+             )
+         )
+         if used_home_channel and isinstance(result, dict) and result.get("success"):
+@@ -782,7 +793,7 @@ async def _send_via_adapter(
+     }
+ 
+ 
+-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
++async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, subject=None):
+     """Route a message to the appropriate platform sender.
+ 
+     Long messages are automatically chunked to fit within platform limits
+@@ -897,17 +908,24 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
+                 return result
+             return result
+         last_result = None
++        # A standalone Discord send to a forum parent creates a thread and
++        # returns its ID.  Reuse that thread for every remaining chunk.
++        # Otherwise each chunk creates a separate forum topic, quickly hitting
++        # Discord's thread-creation rate limit and leaving a partial delivery.
++        delivery_thread_id = thread_id
+         for i, chunk in enumerate(chunks):
+             is_last = (i == len(chunks) - 1)
+             result = await entry.standalone_sender_fn(
+                 pconfig,
+                 chat_id,
+                 chunk,
+-                thread_id=thread_id,
++                thread_id=delivery_thread_id,
+                 media_files=media_files if is_last else [],
+             )
+             if isinstance(result, dict) and result.get("error"):
+                 return result
++            if not delivery_thread_id and isinstance(result, dict):
++                delivery_thread_id = result.get("thread_id") or None
+             last_result = result
+         return last_result
+ 
+@@ -1127,7 +1145,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
+         elif platform == Platform.SIGNAL:
+             result = await _send_signal(pconfig.extra, chat_id, chunk)
+         elif platform == Platform.EMAIL:
+-            result = await _registry_standalone_send("email", pconfig, chat_id, chunk, thread_id)
++            result = await _registry_standalone_send("email", pconfig, chat_id, chunk, thread_id, subject=subject)
+         elif platform == Platform.SMS:
+             result = await _registry_standalone_send("sms", pconfig, chat_id, chunk, thread_id)
+         elif platform == Platform.DINGTALK:
+@@ -1499,7 +1517,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
+ # (plugins/platforms/slack/adapter.py), wired via standalone_sender_fn. #41112.
+ 
+ 
+-async def _registry_standalone_send(platform_name, pconfig, chat_id, message, thread_id=None):
++async def _registry_standalone_send(platform_name, pconfig, chat_id, message, thread_id=None, **kwargs):
+     """Dispatch a one-shot send through a migrated platform plugin's
+     standalone_sender_fn (registry hook).  Used for platforms whose adapter
+     moved out of gateway/platforms/ into plugins/platforms/<name>/ (#41112):
+@@ -1512,7 +1530,7 @@ async def _registry_standalone_send(platform_name, pconfig, chat_id, message, th
+     entry = platform_registry.get(platform_name)
+     if entry is None or entry.standalone_sender_fn is None:
+         return {"error": f"{platform_name} plugin not registered or missing standalone_sender_fn"}
+-    return await entry.standalone_sender_fn(pconfig, chat_id, message, thread_id=thread_id)
++    return await entry.standalone_sender_fn(pconfig, chat_id, message, thread_id=thread_id, **kwargs)
+ 
+ 
+ # _send_whatsapp moved to plugins/platforms/whatsapp/adapter.py::_standalone_send,

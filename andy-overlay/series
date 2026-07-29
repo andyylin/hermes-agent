@@ -1,0 +1,8 @@
+patches/010-metadata.patch
+patches/020-secrets.patch
+patches/030-state.patch
+patches/040-messaging.patch
+patches/050-cron-email.patch
+patches/060-memory-tree.patch
+patches/070-desktop.patch
+patches/080-runtime-compat.patch

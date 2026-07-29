@@ -1,0 +1,3055 @@
+diff --git a/agent/memory_tree_attention.py b/agent/memory_tree_attention.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a362c141c2619f0ce86763b2e5612a8630b461ca
+--- /dev/null
++++ b/agent/memory_tree_attention.py
+@@ -0,0 +1,432 @@
++"""Deterministic Memory Tree attention scanning.
++
++This is the Hermes-native "subconscious" slice: cheap local scans surface stale
++or failed assistant-owned work without waking an LLM. Empty output means no
++attention needed.
++"""
++
++from __future__ import annotations
++
++import json
++import re
++from dataclasses import dataclass
++from datetime import datetime, timezone
++from pathlib import Path
++from typing import Any, Iterable
++
++from hermes_constants import get_hermes_home
++
++LEDGER_PATH = Path("data") / "active-work" / "ledger.json"
++ATTENTION_STATUSES = {"active", "waiting", "blocked", "in_progress", "monitoring"}
++DONE_STATUSES = {
++    "completed",
++    "completed_removed",
++    "inactive",
++    "inactive_tests",
++    "archived_inactive",
++    "stopped",
++    "cancelled",
++}
++FAILED_MARKERS = {"fail", "failed", "failure", "error", "errored", "critical", "broken"}
++HEALTHY_STATUS_PREFIXES = (
++    "ok",
++    "success",
++    "succeeded",
++    "pass",
++    "passed",
++    "clean",
++    "healthy",
++    "silent",
++    "noop",
++    "no_op",
++)
++RESOLVED_STATUS_TOKENS = {
++    "cleared",
++    "fixed",
++    "repaired",
++    "recovered",
++    "resolved",
++    "verified",
++    "validated",
++    "excluded",
++}
++PENDING_FOLLOWUP_TOKENS = {"pending", "awaiting", "waiting"}
++
++
++@dataclass(frozen=True)
++class AttentionItem:
++    kind: str
++    severity: str
++    title: str
++    source_type: str
++    source_id: str
++    source_path: Path
++    age: str
++    evidence: str
++    next_action: str
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "kind": self.kind,
++            "severity": self.severity,
++            "title": self.title,
++            "source_type": self.source_type,
++            "source_id": self.source_id,
++            "source_path": str(self.source_path),
++            "age": self.age,
++            "evidence": self.evidence,
++            "next_action": self.next_action,
++        }
++
++
++def _ledger_path() -> Path:
++    return get_hermes_home() / LEDGER_PATH
++
++
++def _load_json(path: Path) -> dict[str, Any]:
++    try:
++        data = json.loads(path.read_text(encoding="utf-8"))
++    except (FileNotFoundError, json.JSONDecodeError):
++        return {}
++    return data if isinstance(data, dict) else {}
++
++
++def _parse_dt(value: Any) -> datetime | None:
++    if not value:
++        return None
++    if isinstance(value, (int, float)):
++        return datetime.fromtimestamp(float(value), tz=timezone.utc)
++    if not isinstance(value, str):
++        return None
++    text = value.strip()
++    if not text:
++        return None
++    if text.endswith("Z"):
++        text = text[:-1] + "+00:00"
++    try:
++        dt = datetime.fromisoformat(text)
++    except ValueError:
++        return None
++    if dt.tzinfo is None:
++        dt = dt.replace(tzinfo=timezone.utc)
++    return dt.astimezone(timezone.utc)
++
++
++def _record_time(record: dict[str, Any]) -> datetime | None:
++    candidates: list[datetime] = []
++    for key in ("updated_at", "last_checked_at", "created_at", "timestamp"):
++        dt = _parse_dt(record.get(key))
++        if dt:
++            candidates.append(dt)
++    runtime = record.get("runtime")
++    if isinstance(runtime, dict):
++        for key in ("last_run_at", "last_checked_at", "updated_at"):
++            dt = _parse_dt(runtime.get(key))
++            if dt:
++                candidates.append(dt)
++    verification = record.get("verification")
++    if isinstance(verification, dict):
++        for key in ("checked_at", "updated_at", "last_run_at", "last_checked_at"):
++            dt = _parse_dt(verification.get(key))
++            if dt:
++                candidates.append(dt)
++    return max(candidates) if candidates else None
++
++
++def _age(now: datetime, dt: datetime | None) -> tuple[float, str]:
++    if not dt:
++        return 10**9, "unknown"
++    seconds = max((now - dt).total_seconds(), 0)
++    days = seconds / 86400
++    if days >= 1:
++        return days, f"{int(days)}d"
++    hours = seconds / 3600
++    if hours >= 1:
++        return days, f"{int(hours)}h"
++    return days, f"{int(seconds // 60)}m"
++
++
++def _stringify(value: Any) -> str:
++    if isinstance(value, (str, int, float, bool)) or value is None:
++        return "" if value is None else str(value)
++    try:
++        return json.dumps(value, ensure_ascii=False, sort_keys=True)
++    except TypeError:
++        return str(value)
++
++
++def _contains_failure_marker(*values: Any) -> bool:
++    return any(_is_failure_status(v) for v in values)
++
++
++def _is_failure_status(value: Any) -> bool:
++    text = _stringify(value).strip().lower()
++    if not text:
++        return False
++    # Compound status labels such as "ok_with_personal_rclone_errors" are
++    # historical/qualified OK states, not current failures. Likewise,
++    # "*_verified" ledger verification snapshots can describe verified
++    # error-routing/repair coverage rather than an active failure. Current
++    # failures must be encoded as a failing status or a non-empty explicit
++    # error field.
++    healthy_prefixes = "|".join(re.escape(prefix) for prefix in HEALTHY_STATUS_PREFIXES)
++    if re.match(rf"^({healthy_prefixes})(\b|[_-])", text):
++        return False
++    if re.search(r"(^|[_-])(verified|validated|recovered|resolved)$", text):
++        return False
++    tokens = {token for token in re.split(r"[^a-z0-9]+", text) if token}
++    if not tokens & FAILED_MARKERS:
++        return False
++    # Statuses like ``case_only_failure_cleared_pending_next_full_run`` and
++    # ``...personal_vault_excluded_pending...`` describe resolved work with a
++    # pending follow-up. They are not current failures unless paired with an
++    # explicit error field, which is handled separately by _error_values().
++    if tokens & RESOLVED_STATUS_TOKENS:
++        return False
++    if tokens & PENDING_FOLLOWUP_TOKENS and tokens & {"cleared", "excluded", "verified"}:
++        return False
++    return True
++
++
++def _status_values(*containers: Any) -> list[Any]:
++    values: list[Any] = []
++    for container in containers:
++        if not isinstance(container, dict):
++            continue
++        for key in ("status", "last_status", "state", "result", "outcome"):
++            if key in container:
++                values.append(container.get(key))
++    return values
++
++
++def _error_values(*containers: Any) -> list[Any]:
++    values: list[Any] = []
++    for container in containers:
++        if not isinstance(container, dict):
++            continue
++        for key in ("last_error", "error", "exception", "traceback"):
++            if container.get(key):
++                values.append(container.get(key))
++    return values
++
++
++def _short(text: str, limit: int = 280) -> str:
++    text = " ".join(str(text or "").split())
++    if len(text) <= limit:
++        return text
++    omitted = len(text) - limit
++    return text[:limit].rstrip() + f"…[{omitted} chars omitted]"
++
++
++def _record_id(record: dict[str, Any], index: int) -> str:
++    return str(record.get("id") or record.get("title") or f"ledger-record-{index}")
++
++
++def _has_source_of_truth(record: dict[str, Any], runtime: dict[str, Any], verification: dict[str, Any]) -> bool:
++    if str(record.get("source_of_truth") or "").strip():
++        return True
++    if str(record.get("source") or "").strip():
++        return True
++    if runtime.get("cron_job_id") or runtime.get("systemd_unit") or runtime.get("n8n_workflow_id"):
++        return True
++    if verification.get("source") or verification.get("command"):
++        return True
++    return False
++
++
++def _scan_ledger_records(
++    records: Iterable[dict[str, Any]],
++    *,
++    now: datetime,
++    stale_days: int,
++    source_path: Path,
++    include_stale: bool = True,
++) -> list[AttentionItem]:
++    items: list[AttentionItem] = []
++    for index, record in enumerate(records):
++        if not isinstance(record, dict):
++            continue
++        record_id = _record_id(record, index)
++        title = str(record.get("title") or record_id)
++        status = str(record.get("status") or "").strip().lower()
++        raw_runtime = record.get("runtime")
++        raw_verification = record.get("verification")
++        runtime: dict[str, Any] = raw_runtime if isinstance(raw_runtime, dict) else {}
++        verification: dict[str, Any] = raw_verification if isinstance(raw_verification, dict) else {}
++
++        explicit_errors = _error_values(record, runtime, verification)
++        failure_values = [status, *_status_values(runtime, verification)]
++        if explicit_errors or _contains_failure_marker(*failure_values):
++            evidence_parts = [f"status={status or 'unknown'}"]
++            cron_job_id = runtime.get("cron_job_id") if isinstance(runtime, dict) else None
++            if cron_job_id:
++                evidence_parts.append(f"cron_job_id={cron_job_id}")
++            for key in ("last_status", "last_error", "error", "message"):
++                if isinstance(runtime, dict) and runtime.get(key):
++                    evidence_parts.append(f"runtime.{key}={runtime[key]}")
++                if isinstance(verification, dict) and verification.get(key):
++                    evidence_parts.append(f"verification.{key}={verification[key]}")
++            items.append(
++                AttentionItem(
++                    kind="failed_automation",
++                    severity="failure",
++                    title=title,
++                    source_type="active-work",
++                    source_id=record_id,
++                    source_path=source_path,
++                    age=_age(now, _record_time(record))[1],
++                    evidence=_short("; ".join(evidence_parts)),
++                    next_action="Inspect the automation logs/source of truth, repair the failure, then update the ledger verification snapshot.",
++                )
++            )
++            continue
++
++        if status in DONE_STATUSES:
++            continue
++        if status and status not in ATTENTION_STATUSES:
++            continue
++        record_dt = _record_time(record)
++        if not _has_source_of_truth(record, runtime, verification) and record_dt is None:
++            items.append(
++                AttentionItem(
++                    kind="missing_source_of_truth",
++                    severity="attention",
++                    title=title,
++                    source_type="active-work",
++                    source_id=record_id,
++                    source_path=source_path,
++                    age=_age(now, record_dt)[1],
++                    evidence="active ledger record has no source_of_truth, runtime source ID, or verification command",
++                    next_action="Add a concrete source_of_truth/runtime ID if this is alive, or complete/remove the stale ledger record.",
++                )
++            )
++            continue
++        if not include_stale:
++            continue
++        days, age = _age(now, record_dt)
++        if days >= stale_days:
++            purpose = _short(str(record.get("purpose") or record.get("summary") or ""), 180)
++            evidence = f"status={status or 'unknown'}; age={age}"
++            if purpose:
++                evidence += f"; purpose={purpose}"
++            items.append(
++                AttentionItem(
++                    kind="stale_active_work",
++                    severity="attention",
++                    title=title,
++                    source_type="active-work",
++                    source_id=record_id,
++                    source_path=source_path,
++                    age=age,
++                    evidence=evidence,
++                    next_action="Review whether this is still active, complete/remove it, or refresh the ledger with the current blocker and next check.",
++                )
++            )
++    return items
++
++
++def scan_attention(*, now: datetime | None = None, stale_days: int = 7, include_stale: bool = True) -> list[AttentionItem]:
++    """Return deterministic attention items from local Hermes state."""
++
++    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
++    ledger_path = _ledger_path()
++    ledger = _load_json(ledger_path)
++    raw_records = ledger.get("records")
++    records: list[dict[str, Any]] = raw_records if isinstance(raw_records, list) else []
++    items = _scan_ledger_records(records, now=now, stale_days=stale_days, source_path=ledger_path, include_stale=include_stale)
++    severity_rank = {"failure": 0, "attention": 1, "info": 2}
++    return sorted(items, key=lambda item: (severity_rank.get(item.severity, 9), item.kind, item.source_id))
++
++
++def format_attention_report(items: list[AttentionItem], *, max_chars: int = 4000) -> str:
++    """Format a compact report. Empty string means silent no-op."""
++
++    if not items:
++        return ""
++    lines = [f"Attention needed: Memory Tree attention: {len(items)} item(s)"]
++    for idx, item in enumerate(items, start=1):
++        lines.extend(
++            [
++                "",
++                f"{idx}. [{item.severity}] {item.title}",
++                f"   kind: {item.kind}",
++                f"   source: {item.source_type} / {item.source_id}",
++                f"   path: {item.source_path}",
++                f"   age: {item.age}",
++                f"   next: {item.next_action}",
++                f"   why: {item.evidence}",
++            ]
++        )
++    report = "\n".join(lines).rstrip()
++    if len(report) <= max_chars:
++        return report
++    omitted = len(report) - max_chars
++    marker = f"\n...[truncated {omitted} chars]"
++    budget = max(max_chars - len(marker), 0)
++    return report[:budget].rstrip() + marker
++
++
++def _bounded_json(payload: dict[str, Any], *, max_chars: int) -> str:
++    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
++    if len(text) <= max_chars:
++        return text
++    payload = dict(payload)
++    payload["truncated"] = True
++    items = list(payload.get("items") or [])
++    payload["items"] = items
++    for item in items:
++        if isinstance(item, dict):
++            item["title"] = _short(str(item.get("title") or ""), 80)
++            item["evidence"] = _short(str(item.get("evidence") or ""), 80)
++            item["next_action"] = _short(str(item.get("next_action") or ""), 80)
++    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
++    if len(text) <= max_chars:
++        return text
++    compact_items = []
++    for item in items:
++        if isinstance(item, dict):
++            compact_items.append(
++                {
++                    "kind": item.get("kind"),
++                    "severity": item.get("severity"),
++                    "source_id": item.get("source_id"),
++                    "source_path": item.get("source_path"),
++                    "age": item.get("age"),
++                }
++            )
++    payload["items"] = compact_items
++    while compact_items and len(json.dumps(payload, ensure_ascii=False, sort_keys=True)) > max_chars:
++        compact_items.pop()
++    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
++    if len(text) <= max_chars:
++        return text
++    payload["items"] = []
++    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
++    if len(text) <= max_chars:
++        return text
++    return json.dumps({"schema": payload.get("schema"), "total_items": payload.get("total_items", 0), "truncated": True}, sort_keys=True)
++
++
++def format_attention_json(items: list[AttentionItem], *, max_chars: int = 4000) -> str:
++    """Format attention items as bounded machine-readable JSON."""
++
++    payload: dict[str, Any] = {
++        "schema": "memory-tree-attention-v1",
++        "total_items": len(items),
++        "truncated": False,
++        "items": [item.to_dict() for item in items],
++    }
++    return _bounded_json(payload, max_chars=max_chars)
++
++
++def scan_and_format_attention(*, stale_days: int = 7, max_chars: int = 4000, include_stale: bool = True) -> str:
++    return format_attention_report(scan_attention(stale_days=stale_days, include_stale=include_stale), max_chars=max_chars)
++
++
++__all__ = [
++    "AttentionItem",
++    "format_attention_json",
++    "format_attention_report",
++    "scan_and_format_attention",
++    "scan_attention",
++]
+diff --git a/agent/memory_tree_build.py b/agent/memory_tree_build.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c47b0714e52e2129a64797a8cca52e45c7e6176a
+--- /dev/null
++++ b/agent/memory_tree_build.py
+@@ -0,0 +1,321 @@
++"""Repo-backed Memory Tree Lite build helpers.
++
++The cron script and CLI use this module so Memory Tree generation is testable,
++profile-aware, deterministic, and consistently redacted.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import tempfile
++from dataclasses import dataclass
++from datetime import datetime
++from pathlib import Path
++from typing import Any, Iterable
++
++from hermes_constants import get_hermes_home
++from agent.memory_tree_lite import SourceRecord, build_markdown_pack, collect_session_records, write_pack
++
++try:  # pragma: no cover - zoneinfo exists on supported runtimes
++    from zoneinfo import ZoneInfo
++except Exception:  # pragma: no cover
++    ZoneInfo = None  # type: ignore[assignment]
++
++DEFAULT_TZ = "Asia/Taipei"
++DEFAULT_MAX_TEXT_CHARS = 4000
++SECRET_KEY_RE = re.compile(r"(secret|token|password|passwd|api[_-]?key|authorization|auth|credential|cookie)", re.I)
++SECRET_ASSIGNMENT_RE = re.compile(
++    r"(?im)\b([A-Z0-9_.-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY)[A-Z0-9_.-]*)\b(\s*[:=]\s*)([^\s`'\"]+|'[^'\n]+'|\"[^\"\n]+\")"
++)
++SECRET_VALUE_RE = re.compile(
++    r"(?i)(bearer\s+[a-z0-9._~+/=-]{12,}|xox[baprs]-[a-z0-9-]{12,}|sk-[a-z0-9_-]{12,}|gh[pousr]_[a-z0-9_]{16,})"
++)
++
++
++@dataclass(frozen=True)
++class BuildOptions:
++    hermes_home: Path | None = None
++    session_limit: int = 40
++    cron_limit: int = 30
++    ledger_limit: int = 80
++    max_record_chars: int = DEFAULT_MAX_TEXT_CHARS
++    include_tools: bool = False
++    timezone_name: str = DEFAULT_TZ
++
++
++def _home(options: BuildOptions) -> Path:
++    return (options.hermes_home or get_hermes_home()).expanduser()
++
++
++def _now_local(timezone_name: str = DEFAULT_TZ) -> datetime:
++    if ZoneInfo is None:
++        return datetime.now().astimezone()
++    return datetime.now(ZoneInfo(timezone_name))
++
++
++def _sha256_text(text: str) -> str:
++    return hashlib.sha256(text.encode("utf-8")).hexdigest()
++
++
++def _load_json(path: Path, default: Any) -> Any:
++    try:
++        return json.loads(path.read_text(encoding="utf-8"))
++    except (FileNotFoundError, json.JSONDecodeError):
++        return default
++
++
++def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
++    tmp_name: str | None = None
++    try:
++        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as tmp:
++            tmp.write(text)
++            tmp_name = tmp.name
++        Path(tmp_name).replace(path)
++    finally:
++        if tmp_name:
++            tmp_path = Path(tmp_name)
++            if tmp_path.exists():
++                tmp_path.unlink()
++
++
++def redact_secrets(value: Any) -> Any:
++    """Recursively redact obvious secret keys and token-like values."""
++
++    if isinstance(value, dict):
++        out: dict[str, Any] = {}
++        for key, item in value.items():
++            if SECRET_KEY_RE.search(str(key)):
++                out[str(key)] = "[REDACTED]"
++            else:
++                out[str(key)] = redact_secrets(item)
++        return out
++    if isinstance(value, list):
++        return [redact_secrets(item) for item in value[:50]]
++    if isinstance(value, str):
++        redacted = SECRET_ASSIGNMENT_RE.sub("[REDACTED_SECRET_ASSIGNMENT]", value)
++        return SECRET_VALUE_RE.sub("[REDACTED]", redacted)
++    return value
++
++
++def stable_json(value: Any) -> str:
++    return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2)
++
++
++def compact_text(text: str, limit: int = DEFAULT_MAX_TEXT_CHARS) -> str:
++    text = str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
++    if len(text) <= limit:
++        return text
++    return text[:limit].rstrip() + f"\n\n...[truncated {len(text) - limit} chars]"
++
++
++def _redact_record(record: SourceRecord, *, max_chars: int) -> SourceRecord:
++    return SourceRecord(
++        source_type=record.source_type,
++        source_id=record.source_id,
++        title=record.title,
++        timestamp=record.timestamp,
++        text=compact_text(str(redact_secrets(record.text)), max_chars),
++        metadata={str(key): str(redact_secrets(value)) for key, value in record.metadata.items()},
++    )
++
++
++def collect_active_work_records(home: Path, *, limit: int) -> list[SourceRecord]:
++    ledger = _load_json(home / "data" / "active-work" / "ledger.json", {})
++    records = ledger.get("records", []) if isinstance(ledger, dict) else []
++    if not isinstance(records, list):
++        return []
++
++    def score(item: dict[str, Any]) -> tuple[int, str]:
++        status = str(item.get("status", ""))
++        activeish = status in {"active", "scheduled", "scheduled_once", "enabled", "monitoring"}
++        return (0 if activeish else 1, str(item.get("id", "")))
++
++    out: list[SourceRecord] = []
++    for item in sorted((r for r in records if isinstance(r, dict)), key=score)[: max(0, limit)]:
++        source_id = str(item.get("id") or item.get("title") or "active-work-record")
++        title = str(item.get("title") or source_id)
++        body = {
++            "id": source_id,
++            "type": item.get("type"),
++            "status": item.get("status"),
++            "owner": item.get("owner"),
++            "purpose": item.get("purpose"),
++            "source_of_truth": item.get("source_of_truth"),
++            "runtime": item.get("runtime"),
++            "failure_behavior": item.get("failure_behavior"),
++            "verification": item.get("verification"),
++        }
++        out.append(
++            SourceRecord(
++                source_type="active-work",
++                source_id=source_id,
++                title=title,
++                timestamp=None,
++                text=compact_text(stable_json(redact_secrets(body))),
++                metadata={"ledger": "data/active-work/ledger.json", "status": str(item.get("status", ""))},
++            )
++        )
++    return out
++
++
++def iter_recent_cron_outputs(home: Path, limit: int) -> Iterable[Path]:
++    root = home / "cron" / "output"
++    if not root.exists():
++        return []
++    files: list[tuple[float, str, Path]] = []
++    for path in root.glob("*/*.md"):
++        try:
++            if not path.is_file():
++                continue
++            files.append((path.stat().st_mtime, str(path), path))
++        except FileNotFoundError:
++            # Cron output can be pruned while the memory tree build is scanning.
++            # A vanished record is not build-fatal; skip it and keep the pack fresh.
++            continue
++    files.sort(key=lambda item: (item[0], item[1]), reverse=True)
++    return [path for _, _, path in files[: max(0, limit)]]
++
++
++def collect_cron_records(home: Path, *, limit: int) -> list[SourceRecord]:
++    out: list[SourceRecord] = []
++    for path in iter_recent_cron_outputs(home, limit):
++        try:
++            stat = path.stat()
++            text = path.read_text(encoding="utf-8", errors="replace").strip()
++        except FileNotFoundError:
++            # The output disappeared between discovery and read; skip the stale path.
++            continue
++        if not text or text.startswith("[SILENT]"):
++            continue
++        job_id = path.parent.name
++        out.append(
++            SourceRecord(
++                source_type="cron-output",
++                source_id=f"{job_id}/{path.name}",
++                title=f"cron {job_id} {path.stem}",
++                timestamp=stat.st_mtime,
++                text=compact_text(str(redact_secrets(text))),
++                metadata={"path": str(path.relative_to(home))},
++            )
++        )
++    return out
++
++
++def build_memory_tree_packs(options: BuildOptions | None = None) -> dict[str, Any]:
++    """Build Memory Tree Lite packs and return the mutable state payload."""
++
++    options = options or BuildOptions()
++    home = _home(options)
++    data_dir = home / "data" / "memory-tree-lite"
++    state_path = data_dir / "state.json"
++    session_records = collect_session_records(
++        home / "sessions",
++        limit_files=options.session_limit,
++        include_tools=options.include_tools,
++        max_record_chars=options.max_record_chars,
++    )
++    active_records = collect_active_work_records(home, limit=options.ledger_limit)
++    cron_records = collect_cron_records(home, limit=options.cron_limit)
++    records = [
++        *(_redact_record(record, max_chars=options.max_record_chars) for record in session_records),
++        *(_redact_record(record, max_chars=options.max_record_chars) for record in active_records),
++        *(_redact_record(record, max_chars=options.max_record_chars) for record in cron_records),
++    ]
++
++    recent_md = build_markdown_pack(
++        records,
++        title="Hermes Memory Tree Lite - Recent",
++        max_record_chars=options.max_record_chars,
++    )
++    today = _now_local(options.timezone_name).date().isoformat()
++    daily_md = build_markdown_pack(
++        records,
++        title=f"Hermes Memory Tree Lite - {today}",
++        max_record_chars=options.max_record_chars,
++    )
++    outputs = {
++        "recent": data_dir / "recent.md",
++        "daily": data_dir / "daily" / f"{today}.md",
++    }
++    contents = {"recent": recent_md, "daily": daily_md}
++    previous = _load_json(state_path, {})
++    previous_hashes = previous.get("hashes", {}) if isinstance(previous, dict) else {}
++
++    changed: list[str] = []
++    hashes: dict[str, str] = {}
++    for name, content in contents.items():
++        digest = _sha256_text(content)
++        hashes[name] = digest
++        if previous_hashes.get(name) != digest or not outputs[name].exists():
++            write_pack(outputs[name], content)
++            changed.append(name)
++
++    counts = {
++        "records_total": len(records),
++        "sessions": len(session_records),
++        "active_work": len(active_records),
++        "cron_outputs": len(cron_records),
++    }
++    index_md = "\n".join(
++        [
++            "# Hermes Memory Tree Lite Index",
++            "",
++            f"records_total: {len(records)}",
++            f"sessions: {len(session_records)}",
++            f"active_work: {len(active_records)}",
++            f"cron_outputs: {len(cron_records)}",
++            "",
++            "## Packs",
++            "",
++            *[f"- {name}: `{path.relative_to(home)}`" for name, path in outputs.items()],
++            "",
++        ]
++    )
++    index_path = data_dir / "index.md"
++    index_hash = _sha256_text(index_md)
++    hashes["index"] = index_hash
++    if previous_hashes.get("index") != index_hash or not index_path.exists():
++        write_pack(index_path, index_md)
++        changed.append("index")
++
++    state = {
++        "schema": "memory-tree-lite-state-v1",
++        "updated_at": _now_local(options.timezone_name).isoformat(timespec="seconds"),
++        "hashes": hashes,
++        "outputs": {name: str(path) for name, path in {**outputs, "index": index_path}.items()},
++        "counts": counts,
++        "changed": changed,
++    }
++    _write_json_atomic(state_path, state)
++    return state
++
++
++def format_build_report(state: dict[str, Any]) -> str:
++    changed = ", ".join(state.get("changed") or ["none"])
++    counts = state.get("counts", {}) if isinstance(state.get("counts"), dict) else {}
++    outputs = state.get("outputs", {}) if isinstance(state.get("outputs"), dict) else {}
++    return (
++        "Memory Tree Lite build complete\n"
++        f"changed: {changed}\n"
++        f"records: {counts.get('records_total', 0)} "
++        f"(sessions {counts.get('sessions', 0)}, active-work {counts.get('active_work', 0)}, "
++        f"cron {counts.get('cron_outputs', 0)})\n"
++        f"recent: {outputs.get('recent', '')}\n"
++        f"index: {outputs.get('index', '')}"
++    )
++
++
++__all__ = [
++    "BuildOptions",
++    "build_memory_tree_packs",
++    "collect_active_work_records",
++    "collect_cron_records",
++    "compact_text",
++    "format_build_report",
++    "redact_secrets",
++    "stable_json",
++]
+diff --git a/agent/memory_tree_lite.py b/agent/memory_tree_lite.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..656c6e5f0a77663789a6b3a554a7375364f02dff
+--- /dev/null
++++ b/agent/memory_tree_lite.py
+@@ -0,0 +1,410 @@
++"""Local-first, source-aware memory pack helpers for Hermes.
++
++Memory Tree Lite is deliberately small: it builds deterministic Markdown packs
++from existing local Hermes state. It does not replace memory providers or inject
++anything into prompts by itself.
++"""
++
++from __future__ import annotations
++
++import json
++import re
++import tempfile
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any, Sequence
++
++
++@dataclass(frozen=True)
++class SourceRecord:
++    """A provenance-bearing unit of local context."""
++
++    source_type: str
++    source_id: str
++    title: str
++    timestamp: float | int | None
++    text: str
++    metadata: dict[str, str] = field(default_factory=dict)
++
++
++@dataclass(frozen=True)
++class MemorySearchResult:
++    """A ranked Memory Tree Lite match with provenance."""
++
++    score: int
++    pack_path: Path
++    source_type: str
++    source_id: str
++    title: str
++    timestamp: float | int | None
++    snippet: str
++    metadata: dict[str, str] = field(default_factory=dict)
++
++
++def normalize_text(text: str, max_chars: int = 4000) -> str:
++    """Normalize record text and cap it with an explicit truncation marker."""
++
++    normalized = str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
++    if max_chars < 0:
++        max_chars = 0
++    if len(normalized) <= max_chars:
++        return normalized
++    omitted = len(normalized) - max_chars
++    return f"{normalized[:max_chars].rstrip()}\n\n[truncated {omitted} chars]"
++
++
++_TOKEN_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:-]*")
++
++
++def _query_terms(query: str) -> list[str]:
++    seen: set[str] = set()
++    terms: list[str] = []
++    for token in _TOKEN_RE.findall(query.lower()):
++        if token not in seen:
++            seen.add(token)
++            terms.append(token)
++    return terms
++
++
++def _source_weight(source_type: str) -> int:
++    weights = {"session": 3, "active-work": 2, "cron": 1}
++    return weights.get(source_type, 0)
++
++
++def _score_record(record: SourceRecord, terms: Sequence[str]) -> int:
++    if not terms:
++        return 0
++    title = record.title.lower()
++    metadata = "\n".join(f"{key}: {value}" for key, value in record.metadata.items()).lower()
++    text = record.text.lower()
++    score = 0
++    for term in terms:
++        if term in title:
++            score += 8
++        if term in record.source_id.lower():
++            score += 5
++        if term in metadata:
++            score += 3
++        text_hits = text.count(term)
++        if text_hits:
++            score += min(text_hits, 5) * 2
++    return score
++
++
++def _snippet(text: str, terms: Sequence[str], max_chars: int) -> str:
++    text = str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
++    if max_chars < 0:
++        max_chars = 0
++    lower = text.lower()
++    hit_positions = [lower.find(term) for term in terms if term and lower.find(term) >= 0]
++    start = 0
++    if hit_positions:
++        start = max(min(hit_positions) - max_chars // 4, 0)
++    excerpt = text[start : start + max_chars].strip()
++    prefix = "…" if start > 0 else ""
++    suffix = "…" if start + max_chars < len(text) else ""
++    return f"{prefix}{excerpt}{suffix}"
++
++
++def _looks_like_record_header(lines: Sequence[str], idx: int) -> bool:
++    if idx >= len(lines) or not lines[idx].startswith("### "):
++        return False
++    cursor = idx + 1
++    metadata_seen = 0
++    while cursor < len(lines) and metadata_seen < 12:
++        current = lines[cursor]
++        if cursor != idx + 1 and (current.startswith("## ") or current.startswith("### ")):
++            return False
++        if not current.strip():
++            cursor += 1
++            continue
++        if current.startswith("source_id: "):
++            return True
++        if ": " not in current:
++            return False
++        metadata_seen += 1
++        cursor += 1
++    return False
++
++
++def _section_header_before_record(lines: Sequence[str], idx: int) -> bool:
++    if idx >= len(lines) or not lines[idx].startswith("## "):
++        return False
++    cursor = idx + 1
++    while cursor < len(lines):
++        current = lines[cursor]
++        if _looks_like_record_header(lines, cursor):
++            return True
++        if current.startswith("## "):
++            return False
++        if current.strip():
++            return False
++        cursor += 1
++    return False
++
++
++def _parse_markdown_pack(path: Path) -> list[SourceRecord]:
++    """Parse deterministic Memory Tree Lite Markdown back into source records."""
++
++    try:
++        lines = path.read_text(encoding="utf-8").splitlines()
++    except FileNotFoundError:
++        return []
++
++    records: list[SourceRecord] = []
++    source_type = ""
++    idx = 0
++    while idx < len(lines):
++        line = lines[idx]
++        if _section_header_before_record(lines, idx):
++            source_type = line[3:].strip()
++            idx += 1
++            continue
++        if not _looks_like_record_header(lines, idx):
++            idx += 1
++            continue
++
++        title = line[4:].strip()
++        idx += 1
++        metadata: dict[str, str] = {}
++        body: list[str] = []
++        in_body = False
++        while idx < len(lines):
++            current = lines[idx]
++            if _section_header_before_record(lines, idx) or _looks_like_record_header(lines, idx):
++                break
++            if not in_body and current.strip() == "":
++                idx += 1
++                continue
++            if not in_body and ": " in current:
++                key, value = current.split(": ", 1)
++                metadata[key.strip()] = value.strip()
++                idx += 1
++                continue
++            in_body = True
++            body.append(current)
++            idx += 1
++
++        source_id = metadata.pop("source_id", title)
++        raw_timestamp = metadata.pop("timestamp", "")
++        try:
++            timestamp: float | int | None = float(raw_timestamp) if raw_timestamp else None
++        except ValueError:
++            timestamp = None
++            metadata["timestamp"] = raw_timestamp
++        records.append(
++            SourceRecord(
++                source_type=source_type,
++                source_id=source_id,
++                title=title,
++                timestamp=timestamp,
++                text="\n".join(body).strip(),
++                metadata=metadata,
++            )
++        )
++    return records
++
++
++def search_memory_packs(
++    pack_paths: Sequence[Path | str],
++    query: str,
++    *,
++    limit: int = 5,
++    max_snippet_chars: int = 500,
++) -> list[MemorySearchResult]:
++    """Search generated Memory Tree Lite packs with deterministic lexical ranking."""
++
++    terms = _query_terms(query)
++    if not terms or limit <= 0:
++        return []
++
++    results: list[MemorySearchResult] = []
++    for raw_path in pack_paths:
++        path = Path(raw_path).expanduser()
++        for record in _parse_markdown_pack(path):
++            score = _score_record(record, terms)
++            if score <= 0:
++                continue
++            results.append(
++                MemorySearchResult(
++                    score=score,
++                    pack_path=path,
++                    source_type=record.source_type,
++                    source_id=record.source_id,
++                    title=record.title,
++                    timestamp=record.timestamp,
++                    snippet=_snippet(record.text, terms, max_snippet_chars),
++                    metadata=record.metadata,
++                )
++            )
++
++    results.sort(
++        key=lambda result: (
++            -result.score,
++            -float(result.timestamp or 0),
++            -_source_weight(result.source_type),
++            result.source_type,
++            result.source_id,
++            str(result.pack_path),
++        )
++    )
++    return results[:limit]
++
++
++def _record_sort_key(record: SourceRecord) -> tuple[str, float, str]:
++    timestamp = float(record.timestamp or 0)
++    return (record.source_type, timestamp, record.source_id)
++
++
++def build_markdown_pack(
++    records: Sequence[SourceRecord],
++    *,
++    title: str,
++    max_record_chars: int = 4000,
++) -> str:
++    """Build a deterministic Markdown pack grouped by source type."""
++
++    lines: list[str] = [f"# {title}", ""]
++    current_source: str | None = None
++    for record in sorted(records, key=_record_sort_key):
++        if record.source_type != current_source:
++            current_source = record.source_type
++            lines.extend([f"## {current_source}", ""])
++
++        lines.extend(
++            [
++                f"### {record.title or record.source_id}",
++                "",
++                f"source_id: {record.source_id}",
++                f"timestamp: {record.timestamp if record.timestamp is not None else ''}",
++            ]
++        )
++        for key in sorted(record.metadata):
++            lines.append(f"{key}: {record.metadata[key]}")
++        lines.extend(["", normalize_text(record.text, max_chars=max_record_chars), ""])
++
++    return "\n".join(lines).rstrip() + "\n"
++
++
++def _message_text(payload: dict[str, Any]) -> str:
++    content = payload.get("content", "")
++    if isinstance(content, str):
++        return content
++    if isinstance(content, list):
++        parts: list[str] = []
++        for item in content:
++            if isinstance(item, dict):
++                value = item.get("text") or item.get("content")
++                if isinstance(value, str):
++                    parts.append(value)
++            elif isinstance(item, str):
++                parts.append(item)
++        return "\n".join(parts)
++    return str(content)
++
++
++def collect_session_records(
++    sessions_dir: Path,
++    *,
++    limit_files: int = 20,
++    include_tools: bool = False,
++    max_record_chars: int = 4000,
++) -> list[SourceRecord]:
++    """Collect source records from recent Hermes JSONL session files."""
++
++    if not sessions_dir.exists():
++        return []
++
++    files = sorted(
++        (p for p in sessions_dir.glob("*.jsonl") if p.is_file()),
++        key=lambda p: (p.stat().st_mtime, p.name),
++        reverse=True,
++    )[: max(0, limit_files)]
++
++    records: list[SourceRecord] = []
++    for path in files:
++        malformed = 0
++        accepted: list[SourceRecord] = []
++        with path.open("r", encoding="utf-8", errors="replace") as handle:
++            for line_number, line in enumerate(handle, 1):
++                stripped = line.strip()
++                if not stripped:
++                    continue
++                try:
++                    payload = json.loads(stripped)
++                except json.JSONDecodeError:
++                    malformed += 1
++                    continue
++                if not isinstance(payload, dict):
++                    malformed += 1
++                    continue
++
++                role = str(payload.get("role") or "")
++                if role == "tool" and not include_tools:
++                    continue
++                if role not in {"user", "assistant", "tool", "system"}:
++                    continue
++
++                text = normalize_text(_message_text(payload), max_chars=max_record_chars)
++                if not text:
++                    continue
++                metadata = {
++                    "role": role,
++                    "file": path.name,
++                }
++                session_id = payload.get("session_id") or payload.get("session")
++                if session_id is not None:
++                    metadata["session_id"] = str(session_id)
++                timestamp = payload.get("timestamp") or payload.get("created_at")
++                title = str(payload.get("title") or f"{role} message")
++                accepted.append(
++                    SourceRecord(
++                        source_type="session",
++                        source_id=f"{path.name}:{line_number}",
++                        title=title,
++                        timestamp=timestamp if isinstance(timestamp, (int, float)) else None,
++                        text=text,
++                        metadata=metadata,
++                    )
++                )
++
++        if malformed:
++            for idx, record in enumerate(accepted):
++                md = dict(record.metadata)
++                md["malformed_lines"] = str(malformed)
++                accepted[idx] = SourceRecord(
++                    record.source_type,
++                    record.source_id,
++                    record.title,
++                    record.timestamp,
++                    record.text,
++                    md,
++                )
++        records.extend(accepted)
++
++    return records
++
++
++def write_pack(path: Path, content: str) -> Path:
++    """Write a Markdown pack through an atomic same-directory replace."""
++
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp_name: str | None = None
++    try:
++        with tempfile.NamedTemporaryFile(
++            "w",
++            encoding="utf-8",
++            dir=path.parent,
++            prefix=f".{path.name}.",
++            suffix=".tmp",
++            delete=False,
++        ) as handle:
++            tmp_name = handle.name
++            handle.write(content)
++        Path(tmp_name).replace(path)
++    finally:
++        if tmp_name:
++            tmp = Path(tmp_name)
++            if tmp.exists():
++                tmp.unlink()
++    return path
+diff --git a/agent/memory_tree_privacy.py b/agent/memory_tree_privacy.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f328d0096eab3c1975d76a92f379162387349bb9
+--- /dev/null
++++ b/agent/memory_tree_privacy.py
+@@ -0,0 +1,240 @@
++"""Deterministic privacy/leak scanner for Memory Tree Lite packs.
++
++This scans generated Memory Tree pack outputs for credential-shaped lines without
++printing full secrets back into reports. It is intentionally boring: local files,
++bounded findings, redacted snippets, and silence when clean.
++"""
++from __future__ import annotations
++
++import json
++import re
++from dataclasses import asdict, dataclass
++from html import escape
++from pathlib import Path
++from typing import Any
++
++from hermes_constants import get_hermes_home
++
++STATE_RELATIVE_PATH = Path("data") / "memory-tree-lite" / "state.json"
++
++_SECRET_ASSIGNMENT_RE = re.compile(
++    r"(?i)\b([A-Z0-9_\-.]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY)[A-Z0-9_\-.]*)\b\s*[:=]\s*([^\s`'\"]{8,}|['\"][^'\"]{8,}['\"])",
++)
++_BEARER_RE = re.compile(r"(?i)\bbearer\s+([A-Za-z0-9._~+/=-]{16,})")
++_PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
++_LONG_CREDENTIAL_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b")
++_REDACTED_VALUES = {"***", "[REDACTED]", "<REDACTED>", "REDACTED", "<redacted>", "redacted"}
++
++
++def _assignment_match(line: str) -> re.Match[str] | None:
++    match = _SECRET_ASSIGNMENT_RE.search(line)
++    if not match:
++        return None
++    key = match.group(1)
++    # Avoid ordinary config words like contextTokens=500/dialecticMaxChars=400.
++    if key != key.upper() and "_" not in key and "-" not in key:
++        return None
++    value = match.group(2).strip().strip("'\"")
++    if value in _REDACTED_VALUES:
++        return None
++    return match
++
++
++@dataclass(frozen=True)
++class PrivacyFinding:
++    pack: str
++    path: str
++    line: int
++    kind: str
++    severity: str
++    snippet: str
++
++
++@dataclass(frozen=True)
++class PrivacyReport:
++    findings: list[PrivacyFinding]
++    summary: dict[str, int]
++
++
++def _state_path(home: Path | None = None) -> Path:
++    return (home or get_hermes_home()) / STATE_RELATIVE_PATH
++
++
++def _load_pack_paths(state_path: Path) -> dict[str, Path]:
++    try:
++        data = json.loads(state_path.read_text(encoding="utf-8"))
++    except (FileNotFoundError, json.JSONDecodeError):
++        return {}
++    outputs = data.get("outputs") if isinstance(data, dict) else None
++    if not isinstance(outputs, dict):
++        return {}
++    paths: dict[str, Path] = {}
++    for name, value in outputs.items():
++        if isinstance(value, str):
++            paths[str(name)] = Path(value)
++    return paths
++
++
++def _truncate(text: str, max_chars: int) -> str:
++    if max_chars <= 0:
++        return ""
++    text = " ".join(text.strip().split())
++    if len(text) <= max_chars:
++        return text
++    if max_chars <= 1:
++        return "…"[:max_chars]
++    return text[: max_chars - 1].rstrip() + "…"
++
++
++def _redact_line(line: str) -> str:
++    redacted = _SECRET_ASSIGNMENT_RE.sub(lambda m: f"{m.group(1)}=<redacted>", line)
++    redacted = _BEARER_RE.sub("Bearer <redacted>", redacted)
++    redacted = _LONG_CREDENTIAL_RE.sub("<redacted>", redacted)
++    if _PRIVATE_KEY_RE.search(redacted):
++        redacted = _PRIVATE_KEY_RE.sub("-----BEGIN <redacted> PRIVATE KEY-----", redacted)
++    return redacted
++
++
++def _finding_kind(line: str) -> str | None:
++    if _PRIVATE_KEY_RE.search(line):
++        return "private_key"
++    if _assignment_match(line):
++        return "secret_assignment"
++    if _BEARER_RE.search(line):
++        return "bearer_token"
++    if _LONG_CREDENTIAL_RE.search(line):
++        return "credential_like_value"
++    return None
++
++
++def _scan_pack(pack: str, path: Path, max_snippet_chars: int) -> list[PrivacyFinding]:
++    try:
++        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
++    except OSError:
++        return []
++    findings: list[PrivacyFinding] = []
++    for line_no, line in enumerate(lines, start=1):
++        kind = _finding_kind(line)
++        if not kind:
++            continue
++        findings.append(
++            PrivacyFinding(
++                pack=pack,
++                path=str(path),
++                line=line_no,
++                kind=kind,
++                severity="problem",
++                snippet=_truncate(_redact_line(line), max_snippet_chars),
++            )
++        )
++    return findings
++
++
++def scan_memory_tree_privacy(
++    *,
++    state_path: Path | None = None,
++    max_snippet_chars: int = 160,
++) -> PrivacyReport:
++    """Scan generated Memory Tree pack outputs for credential-shaped leaks."""
++    state = state_path or _state_path()
++    findings: list[PrivacyFinding] = []
++    for pack, path in sorted(_load_pack_paths(state).items()):
++        findings.extend(_scan_pack(pack, path, max_snippet_chars))
++    summary = {"findings": len(findings), "packs_scanned": len(_load_pack_paths(state))}
++    return PrivacyReport(findings=findings, summary=summary)
++
++
++def _finding_to_json(finding: PrivacyFinding) -> dict[str, Any]:
++    return asdict(finding)
++
++
++def format_privacy_json(report: PrivacyReport, *, max_chars: int = 4000) -> str:
++    payload: dict[str, Any] = {
++        "schema": "memory-tree-privacy-v1",
++        "summary": report.summary,
++        "total_findings": len(report.findings),
++        "truncated": False,
++        "findings": [],
++    }
++    for finding in report.findings:
++        candidate = dict(payload)
++        candidate["findings"] = payload["findings"] + [_finding_to_json(finding)]
++        text = json.dumps(candidate, ensure_ascii=False, sort_keys=True)
++        if len(text) > max_chars:
++            payload["truncated"] = True
++            break
++        payload = candidate
++    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
++    if len(text) <= max_chars:
++        return text
++    # Pathological tiny bound: return a valid minimal JSON object.
++    minimal = {
++        "schema": "memory-tree-privacy-v1",
++        "summary": report.summary,
++        "total_findings": len(report.findings),
++        "truncated": True,
++        "findings": [],
++    }
++    return json.dumps(minimal, ensure_ascii=False, sort_keys=True)[:max_chars]
++
++
++def format_privacy_text(report: PrivacyReport, *, max_chars: int = 4000) -> str:
++    if not report.findings:
++        return ""
++    lines = [f"Memory Tree privacy scan found {len(report.findings)} finding(s):"]
++    for finding in report.findings:
++        lines.append(
++            f"- {finding.severity}: {finding.kind} in {finding.pack} line {finding.line} ({finding.path}) — {finding.snippet}"
++        )
++        text = "\n".join(lines)
++        if len(text) > max_chars:
++            return _truncate(text, max_chars)
++    return "\n".join(lines)
++
++
++def format_privacy_html(report: PrivacyReport, *, max_chars: int = 12000) -> str:
++    """Return an email-safe HTML privacy report with redacted snippets."""
++    if not report.findings:
++        return ""
++
++    rows: list[str] = []
++    for finding in report.findings:
++        rows.append(
++            "<tr>"
++            f"<td>{escape(finding.severity)}</td>"
++            f"<td><code>{escape(finding.kind)}</code></td>"
++            f"<td>{escape(finding.pack)}</td>"
++            f"<td><code>{escape(str(finding.line))}</code></td>"
++            f"<td><code>{escape(finding.path)}</code></td>"
++            f"<td><code>{escape(finding.snippet)}</code></td>"
++            "</tr>"
++        )
++
++    body = (
++        "<!doctype html><html><body>"
++        "<h2>Memory Tree Privacy Scan</h2>"
++        "<blockquote><strong>Action required:</strong> generated Memory Tree packs contain "
++        "credential-shaped text. Findings are reported with redacted snippets only; "
++        "the scanner does not delete or rewrite files automatically.</blockquote>"
++        "<ul>"
++        f"<li><strong>Findings:</strong> {len(report.findings)}</li>"
++        f"<li><strong>Packs scanned:</strong> {report.summary.get('packs_scanned', 0)}</li>"
++        "<li><strong>Default behavior:</strong> report-only, fingerprint-deduped notifications.</li>"
++        "</ul>"
++        "<h3>Findings</h3>"
++        "<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\">"
++        "<thead><tr><th>Severity</th><th>Kind</th><th>Pack</th><th>Line</th><th>Path</th><th>Redacted snippet</th></tr></thead>"
++        "<tbody>"
++        + "".join(rows)
++        + "</tbody></table>"
++        "<h3>What happens next</h3>"
++        "<ul>"
++        "<li>Nothing is removed automatically. That would be too blunt for a generated index.</li>"
++        "<li>The notification repeats only when the finding set changes.</li>"
++        "<li>Fix is manual: remove the source secret, rebuild Memory Tree, then confirm the scan is clean.</li>"
++        "</ul>"
++        "</body></html>"
++    )
++    if len(body) <= max_chars:
++        return body
++    return format_privacy_text(report, max_chars=max_chars)
+diff --git a/agent/memory_tree_reconcile.py b/agent/memory_tree_reconcile.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5f93859219a3e4632d2ef349c1088c78c32fadf6
+--- /dev/null
++++ b/agent/memory_tree_reconcile.py
+@@ -0,0 +1,567 @@
++"""Deterministic source-of-truth reconciliation for Memory Tree attention.
++
++This module checks whether assistant-owned active-work ledger records still point
++at concrete, live runtime state. It is intentionally read-only by default: it
++reports dead or undocumented references instead of mutating the ledger.
++"""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++from dataclasses import asdict, dataclass
++from datetime import datetime
++from pathlib import Path
++from typing import Any
++
++import yaml
++
++from hermes_constants import get_hermes_home
++
++LEDGER_PATH = Path("data") / "active-work" / "ledger.json"
++ACTIVE_STATUSES = {"active", "waiting", "blocked", "in_progress", "monitoring"}
++RECONCILE_SCHEMA = "memory-tree-reconcile-v1"
++
++
++@dataclass(frozen=True)
++class ReconcileItem:
++    status: str
++    source_id: str
++    title: str
++    severity: str
++    source_path: str
++    evidence: str
++    next_action: str
++
++
++@dataclass(frozen=True)
++class ReconcileReport:
++    items: list[ReconcileItem]
++    summary: dict[str, int]
++
++
++def _ledger_path(home: Path | None = None) -> Path:
++    return (home or get_hermes_home()) / LEDGER_PATH
++
++
++def _load_json(path: Path) -> Any:
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def _load_ledger_records(path: Path) -> list[dict[str, Any]]:
++    if not path.exists():
++        return []
++    data = _load_json(path)
++    records = data.get("records", []) if isinstance(data, dict) else []
++    return [record for record in records if isinstance(record, dict)]
++
++
++def _active_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    return [
++        record
++        for record in records
++        if str(record.get("status", "")).strip().lower() in ACTIVE_STATUSES
++    ]
++
++
++def _source_dict(record: dict[str, Any]) -> dict[str, Any]:
++    source = record.get("source_of_truth")
++    if isinstance(source, dict):
++        merged = dict(source)
++    else:
++        merged = {}
++    runtime = record.get("runtime")
++    if isinstance(runtime, dict):
++        # Some older ledger entries put the concrete handle in runtime only.
++        keys = {
++            "cron_job_id",
++            "hermes_cron_job_id",
++            "cron_jobs_file",
++            "hermes_cron_jobs_file",
++            "current_cron_job_ids",
++            "cron_jobs",
++            "profile",
++            "script",
++            "state_file",
++            "n8n_workflow_id",
++            "n8n_workflow_name",
++            "health_endpoint",
++            "service_dependencies",
++            "gateway_config_key",
++            "profiles_enabled",
++            "systemd_user_timer",
++            "systemd_user_service",
++        }
++        for key in keys:
++            if key in runtime and key not in merged:
++                merged[key] = runtime[key]
++    if "cron_job_id" not in merged and merged.get("hermes_cron_job_id"):
++        merged["cron_job_id"] = merged["hermes_cron_job_id"]
++    if "cron_jobs_file" not in merged and merged.get("hermes_cron_jobs_file"):
++        merged["cron_jobs_file"] = merged["hermes_cron_jobs_file"]
++    return merged
++
++
++def _default_cron_path(profile: str | None = None, home: Path | None = None) -> Path:
++    root = home or get_hermes_home()
++    if profile and profile not in {"default", "main"}:
++        return root / "profiles" / profile / "cron" / "jobs.json"
++    return root / "cron" / "jobs.json"
++
++
++def _cron_jobs_from_file(path: Path) -> list[dict[str, Any]]:
++    data = _load_json(path)
++    if isinstance(data, dict):
++        jobs = data.get("jobs", [])
++    elif isinstance(data, list):
++        jobs = data
++    else:
++        jobs = []
++    return [job for job in jobs if isinstance(job, dict)]
++
++
++def _find_cron_job(path: Path, job_id: str) -> dict[str, Any] | None:
++    for job in _cron_jobs_from_file(path):
++        if str(job.get("id", "")) == job_id:
++            return job
++    return None
++
++
++def _parse_iso_datetime(value: Any) -> datetime | None:
++    if not value:
++        return None
++    text = str(value).strip()
++    if not text:
++        return None
++    try:
++        return datetime.fromisoformat(text.replace("Z", "+00:00"))
++    except ValueError:
++        return None
++
++
++def _cron_job_runtime_ok(job: dict[str, Any]) -> bool:
++    if not bool(job.get("enabled", True)):
++        return False
++    if str(job.get("last_status") or "unknown") != "error":
++        return True
++    if str(job.get("last_repair_verification_status") or "").lower() != "ok":
++        return False
++    verified_at = _parse_iso_datetime(job.get("last_repair_verification_at"))
++    last_run_at = _parse_iso_datetime(job.get("last_run_at"))
++    return bool(verified_at and (last_run_at is None or verified_at > last_run_at))
++
++
++def _cron_job_evidence_status(job: dict[str, Any]) -> str:
++    last_status = str(job.get("last_status") or "unknown")
++    repair_status = str(job.get("last_repair_verification_status") or "").lower()
++    repair_at = job.get("last_repair_verification_at")
++    if last_status == "error" and repair_status == "ok" and repair_at:
++        return f"last_status=error post_failure_verification=ok at {repair_at}"
++    return f"last_status={last_status}"
++
++
++def _record_id(record: dict[str, Any]) -> str:
++    return str(record.get("id") or record.get("record_id") or record.get("title") or "unknown")
++
++
++def _record_title(record: dict[str, Any]) -> str:
++    return str(record.get("title") or _record_id(record))
++
++
++def _missing_source(record: dict[str, Any], ledger_path: Path) -> ReconcileItem:
++    return ReconcileItem(
++        status="missing_source",
++        source_id=_record_id(record),
++        title=_record_title(record),
++        severity="attention",
++        source_path=str(ledger_path),
++        evidence="active ledger record has no concrete source_of_truth or runtime handle",
++        next_action="Add a source_of_truth/runtime handle, mark it complete, or remove the stale record.",
++    )
++
++
++def _verify_cron_record(record: dict[str, Any], source: dict[str, Any], home: Path) -> ReconcileItem:
++    job_id = str(source.get("cron_job_id") or "")
++    cron_path_raw = source.get("cron_jobs_file")
++    cron_path = Path(cron_path_raw) if cron_path_raw else _default_cron_path(source.get("profile"), home)
++    if not cron_path.is_absolute():
++        cron_path = home / cron_path
++
++    if not cron_path.exists():
++        return ReconcileItem(
++            status="verification_unavailable",
++            source_id=_record_id(record),
++            title=_record_title(record),
++            severity="attention",
++            source_path=str(cron_path),
++            evidence=f"cron jobs file missing for cron_job_id={job_id}",
++            next_action="Verify the profile/home path or update the ledger source_of_truth.",
++        )
++
++    try:
++        job = _find_cron_job(cron_path, job_id)
++    except (OSError, json.JSONDecodeError) as exc:
++        return ReconcileItem(
++            status="verification_unavailable",
++            source_id=_record_id(record),
++            title=_record_title(record),
++            severity="attention",
++            source_path=str(cron_path),
++            evidence=f"could not read cron jobs file: {exc}",
++            next_action="Fix the cron jobs file or update the ledger source_of_truth.",
++        )
++
++    if job is None:
++        return ReconcileItem(
++            status="dead_reference",
++            source_id=_record_id(record),
++            title=_record_title(record),
++            severity="problem",
++            source_path=str(cron_path),
++            evidence=f"cron job {job_id} not found",
++            next_action="Retire/remove the ledger record or update it to the current cron job id.",
++        )
++
++    enabled = bool(job.get("enabled", True))
++    status = "active_verified" if _cron_job_runtime_ok(job) else "runtime_attention"
++    severity = "ok" if status == "active_verified" else "attention"
++    return ReconcileItem(
++        status=status,
++        source_id=_record_id(record),
++        title=_record_title(record),
++        severity=severity,
++        source_path=str(cron_path),
++        evidence=f"cron job {job_id} enabled={enabled} {_cron_job_evidence_status(job)}",
++        next_action="No action." if status == "active_verified" else "Inspect the cron job and update the ledger verification.",
++    )
++
++
++def _cron_job_ids(source: dict[str, Any]) -> list[str]:
++    if source.get("cron_job_id"):
++        return [str(source["cron_job_id"])]
++    ids = source.get("current_cron_job_ids")
++    if isinstance(ids, list):
++        return [str(item) for item in ids if item]
++    jobs = source.get("cron_jobs")
++    if isinstance(jobs, list):
++        return [str(job.get("cron_job_id") or job.get("id")) for job in jobs if isinstance(job, dict) and (job.get("cron_job_id") or job.get("id"))]
++    return []
++
++
++def _verify_cron_jobs_record(record: dict[str, Any], source: dict[str, Any], home: Path) -> ReconcileItem:
++    ids = _cron_job_ids(source)
++    if len(ids) == 1:
++        source = dict(source)
++        source["cron_job_id"] = ids[0]
++        return _verify_cron_record(record, source, home)
++    cron_path_raw = source.get("cron_jobs_file")
++    cron_path = Path(cron_path_raw) if cron_path_raw else _default_cron_path(source.get("profile"), home)
++    if not cron_path.is_absolute():
++        cron_path = home / cron_path
++    if not ids:
++        return _missing_source(record, _ledger_path(home))
++    if not cron_path.exists():
++        return ReconcileItem(
++            status="verification_unavailable",
++            source_id=_record_id(record),
++            title=_record_title(record),
++            severity="attention",
++            source_path=str(cron_path),
++            evidence="cron jobs file missing for multiple cron job ids",
++            next_action="Verify the profile/home path or update the ledger source_of_truth.",
++        )
++    try:
++        jobs = {str(job.get("id")): job for job in _cron_jobs_from_file(cron_path)}
++    except (OSError, json.JSONDecodeError) as exc:
++        return ReconcileItem(
++            status="verification_unavailable",
++            source_id=_record_id(record),
++            title=_record_title(record),
++            severity="attention",
++            source_path=str(cron_path),
++            evidence=f"could not read cron jobs file: {exc}",
++            next_action="Fix the cron jobs file or update the ledger source_of_truth.",
++        )
++    missing = [job_id for job_id in ids if job_id not in jobs]
++    if missing:
++        return ReconcileItem(
++            status="dead_reference",
++            source_id=_record_id(record),
++            title=_record_title(record),
++            severity="problem",
++            source_path=str(cron_path),
++            evidence=f"cron jobs missing={','.join(missing)}",
++            next_action="Retire/remove missing job ids or update the ledger to current cron ids.",
++        )
++    bad = [job_id for job_id in ids if not _cron_job_runtime_ok(jobs[job_id])]
++    status = "active_verified" if not bad else "runtime_attention"
++    evidence = f"cron jobs verified={len(ids)}"
++    if bad:
++        evidence = f"cron jobs need attention={','.join(bad)}"
++    elif any(str(jobs[job_id].get("last_status") or "unknown") == "error" for job_id in ids):
++        evidence = "cron jobs verified by post-failure repair diagnostics"
++    return ReconcileItem(
++        status=status,
++        source_id=_record_id(record),
++        title=_record_title(record),
++        severity="ok" if status == "active_verified" else "attention",
++        source_path=str(cron_path),
++        evidence=evidence,
++        next_action="No action." if status == "active_verified" else "Inspect the cron jobs and update ledger verification.",
++    )
++
++
++def _n8n_db_path(home: Path) -> Path:
++    # Tests isolate n8n under HERMES_HOME/.n8n; Andy's live runtime uses
++    # /home/pi/.n8n/database.sqlite while HERMES_HOME is /home/pi/.hermes.
++    hermes_local = home / ".n8n" / "database.sqlite"
++    if hermes_local.exists():
++        return hermes_local
++    return home.parent / ".n8n" / "database.sqlite"
++
++
++def _verify_n8n_record(record: dict[str, Any], source: dict[str, Any], home: Path) -> ReconcileItem:
++    workflow_id = str(source.get("n8n_workflow_id") or "")
++    db_path = Path(str(source.get("n8n_db_path") or _n8n_db_path(home)))
++    if not db_path.exists():
++        return ReconcileItem(
++            status="verification_unavailable",
++            source_id=_record_id(record),
++            title=_record_title(record),
++            severity="attention",
++            source_path=str(db_path),
++            evidence=f"n8n database missing for workflow_id={workflow_id}",
++            next_action="Verify n8n DB path or update the ledger source_of_truth.",
++        )
++    try:
++        with sqlite3.connect(db_path) as con:
++            row = con.execute(
++                "select id, name, active, updatedAt from workflow_entity where id=?",
++                (workflow_id,),
++            ).fetchone()
++    except sqlite3.Error as exc:
++        return ReconcileItem(
++            status="verification_unavailable",
++            source_id=_record_id(record),
++            title=_record_title(record),
++            severity="attention",
++            source_path=str(db_path),
++            evidence=f"could not query n8n workflow_entity: {exc}",
++            next_action="Verify n8n DB schema/path or update the ledger source_of_truth.",
++        )
++    if row is None:
++        return ReconcileItem(
++            status="dead_reference",
++            source_id=_record_id(record),
++            title=_record_title(record),
++            severity="problem",
++            source_path=str(db_path),
++            evidence=f"n8n workflow {workflow_id} not found",
++            next_action="Retire/remove the ledger record or update it to the current workflow id.",
++        )
++    active = bool(row[2])
++    status = "active_verified" if active else "runtime_attention"
++    return ReconcileItem(
++        status=status,
++        source_id=_record_id(record),
++        title=_record_title(record),
++        severity="ok" if active else "attention",
++        source_path=str(db_path),
++        evidence=f"n8n workflow {workflow_id} active={active}",
++        next_action="No action." if active else "Inspect/activate the n8n workflow or update the ledger.",
++    )
++
++
++def _verification_status(record: dict[str, Any]) -> str | None:
++    verification = record.get("verification")
++    if isinstance(verification, dict):
++        status = verification.get("status") or verification.get("last_status")
++        if status:
++            return str(status)
++    return None
++
++
++def _verify_manual_record(record: dict[str, Any], ledger_path: Path) -> ReconcileItem | None:
++    status = (_verification_status(record) or "").strip().lower()
++    if status in {"active", "ok", "active_partial"}:
++        return ReconcileItem(
++            status="active_verified",
++            source_id=_record_id(record),
++            title=_record_title(record),
++            severity="ok",
++            source_path=str(ledger_path),
++            evidence=f"manual verification status={status}",
++            next_action="No action.",
++        )
++    return None
++
++
++def _get_nested(data: dict[str, Any], dotted_key: str) -> Any:
++    node: Any = data
++    for part in dotted_key.split("."):
++        if not isinstance(node, dict):
++            return None
++        node = node.get(part)
++    return node
++
++
++def _config_path_for_profile(home: Path, profile: str) -> Path:
++    if profile in {"default", "main"}:
++        return home / "config.yaml"
++    return home / "profiles" / profile / "config.yaml"
++
++
++def _verify_gateway_config_record(record: dict[str, Any], source: dict[str, Any], home: Path) -> ReconcileItem:
++    key = str(source.get("gateway_config_key") or "")
++    profiles = source.get("profiles_enabled") or ["default"]
++    if not isinstance(profiles, list):
++        profiles = ["default"]
++    missing: list[str] = []
++    disabled: list[str] = []
++    verified = 0
++    for profile in [str(p) for p in profiles]:
++        path = _config_path_for_profile(home, profile)
++        if not path.exists():
++            missing.append(profile)
++            continue
++        try:
++            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
++        except (OSError, yaml.YAMLError):
++            missing.append(profile)
++            continue
++        value = _get_nested(data, key)
++        if isinstance(value, dict) and value.get("enabled") is True:
++            verified += 1
++        elif value is True:
++            verified += 1
++        else:
++            disabled.append(profile)
++    if missing or disabled:
++        return ReconcileItem(
++            status="runtime_attention",
++            source_id=_record_id(record),
++            title=_record_title(record),
++            severity="attention",
++            source_path=str(home),
++            evidence=f"gateway config key {key} missing={','.join(missing) or 'none'} disabled={','.join(disabled) or 'none'}",
++            next_action="Update the gateway config/profile list or mark the ledger record inactive.",
++        )
++    return ReconcileItem(
++        status="active_verified",
++        source_id=_record_id(record),
++        title=_record_title(record),
++        severity="ok",
++        source_path=str(home),
++        evidence=f"gateway config key {key} profiles verified={verified}",
++        next_action="No action.",
++    )
++
++
++def _verify_record(record: dict[str, Any], ledger_path: Path, home: Path) -> ReconcileItem:
++    source = _source_dict(record)
++    if not source:
++        return _missing_source(record, ledger_path)
++    if _cron_job_ids(source):
++        return _verify_cron_jobs_record(record, source, home)
++    if source.get("n8n_workflow_id"):
++        return _verify_n8n_record(record, source, home)
++    if source.get("gateway_config_key"):
++        return _verify_gateway_config_record(record, source, home)
++    manual = _verify_manual_record(record, ledger_path)
++    if manual is not None:
++        return manual
++    # Deterministic but conservative: unknown source types are not failures.
++    return ReconcileItem(
++        status="verification_unavailable",
++        source_id=_record_id(record),
++        title=_record_title(record),
++        severity="attention",
++        source_path=str(ledger_path),
++        evidence="source_of_truth exists but no supported verifier is available",
++        next_action="Add a supported verifier or refresh this record manually.",
++    )
++
++
++def reconcile_active_work(home: Path | None = None) -> ReconcileReport:
++    root = home or get_hermes_home()
++    ledger_path = _ledger_path(root)
++    records = _active_records(_load_ledger_records(ledger_path))
++    items = [_verify_record(record, ledger_path, root) for record in records]
++    summary = {
++        "active_verified": 0,
++        "missing_source": 0,
++        "dead_reference": 0,
++        "runtime_attention": 0,
++        "verification_unavailable": 0,
++    }
++    for item in items:
++        summary[item.status] = summary.get(item.status, 0) + 1
++    return ReconcileReport(items=items, summary=summary)
++
++
++def _truncate(value: str, max_len: int) -> str:
++    if len(value) <= max_len:
++        return value
++    if max_len <= 1:
++        return "…"[:max_len]
++    return value[: max_len - 1].rstrip() + "…"
++
++
++def _item_to_json(item: ReconcileItem, max_field_chars: int = 160) -> dict[str, str]:
++    data = asdict(item)
++    for key in ("title", "evidence", "next_action", "source_path"):
++        data[key] = _truncate(str(data[key]), max_field_chars)
++    return data
++
++
++def format_reconcile_json(report: ReconcileReport, max_chars: int = 4000) -> str:
++    # Keep machine output useful even when tightly bounded: shorter per-field
++    # snippets are better than dropping every item.
++    field_chars = 160 if max_chars >= 1200 else 72
++    compact_items = [_item_to_json(item, max_field_chars=field_chars) for item in report.items]
++    payload: dict[str, Any] = {
++        "schema": RECONCILE_SCHEMA,
++        "summary": report.summary,
++        "total_items": len(report.items),
++        "truncated": False,
++        "items": compact_items,
++    }
++    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
++    while len(text) > max_chars and compact_items:
++        compact_items.pop()
++        payload["truncated"] = True
++        text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
++    if len(text) <= max_chars:
++        return text
++    payload = {
++        "schema": RECONCILE_SCHEMA,
++        "summary": report.summary,
++        "total_items": len(report.items),
++        "truncated": True,
++        "items": [],
++    }
++    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
++    return _truncate(text, max_chars)
++
++
++def format_reconcile_text(report: ReconcileReport, max_chars: int = 4000) -> str:
++    actionable = [item for item in report.items if item.status != "active_verified"]
++    if not actionable:
++        return ""
++    lines = ["Memory Tree reconcile attention", ""]
++    for key, value in report.summary.items():
++        if value:
++            lines.append(f"{key}: {value}")
++    lines.append("")
++    for item in actionable:
++        lines.extend(
++            [
++                f"- {item.title} [{item.status}]",
++                f"  source_id: {item.source_id}",
++                f"  source_path: {item.source_path}",
++                f"  evidence: {item.evidence}",
++                f"  next: {item.next_action}",
++            ]
++        )
++    text = "\n".join(lines).rstrip() + "\n"
++    return _truncate(text, max_chars)
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 1b49aabd5033c5739a53af9f9cdcf6bab92df85f..acfa4d1de9c88cd92ee20b96f0e79c8920798d84 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -15415,7 +15415,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
+         "computer-use",
+         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
+         "dump", "egress", "fallback", "gateway", "hooks", "import", "insights",
+-        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
++        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "memory-tree", "migrate", "moa",
+         "journey", "memory-graph", "learning",
+         "model", "pairing", "pets", "plugins", "portal", "profile",
+         "project", "proxy",
+@@ -16463,6 +16463,13 @@ def main():
+     except Exception as _exc:
+         logging.getLogger(__name__).debug("pets CLI wiring failed: %s", _exc)
+ 
++    # =========================================================================
++    # memory-tree command
++    # =========================================================================
++    from hermes_cli.memory_tree import add_memory_tree_parser
++
++    add_memory_tree_parser(subparsers)
++
+     # =========================================================================
+     # journey command — learned skills + memories over time, in the terminal
+     # =========================================================================
+diff --git a/hermes_cli/memory_tree.py b/hermes_cli/memory_tree.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa884aeca094555f7416b868b7b5a41540eb1ca4
+--- /dev/null
++++ b/hermes_cli/memory_tree.py
+@@ -0,0 +1,357 @@
++"""CLI and callable helpers for Memory Tree Lite.
++
++Memory Tree is deliberately on-call: these helpers read generated packs and
++scanner outputs only when explicitly invoked. They do not mutate prompt state or
++auto-inject context.
++"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Any, Iterable
++
++from hermes_constants import get_hermes_home
++
++
++DEFAULT_PACKS = ("recent",)
++
++
++def _home() -> Path:
++    return get_hermes_home()
++
++
++def _data_dir(home: Path | None = None) -> Path:
++    return (home or _home()) / "data" / "memory-tree-lite"
++
++
++def _load_json(path: Path, default: Any) -> Any:
++    try:
++        return json.loads(path.read_text(encoding="utf-8"))
++    except (FileNotFoundError, json.JSONDecodeError):
++        return default
++
++
++def _load_config(home: Path | None = None) -> dict[str, Any]:
++    path = (home or _home()) / "config.yaml"
++    try:
++        import yaml  # type: ignore
++    except Exception:
++        return {}
++    try:
++        data = yaml.safe_load(path.read_text(encoding="utf-8"))
++    except (OSError, yaml.YAMLError):
++        return {}
++    return data if isinstance(data, dict) else {}
++
++
++def _memory_tree_config(home: Path | None = None) -> dict[str, Any]:
++    config = _load_config(home).get("memory_tree")
++    if not isinstance(config, dict):
++        config = {}
++    return {
++        "enabled": bool(config.get("enabled", False)),
++        "mode": str(config.get("mode", "manual")),
++        "max_results": int(config.get("max_results", 3) or 3),
++        "max_chars": int(config.get("max_chars", 1200) or 1200),
++        "snippet_chars": int(config.get("snippet_chars", 360) or 360),
++        "packs": list(config.get("packs") or DEFAULT_PACKS),
++        "allowed_sources": list(config.get("allowed_sources") or []),
++    }
++
++
++def _state(home: Path | None = None) -> dict[str, Any]:
++    data = _load_json(_data_dir(home) / "state.json", {})
++    return data if isinstance(data, dict) else {}
++
++
++def _pack_path(name_or_path: str, *, home: Path | None = None, state: dict[str, Any] | None = None) -> Path:
++    raw = str(name_or_path)
++    path = Path(raw).expanduser()
++    if path.is_absolute() or raw.endswith(".md") or "/" in raw:
++        return path
++    outputs = (state or _state(home)).get("outputs")
++    if isinstance(outputs, dict) and raw in outputs:
++        return Path(str(outputs[raw])).expanduser()
++    if raw == "recent":
++        return _data_dir(home) / "recent.md"
++    if raw == "index":
++        return _data_dir(home) / "index.md"
++    if raw == "daily":
++        outputs = (state or _state(home)).get("outputs")
++        if isinstance(outputs, dict) and "daily" in outputs:
++            return Path(str(outputs["daily"])).expanduser()
++    return _data_dir(home) / f"{raw}.md"
++
++
++def resolve_pack_paths(packs: Iterable[str] | None = None, *, home: Path | None = None) -> list[Path]:
++    state = _state(home)
++    config = _memory_tree_config(home)
++    selected = list(packs or config.get("packs") or DEFAULT_PACKS)
++    return [_pack_path(pack, home=home, state=state) for pack in selected]
++
++
++def _pack_status(path: Path) -> dict[str, Any]:
++    exists = path.exists()
++    return {
++        "path": str(path),
++        "exists": exists,
++        "bytes": path.stat().st_size if exists else 0,
++    }
++
++
++def memory_tree_status(*, json_mode: bool = False, verbose: bool = False, home: Path | None = None) -> str:
++    state = _state(home)
++    config = _memory_tree_config(home)
++    packs = resolve_pack_paths(config.get("packs"), home=home)
++    raw_counts = state.get("counts")
++    counts: dict[str, Any] = raw_counts if isinstance(raw_counts, dict) else {}
++    payload = {
++        "schema": "memory-tree-status-v1",
++        "updated_at": state.get("updated_at"),
++        "context": {
++            "enabled": config["enabled"],
++            "mode": config["mode"],
++            "auto_injection": bool(config["enabled"] and config["mode"] == "auto"),
++            "note": "Memory Tree is on-call only unless memory_tree.enabled=true and mode=auto.",
++        },
++        "build": {
++            "records_total": counts.get("records_total", 0),
++            "sessions": counts.get("sessions", 0),
++            "active_work": counts.get("active_work", 0),
++            "cron_outputs": counts.get("cron_outputs", 0),
++        },
++        "packs": [_pack_status(path) for path in packs],
++        "scanner_state": {
++            "attention": str(_data_dir(home) / "attention-state.json"),
++            "reconcile": str(_data_dir(home) / "reconcile-state.json"),
++            "privacy": str(_data_dir(home) / "privacy-state.json"),
++        },
++    }
++    if json_mode:
++        return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
++
++    lines = ["Memory Tree Lite status"]
++    lines.append(f"context: enabled={payload['context']['enabled']} mode={payload['context']['mode']} auto_injection={payload['context']['auto_injection']}")
++    lines.append(f"updated_at: {payload['updated_at'] or 'never'}")
++    lines.append(
++        "records: total={records_total} sessions={sessions} active_work={active_work} cron_outputs={cron_outputs}".format(
++            **payload["build"]
++        )
++    )
++    lines.append("packs:")
++    for pack in payload["packs"]:
++        lines.append(f"- {pack['path']} ({'present' if pack['exists'] else 'missing'}, {pack['bytes']} bytes)")
++    if verbose:
++        lines.append("scanner_state:")
++        for name, path in payload["scanner_state"].items():
++            lines.append(f"- {name}: {path}")
++    return "\n".join(lines)
++
++
++def _result_to_dict(result: Any) -> dict[str, Any]:
++    return {
++        "score": result.score,
++        "pack_path": str(result.pack_path),
++        "source_type": result.source_type,
++        "source_id": result.source_id,
++        "title": result.title,
++        "timestamp": result.timestamp,
++        "snippet": result.snippet,
++        "metadata": result.metadata,
++    }
++
++
++def _search_results(query: str, *, packs: Iterable[str] | None = None, limit: int = 5, chars: int = 500) -> list[Any]:
++    from agent.memory_tree_lite import search_memory_packs
++
++    return search_memory_packs(resolve_pack_paths(packs), query, limit=limit, max_snippet_chars=chars)
++
++
++def memory_tree_search(
++    query: str,
++    *,
++    packs: Iterable[str] | None = None,
++    limit: int = 5,
++    chars: int = 500,
++    json_mode: bool = False,
++) -> str:
++    results = _search_results(query, packs=packs, limit=limit, chars=chars)
++    if json_mode:
++        return json.dumps(
++            {"schema": "memory-tree-search-v1", "query": query, "results": [_result_to_dict(r) for r in results]},
++            ensure_ascii=False,
++            indent=2,
++            sort_keys=True,
++        )
++    if not results:
++        return "Memory Tree search: no matches"
++    lines = [f"Memory Tree search: {len(results)} match(es) for {query!r}"]
++    for idx, result in enumerate(results, start=1):
++        lines.extend(
++            [
++                f"{idx}. {result.title}",
++                f"   source: {result.source_type} / {result.source_id}",
++                f"   score: {result.score}",
++                f"   snippet: {result.snippet}",
++            ]
++        )
++    return "\n".join(lines)
++
++
++def memory_tree_context_preview(
++    query: str,
++    *,
++    packs: Iterable[str] | None = None,
++    limit: int = 3,
++    chars: int = 1200,
++    json_mode: bool = False,
++) -> str:
++    results = _search_results(query, packs=packs, limit=limit, chars=chars)
++    block_lines = [
++        "[Memory Tree context preview — on-call retrieval only; not auto-injected]",
++        f"query: {query}",
++    ]
++    for idx, result in enumerate(results, start=1):
++        block_lines.extend(
++            [
++                f"\n{idx}. {result.title}",
++                f"source: {result.source_type} / {result.source_id}",
++                f"pack: {result.pack_path}",
++                "content:",
++                result.snippet,
++            ]
++        )
++    context = "\n".join(block_lines)
++    if json_mode:
++        return json.dumps(
++            {
++                "schema": "memory-tree-context-preview-v1",
++                "query": query,
++                "auto_injected": False,
++                "context": context,
++                "results": [_result_to_dict(r) for r in results],
++            },
++            ensure_ascii=False,
++            indent=2,
++            sort_keys=True,
++        )
++    return context
++
++
++def cmd_memory_tree(args: Any) -> int:
++    action = getattr(args, "memory_tree_command", None) or "status"
++    if action == "status":
++        print(memory_tree_status(json_mode=getattr(args, "json", False), verbose=getattr(args, "verbose", False)))
++        return 0
++    if action == "build":
++        from agent.memory_tree_build import BuildOptions, build_memory_tree_packs, format_build_report
++
++        state = build_memory_tree_packs(
++            BuildOptions(
++                session_limit=getattr(args, "session_limit", 40),
++                cron_limit=getattr(args, "cron_limit", 30),
++                ledger_limit=getattr(args, "ledger_limit", 80),
++                max_record_chars=getattr(args, "max_record_chars", 4000),
++                include_tools=getattr(args, "include_tools", False),
++            )
++        )
++        if getattr(args, "json", False):
++            print(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True))
++        elif getattr(args, "report", False):
++            print(format_build_report(state))
++        return 0
++    if action == "search":
++        print(
++            memory_tree_search(
++                getattr(args, "query"),
++                packs=getattr(args, "packs", None),
++                limit=getattr(args, "limit", 5),
++                chars=getattr(args, "chars", 500),
++                json_mode=getattr(args, "json", False),
++            )
++        )
++        return 0
++    if action == "context-preview":
++        print(
++            memory_tree_context_preview(
++                getattr(args, "query"),
++                packs=getattr(args, "packs", None),
++                limit=getattr(args, "limit", 3),
++                chars=getattr(args, "chars", 1200),
++                json_mode=getattr(args, "json", False),
++            )
++        )
++        return 0
++    if action == "attention":
++        from agent.memory_tree_attention import format_attention_json, format_attention_report, scan_attention
++
++        items = scan_attention(stale_days=getattr(args, "stale_days", 7), include_stale=getattr(args, "include_stale", False))
++        print(format_attention_json(items, max_chars=getattr(args, "chars", 4000)) if getattr(args, "json", False) else format_attention_report(items, max_chars=getattr(args, "chars", 4000)))
++        return 0
++    if action == "reconcile":
++        from agent.memory_tree_reconcile import format_reconcile_json, format_reconcile_text, reconcile_active_work
++
++        report = reconcile_active_work()
++        print(format_reconcile_json(report, max_chars=getattr(args, "chars", 4000)) if getattr(args, "json", False) else format_reconcile_text(report, max_chars=getattr(args, "chars", 4000)))
++        return 0
++    if action == "privacy":
++        from agent.memory_tree_privacy import format_privacy_json, format_privacy_text, scan_memory_tree_privacy
++
++        report = scan_memory_tree_privacy(max_snippet_chars=getattr(args, "snippet_chars", 160))
++        print(format_privacy_json(report, max_chars=getattr(args, "chars", 4000)) if getattr(args, "json", False) else format_privacy_text(report, max_chars=getattr(args, "chars", 4000)))
++        return 0
++    raise SystemExit(f"Unknown memory-tree command: {action}")
++
++
++def add_memory_tree_parser(subparsers: Any) -> Any:
++    parser = subparsers.add_parser(
++        "memory-tree",
++        help="Inspect/search generated Memory Tree Lite packs without auto-injection",
++        description="Build, inspect, search, and preview Memory Tree Lite context on demand.",
++    )
++    sub = parser.add_subparsers(dest="memory_tree_command")
++
++    status = sub.add_parser("status", help="Show pack/build/config status")
++    status.add_argument("--json", action="store_true", help="Emit JSON")
++    status.add_argument("--verbose", action="store_true", help="Show scanner state paths")
++
++    build = sub.add_parser("build", help="Build packs from local Hermes state")
++    build.add_argument("--session-limit", type=int, default=40)
++    build.add_argument("--cron-limit", type=int, default=30)
++    build.add_argument("--ledger-limit", type=int, default=80)
++    build.add_argument("--max-record-chars", type=int, default=4000)
++    build.add_argument("--include-tools", action="store_true")
++    build.add_argument("--report", action="store_true", help="Print compact report")
++    build.add_argument("--json", action="store_true", help="Emit build state JSON")
++
++    search = sub.add_parser("search", help="Search generated packs")
++    search.add_argument("query")
++    search.add_argument("--limit", type=int, default=5)
++    search.add_argument("--chars", type=int, default=500)
++    search.add_argument("--pack", dest="packs", action="append", help="Pack name or path; repeatable")
++    search.add_argument("--json", action="store_true")
++
++    preview = sub.add_parser("context-preview", help="Preview a bounded context block for a query")
++    preview.add_argument("query")
++    preview.add_argument("--limit", type=int, default=3)
++    preview.add_argument("--chars", type=int, default=1200)
++    preview.add_argument("--pack", dest="packs", action="append", help="Pack name or path; repeatable")
++    preview.add_argument("--json", action="store_true")
++
++    attention = sub.add_parser("attention", help="Run attention scan")
++    attention.add_argument("--stale-days", type=int, default=7)
++    attention.add_argument("--chars", type=int, default=4000)
++    attention.add_argument("--include-stale", action="store_true", help="Include low-priority stale active-work ledger review items")
++    attention.add_argument("--json", action="store_true")
++
++    reconcile = sub.add_parser("reconcile", help="Reconcile active-work source handles")
++    reconcile.add_argument("--chars", type=int, default=4000)
++    reconcile.add_argument("--json", action="store_true")
++
++    privacy = sub.add_parser("privacy", help="Scan packs for credential-shaped leaks")
++    privacy.add_argument("--chars", type=int, default=4000)
++    privacy.add_argument("--snippet-chars", type=int, default=160)
++    privacy.add_argument("--json", action="store_true")
++
++    parser.set_defaults(func=cmd_memory_tree)
++    return parser
+diff --git a/tests/test_memory_tree_attention.py b/tests/test_memory_tree_attention.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..159956e4b73e2bdc21d206acc5fe93554226a301
+--- /dev/null
++++ b/tests/test_memory_tree_attention.py
+@@ -0,0 +1,145 @@
++from __future__ import annotations
++
++from datetime import datetime, timezone
++from pathlib import Path
++
++from agent.memory_tree_attention import _scan_ledger_records, format_attention_report
++
++
++def _items(records):
++    return _scan_ledger_records(
++        records,
++        now=datetime(2026, 6, 4, tzinfo=timezone.utc),
++        stale_days=7,
++        source_path=Path("ledger.json"),
++    )
++
++
++def test_ok_status_with_historical_error_word_is_stale_not_failure():
++    records = [
++        {
++            "id": "backup-monitor",
++            "title": "Backup monitor",
++            "status": "active",
++            "updated_at": "2026-05-28T00:00:00+00:00",
++            "runtime": {"cron_job_id": "abc123", "last_status": "ok"},
++            "verification": {
++                "status": "ok_with_personal_rclone_errors",
++                "checked_at": "2026-05-28T00:00:00+00:00",
++                "evidence": "Old note mentions prior errors but current run is clean.",
++            },
++        }
++    ]
++
++    items = _items(records)
++
++    assert len(items) == 1
++    assert items[0].kind == "stale_active_work"
++    assert items[0].severity == "attention"
++
++
++def test_verified_error_routing_status_is_not_failure():
++    records = [
++        {
++            "id": "supervisor-agent-health-scan",
++            "title": "Supervisor-agent health scan",
++            "status": "active",
++            "updated_at": "2026-06-04T00:00:00+00:00",
++            "runtime": {"cron_job_id": "79b7c4346140", "last_status": "ok"},
++            "verification": {
++                "status": "broad_error_routing_verified",
++                "checked_at": "2026-06-04T00:00:00+00:00",
++                "evidence": "Repair-gate error routing was verified; this is not a current error.",
++            },
++        }
++    ]
++
++    assert _items(records) == []
++
++
++def test_resolved_failure_pending_next_run_is_not_current_failure():
++    records = [
++        {
++            "id": "backup-monitor",
++            "title": "Backup monitor",
++            "status": "active_remote_cron_running_with_case_rename_autorepair_and_personal_vault_exclusion",
++            "updated_at": "2026-06-04T00:00:00+00:00",
++            "runtime": {"cron_job_id": "abc123", "last_status": "ok"},
++            "verification": {
++                "status": "case_only_failure_cleared_personal_vault_excluded_pending_next_full_run",
++                "checked_at": "2026-06-04T00:00:00+00:00",
++                "evidence": "Prior case-only rename failure was cleared; next full run will prove the mirror.",
++            },
++        }
++    ]
++
++    assert _items(records) == []
++
++
++def test_current_runtime_error_is_still_failure():
++    records = [
++        {
++            "id": "broken-job",
++            "title": "Broken job",
++            "status": "active",
++            "runtime": {"cron_job_id": "abc123", "last_status": "error"},
++            "verification": {"status": "ok", "checked_at": "2026-06-04T00:00:00+00:00"},
++        }
++    ]
++
++    items = _items(records)
++
++    assert len(items) == 1
++    assert items[0].kind == "failed_automation"
++    assert items[0].severity == "failure"
++
++
++def test_stale_active_work_can_be_suppressed_for_quiet_monitoring():
++    records = [
++        {
++            "id": "stale-but-not-broken",
++            "title": "Stale but not broken",
++            "status": "active",
++            "updated_at": "2026-05-01T00:00:00+00:00",
++            "runtime": {"cron_job_id": "abc123", "last_status": "ok"},
++            "verification": {"status": "ok", "checked_at": "2026-05-01T00:00:00+00:00"},
++        }
++    ]
++
++    assert _scan_ledger_records(
++        records,
++        now=datetime(2026, 6, 4, tzinfo=timezone.utc),
++        stale_days=7,
++        source_path=Path("ledger.json"),
++        include_stale=False,
++    ) == []
++
++
++def test_recent_verification_with_source_handle_is_not_attention():
++    records = [
++        {
++            "id": "healthy-job",
++            "title": "Healthy job",
++            "status": "active",
++            "updated_at": "2026-05-01T00:00:00+00:00",
++            "runtime": {"cron_job_id": "abc123", "last_status": "ok"},
++            "verification": {"status": "ok", "checked_at": "2026-06-03T00:00:00+00:00"},
++        }
++    ]
++
++    assert _items(records) == []
++
++
++def test_attention_report_starts_with_repair_gate_marker():
++    records = [
++        {
++            "id": "broken-job",
++            "title": "Broken job",
++            "status": "active",
++            "runtime": {"cron_job_id": "abc123", "last_status": "error"},
++        }
++    ]
++
++    report = format_attention_report(_items(records))
++
++    assert report.startswith("Attention needed: Memory Tree attention:")
+diff --git a/tests/test_memory_tree_build.py b/tests/test_memory_tree_build.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d926a2462d2bd9da47856a0e1b2717331ab1b80e
+--- /dev/null
++++ b/tests/test_memory_tree_build.py
+@@ -0,0 +1,40 @@
++from pathlib import Path
++
++from agent.memory_tree_build import collect_cron_records, iter_recent_cron_outputs
++
++
++def test_iter_recent_cron_outputs_skips_file_removed_during_scan(tmp_path, monkeypatch):
++    home = tmp_path
++    output = home / "cron" / "output" / "job1"
++    output.mkdir(parents=True)
++    vanished = output / "gone.md"
++    vanished.write_text("gone", encoding="utf-8")
++    kept = output / "kept.md"
++    kept.write_text("kept", encoding="utf-8")
++
++    original_stat = Path.stat
++    stat_calls = {vanished: 0}
++
++    def flaky_stat(self, *args, **kwargs):
++        if self == vanished:
++            stat_calls[vanished] += 1
++            if stat_calls[vanished] >= 2:
++                raise FileNotFoundError(str(self))
++        return original_stat(self, *args, **kwargs)
++
++    monkeypatch.setattr(Path, "stat", flaky_stat)
++
++    assert iter_recent_cron_outputs(home, 10) == [kept]
++
++
++def test_collect_cron_records_skips_file_removed_after_discovery(tmp_path, monkeypatch):
++    home = tmp_path
++    output = home / "cron" / "output" / "job1"
++    output.mkdir(parents=True)
++    vanished = output / "gone.md"
++    vanished.write_text("gone", encoding="utf-8")
++
++    monkeypatch.setattr("agent.memory_tree_build.iter_recent_cron_outputs", lambda home, limit: [vanished])
++    vanished.unlink()
++
++    assert collect_cron_records(home, limit=10) == []
+diff --git a/tests/test_memory_tree_cli_tool.py b/tests/test_memory_tree_cli_tool.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..358b05a7dc6366ec76c979c27721674d79b75dca
+--- /dev/null
++++ b/tests/test_memory_tree_cli_tool.py
+@@ -0,0 +1,91 @@
++import json
++from pathlib import Path
++
++from agent.memory_tree_lite import SourceRecord, build_markdown_pack
++
++
++def _write_pack(home: Path) -> Path:
++    pack = home / "data" / "memory-tree-lite" / "recent.md"
++    pack.parent.mkdir(parents=True, exist_ok=True)
++    pack.write_text(
++        build_markdown_pack(
++            [
++                SourceRecord(
++                    source_type="active-work",
++                    source_id="mattermost-brief",
++                    title="Mattermost morning brief",
++                    timestamp=123.0,
++                    text="The Mattermost brief uses deterministic packet context and stays silent on no-op.",
++                    metadata={"path": "data/active-work/ledger.json"},
++                )
++            ],
++            title="Hermes Memory Tree Lite - Recent",
++        ),
++        encoding="utf-8",
++    )
++    (home / "data" / "memory-tree-lite" / "state.json").write_text(
++        json.dumps(
++            {
++                "schema": "memory-tree-lite-state-v1",
++                "updated_at": "2026-06-01T12:00:00+08:00",
++                "counts": {"records_total": 1, "sessions": 0, "active_work": 1, "cron_outputs": 0},
++                "outputs": {"recent": str(pack)},
++            }
++        ),
++        encoding="utf-8",
++    )
++    return pack
++
++
++def test_memory_tree_status_json_reports_manual_context_gate(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    _write_pack(tmp_path)
++    (tmp_path / "config.yaml").write_text(
++        "memory_tree:\n  enabled: false\n  mode: manual\n  packs:\n    - recent\n",
++        encoding="utf-8",
++    )
++
++    from hermes_cli.memory_tree import memory_tree_status
++
++    status = memory_tree_status(json_mode=True)
++    payload = json.loads(status)
++
++    assert payload["schema"] == "memory-tree-status-v1"
++    assert payload["context"]["enabled"] is False
++    assert payload["context"]["mode"] == "manual"
++    assert payload["build"]["records_total"] == 1
++    assert payload["packs"][0]["exists"] is True
++
++
++def test_memory_tree_search_formats_provenance_matches(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    _write_pack(tmp_path)
++
++    from hermes_cli.memory_tree import memory_tree_search
++
++    output = memory_tree_search("Mattermost", limit=2, chars=300)
++
++    assert "Mattermost morning brief" in output
++    assert "active-work / mattermost-brief" in output
++    assert "deterministic packet context" in output
++
++
++def test_memory_tree_tool_context_preview_is_callable_without_auto_injection(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    _write_pack(tmp_path)
++
++    from tools.memory_tree_tool import memory_tree_tool
++
++    result = memory_tree_tool({"action": "context-preview", "query": "Mattermost", "limit": 1, "chars": 500})
++
++    assert result["success"] is True
++    assert result["auto_injected"] is False
++    assert "Memory Tree context preview" in result["context"]
++    assert "Mattermost morning brief" in result["context"]
++
++
++def test_default_toolsets_expose_memory_tree_on_call():
++    from toolsets import _HERMES_CORE_TOOLS, TOOLSETS
++
++    assert "memory_tree" in _HERMES_CORE_TOOLS
++    assert "memory_tree" in TOOLSETS["memory_tree"]["tools"]
+diff --git a/tests/test_memory_tree_privacy.py b/tests/test_memory_tree_privacy.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9c400b7ad2c00a570f402cf64654ea71f7682776
+--- /dev/null
++++ b/tests/test_memory_tree_privacy.py
+@@ -0,0 +1,48 @@
++import json
++from pathlib import Path
++
++from agent.memory_tree_build import redact_secrets
++from agent.memory_tree_privacy import scan_memory_tree_privacy
++
++
++def _state_with_pack(home: Path, text: str) -> Path:
++    pack = home / "data" / "memory-tree-lite" / "recent.md"
++    pack.parent.mkdir(parents=True, exist_ok=True)
++    pack.write_text(text, encoding="utf-8")
++    state = home / "data" / "memory-tree-lite" / "state.json"
++    state.write_text(json.dumps({"outputs": {"recent": str(pack)}}), encoding="utf-8")
++    return state
++
++
++def test_redact_secrets_removes_assignment_style_values_from_text():
++    text = "EMAIL_PASSWORD=your_16_character_google_app_password\n# EMAIL_OAUTH_TOKEN_CMD=token-command"
++
++    redacted = redact_secrets(text)
++
++    assert "your_16_character_google_app_password" not in redacted
++    assert "token-command" not in redacted
++    assert "EMAIL_PASSWORD=" not in redacted
++    assert "EMAIL_OAUTH_TOKEN_CMD=" not in redacted
++    assert redacted.count("[REDACTED_SECRET_ASSIGNMENT]") == 2
++
++
++def test_privacy_scan_ignores_redacted_assignments_and_context_tokens(tmp_path):
++    state = _state_with_pack(
++        tmp_path,
++        "EMAIL_PASSWORD=[REDACTED]\nEMAIL_TOKEN=***\ncontextTokens=500/dialecticMaxChars=400\n",
++    )
++
++    report = scan_memory_tree_privacy(state_path=state)
++
++    assert report.findings == []
++
++
++def test_privacy_scan_flags_unredacted_assignment_without_leaking_value(tmp_path):
++    state = _state_with_pack(tmp_path, "EMAIL_PASSWORD=your_16_character_google_app_password\n")
++
++    report = scan_memory_tree_privacy(state_path=state)
++
++    assert len(report.findings) == 1
++    assert report.findings[0].kind == "secret_assignment"
++    assert "your_16_character_google_app_password" not in report.findings[0].snippet
++    assert "EMAIL_PASSWORD=<redacted>" in report.findings[0].snippet
+diff --git a/tests/test_memory_tree_reconcile_repair_verification.py b/tests/test_memory_tree_reconcile_repair_verification.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b0f043e1c78db6e61d78fff9248f06c7c12474bb
+--- /dev/null
++++ b/tests/test_memory_tree_reconcile_repair_verification.py
+@@ -0,0 +1,139 @@
++import json
++from pathlib import Path
++
++from agent.memory_tree_reconcile import format_reconcile_text, reconcile_active_work
++
++
++def _write_json(path: Path, data: dict) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
++
++
++def test_cron_error_after_post_failure_verification_is_active(tmp_path: Path) -> None:
++    cron_path = tmp_path / "profiles" / "wife" / "cron" / "jobs.json"
++    _write_json(
++        cron_path,
++        {
++            "jobs": [
++                {
++                    "id": "job-a",
++                    "enabled": True,
++                    "last_status": "error",
++                    "last_run_at": "2026-07-02T01:36:22+08:00",
++                    "last_repair_verification_status": "ok",
++                    "last_repair_verification_at": "2026-07-02T07:38:40+08:00",
++                }
++            ]
++        },
++    )
++    _write_json(
++        tmp_path / "data" / "active-work" / "ledger.json",
++        {
++            "records": [
++                {
++                    "id": "wife-job",
++                    "title": "Wife job",
++                    "status": "active",
++                    "source_of_truth": {
++                        "cron_jobs_file": str(cron_path),
++                        "cron_job_id": "job-a",
++                    },
++                }
++            ]
++        },
++    )
++
++    report = reconcile_active_work(tmp_path)
++
++    assert report.summary["active_verified"] == 1
++    assert report.summary["runtime_attention"] == 0
++    assert format_reconcile_text(report) == ""
++    assert "post_failure_verification=ok" in report.items[0].evidence
++
++
++def test_cron_error_with_stale_repair_verification_still_needs_attention(tmp_path: Path) -> None:
++    cron_path = tmp_path / "profiles" / "wife" / "cron" / "jobs.json"
++    _write_json(
++        cron_path,
++        {
++            "jobs": [
++                {
++                    "id": "job-a",
++                    "enabled": True,
++                    "last_status": "error",
++                    "last_run_at": "2026-07-02T07:00:00+08:00",
++                    "last_repair_verification_status": "ok",
++                    "last_repair_verification_at": "2026-07-02T06:59:59+08:00",
++                }
++            ]
++        },
++    )
++    _write_json(
++        tmp_path / "data" / "active-work" / "ledger.json",
++        {
++            "records": [
++                {
++                    "id": "wife-job",
++                    "title": "Wife job",
++                    "status": "active",
++                    "source_of_truth": {
++                        "cron_jobs_file": str(cron_path),
++                        "cron_job_id": "job-a",
++                    },
++                }
++            ]
++        },
++    )
++
++    report = reconcile_active_work(tmp_path)
++
++    assert report.summary["runtime_attention"] == 1
++    text = format_reconcile_text(report)
++    assert "Memory Tree reconcile attention" in text
++    assert "wife-job" in text
++
++
++def test_multi_cron_record_accepts_post_failure_verification(tmp_path: Path) -> None:
++    cron_path = tmp_path / "profiles" / "wife" / "cron" / "jobs.json"
++    _write_json(
++        cron_path,
++        {
++            "jobs": [
++                {
++                    "id": "job-a",
++                    "enabled": True,
++                    "last_status": "error",
++                    "last_run_at": "2026-07-02T01:36:22+08:00",
++                    "last_repair_verification_status": "ok",
++                    "last_repair_verification_at": "2026-07-02T07:38:40+08:00",
++                },
++                {
++                    "id": "job-b",
++                    "enabled": True,
++                    "last_status": "ok",
++                },
++            ]
++        },
++    )
++    _write_json(
++        tmp_path / "data" / "active-work" / "ledger.json",
++        {
++            "records": [
++                {
++                    "id": "wife-jobs",
++                    "title": "Wife jobs",
++                    "status": "active",
++                    "source_of_truth": {
++                        "cron_jobs_file": str(cron_path),
++                        "current_cron_job_ids": ["job-a", "job-b"],
++                    },
++                }
++            ]
++        },
++    )
++
++    report = reconcile_active_work(tmp_path)
++
++    assert report.summary["active_verified"] == 1
++    assert report.summary["runtime_attention"] == 0
++    assert report.items[0].evidence == "cron jobs verified by post-failure repair diagnostics"
+diff --git a/tests/test_tui_gateway_server.py b/tests/test_tui_gateway_server.py
+index 5ac3ef247c54aec4a0ed3059bae5b99cd07c784c..237d282c463408c942276f216092ba9d28cfece1 100644
+--- a/tests/test_tui_gateway_server.py
++++ b/tests/test_tui_gateway_server.py
+@@ -1803,10 +1803,13 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
+         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
+     )
+ 
+-    # Sorted: ["kanban", "memory", "project"]. `kanban` is auto-recovered by
++    # Sorted: ["kanban", "memory", "memory_tree", "project"]. `kanban` is auto-recovered by
+     # _get_platform_tools (a non-configurable platform toolset in hermes-cli's
+-    # universe); `project` is GUI-only, folded in by _load_enabled_toolsets.
+-    assert server._load_enabled_toolsets() == ["kanban", "memory", "project"]
++    # universe); `memory_tree` is retained runtime policy; `project` is GUI-only,
++    # folded in by _load_enabled_toolsets.
++    assert server._load_enabled_toolsets() == [
++        "kanban", "memory", "memory_tree", "project"
++    ]
+     err = capsys.readouterr().err
+     assert "ignoring disabled MCP servers" in err
+     assert "mcp-off" in err
+@@ -1827,7 +1830,9 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
+         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
+     )
+ 
+-    assert server._load_enabled_toolsets() == ["kanban", "memory", "project"]
++    assert server._load_enabled_toolsets() == [
++        "kanban", "memory", "memory_tree", "project"
++    ]
+     assert "using configured CLI toolsets" in capsys.readouterr().err
+ 
+ 
+diff --git a/tools/memory_tree_tool.py b/tools/memory_tree_tool.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..23dac10b0dbb195ae86077de9e07af9daa6f7189
+--- /dev/null
++++ b/tools/memory_tree_tool.py
+@@ -0,0 +1,108 @@
++"""On-call Memory Tree Lite retrieval tool.
++
++This exposes generated Memory Tree packs to the agent only when explicitly
++called. It never auto-injects context into prompts.
++"""
++from __future__ import annotations
++
++import json
++from typing import Any
++
++
++def check_memory_tree_requirements() -> bool:
++    return True
++
++
++MEMORY_TREE_SCHEMA = {
++    "name": "memory_tree",
++    "description": (
++        "On-call retrieval from generated Hermes Memory Tree Lite packs. "
++        "Use this for current assistant-owned automation/runtime state, active-work ledger context, "
++        "or bounded context-preview from generated local packs. This tool does NOT auto-inject memory; "
++        "it only returns results when called."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "action": {
++                "type": "string",
++                "enum": ["status", "search", "context-preview"],
++                "description": "Operation to perform. status reports build/context config; search returns matches; context-preview returns a bounded context block.",
++                "default": "search",
++            },
++            "query": {
++                "type": "string",
++                "description": "Search query. Required for search and context-preview.",
++            },
++            "limit": {
++                "type": "integer",
++                "description": "Maximum number of search results/context records.",
++                "default": 3,
++            },
++            "chars": {
++                "type": "integer",
++                "description": "Maximum snippet/context chars per record.",
++                "default": 800,
++            },
++            "packs": {
++                "type": "array",
++                "items": {"type": "string"},
++                "description": "Optional pack names or Markdown paths. Defaults to configured packs, usually recent.",
++            },
++        },
++        "required": [],
++    },
++}
++
++
++def memory_tree_tool(args: dict[str, Any] | None = None, **_: Any) -> dict[str, Any]:
++    args = args or {}
++    action = str(args.get("action") or "search")
++    query = str(args.get("query") or "").strip()
++    limit = int(args.get("limit") or 3)
++    chars = int(args.get("chars") or 800)
++    packs = args.get("packs")
++
++    from hermes_cli.memory_tree import memory_tree_context_preview, memory_tree_search, memory_tree_status
++
++    if action == "status":
++        return {
++            "success": True,
++            "auto_injected": False,
++            "status": json.loads(memory_tree_status(json_mode=True)),
++        }
++    if action == "search":
++        if not query:
++            return {"success": False, "error": "query is required for memory_tree search", "auto_injected": False}
++        return {
++            "success": True,
++            "auto_injected": False,
++            "result": json.loads(
++                memory_tree_search(query, packs=packs, limit=limit, chars=chars, json_mode=True)
++            ),
++        }
++    if action == "context-preview":
++        if not query:
++            return {"success": False, "error": "query is required for memory_tree context-preview", "auto_injected": False}
++        payload = json.loads(
++            memory_tree_context_preview(query, packs=packs, limit=limit, chars=chars, json_mode=True)
++        )
++        return {
++            "success": True,
++            "auto_injected": False,
++            "context": payload["context"],
++            "result": payload,
++        }
++    return {"success": False, "error": f"unknown memory_tree action: {action}", "auto_injected": False}
++
++
++from tools.registry import registry
++
++registry.register(
++    name="memory_tree",
++    toolset="memory_tree",
++    schema=MEMORY_TREE_SCHEMA,
++    handler=lambda args, **kw: memory_tree_tool(args, **kw),
++    check_fn=check_memory_tree_requirements,
++    emoji="🌳",
++)
+diff --git a/toolsets.py b/toolsets.py
+index 75219f719cf75a781542f57a7ab1c1d81d3ed2ab..01652a6551d90e72fe760a6b49c085aab052699f 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -51,7 +51,7 @@ _HERMES_CORE_TOOLS = [
+     # Text-to-speech
+     "text_to_speech",
+     # Planning & memory
+-    "todo", "memory",
++    "todo", "memory", "memory_tree",
+     # NOTE: the desktop Project tools (project_list/create/switch) are
+     # deliberately NOT here. They only make sense where a GUI can follow the
+     # move, so they live in the `project` toolset and are enabled solely by the
+@@ -215,6 +215,12 @@ TOOLSETS = {
+         "includes": []
+     },
+ 
++    "memory_tree": {
++        "description": "On-call retrieval from generated Memory Tree Lite packs (no auto-injection)",
++        "tools": ["memory_tree"],
++        "includes": []
++    },
++
+     "context_engine": {
+         "description": "Runtime tools exposed by the active context engine",
+         "tools": [],
