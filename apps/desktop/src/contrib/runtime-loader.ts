@@ -343,8 +343,8 @@ export function watchRuntimePlugins(): void {
     }
 
     try {
-      const { hermes_home } = await getStatus()
-      dirWatchId = (await desktop.watchDirectory(`${hermes_home}/desktop-plugins`)).id
+      const pluginsDir = await getLocalDesktopPluginsDir()
+      dirWatchId = (await desktop.watchDirectory(pluginsDir)).id
 
       return true
     } catch {

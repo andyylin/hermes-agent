@@ -44,6 +44,9 @@ class TestTryWalCheckpointPassive:
         mock_conn.execute.side_effect = tracking_execute
         mock_conn.fetchone.return_value = None
         db._conn = mock_conn
+        # CI may intentionally force journal_mode=DELETE when its linked SQLite
+        # is vulnerable to the WAL-reset bug; this test targets the WAL branch.
+        db._wal_active = True
 
         db._try_wal_checkpoint()
 
@@ -61,6 +64,9 @@ class TestTryWalCheckpointPassive:
         mock_conn = MagicMock()
         mock_conn.execute.side_effect = sqlite3.OperationalError("disk I/O error")
         db._conn = mock_conn
+        # Exercise failure handling in the WAL-active branch regardless of the
+        # linked SQLite safety fallback selected by the fixture.
+        db._wal_active = True
 
         with caplog.at_level(logging.WARNING):
             db._try_wal_checkpoint()

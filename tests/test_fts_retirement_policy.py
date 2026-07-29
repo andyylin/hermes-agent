@@ -1,6 +1,8 @@
 """Andy custom-runtime policy: canonical LIKE search, no live SQLite FTS."""
 
+import ast
 import sqlite3
+from pathlib import Path
 
 from hermes_state import SessionDB, _cjk_fts_config_enabled
 
@@ -76,3 +78,21 @@ def test_compatibility_flag_cannot_reactivate_live_fts(monkeypatch):
     for value in ("0", "1", "false", "true"):
         monkeypatch.setenv("HERMES_CJK_FTS", value)
         assert _cjk_fts_config_enabled() is False
+
+
+def test_operator_repair_guidance_retires_fts_instead_of_rebuilding_it():
+    """Recovery guidance must not resurrect the retired derived index."""
+    doctor_source = (
+        Path(__file__).resolve().parents[1] / "hermes_cli" / "doctor.py"
+    ).read_text(encoding="utf-8")
+
+    messages = [
+        node.value
+        for node in ast.walk(ast.parse(doctor_source))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+
+    assert "rebuild the FTS index" not in doctor_source
+    assert any(
+        "retire corrupted FTS artifacts" in message for message in messages
+    )

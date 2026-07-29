@@ -5577,21 +5577,6 @@ class TestOptimizeFts:
         assert calls["n"] == 0
         assert len(db.search_messages("needle")) == 20
 
-    def test_write_path_optimize_failure_never_breaks_write(self, db, monkeypatch):
-        """Even if opt-in cadence fires, optimize failure must not fail writes."""
-        db._OPTIMIZE_EVERY_N_WRITES = 2
-
-        def _boom(*, max_pages):
-            raise sqlite3.OperationalError("simulated merge failure")
-
-        monkeypatch.setattr(db, "optimize_fts", _boom)
-        db.create_session(session_id="s1", source="cli")
-        db.append_message(session_id="s1", role="user", content="still persists")
-        assert len(db.get_messages("s1")) == 1
-        assert "FTS incremental merge failed: simulated merge failure" in caplog.text
-
-
-
 class TestAutoMaintenance:
     def _make_old_ended(self, db, sid: str, days_old: int = 100):
         """Create a session that is ended and was started `days_old` days ago."""

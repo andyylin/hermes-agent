@@ -136,6 +136,10 @@ This cycle linearly merges the frozen cutoff into the prior published source can
   - `cron definitions export` writes a stable, diffable representation on explicit request; it is not an automatic scheduler write path.
   - Implemented by `cron/definitions_export.py`, `cron/jobs.py:export_definitions_file`, and `hermes_cli/cron.py`.
 
+- **Dormant cron repair-gate detectors**
+  - Warning/error classification helpers remain for compatibility, but no scheduler call site suppresses delivery through them.
+  - `cron.route_alerts_through_repair_gate` must stay disabled unless an enabled, tested repair job and fail-open delivery path are deployed together.
+
 - **Email HTML and notification rendering**
   - Multipart alternative output with readable plain fallback.
   - Safe Markdown-ish HTML rendering.

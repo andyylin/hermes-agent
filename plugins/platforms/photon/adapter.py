@@ -883,11 +883,28 @@ class PhotonAdapter(BasePlatformAdapter):
             # afterwards with a different message id. If we dispatch the
             # placeholder as a standalone text turn, the subsequent media event
             # arrives while that turn is active and the gateway sends a bogus
-            # "Interrupting current task" busy ack. Drop placeholder-only text
-            # at the platform boundary; the real media event carries the bytes.
+            # "Interrupting current task" busy ack. Hold a bounded pending task
+            # so the following attachment can cancel it; no text turn is ever
+            # dispatched for the placeholder itself.
             if raw_text.strip() == "\ufffc":
-                logger.debug("[photon] ignoring iMessage object-placeholder text event")
+                prior = self._pending_fffc.pop(space_id, None)
+                if prior is not None and not prior[1].done():
+                    prior[1].cancel()
+                task = asyncio.create_task(
+                    self._fffc_timeout_handler(
+                        space_id, str(event.get("messageId") or "unknown")
+                    )
+                )
+                self._pending_fffc[space_id] = (time.time(), task)
+                logger.debug(
+                    "[photon] waiting for attachment after iMessage object placeholder"
+                )
                 return
+        elif ctype in {"attachment", "voice"}:
+            pending = self._pending_fffc.pop(space_id, None)
+            if pending is not None and not pending[1].done():
+                pending[1].cancel()
+
         if ctype == "reaction":
             # Route only tapbacks on messages WE sent — those are implicitly
             # addressed to the bot (feishu precedent: synthetic text event).
