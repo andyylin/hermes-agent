@@ -335,6 +335,38 @@ index 0000000000000000000000000000000000000000..52897dfa81f714b019effdce34b68a6c
 +## Production boundary
 +
 +This manifest does not authorize deployment or restart. Source promotion, release creation, Desktop rebuild/install, plugin activation, and each gateway restart are separate operations requiring their own verified handoff and approval.
+diff --git a/contributors/emails/DavidMetcalfe@users.noreply.github.com b/contributors/emails/DavidMetcalfe@users.noreply.github.com
+new file mode 100644
+index 0000000000000000000000000000000000000000..b4202f3128e85d2e28664c7dd8e93b4eae07d9be
+--- /dev/null
++++ b/contributors/emails/DavidMetcalfe@users.noreply.github.com
+@@ -0,0 +1,2 @@
++DavidMetcalfe
++# GitHub-linked commit: NousResearch/hermes-agent@31385a0102bf7f22603820db667ae9cb183cf77d
+diff --git a/contributors/emails/b@b b/contributors/emails/b@b
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3d8d6e2ccd9ab2922b57e45ff394d896406deff
+--- /dev/null
++++ b/contributors/emails/b@b
+@@ -0,0 +1,2 @@
++blavlabla
++# GitHub-linked commit: NousResearch/hermes-agent@628ce5bb866582f79fe9cc3ef2866450f0533396
+diff --git a/contributors/emails/jfmusa2024@gmail.com b/contributors/emails/jfmusa2024@gmail.com
+new file mode 100644
+index 0000000000000000000000000000000000000000..934c910b190939fdc6935b9f1fc683b4624951fd
+--- /dev/null
++++ b/contributors/emails/jfmusa2024@gmail.com
+@@ -0,0 +1,2 @@
++jfmusa2024-cyber
++# GitHub-linked commit: NousResearch/hermes-agent@f8a554bced3122c10b220c0f847fca968eb88cba
+diff --git a/contributors/emails/jquesnelle@gmail.com b/contributors/emails/jquesnelle@gmail.com
+new file mode 100644
+index 0000000000000000000000000000000000000000..8561ade2e10a2299df03b36627cf0bb8c6cd98c3
+--- /dev/null
++++ b/contributors/emails/jquesnelle@gmail.com
+@@ -0,0 +1,2 @@
++jquesnelle
++# GitHub-linked commit: NousResearch/hermes-agent@841a5a744ad115b001a2720bf1eeb6bec3dfcc7d
 diff --git a/contributors/emails/nousbot@nousresearch.com b/contributors/emails/nousbot@nousresearch.com
 new file mode 100644
 index 0000000000000000000000000000000000000000..aa6d94ec3b9a87c256a124cfdaa447fcb2b398c9
@@ -351,6 +383,14 @@ index 0000000000000000000000000000000000000000..d28ebcf6912350a475c4802278e45f1a
 @@ -0,0 +1,2 @@
 +HOYALIM
 +# upstream commit f33e0579d87f retained in runtime reconstruction
+diff --git a/contributors/emails/vitor@vitorcepedalopes.com b/contributors/emails/vitor@vitorcepedalopes.com
+new file mode 100644
+index 0000000000000000000000000000000000000000..c93409f9a62d650c853eed78ef51a2d51e39fe8a
+--- /dev/null
++++ b/contributors/emails/vitor@vitorcepedalopes.com
+@@ -0,0 +1,2 @@
++TheAngryPit
++# GitHub-linked commit: NousResearch/hermes-agent@704a32187030146d83fcfa323c62bcd60c32e126
 diff --git a/website/docs/user-guide/features/tts.md b/website/docs/user-guide/features/tts.md
 index 9c20ca79968fef255bf42a7b7acbd91b7ba3979a..1954391ed22f58f169e92f2299a14cefabc1fa7f 100644
 --- a/website/docs/user-guide/features/tts.md

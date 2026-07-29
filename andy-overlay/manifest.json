@@ -5,10 +5,10 @@
     "sha": "533d633ab9d18ce0f05bc44d4077576b69dc58e8"
   },
   "source_candidate": {
-    "sha": "da4d73940b8e0b9f8a74d0e98fb4ac12d20ba598",
-    "tree": "d134b90ba35f8501481f7be6cd4807d030415162"
+    "sha": "c2cc40dce75905a1dc7520f52924d06c758370a2",
+    "tree": "7338bbd535ff2b79983b9d83caf972aa2219963f"
   },
-  "expected_payload_tree": "d134b90ba35f8501481f7be6cd4807d030415162",
+  "expected_payload_tree": "7338bbd535ff2b79983b9d83caf972aa2219963f",
   "groups": [
     {
       "name": "010-metadata",
@@ -16,13 +16,18 @@
       "paths": [
         "ANDY_MINIMAL_OVERLAY.md",
         "ANDY_RUNTIME_PATCHES.md",
+        "contributors/emails/DavidMetcalfe@users.noreply.github.com",
+        "contributors/emails/b@b",
+        "contributors/emails/jfmusa2024@gmail.com",
+        "contributors/emails/jquesnelle@gmail.com",
         "contributors/emails/nousbot@nousresearch.com",
         "contributors/emails/subhoya@gmail.com",
+        "contributors/emails/vitor@vitorcepedalopes.com",
         "website/docs/user-guide/features/tts.md",
         "website/docs/user-guide/messaging/discord.md"
       ],
       "patch": "patches/010-metadata.patch",
-      "sha256": "6465a40965ad0d7288f31a9d542e506805489ab805f7a94865d4128c2fa798f4"
+      "sha256": "03168d3078dfd10413b861ea104d4e2f1d9ad5ee0e37e36b735595af8c66b499"
     },
     {
       "name": "020-secrets",
