@@ -602,7 +602,12 @@ class TestRoutingIntents:
 
     def test_all_with_no_connected_channels_returns_empty(self, monkeypatch):
         """deliver='all' with nothing connected returns [] — delivery is recorded as failed upstream."""
-        from cron.scheduler import _resolve_delivery_targets
+        from cron.scheduler import (
+            _LEGACY_HOME_TARGET_ENV_VARS,
+            _iter_home_target_platforms,
+            _resolve_delivery_targets,
+            _resolve_home_env_var,
+        )
 
         # Scope discovery so real plugin home-channel configuration cannot leak
         # into this routing-unit test.

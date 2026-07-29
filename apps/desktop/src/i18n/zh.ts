@@ -255,6 +255,8 @@ export const zh: Translations = {
       'view.showFiles': '显示文件浏览器',
       'view.showTerminal': '显示终端',
       'view.terminalSelection': '将终端选区发送到输入框',
+      'view.terminalCopy': '复制终端选区',
+      'view.terminalPaste': '粘贴到终端',
       'view.closeTab': '关闭标签',
       'view.reopenTab': '重新打开已关闭的标签',
       'view.flipPanes': '交换侧边栏位置',
@@ -760,11 +762,11 @@ export const zh: Translations = {
       invalidJson: '配置 JSON 无效',
       keepAwakeTitle: '保持电脑唤醒',
       keepAwakeDesc: '阻止本机休眠，让长时间或通宵运行继续进行。屏幕仍可变暗。',
-      attachmentSizeTitle: '附件大小上限',
+      attachmentSizeTitle: '预览 / 图片加载大小上限',
       attachmentSizeDesc:
-        '桌面端为附件和预览加载本地文件的大小上限（MB）。默认为 16。此限制仅作用于本机。设置过大会将整个文件读入内存，可能导致应用卡死或崩溃。',
+        '桌面端为预览和图片附件加载本地文件的大小上限（MB）。默认为 16。远程非图片附件使用单独的 256 MB 上限。设置过大会将整个文件读入内存，可能导致应用卡死或崩溃。',
       attachmentSizeUnit: 'MB',
-      attachmentSizeLabel: '附件大小上限（MB）'
+      attachmentSizeLabel: '预览 / 图片加载大小上限（MB）'
     },
     quickEntry: {
       enabledTitle: '快速输入',
@@ -2154,6 +2156,9 @@ export const zh: Translations = {
     voiceDictation: '语音听写',
     speakReplies: '朗读回复',
     stopSpeakingReplies: '停止朗读回复',
+    wakeWordListening: phrase => `唤醒词:"${phrase}" — 正在监听`,
+    wakeWordOff: phrase => `唤醒词:"${phrase}" — 已关闭`,
+    wakeWordPausedVoice: phrase => `唤醒词:"${phrase}" — 语音对话期间暂停`,
     lookupLoading: '查找中…',
     lookupNoMatches: '没有匹配项。',
     lookupTry: '试试',

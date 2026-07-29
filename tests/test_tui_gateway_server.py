@@ -1284,6 +1284,7 @@ def test_voice_record_start_handles_non_dict_voice_cfg(monkeypatch):
         assert captured["silence_duration"] == 3.0
         assert captured["auto_restart"] is False
 
+
     # Round-12 Copilot review regression on #19835: ``bool`` is a subclass
     # of ``int``, so the naive ``isinstance(threshold, (int, float))``
     # guard would forward ``silence_threshold: true`` as ``1`` instead
@@ -1312,6 +1313,313 @@ def test_voice_record_start_handles_non_dict_voice_cfg(monkeypatch):
             captured["silence_duration"] == 3.0
         ), f"bool silence_duration leaked through for {bad_bool_cfg!r}"
         assert captured["auto_restart"] is False
+
+
+def test_wake_owner_is_sticky_and_routes_detection_to_first_transport(monkeypatch):
+    from tools import wake_word
+
+    state = {"owner": None, "callback": None, "paused": False}
+    voice_callbacks = {}
+
+    def start_listening(callback, *, owner, config):
+        if state["owner"] is not None and state["owner"] is not owner:
+            raise wake_word.WakeWordInUse
+        state.update(owner=owner, callback=callback, paused=False)
+
+    def pause_listening(*, owner):
+        if state["owner"] is not owner:
+            return False
+        state["paused"] = True
+        return True
+
+    def stop_listening(*, owner):
+        if state["owner"] is not owner:
+            return False
+        state.update(owner=None, callback=None, paused=False)
+        return True
+
+    def resume_listening(*, owner):
+        if state["owner"] is not owner:
+            return False
+        state["paused"] = False
+        return True
+
+    def start_continuous(**callbacks):
+        voice_callbacks.update(callbacks)
+        return True
+
+    monkeypatch.setattr(wake_word, "load_wake_word_config", lambda: {
+        "enabled": True,
+        "phrase": "hey hermes",
+        "surface": "auto",
+        "start_new_session": True,
+    })
+    monkeypatch.setattr(wake_word, "check_wake_word_requirements", lambda _cfg: {
+        "available": True,
+        "phrase": "hey hermes",
+        "provider": "test",
+        "hint": "",
+    })
+    monkeypatch.setattr(wake_word, "start_listening", start_listening)
+    monkeypatch.setattr(wake_word, "pause_listening", pause_listening)
+    monkeypatch.setattr(wake_word, "stop_listening", stop_listening)
+    monkeypatch.setattr(wake_word, "owns_listener", lambda owner: state["owner"] is owner)
+    monkeypatch.setattr(
+        wake_word,
+        "is_listening",
+        lambda: state["owner"] is not None and not state["paused"],
+    )
+    monkeypatch.setattr(
+        wake_word,
+        "resume_listening",
+        resume_listening,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.voice",
+        types.SimpleNamespace(
+            start_continuous=start_continuous,
+            stop_continuous=lambda **_kwargs: None,
+        ),
+    )
+    monkeypatch.setenv("HERMES_VOICE", "1")
+
+    first = types.SimpleNamespace(_closed=False)
+    second = types.SimpleNamespace(_closed=False)
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload: emitted.append(
+            (event, sid, payload, server.current_transport())
+        ),
+    )
+    server._wake_owner_transport = None
+    server._wake_owner_surface = ""
+    try:
+        started = server.dispatch({
+            "id": "wake-1",
+            "method": "wake.start",
+            "params": {"surface": "gui", "session_id": "first-session"},
+        }, transport=first)
+        denied = server.dispatch({
+            "id": "wake-2",
+            "method": "wake.start",
+            "params": {"surface": "tui", "session_id": "second-session"},
+        }, transport=second)
+        denied_stop = server.dispatch({
+            "id": "wake-stop-2",
+            "method": "wake.stop",
+            "params": {},
+        }, transport=second)
+        denied_voice_stop = server.dispatch({
+            "id": "voice-stop-2",
+            "method": "voice.record",
+            "params": {"action": "stop"},
+        }, transport=second)
+
+        assert started["result"]["started"] is True
+        assert denied["result"] == {
+            "started": False,
+            "reason": "owned",
+            "owner_surface": "gui",
+        }
+        assert denied_stop["result"] == {
+            "stopped": False,
+            "reason": "not_owner",
+            "disabled_persisted": False,
+        }
+        assert denied_voice_stop["result"] == {
+            "status": "busy",
+            "reason": "wake_owned",
+        }
+
+        state["callback"]()
+        assert emitted == [(
+            "wake.detected",
+            "first-session",
+            {"phrase": "hey hermes", "profile": None, "start_new_session": True},
+            first,
+        )]
+        assert state["paused"] is True
+
+        voice_started = server.dispatch({
+            "id": "voice-start-1",
+            "method": "voice.record",
+            "params": {"action": "start", "session_id": "first-session"},
+        }, transport=first)
+        assert voice_started["result"]["status"] == "recording"
+        voice_callbacks["on_status"]("idle")
+        assert state["paused"] is False
+
+        stopped = server.dispatch({
+            "id": "wake-stop-1",
+            "method": "wake.stop",
+            "params": {},
+        }, transport=first)
+        assert stopped["result"] == {
+            "stopped": True,
+            "reason": None,
+            "disabled_persisted": False,
+        }
+
+        reclaimed = server.dispatch({
+            "id": "wake-reclaim-2",
+            "method": "wake.start",
+            "params": {"surface": "tui", "session_id": "second-session"},
+        }, transport=second)
+        assert reclaimed["result"]["started"] is True
+        assert state["owner"] is second
+
+        state["callback"]()
+        assert emitted[-1] == (
+            "wake.detected",
+            "second-session",
+            {"phrase": "hey hermes", "profile": None, "start_new_session": True},
+            second,
+        )
+
+        stopped_again = server.dispatch({
+            "id": "wake-stop-2-after-reclaim",
+            "method": "wake.stop",
+            "params": {},
+        }, transport=second)
+        assert stopped_again["result"] == {
+            "stopped": True,
+            "reason": None,
+            "disabled_persisted": False,
+        }
+    finally:
+        server._wake_owner_transport = None
+        server._wake_owner_surface = ""
+
+
+def test_wake_toggle_persists_enabled_flag_only_on_explicit_gesture(monkeypatch):
+    """The ear toggle / /wake on|off write wake_word.enabled; auto-arm never does."""
+    from tools import wake_word
+
+    config = {"enabled": False, "phrase": "hey hermes", "surface": "auto",
+              "start_new_session": True}
+    persisted = []
+
+    def fake_persist(enabled):
+        persisted.append(enabled)
+        config["enabled"] = enabled
+        return True
+
+    monkeypatch.setattr(server, "_persist_wake_enabled", fake_persist)
+    monkeypatch.setattr(wake_word, "load_wake_word_config", lambda: dict(config))
+    monkeypatch.setattr(wake_word, "check_wake_word_requirements", lambda _cfg: {
+        "available": True,
+        "phrase": "hey hermes",
+        "provider": "test",
+        "hint": "",
+    })
+    listener = {"owner": None}
+    monkeypatch.setattr(
+        wake_word, "start_listening",
+        lambda callback, *, owner, config: listener.update(owner=owner),
+    )
+    monkeypatch.setattr(
+        wake_word, "stop_listening",
+        lambda *, owner: listener["owner"] is owner and not listener.update(owner=None),
+    )
+    monkeypatch.setattr(wake_word, "owns_listener", lambda owner: listener["owner"] is owner)
+
+    transport = types.SimpleNamespace(_closed=False)
+    server._wake_owner_transport = None
+    server._wake_owner_surface = ""
+    try:
+        # Passive auto-arm (no persist): refused, config untouched.
+        passive = server.dispatch({
+            "id": "wake-passive",
+            "method": "wake.start",
+            "params": {"surface": "gui"},
+        }, transport=transport)
+        assert passive["result"] == {"started": False, "reason": "disabled"}
+        assert persisted == []
+
+        # Explicit gesture: enables in config AND arms.
+        clicked = server.dispatch({
+            "id": "wake-click",
+            "method": "wake.start",
+            "params": {"surface": "gui", "persist": True},
+        }, transport=transport)
+        assert clicked["result"]["started"] is True
+        assert clicked["result"]["enabled_persisted"] is True
+        assert persisted == [True]
+
+        # Explicit stop: disables in config.
+        stopped = server.dispatch({
+            "id": "wake-click-off",
+            "method": "wake.stop",
+            "params": {"persist": True},
+        }, transport=transport)
+        assert stopped["result"]["stopped"] is True
+        assert stopped["result"]["disabled_persisted"] is True
+        assert persisted == [True, False]
+
+        # persist does NOT override an explicit surface scoping.
+        config.update(enabled=True, surface="tui")
+        scoped = server.dispatch({
+            "id": "wake-scoped",
+            "method": "wake.start",
+            "params": {"surface": "gui", "persist": True},
+        }, transport=transport)
+        assert scoped["result"] == {"started": False, "reason": "disabled_for_surface"}
+        assert persisted == [True, False]
+    finally:
+        server._wake_owner_transport = None
+        server._wake_owner_surface = ""
+
+
+def test_voice_record_start_forwards_max_recording_seconds(monkeypatch):
+    """voice.max_recording_seconds must reach start_continuous from the TUI.
+
+    The CLI wiring alone doesn't cover TUI recordings: the gateway forwards
+    recorder params explicitly, so a missing kwarg here silently leaves the
+    cap dead in the TUI while CLI tests stay green. Semantics mirror the
+    silence params: non-numeric / bool / missing falls back to the documented
+    120 default, an explicit numeric value <= 0 disables the cap.
+    """
+    captured: dict = {}
+
+    def fake_start_continuous(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.voice",
+        types.SimpleNamespace(
+            start_continuous=fake_start_continuous, stop_continuous=lambda: None
+        ),
+    )
+    monkeypatch.setenv("HERMES_VOICE", "1")
+
+    for cfg, expected in (
+        ({"max_recording_seconds": 45}, 45),        # explicit cap forwarded as-is
+        ({"max_recording_seconds": 0}, 0.0),        # explicit 0 = disabled
+        ({"max_recording_seconds": -5}, 0.0),       # negative = disabled
+        ({}, 120.0),                                # missing = documented default
+        ({"max_recording_seconds": True}, 120.0),   # bool must not become 1s cap
+        ({"max_recording_seconds": "long"}, 120.0), # garbage = documented default
+    ):
+        captured.clear()
+        monkeypatch.setattr(server, "_load_cfg", lambda c=cfg: {"voice": c})
+
+        resp = server.dispatch(
+            {
+                "id": "voice-record-cap",
+                "method": "voice.record",
+                "params": {"action": "start"},
+            }
+        )
+
+        assert "result" in resp, f"voice.record raised for cfg={cfg!r}: {resp.get('error')}"
+        assert resp["result"]["status"] == "recording"
+        assert (
+            captured["max_recording_seconds"] == expected
+        ), f"cfg={cfg!r} forwarded {captured.get('max_recording_seconds')!r}, expected {expected!r}"
 
 
 def test_voice_record_stop_forces_transcription(monkeypatch):
@@ -7292,6 +7600,66 @@ def test_commands_catalog_surfaces_quick_commands(monkeypatch):
 
     assert resp["result"]["canon"]["/build"] == "/build"
     assert resp["result"]["canon"]["/notes"] == "/notes"
+
+
+def test_commands_catalog_ranks_skill_commands_by_recorded_usage(monkeypatch):
+    """Skill entries carry the usage + origin the `/` menu ranks on.
+
+    Without it the menu is alphabetical, so a bundled skill the user has never
+    opened outranks the one they invoke daily.
+    """
+    monkeypatch.setattr(
+        server,
+        "_skill_usage_lookup",
+        lambda: (
+            lambda name: {"research": 60, "work": 172}.get(name, 0),
+            lambda name: "bundled" if name == "research-paper-writing" else "local",
+        ),
+    )
+    monkeypatch.setattr(
+        "agent.skill_commands.scan_skill_commands",
+        lambda: {
+            "/research": {"name": "research", "description": "Look it up"},
+            "/research-paper-writing": {
+                "name": "research-paper-writing",
+                "description": "Write a paper",
+            },
+            "/work": {"name": "work", "description": "Fresh worktree"},
+        },
+    )
+
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+
+    skills = resp["result"]["skills"]
+    assert skills["/work"] == {"usage": 172, "origin": "local"}
+    assert skills["/research"] == {"usage": 60, "origin": "local"}
+    assert skills["/research-paper-writing"] == {"usage": 0, "origin": "bundled"}
+
+    # Every advertised skill command is rankable — a missing entry silently
+    # sorts that skill to the bottom of the menu.
+    advertised = {name for name, _ in resp["result"]["pairs"]}
+    assert set(skills) <= advertised
+    assert resp["result"]["skill_count"] == len(skills)
+
+
+def test_commands_catalog_survives_an_unreadable_usage_sidecar(monkeypatch):
+    """A broken/absent .usage.json degrades to no ranking, never a broken menu."""
+    monkeypatch.setattr(
+        "tools.skill_usage.load_usage",
+        lambda: (_ for _ in ()).throw(OSError("sidecar is gone")),
+    )
+
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+
+    assert "error" not in resp
+    assert all(
+        entry == {"usage": 0, "origin": "local"}
+        for entry in resp["result"]["skills"].values()
+    )
 
 
 def test_commands_catalog_includes_tui_mouse_command():
@@ -13698,9 +14066,9 @@ def test_persist_model_switch_preserves_sibling_model_keys(tmp_path, monkeypatch
         "agent:\n"
         "  system_prompt: keepme\n"
     )
-    # save_config_value() resolves the config path from cli._hermes_home, which
-    # is captured at import time — patch it directly (set_hermes_home_override
-    # does NOT affect this snapshot).
+    # save_config_value() resolves the config path from get_hermes_home() (live
+    # env var), always targeting HERMES_HOME/config.yaml — point it at tmp_path.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(cli, "_hermes_home", tmp_path)
 
     result = types.SimpleNamespace(
@@ -13733,6 +14101,7 @@ def test_persist_model_switch_clears_stale_base_url(tmp_path, monkeypatch):
         "  provider: custom:mylocal\n"
         "  base_url: http://localhost:1234/v1\n"
     )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(cli, "_hermes_home", tmp_path)
 
     # Switch to a native provider with no base_url.

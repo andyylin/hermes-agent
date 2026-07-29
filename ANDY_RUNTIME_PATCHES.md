@@ -16,15 +16,15 @@ Upstream is authoritative for Projects. Existing state databases are migration a
 ## Frozen composition
 
 - Actual live runtime ancestry: `01ffcd6529a7d626990eafff0784a2ad09a16560`
-- Previously published live-derived merge: `9877fb69fc3c00c2ce2365424f0c0c3a0b13c7a3`
+- Prior published source candidate: `b40724ace24392c9b82cfd6dd046cda5d24fb050`
 - Classified retained-overlay parent: `56e6855edd4abcef1ffcefc3d5336a8a078cf5fa`
-- Frozen latest-upstream cutoff: `585726ac2e08dcc2bd32c134e0124e0657ecc519`
-- Linear candidate branch: `integrate/andy-runtime-upstream-linear-20260728T155822Z`
-- Candidate worktree: `/home/pi/.hermes/worktrees/integrate/andy-runtime-upstream-linear-20260728T155822Z`
-- Candidate lease: `/home/pi/.hermes/recovery/runtime-update-owner-20260728T155822Z.json`
-- Rollback ref: `backup/andy-runtime-pre-linear-upstream-20260728T155822Z`
+- Frozen latest-upstream cutoff: `f088fa507007524e4939f07776cd908766061dbf`
+- Linear candidate branch: `integrate/andy-runtime-upstream-linear-20260729T020809Z`
+- Candidate worktree: `/home/pi/.hermes/worktrees/integrate/andy-runtime-upstream-linear-20260729T020809Z`
+- Candidate lease: `/home/pi/.hermes/recovery/runtime-update-owner-20260729T020809Z.json`
+- Rollback ref: `backup/andy-runtime-pre-upstream-20260729T020809Z`
 
-The linear candidate first merges the frozen cutoff into the actual live-derived runtime, then merges the final classified retained-overlay tree. This preserves all three ancestry lines while resolving overlap toward current upstream/live architecture. The final candidate SHA is recorded externally in exact-SHA GitHub CI evidence because a commit cannot truthfully contain its own hash.
+This cycle linearly merges the frozen cutoff into the prior published source candidate, whose ancestry already contains the live-derived runtime and classified retained-overlay tree. Overlap is resolved toward current upstream architecture while preserving the explicit PORT invariants below. The final candidate SHA is recorded externally in exact-SHA GitHub CI evidence because a commit cannot truthfully contain its own hash.
 
 ## PORT
 
@@ -149,7 +149,7 @@ The linear candidate first merges the frozen cutoff into the actual live-derived
 ## UPSTREAM
 
 - **Projects authority and repository discovery**
-  - Frozen upstream cutoff `585726ac2` owns Project records, repository discovery, Project RPCs, and Desktop Project UI behavior.
+  - Frozen upstream cutoff `f088fa507` owns Project records, repository discovery, Project RPCs, and Desktop Project UI behavior.
   - Candidate-only diff against the frozen cutoff must contain no retired custom Project authority.
 
 - **Discord smart provisional titles and first-exchange semantic retitling**

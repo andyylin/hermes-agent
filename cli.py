@@ -984,6 +984,7 @@ def _cleanup_all_browsers(*args, **kwargs):
 
 # Guard to prevent cleanup from running multiple times on exit
 _cleanup_done = False
+_cli_wake_owner = None
 # One-shot CLI finalization runs before process cleanup so plugins can observe
 # the session boundary while the agent is still attached. If a signal lands in
 # that narrow window, atexit cleanup must not emit that session finalize again.
@@ -1177,6 +1178,12 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
     # can't skip the reset (#36823). No-op unless the TUI actually ran.
     _reset_terminal_input_modes_on_exit()
 
+    try:
+        from tools.wake_word import stop_listening as _stop_wake_word
+        if _cli_wake_owner is not None:
+            _stop_wake_word(owner=_cli_wake_owner)
+    except Exception:
+        pass
     try:
         _cleanup_all_terminals()
     except Exception:
@@ -1475,10 +1482,14 @@ def _resolve_worktree_base(repo_root: str) -> tuple:
     """
     import subprocess
 
+    from hermes_cli._subprocess_compat import noninteractive_git_env
+
     def _git(args, timeout=20):
         return subprocess.run(
             ["git", *args],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=repo_root,
+            stdin=subprocess.DEVNULL,
+            env=noninteractive_git_env(),
         )
 
     # 1. Current branch's upstream, if it tracks one.
@@ -4012,10 +4023,20 @@ def save_config_value(key_path: str, value: any) -> bool:
     Returns:
         True if successful, False otherwise
     """
-    # Use the same precedence as load_cli_config: user config first, then project config
-    user_config_path = _hermes_home / 'config.yaml'
-    project_config_path = Path(__file__).parent / 'cli-config.yaml'
-    config_path = user_config_path if user_config_path.exists() else project_config_path
+    # Runtime persistence ALWAYS targets the user's HERMES_HOME config.yaml,
+    # creating it if needed. Resolve HERMES_HOME live (not the import-time
+    # _hermes_home constant) so profile switches and test isolation land right.
+    #
+    # We deliberately do NOT fall back to the repo's project cli-config.yaml:
+    # that file is a shipped default/template, and most config readers
+    # (load_config → get_hermes_home()/config.yaml, including
+    # load_wake_word_config) never read it. Writing a user setting there means
+    # the reader never sees it. This was the "wake-word ear reverts to disabled
+    # after restart" bug — the toggle's persist wrote to cli-config.yaml (which
+    # exists in the checkout) while startup read HERMES_HOME/config.yaml, so the
+    # setting silently vanished every restart on any install whose
+    # HERMES_HOME/config.yaml didn't exist yet.
+    config_path = get_hermes_home() / 'config.yaml'
     
     try:
         # Ensure parent directory exists (for ~/.hermes/config.yaml on first use)
@@ -4073,6 +4094,23 @@ def _normalize_moa_model(model: Optional[str]) -> tuple[Optional[str], Optional[
             if preset:
                 return "moa", preset
     return None, model
+
+
+class _VoiceInputMessage:
+    """Sentinel wrapper for voice-transcribed messages in ``_pending_input``.
+
+    Distinguishes STT output from manually typed text while voice mode is
+    active, so the concise-voice-response prefix is applied only to messages
+    that actually came from the microphone (#65827).
+    """
+
+    __slots__ = ("text",)
+
+    def __init__(self, text: str):
+        self.text = text
+
+    def __str__(self) -> str:
+        return self.text
 
 
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
@@ -9926,6 +9964,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_skin_command(cmd_original)
         elif canonical == "voice":
             self._handle_voice_command(cmd_original)
+        elif canonical == "wake":
+            self._handle_wake_command(cmd_original)
         elif canonical == "busy":
             self._handle_busy_command(cmd_original)
         else:
@@ -11766,6 +11806,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._voice_recorder._silence_duration = (
             _duration if isinstance(_duration, (int, float)) and not isinstance(_duration, bool) else 3.0
         )
+        # voice.max_recording_seconds — hard cap on a single recording's length.
+        # Same numeric guard as the silence params (bool excluded: a hand-edited
+        # ``max_recording_seconds: true`` must not become ``1`` — it falls back
+        # to the documented 120 default, mirroring the silence-param handling).
+        # An explicit numeric value <= 0 disables the cap. Previously this
+        # documented key was never read (dead config); wiring it here makes it
+        # take effect.
+        _max_rec = voice_cfg.get("max_recording_seconds")
+        self._voice_recorder._max_recording_seconds = (
+            (_max_rec if _max_rec > 0 else 0.0)
+            if isinstance(_max_rec, (int, float)) and not isinstance(_max_rec, bool)
+            else 120.0
+        )
 
         def _on_silence():
             """Called by AudioRecorder when silence is detected after speech."""
@@ -11813,13 +11866,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         threading.Thread(target=_refresh_level, daemon=True).start()
 
     def _voice_stt_model(self) -> Optional[str]:
-        """STT model override from config, or None for the provider default."""
+        """STT model override from config, or None for the provider default.
+
+        For the local provider, prefer stt.local.model (default ``base``) so the
+        CLI passes a real model name into the local STT backend.
+        """
         try:
             from hermes_cli.config import load_config
             stt_config = load_config().get("stt", {})
-            return stt_config.get("model") if isinstance(stt_config, dict) else None
+            if not isinstance(stt_config, dict):
+                return None
+            provider = str(stt_config.get("provider") or "").strip().lower()
+            if provider == "local":
+                local_config = stt_config.get("local") or {}
+                if not isinstance(local_config, dict):
+                    local_config = {}
+                return local_config.get("model") or "base"
+            return stt_config.get("model")
         except Exception:
             return None
+
+    def _voice_stt_provider(self) -> str:
+        """Configured STT provider name (lowercased), or empty string."""
+        try:
+            from hermes_cli.config import load_config
+            stt_config = load_config().get("stt", {})
+            if not isinstance(stt_config, dict):
+                return ""
+            return str(stt_config.get("provider") or "").strip().lower()
+        except Exception:
+            return ""
 
     def _voice_restart_recording_async(self) -> None:
         """Restart continuous-mode recording off-thread (start() can block)."""
@@ -11867,10 +11943,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # _voice_processing is already True (set atomically above)
             if hasattr(self, '_app') and self._app:
                 self._app.invalidate()
-            _cprint(f"{_DIM}Transcribing...{_RST}")
+
+            stt_model = self._voice_stt_model()
+            if self._voice_stt_provider() == "local":
+                _cprint(
+                    f"{_DIM}Preparing local STT model '{stt_model}' "
+                    f"(first use may download it from Hugging Face)...{_RST}"
+                )
+            else:
+                _cprint(f"{_DIM}Transcribing...{_RST}")
 
             from tools.voice_mode import transcribe_recording
-            result = transcribe_recording(wav_path, model=self._voice_stt_model())
+            result = transcribe_recording(wav_path, model=stt_model)
 
             if result.get("success") and result.get("transcript", "").strip():
                 transcript = result["transcript"].strip()
@@ -11884,7 +11968,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self._attached_images.clear()
                 if hasattr(self, '_app') and self._app:
                     self._app.invalidate()
-                self._pending_input.put(transcript)
+                self._pending_input.put(_VoiceInputMessage(transcript))
                 submitted = True
             elif result.get("success"):
                 _cprint(f"{_DIM}No speech detected.{_RST}")
@@ -11913,13 +11997,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 pass
 
             # Track consecutive no-speech cycles to avoid infinite restart loops.
+            stop_continuous_restart = False
             if not submitted:
                 self._no_speech_count = getattr(self, '_no_speech_count', 0) + 1
                 if self._no_speech_count >= 3:
                     self._voice_continuous = False
                     self._no_speech_count = 0
                     _cprint(f"{_DIM}No speech detected 3 times, continuous mode stopped.{_RST}")
-                    return
+                    stop_continuous_restart = True
             else:
                 self._no_speech_count = 0
 
@@ -11927,7 +12012,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # restart recording so the user can keep talking.
             # (When transcript IS submitted, process_loop handles restart
             # after chat() completes.)
-            if self._voice_continuous and not submitted and not self._voice_recording:
+            if (
+                self._voice_continuous
+                and not submitted
+                and not self._voice_recording
+                and not stop_continuous_restart
+            ):
                 self._voice_restart_recording_async()
 
     def _voice_speak_response_async(self, text: str) -> None:
@@ -11950,19 +12040,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             from tools.tts_tool import text_to_speech_tool
             from tools.voice_mode import play_audio_file
 
-            # Strip markdown and non-speech content for cleaner TTS
-            tts_text = text[:4000] if len(text) > 4000 else text
-            tts_text = re.sub(r'```[\s\S]*?```', ' ', tts_text)   # fenced code blocks
-            tts_text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', tts_text)  # [text](url) -> text
-            tts_text = re.sub(r'https?://\S+', '', tts_text)      # URLs
-            tts_text = re.sub(r'\*\*(.+?)\*\*', r'\1', tts_text)  # bold
-            tts_text = re.sub(r'\*(.+?)\*', r'\1', tts_text)      # italic
-            tts_text = re.sub(r'`(.+?)`', r'\1', tts_text)        # inline code
-            tts_text = re.sub(r'^#+\s*', '', tts_text, flags=re.MULTILINE)  # headers
-            tts_text = re.sub(r'^\s*[-*]\s+', '', tts_text, flags=re.MULTILINE)  # list items
-            tts_text = re.sub(r'---+', '', tts_text)              # horizontal rules
-            tts_text = re.sub(r'\n{3,}', '\n\n', tts_text)        # excessive newlines
-            tts_text = tts_text.strip()
+            # Strip markdown and non-speech content for cleaner TTS via the
+            # shared cleaner (tools/tts_text_normalize): markdown, emoji,
+            # <think> blocks, verifier footer, units, newline flattening.
+            try:
+                from tools.tts_text_normalize import prepare_spoken_text
+                tts_text = prepare_spoken_text(text, max_chars=4000)
+            except Exception:
+                # Legacy fallback pipeline — keep voice replies best-effort.
+                tts_text = text[:4000] if len(text) > 4000 else text
+                tts_text = re.sub(r'```[\s\S]*?```', ' ', tts_text)   # fenced code blocks
+                tts_text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', tts_text)  # [text](url) -> text
+                tts_text = re.sub(r'https?://\S+', '', tts_text)      # URLs
+                tts_text = re.sub(r'\*\*(.+?)\*\*', r'\1', tts_text)  # bold
+                tts_text = re.sub(r'\*(.+?)\*', r'\1', tts_text)      # italic
+                tts_text = re.sub(r'`(.+?)`', r'\1', tts_text)        # inline code
+                tts_text = re.sub(r'^#+\s*', '', tts_text, flags=re.MULTILINE)  # headers
+                tts_text = re.sub(r'^\s*[-*]\s+', '', tts_text, flags=re.MULTILINE)  # list items
+                tts_text = re.sub(r'---+', '', tts_text)              # horizontal rules
+                tts_text = re.sub(r'\n{3,}', '\n\n', tts_text)        # excessive newlines
+                tts_text = tts_text.strip()
             if not tts_text:
                 return
 
@@ -11974,17 +12071,30 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 f"tts_{time.strftime('%Y%m%d_%H%M%S')}.mp3",
             )
 
-            text_to_speech_tool(text=tts_text, output_path=mp3_path)
+            raw_result = text_to_speech_tool(text=tts_text, output_path=mp3_path)
+            try:
+                tts_result = json.loads(raw_result) if isinstance(raw_result, str) else {}
+            except Exception:
+                tts_result = {}
 
-            # Play the MP3 directly (the TTS tool returns OGG path but MP3 still exists)
-            if os.path.isfile(mp3_path) and os.path.getsize(mp3_path) > 0:
-                play_audio_file(mp3_path)
+            # Prefer the requested MP3 when the provider produced it. This
+            # preserves reliable local playback while still supporting
+            # providers that write to and return a different path.
+            audio_path = mp3_path
+            if not os.path.isfile(mp3_path) or os.path.getsize(mp3_path) == 0:
+                audio_path = tts_result.get("file_path") or mp3_path
+
+            if os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0:
+                play_audio_file(audio_path)
                 # Clean up
                 try:
-                    os.unlink(mp3_path)
-                    ogg_path = mp3_path.rsplit(".", 1)[0] + ".ogg"
-                    if os.path.isfile(ogg_path):
-                        os.unlink(ogg_path)
+                    cleanup_paths = {audio_path, mp3_path}
+                    for path in list(cleanup_paths):
+                        ogg_path = path.rsplit(".", 1)[0] + ".ogg"
+                        cleanup_paths.add(ogg_path)
+                    for path in cleanup_paths:
+                        if os.path.isfile(path):
+                            os.unlink(path)
                 except OSError:
                     pass
         except Exception as e:
@@ -12046,7 +12156,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _cprint(f"\n{_DIM}Stop phrase detected — ending voice chat.{_RST}")
                     self._disable_voice_mode()
                     return
-                self._pending_input.put(transcript)
+                self._pending_input.put(_VoiceInputMessage(transcript))
                 submitted = True
             elif not result.get("success"):
                 _cprint(f"\n{_DIM}Transcription failed: {result.get('error', 'Unknown error')}{_RST}")
@@ -12067,9 +12177,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """Return whether CLI voice mode should play record start/stop beeps."""
         try:
             from hermes_cli.config import load_config
+            from utils import is_truthy_value
             voice_cfg = load_config().get("voice", {})
             if isinstance(voice_cfg, dict):
-                return bool(voice_cfg.get("beep_enabled", True))
+                # is_truthy_value handles quoted YAML strings like "false"
+                # which bool() would misread as True (#49883).
+                return is_truthy_value(voice_cfg.get("beep_enabled", True), default=True)
         except Exception:
             pass
         return True
@@ -12167,6 +12280,230 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._voice_tts_done.set()
 
         _cprint(f"\n{_DIM}Voice mode disabled.{_RST}")
+
+    # ── Wake word ("Hey Hermes") ─────────────────────────────────────────
+    #
+    # An always-on hotword listener (tools/wake_word.py) that, on detecting
+    # the wake phrase, starts a fresh session and captures one utterance via
+    # the existing voice pipeline — the "Hey Siri" pattern, fully on-device.
+    #
+    # The detector holds the microphone, so it must be paused while a voice
+    # turn records (two input streams on one device is unreliable). On wake we
+    # pause it and mark the system suspended; a lightweight watchdog resumes it
+    # once the turn finishes and the CLI is idle again — covering every exit
+    # path (transcript submitted, no speech, or transcription error) without
+    # threading resume logic through the voice machinery.
+
+    def _maybe_start_wake_word(self):
+        """Start the wake-word listener at CLI startup if this surface is eligible."""
+        try:
+            from tools.wake_word import wake_surface_enabled
+            if not wake_surface_enabled("cli"):
+                return
+        except Exception:
+            return
+        self._start_wake_word_listener(announce=True)
+
+    def _start_wake_word_listener(self, announce: bool = False) -> bool:
+        """Build + start the hotword detector. Returns True on success."""
+        try:
+            from tools.wake_word import (
+                check_wake_word_requirements,
+                load_wake_word_config,
+                owns_listener,
+                start_listening,
+            )
+        except Exception as e:
+            if announce:
+                _cprint(f"{_DIM}Wake word unavailable: {e}{_RST}")
+            return False
+
+        if getattr(self, "_wake_word_active", False) and owns_listener(self):
+            if announce:
+                _cprint(f"{_DIM}Wake word is already listening.{_RST}")
+            return True
+        self._wake_word_active = False
+
+        cfg = load_wake_word_config()
+        reqs = check_wake_word_requirements(cfg)
+        if not reqs["available"]:
+            if announce:
+                _cprint(f"\n{_ACCENT}Wake word requirements not met:{_RST}")
+                if reqs.get("hint"):
+                    _cprint(f"  {_DIM}{reqs['hint']}{_RST}")
+            return False
+
+        if announce and not reqs.get("deps_available", True):
+            # Fresh install: the engine constructor lazy-installs its deps
+            # (onnxruntime is a large wheel) — tell the user why this is slow.
+            _cprint(f"{_DIM}Installing wake word engine (first use — this may take a minute)...{_RST}")
+
+        self._wake_start_new_session = bool(cfg.get("start_new_session", True))
+        try:
+            start_listening(self._on_wake_word, owner=self, config=cfg)
+        except Exception as e:
+            if announce:
+                _cprint(f"\n{_DIM}Failed to start wake word: {e}{_RST}")
+            return False
+
+        self._wake_word_active = True
+        self._wake_suspended = False
+        global _cli_wake_owner
+        _cli_wake_owner = self
+        self._start_wake_watchdog()
+        if announce:
+            _cprint(f"\n{_ACCENT}Wake word listening{_RST} "
+                    f"{_DIM}(say \"{reqs['phrase']}\" — /wake off to stop){_RST}")
+        return True
+
+    def _stop_wake_word_listener(self, announce: bool = False):
+        """Stop and tear down the hotword detector."""
+        global _cli_wake_owner
+        was_active = getattr(self, "_wake_word_active", False)
+        self._wake_word_active = False
+        self._wake_suspended = False
+        try:
+            from tools.wake_word import stop_listening
+            stop_listening(owner=self)
+        except Exception:
+            pass
+        if _cli_wake_owner is self:
+            _cli_wake_owner = None
+        if announce:
+            if was_active:
+                _cprint(f"{_DIM}Wake word stopped.{_RST}")
+            else:
+                _cprint(f"{_DIM}Wake word is not running.{_RST}")
+
+    def _on_wake_word(self):
+        """Fired after the detector hears the wake phrase."""
+        if getattr(self, "_should_exit", False):
+            return
+        # Ignore wake while a turn is in flight or the mic is already in use.
+        if self._agent_running or self._voice_recording or getattr(self, "_voice_processing", False):
+            return
+
+        # Release the mic so STT can capture the command utterance.
+        try:
+            from tools.wake_word import pause_listening
+            if not pause_listening(owner=self):
+                self._wake_word_active = False
+                return
+        except Exception as e:
+            logger.debug("wake word pause failed: %s", e)
+            return
+        self._wake_suspended = True
+
+        # Multi-profile routing: the CLI is a single-profile process, so a
+        # phrase enrolled by ANOTHER profile can't be routed here — print the
+        # switch command and re-arm rather than answering as the wrong profile.
+        try:
+            from tools.wake_word import get_last_match
+            _match = get_last_match()
+        except Exception:
+            _match = None
+        if _match and _match[1]:
+            from tools.wake_word import _active_profile_name
+            if _match[1] != _active_profile_name():
+                _cprint(f"\n{_DIM}Wake phrase for profile '{_match[1]}' — "
+                        f"run: hermes -p {_match[1]}{_RST}")
+                self._wake_suspended = True  # watchdog resumes the listener
+                return
+
+        _cprint(f"\n{_ACCENT}✦ Wake word detected — listening...{_RST}")
+        if getattr(self, "_app", None):
+            try:
+                self._app.invalidate()
+            except Exception:
+                pass
+
+        if getattr(self, "_wake_start_new_session", True):
+            try:
+                self.new_session(silent=True)
+            except Exception as e:
+                logger.debug("wake word new_session failed: %s", e)
+
+        # Single-utterance capture (not continuous) via the voice pipeline;
+        # VAD auto-stop transcribes and queues the transcript for process_loop.
+        with self._voice_lock:
+            self._voice_mode = True
+        self._voice_continuous = False
+        try:
+            self._voice_start_recording()
+        except Exception as e:
+            _cprint(f"{_DIM}Wake capture failed: {e}{_RST}")
+            # Leave _wake_suspended set; the watchdog resumes once idle.
+
+    def _start_wake_watchdog(self):
+        """Resume the paused detector when the CLI returns to a stable idle."""
+        if getattr(self, "_wake_watchdog_started", False):
+            return
+        self._wake_watchdog_started = True
+
+        def _loop():
+            idle_polls = 0
+            try:
+                while getattr(self, "_wake_word_active", False) and not getattr(self, "_should_exit", False):
+                    time.sleep(0.25)
+                    if not getattr(self, "_wake_suspended", False):
+                        idle_polls = 0
+                        continue
+                    busy = (
+                        self._agent_running
+                        or self._voice_recording
+                        or getattr(self, "_voice_processing", False)
+                        or not self._pending_input.empty()
+                    )
+                    if busy:
+                        idle_polls = 0
+                        continue
+                    # Require a few consecutive idle polls (~0.75s) so we don't
+                    # resume in the gap between VAD stop and the agent starting.
+                    idle_polls += 1
+                    if idle_polls >= 3:
+                        idle_polls = 0
+                        try:
+                            from tools.wake_word import resume_listening
+                            if resume_listening(owner=self):
+                                self._wake_suspended = False
+                            else:
+                                self._wake_word_active = False
+                        except Exception as e:
+                            logger.debug("wake word resume failed: %s", e)
+            finally:
+                self._wake_watchdog_started = False
+
+        threading.Thread(target=_loop, daemon=True, name="wake-watchdog").start()
+
+    def _show_wake_word_status(self):
+        """Show current wake-word listener status."""
+        from tools.wake_word import (
+            audio_is_silent,
+            check_wake_word_requirements,
+            is_listening,
+            load_wake_word_config,
+            owns_listener,
+        )
+
+        cfg = load_wake_word_config()
+        reqs = check_wake_word_requirements(cfg)
+        owned = owns_listener(self)
+        state = "LISTENING" if owned and is_listening() else "PAUSED" if owned else "OFF"
+
+        _cprint(f"\n{_BOLD}Wake Word Status{_RST}")
+        _cprint(f"  State:       {state}")
+        _cprint(f"  Phrase:      \"{reqs['phrase']}\"")
+        _cprint(f"  Provider:    {reqs['provider']}")
+        _cprint(f"  Surface:     {cfg.get('surface', 'auto')}")
+        _cprint(f"  New session: {'yes' if cfg.get('start_new_session', True) else 'no'}")
+        if state == "LISTENING" and audio_is_silent():
+            _cprint(f"  {_ACCENT}⚠ Microphone delivers only silence — the listener can't hear anything.{_RST}")
+            _cprint(f"  {_DIM}On macOS: System Settings > Privacy & Security > Microphone — allow your"
+                    f" terminal/Hermes, then /wake off + /wake on.{_RST}")
+        if not reqs["available"] and reqs.get("hint"):
+            _cprint(f"  {_DIM}{reqs['hint']}{_RST}")
+        if not owned:
+            _cprint(f"  {_DIM}Enable with /wake on{_RST}")
 
     def _toggle_voice_tts(self):
         """Toggle TTS output for voice mode."""
@@ -12750,7 +13087,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None) -> Optional[str]:
+    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -12765,6 +13102,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         Args:
             message: The user's message (str or multimodal content list)
             images: Optional list of Path objects for attached images
+            voice_input: True when the message came from voice transcription
+                (gates the concise voice-response prefix, #65827)
             
         Returns:
             The agent's response, or None on error
@@ -12992,7 +13331,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # model responds concisely. The prefix is API-call-local only —
             # run_conversation persists the original clean user message.
             _voice_prefix = ""
-            if self._voice_mode and isinstance(message, str):
+            if voice_input and isinstance(message, str):
                 _voice_prefix = (
                     "[Voice input — respond concisely and conversationally, "
                     "2-3 sentences max. No code blocks or markdown.] "
@@ -15021,15 +15360,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     daemon=True,
                 ).start()
             else:
-                # Guard: don't START recording during agent run or interactive prompts
-                if cli_ref._agent_running:
+                # Allow disarming continuous mode even when the agent is
+                # running or transcribing — otherwise the user is stuck in
+                # an auto-restart loop until /voice off (#67545).
+                if cli_ref._agent_running or cli_ref._voice_processing:
+                    with cli_ref._voice_lock:
+                        cli_ref._voice_continuous = False
+                    event.app.invalidate()
                     return
+                # Guard: don't START recording during interactive prompts
                 if cli_ref._clarify_state or cli_ref._sudo_state or cli_ref._approval_state or cli_ref._slash_confirm_state:
-                    return
-                # Guard: don't start while a previous stop/transcribe cycle is
-                # still running — recorder.stop() holds AudioRecorder._lock and
-                # start() would block the event-loop thread waiting for it.
-                if cli_ref._voice_processing:
                     return
 
                 # Interrupt TTS if playing, so user can start talking.
@@ -16155,7 +16495,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             except Exception:
                                 pass
                         continue
-                    
+
+                    # Voice-transcribed messages arrive wrapped in a sentinel
+                    # so only genuine STT output gets the voice prefix (#65827).
+                    is_voice_input = isinstance(user_input, _VoiceInputMessage)
+                    if is_voice_input:
+                        user_input = user_input.text
+
                     if not user_input:
                         continue
 
@@ -16251,7 +16597,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None)
+                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""
@@ -16332,7 +16678,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Start processing thread
         process_thread = threading.Thread(target=process_loop, daemon=True)
         process_thread.start()
-        
+
+        # Wake word ("Hey Hermes") — start the always-on hotword listener if
+        # enabled. Off-thread so a first-run engine install never blocks the
+        # prompt; best-effort, so deps/mic/key gaps are surfaced, never fatal.
+        def _wake_startup():
+            try:
+                self._maybe_start_wake_word()
+            except Exception as e:
+                logger.debug("wake-word startup skipped: %s", e)
+        threading.Thread(target=_wake_startup, daemon=True, name="wake-startup").start()
+
         # Register atexit cleanup so resources are freed even on unexpected exit
         atexit.register(_run_cleanup)
         
