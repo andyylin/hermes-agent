@@ -119,8 +119,9 @@ This cycle linearly merges the frozen cutoff into the prior published source can
 - **Retired live FTS write/rebuild surface**
   - Canonical LIKE search remains authoritative.
   - Healthy opens avoid retired FTS DDL/rebuild/write-retry behavior.
-  - Gateway transcript failures use the bounded canonical dirty queue and never classify generic SQLite corruption as a derived-index repair opportunity.
-  - Preserved from the protected minimal live ancestry.
+  - Gateway transcript failures use a bounded canonical dirty queue and never classify generic SQLite corruption as a derived-index repair opportunity.
+  - Queue saturation fails closed with explicit `TranscriptQueueFullError` backpressure; it never evicts older pending messages to accept new work.
+  - Preserved from the protected minimal live ancestry and hardened by the current state-review repair.
 
 ### Sessions, cron, and email
 

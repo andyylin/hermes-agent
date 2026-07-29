@@ -1157,6 +1157,14 @@ class AsyncSessionStore:
         return _offloaded
 
 
+class TranscriptQueueFullError(RuntimeError):
+    """Raised when transcript persistence backpressure reaches its hard cap.
+
+    Existing pending messages are preserved; callers must surface the failure
+    rather than accepting new work that cannot be durably recorded.
+    """
+
+
 class SessionStore:
     """
     Manages session storage and retrieval.
@@ -2951,16 +2959,21 @@ class SessionStore:
         """
         with self._transcript_retry_lock:
             pending = self._dirty_transcripts.setdefault(session_id, [])
-            pending.append(dict(message))
-            # Cap pending messages per session to avoid unbounded memory
-            # growth when the DB is persistently broken. Drop the oldest.
-            if len(pending) > self._MAX_PENDING_PER_SESSION:
-                dropped = pending.pop(0)
-                logger.warning(
-                    "Session DB transcript pending queue full for %s "
-                    "(cap=%d); dropping oldest message to make room",
-                    session_id, self._MAX_PENDING_PER_SESSION,
+            # Bound memory without silently evicting older canonical messages.
+            # Once full, apply explicit backpressure so callers surface the
+            # persistence failure instead of pretending a new message was saved.
+            if len(pending) >= self._MAX_PENDING_PER_SESSION:
+                logger.error(
+                    "Session DB transcript pending queue full for %s (cap=%d); "
+                    "rejecting new append",
+                    session_id,
+                    self._MAX_PENDING_PER_SESSION,
                 )
+                raise TranscriptQueueFullError(
+                    f"transcript pending queue full for {session_id} "
+                    f"(cap={self._MAX_PENDING_PER_SESSION})"
+                )
+            pending.append(dict(message))
             # Snapshot the first pending message, then release the lock
             # before the DB write so other sessions are not blocked.
             msg = pending[0]
@@ -3078,8 +3091,8 @@ class SessionStore:
             api_content=extract_api_content_sidecar(message),
         )
 
-    # Maximum in-memory pending messages per session before dropping the
-    # oldest. Prevents unbounded growth when the DB is persistently broken.
+    # Maximum in-memory pending messages per session before explicit
+    # backpressure. Prevents both unbounded growth and silent old-message loss.
     _MAX_PENDING_PER_SESSION = 200
 
     def _clear_dirty_transcript(self, session_id: str) -> None:

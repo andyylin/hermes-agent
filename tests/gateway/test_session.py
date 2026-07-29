@@ -12,6 +12,7 @@ from gateway.session import (
     SessionEntry,
     SessionSource,
     SessionStore,
+    TranscriptQueueFullError,
     build_session_context,
     build_session_context_prompt,
     build_session_key,
@@ -2476,9 +2477,8 @@ class TestGatewaySessionDbRecovery:
         store.rewind_session("s1", 1)
         assert "s1" not in store._dirty_transcripts
 
-    def test_pending_queue_caps_at_max(self):
-        """Pending queue should drop oldest messages when exceeding the cap
-        to prevent unbounded memory growth on persistent DB failure."""
+    def test_pending_queue_applies_backpressure_without_evicting_old_messages(self):
+        """A full pending queue rejects new work without losing old messages."""
         import threading
 
         class FakeDb:
@@ -2498,12 +2498,18 @@ class TestGatewaySessionDbRecovery:
         store._dirty_transcripts = {}
         store._transcript_append_failures = {}
 
-        # Fill beyond the cap
-        for i in range(store._MAX_PENDING_PER_SESSION + 10):
+        for i in range(store._MAX_PENDING_PER_SESSION):
             store.append_to_transcript("s1", {"role": "user", "content": f"msg{i}"})
 
-        pending = store._dirty_transcripts.get("s1", [])
-        assert len(pending) <= store._MAX_PENDING_PER_SESSION
+        with pytest.raises(TranscriptQueueFullError, match="pending queue full"):
+            store.append_to_transcript(
+                "s1", {"role": "user", "content": "must-not-evict"}
+            )
+
+        pending = store._dirty_transcripts["s1"]
+        assert len(pending) == store._MAX_PENDING_PER_SESSION
+        assert pending[0]["content"] == "msg0"
+        assert pending[-1]["content"] == f"msg{store._MAX_PENDING_PER_SESSION - 1}"
 
     def test_new_session_records_gateway_peer_fields(self, tmp_path):
         store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())

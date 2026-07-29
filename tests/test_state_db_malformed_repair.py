@@ -432,10 +432,11 @@ def test_fts_read_probe_returns_none_when_trigram_missing(tmp_path, monkeypatch)
 
 
 # ── FTS write-corruption class (#50502) ──────────────────────────────────
-# A readable state.db can still reject every message write through the
-# messages_fts* triggers when the FTS index is corrupt. Plain
-# `SELECT COUNT(*)` reads succeed, so the old read-only health probe reported
-# it healthy and the gateway silently dropped conversation history.
+def test_repair_retires_corrupt_legacy_fts_without_losing_canonical_rows(tmp_path):
+    """A readable DB with broken legacy FTS is repaired from canonical rows."""
+    # A readable state.db can still reject every message write through legacy
+    # messages_fts* triggers when the derived index is corrupt. Plain
+    # `SELECT COUNT(*)` reads succeed, so repair must retire those artifacts.
 
     db_path = tmp_path / "state.db"
     _build_healthy_db(db_path)
