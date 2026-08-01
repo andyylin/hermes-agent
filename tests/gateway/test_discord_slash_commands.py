@@ -142,6 +142,22 @@ async def test_registers_native_thread_slash_command(adapter):
 
 
 @pytest.mark.asyncio
+async def test_thread_slash_uses_profile_retention_when_duration_omitted(adapter):
+    adapter.config.extra["thread_auto_archive_minutes"] = 1440
+    adapter._handle_thread_create_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    command = adapter._client.tree.commands["thread"]
+    interaction = SimpleNamespace(response=SimpleNamespace(defer=AsyncMock()))
+
+    await command(interaction, name="Planning", message="")
+
+    adapter._handle_thread_create_slash.assert_awaited_once_with(
+        interaction, "Planning", "", 1440
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_simple_slash_executes_when_defer_interaction_expired(adapter):
     class UnknownInteraction(Exception):
         status = 404
