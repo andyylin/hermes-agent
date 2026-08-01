@@ -167,6 +167,10 @@ Cron jobs with `deliver: line` route to `LINE_HOME_CHANNEL`. The adapter ships a
 | `LINE_PUBLIC_URL` | for media | — | Public HTTPS base URL; required for image/voice/video sends |
 | `LINE_ALLOWED_USERS` | one of | — | Comma-separated user IDs (U-prefixed) |
 | `LINE_ALLOWED_GROUPS` | one of | — | Comma-separated group IDs (C-prefixed) |
+| `LINE_READ_ONLY_GROUPS` | no | — | Group IDs archived locally without agent dispatch |
+| `LINE_ARCHIVE_GROUPS` | no | — | Group IDs archived locally while normal dispatch remains enabled |
+| `LINE_REQUIRE_PREFIX_GROUPS` | no | — | Group IDs requiring one of `LINE_GROUP_PREFIXES` before dispatch |
+| `LINE_GROUP_PREFIXES` | no | `Hermes:,Joi:` | Comma-separated accepted prefixes for prefix-gated groups |
 | `LINE_ALLOWED_ROOMS` | one of | — | Comma-separated room IDs (R-prefixed) |
 | `LINE_ALLOW_ALL_USERS` | dev only | `false` | Skip allowlist entirely |
 | `LINE_HOME_CHANNEL` | no | — | Default cron / notification delivery target |
@@ -175,6 +179,8 @@ Cron jobs with `deliver: line` route to `LINE_HOME_CHANNEL`. The adapter ships a
 | `LINE_BUTTON_LABEL` | no | "Get answer" | Button label |
 | `LINE_DELIVERED_TEXT` | no | "Already replied ✅" | Reply when an already-delivered button is tapped again |
 | `LINE_INTERRUPTED_TEXT` | no | "Run was interrupted before completion." | Reply when a `/stop` orphan button is tapped |
+
+Read-only and archive-group messages are stored under `~/.hermes/data/line-read-only/` in owner-only files. Each group archive rotates at 10 MiB and retains three backups, bounding each group's archive footprint to roughly 40 MiB plus one in-flight record.
 
 ---
 
