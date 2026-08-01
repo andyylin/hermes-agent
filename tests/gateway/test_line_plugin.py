@@ -361,7 +361,19 @@ class TestValidateConfig:
 class TestAdapterInit:
 
     def test_init_from_config_extra(self, monkeypatch):
-        for k in ("LINE_CHANNEL_ACCESS_TOKEN", "LINE_CHANNEL_SECRET", "LINE_PORT"):
+        for k in (
+            "LINE_CHANNEL_ACCESS_TOKEN",
+            "LINE_CHANNEL_SECRET",
+            "LINE_PORT",
+            "LINE_PUBLIC_URL",
+            "LINE_ALLOWED_USERS",
+            "LINE_ALLOWED_GROUPS",
+            "LINE_ALLOWED_ROOMS",
+            "LINE_READ_ONLY_GROUPS",
+            "LINE_ARCHIVE_GROUPS",
+            "LINE_REQUIRE_PREFIX_GROUPS",
+            "LINE_GROUP_PREFIXES",
+        ):
             monkeypatch.delenv(k, raising=False)
         from gateway.config import PlatformConfig
         cfg = PlatformConfig(

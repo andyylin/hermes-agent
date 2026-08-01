@@ -426,7 +426,12 @@ class GatewayAuthorizationMixin:
                 Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
                 Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
             }.get(source.platform, "")
-            if chat_allowlist_env:
+            chat_allowlist_envs = (chat_allowlist_env,) if chat_allowlist_env else ()
+            if source.platform and source.platform.value == "line":
+                # Archive-and-dispatch is itself an explicit operator grant.
+                # Read-only groups never reach this gateway gate.
+                chat_allowlist_envs = ("LINE_ALLOWED_GROUPS", "LINE_ARCHIVE_GROUPS")
+            for chat_allowlist_env in chat_allowlist_envs:
                 raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
                 if raw_chat_allowlist:
                     allowed_group_ids = {
@@ -447,11 +452,16 @@ class GatewayAuthorizationMixin:
                 adapter = self._adapter_for_source(source)
                 if adapter is not None:
                     extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
-                    adapter_group_allowed = extra.get("group_allowed_chats")
-                    if adapter_group_allowed:
-                        allowed = _coerce_allow_set(adapter_group_allowed)
-                        if "*" in allowed or source.chat_id in allowed:
-                            return True
+                    adapter_group_allowlists = [extra.get("group_allowed_chats")]
+                    if source.platform and source.platform.value == "line":
+                        adapter_group_allowlists.extend(
+                            (extra.get("allowed_groups"), extra.get("archive_groups"))
+                        )
+                    for adapter_group_allowed in adapter_group_allowlists:
+                        if adapter_group_allowed:
+                            allowed = _coerce_allow_set(adapter_group_allowed)
+                            if "*" in allowed or source.chat_id in allowed:
+                                return True
             except Exception:
                 pass
 
@@ -502,6 +512,8 @@ class GatewayAuthorizationMixin:
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
             Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
         }
+        if source.platform and source.platform.value == "line":
+            platform_group_chat_env_map[source.platform] = "LINE_ALLOWED_GROUPS"
         platform_allow_all_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
             Platform.DISCORD: "DISCORD_ALLOW_ALL_USERS",
@@ -826,6 +838,11 @@ class GatewayAuthorizationMixin:
                 ),
                 Platform.QQBOT: ("QQ_GROUP_ALLOWED_USERS",),
             }
+            if platform and platform.value == "line":
+                platform_group_env_map[platform] = (
+                    "LINE_ALLOWED_GROUPS",
+                    "LINE_ARCHIVE_GROUPS",
+                )
             if os.getenv(platform_env_map.get(platform, ""), "").strip():
                 return "ignore"
             for env_key in platform_group_env_map.get(platform, ()):

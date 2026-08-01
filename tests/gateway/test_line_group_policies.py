@@ -1,0 +1,98 @@
+"""Regression tests for private LINE group collection policies."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from unittest.mock import AsyncMock
+
+from gateway.config import PlatformConfig
+from tests.gateway._plugin_adapter_loader import load_plugin_adapter
+
+LineAdapter = load_plugin_adapter("line").LineAdapter
+
+
+def _event(*, chat_id: str, text: str = "hello", msg_type: str = "text") -> dict:
+    message = {"id": "m1", "type": msg_type}
+    if msg_type == "text":
+        message["text"] = text
+    return {
+        "type": "message",
+        "timestamp": 123,
+        "webhookEventId": "evt1",
+        "replyToken": "reply-token",
+        "source": {"type": "group", "groupId": chat_id, "userId": "Uother"},
+        "message": message,
+    }
+
+
+def _adapter(**extra):
+    cfg = PlatformConfig(
+        enabled=True,
+        extra={
+            "channel_access_token": "tok",
+            "channel_secret": "sec",
+            **extra,
+        },
+    )
+    adapter = LineAdapter(cfg)
+    adapter.handle_message = AsyncMock()
+    return adapter
+
+
+def test_read_only_group_archives_without_dispatch(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _adapter(read_only_groups=["Creadonly"])
+
+    asyncio.run(adapter._dispatch_event(_event(chat_id="Creadonly", text="archive me")))
+
+    adapter.handle_message.assert_not_awaited()
+    assert "Creadonly" not in adapter._reply_tokens
+    archive = tmp_path / "data" / "line-read-only" / "Creadonly.jsonl"
+    row = json.loads(archive.read_text(encoding="utf-8").splitlines()[-1])
+    assert row["chat_id"] == "Creadonly"
+    assert row["text"] == "archive me"
+
+
+def test_archive_group_records_and_dispatches_prefixed_message(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _adapter(
+        allowed_groups=["Carchive"],
+        archive_groups=["Carchive"],
+        require_prefix_groups=["Carchive"],
+        group_prefixes=["Hermes:"],
+    )
+
+    asyncio.run(adapter._dispatch_event(_event(chat_id="Carchive", text="Hermes: summarize")))
+
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args.args[0].text == "summarize"
+    archive = tmp_path / "data" / "line-read-only" / "Carchive.jsonl"
+    row = json.loads(archive.read_text(encoding="utf-8").splitlines()[-1])
+    assert row["text"] == "Hermes: summarize"
+
+
+def test_prefix_required_group_drops_unprefixed_text():
+    adapter = _adapter(
+        allowed_groups=["Cprefix"],
+        require_prefix_groups=["Cprefix"],
+        group_prefixes=["Hermes:"],
+    )
+
+    asyncio.run(adapter._dispatch_event(_event(chat_id="Cprefix", text="not for Hermes")))
+
+    adapter.handle_message.assert_not_awaited()
+    assert "Cprefix" not in adapter._reply_tokens
+
+
+def test_prefix_required_group_drops_non_text_message():
+    adapter = _adapter(
+        allowed_groups=["Cprefix"],
+        require_prefix_groups=["Cprefix"],
+    )
+    adapter._download_media = AsyncMock(return_value=("/tmp/image.jpg", "image/jpeg"))
+
+    asyncio.run(adapter._dispatch_event(_event(chat_id="Cprefix", msg_type="image")))
+
+    adapter.handle_message.assert_not_awaited()
+    assert "Cprefix" not in adapter._reply_tokens
