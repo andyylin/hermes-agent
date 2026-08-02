@@ -879,6 +879,21 @@ class GatewayAuthorizationMixin:
         # if any allowlist is configured for this platform, silently drop
         # unauthorized messages instead of sending pairing codes.
         if platform:
+            # LINE policy is already resolved by the profile-owned adapter.
+            # Never re-read its env vars here: this message path can run outside
+            # a profile secret scope in multiplex mode, where os.environ may
+            # contain another profile's policy.
+            if platform.value == "line":
+                adapter = self._authorization_adapter(platform, profile)
+                for attr in (
+                    "allowed_users",
+                    "allowed_groups",
+                    "archive_groups",
+                    "allowed_rooms",
+                ):
+                    if _coerce_allow_set(getattr(adapter, attr, None)):
+                        return "ignore"
+
             platform_env_map = {
                 Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",
                 Platform.DISCORD:  "DISCORD_ALLOWED_USERS",
