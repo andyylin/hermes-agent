@@ -132,6 +132,38 @@ def test_line_process_env_does_not_cross_profile_adapter_boundary(monkeypatch):
     assert runner._is_user_authorized(source) is False
 
 
+def test_line_unauthorized_dm_behavior_ignores_poisoned_global_policy(monkeypatch):
+    from agent import secret_scope as ss
+
+    monkeypatch.setenv("LINE_ALLOWED_GROUPS", "Cother-profile")
+    monkeypatch.setenv("LINE_ARCHIVE_GROUPS", "Cother-profile")
+    monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+
+    platform = Platform("line")
+    runner = _runner()
+    runner.adapters = {platform: _line_adapter()}
+
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope({})
+    try:
+        assert runner._get_unauthorized_dm_behavior(platform) == "pair"
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
+
+
+def test_line_unauthorized_dm_behavior_uses_active_adapter_policy(monkeypatch):
+    monkeypatch.delenv("LINE_ALLOWED_GROUPS", raising=False)
+    monkeypatch.delenv("LINE_ARCHIVE_GROUPS", raising=False)
+    monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+
+    platform = Platform("line")
+    runner = _runner()
+    runner.adapters = {platform: _line_adapter(allowed={"Cactive-profile"})}
+
+    assert runner._get_unauthorized_dm_behavior(platform) == "ignore"
+
+
 def test_line_read_only_group_is_not_dispatched_through_gateway(monkeypatch):
     monkeypatch.delenv("LINE_ALLOWED_GROUPS", raising=False)
     monkeypatch.setenv("LINE_READ_ONLY_GROUPS", "Creadonly")
