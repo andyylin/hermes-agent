@@ -77,6 +77,7 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -687,6 +688,30 @@ def _csv_list(value: str) -> List[str]:
     return [x.strip() for x in value.split(",") if x.strip()]
 
 
+@contextmanager
+def _line_policy_secret_scope():
+    """Install the active Hermes home's secrets for unscoped multiplex startup."""
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        current_secret_scope,
+        is_multiplex_active,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+
+    if not is_multiplex_active() or current_secret_scope() is not None:
+        yield
+        return
+
+    from hermes_constants import get_hermes_home
+
+    token = set_secret_scope(build_profile_secret_scope(Path(get_hermes_home())))
+    try:
+        yield
+    finally:
+        reset_secret_scope(token)
+
+
 def _truthy_env(name: str, default: bool = False) -> bool:
     v = _getenv(name)
     if v is None:
@@ -742,31 +767,35 @@ class LineAdapter(BasePlatformAdapter):
             or ""
         ).rstrip("/")
 
-        # Three-allowlist gating
-        self.allow_all = _truthy_env(
-            "LINE_ALLOW_ALL_USERS", bool(extra.get("allow_all_users", False))
-        )
-        self.allowed_users = _csv_set(
-            _getenv("LINE_ALLOWED_USERS", "") or ""
-        ) | set(extra.get("allowed_users", []))
-        self.allowed_groups = _csv_set(
-            _getenv("LINE_ALLOWED_GROUPS", "") or ""
-        ) | set(extra.get("allowed_groups", []))
-        self.read_only_groups = _csv_set(
-            _getenv("LINE_READ_ONLY_GROUPS", "") or ""
-        ) | set(extra.get("read_only_groups", []))
-        self.archive_groups = _csv_set(
-            _getenv("LINE_ARCHIVE_GROUPS", "") or ""
-        ) | set(extra.get("archive_groups", []))
-        self.require_prefix_groups = _csv_set(
-            _getenv("LINE_REQUIRE_PREFIX_GROUPS", "") or ""
-        ) | set(extra.get("require_prefix_groups", []))
-        self.group_prefixes = _csv_list(
-            _getenv("LINE_GROUP_PREFIXES", "") or ""
-        ) or list(extra.get("group_prefixes", [])) or ["Hermes:"]
-        self.allowed_rooms = _csv_set(
-            _getenv("LINE_ALLOWED_ROOMS", "") or ""
-        ) | set(extra.get("allowed_rooms", []))
+        # Three-allowlist gating. Primary adapters are constructed outside
+        # ``_profile_runtime_scope`` even when multiplexing is active. Install
+        # the active/default profile's isolated secret mapping for this policy
+        # snapshot so process-global values from another profile cannot leak in.
+        with _line_policy_secret_scope():
+            self.allow_all = _truthy_env(
+                "LINE_ALLOW_ALL_USERS", bool(extra.get("allow_all_users", False))
+            )
+            self.allowed_users = _csv_set(
+                _getenv("LINE_ALLOWED_USERS", "") or ""
+            ) | set(extra.get("allowed_users", []))
+            self.allowed_groups = _csv_set(
+                _getenv("LINE_ALLOWED_GROUPS", "") or ""
+            ) | set(extra.get("allowed_groups", []))
+            self.read_only_groups = _csv_set(
+                _getenv("LINE_READ_ONLY_GROUPS", "") or ""
+            ) | set(extra.get("read_only_groups", []))
+            self.archive_groups = _csv_set(
+                _getenv("LINE_ARCHIVE_GROUPS", "") or ""
+            ) | set(extra.get("archive_groups", []))
+            self.require_prefix_groups = _csv_set(
+                _getenv("LINE_REQUIRE_PREFIX_GROUPS", "") or ""
+            ) | set(extra.get("require_prefix_groups", []))
+            self.group_prefixes = _csv_list(
+                _getenv("LINE_GROUP_PREFIXES", "") or ""
+            ) or list(extra.get("group_prefixes", [])) or ["Hermes:"]
+            self.allowed_rooms = _csv_set(
+                _getenv("LINE_ALLOWED_ROOMS", "") or ""
+            ) | set(extra.get("allowed_rooms", []))
 
         # Slow-LLM postback button threshold
         try:
