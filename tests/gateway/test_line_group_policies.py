@@ -59,6 +59,48 @@ def test_group_policy_env_is_profile_scoped_in_multiplex(monkeypatch):
     assert adapter.read_only_groups == {"Cscoped"}
 
 
+def test_group_policy_env_installs_default_profile_scope_when_multiplex_unscoped(
+    monkeypatch, tmp_path
+):
+    from agent import secret_scope as ss
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    scoped = {
+        "LINE_ALLOW_ALL_USERS": "false",
+        "LINE_ALLOWED_USERS": "Uscoped",
+        "LINE_ALLOWED_GROUPS": "Callowed-scoped",
+        "LINE_READ_ONLY_GROUPS": "Creadonly-scoped",
+        "LINE_ARCHIVE_GROUPS": "Carchive-scoped",
+        "LINE_REQUIRE_PREFIX_GROUPS": "Cprefix-scoped",
+        "LINE_GROUP_PREFIXES": "Scoped:,Hermes:",
+        "LINE_ALLOWED_ROOMS": "Rscoped",
+    }
+    (tmp_path / ".env").write_text(
+        "\n".join(f"{name}={value}" for name, value in scoped.items()) + "\n",
+        encoding="utf-8",
+    )
+    for name in scoped:
+        monkeypatch.setenv(name, "true" if name == "LINE_ALLOW_ALL_USERS" else "poison")
+
+    ss.set_multiplex_active(True)
+    home_token = set_hermes_home_override(str(tmp_path))
+    try:
+        assert ss.current_secret_scope() is None
+        adapter = _adapter()
+    finally:
+        reset_hermes_home_override(home_token)
+        ss.set_multiplex_active(False)
+
+    assert adapter.allow_all is False
+    assert adapter.allowed_users == {"Uscoped"}
+    assert adapter.allowed_groups == {"Callowed-scoped"}
+    assert adapter.read_only_groups == {"Creadonly-scoped"}
+    assert adapter.archive_groups == {"Carchive-scoped"}
+    assert adapter.require_prefix_groups == {"Cprefix-scoped"}
+    assert adapter.group_prefixes == ["Scoped:", "Hermes:"]
+    assert adapter.allowed_rooms == {"Rscoped"}
+
+
 def test_read_only_group_archives_without_dispatch(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     adapter = _adapter(read_only_groups=["Creadonly"])
