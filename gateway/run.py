@@ -22251,12 +22251,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_name,
         )
         try:
+            rename_options: Dict[str, Any] = {
+                "only_if_current_name": guard_name,
+            }
+            if use_connector_guard:
+                rename_options["prefer_connector_created"] = True
+                rename_options["parent_chat_id"] = parent_chat_id
             renamed = await rename_thread(
                 target_thread_id,
                 thread_name,
-                prefer_connector_created=use_connector_guard,
-                only_if_current_name=guard_name,
-                parent_chat_id=parent_chat_id,
+                **rename_options,
             )
             logger.info(
                 "discord auto-thread rename result: thread=%s applied=%s",
