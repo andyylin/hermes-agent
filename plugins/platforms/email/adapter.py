@@ -31,6 +31,7 @@ from agent.secret_scope import get_secret as _scoped_get_secret
 import ssl
 import uuid
 from email.header import decode_header
+from functools import partial
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -1299,6 +1300,39 @@ class EmailAdapter(BasePlatformAdapter):
             return self._address.rsplit("@", 1)[-1] or "localhost"
         return "localhost"
 
+    def _apply_notification_headers(
+        self,
+        msg: MIMEMultipart,
+        to_addr: str,
+        *,
+        reply_to_msg_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Apply one subject/threading contract to text and attachment emails."""
+        metadata = metadata or {}
+        explicit_subject = metadata.get("subject")
+        suppress_threading = bool(metadata.get("suppress_threading"))
+        thread_anchor_key = metadata.get("thread_anchor_key")
+
+        ctx = self._thread_context.get(to_addr, {})
+        if explicit_subject:
+            subject = str(explicit_subject)
+        else:
+            subject = ctx.get("subject", "Hermes Agent")
+            if not subject.startswith("Re:"):
+                subject = f"Re: {subject}"
+        msg["Subject"] = subject
+
+        anchor = _stable_thread_message_id(
+            str(thread_anchor_key or ""), self._message_id_domain()
+        )
+        original_msg_id = anchor or (
+            None if suppress_threading else (reply_to_msg_id or ctx.get("message_id"))
+        )
+        if original_msg_id:
+            msg["In-Reply-To"] = original_msg_id
+            msg["References"] = original_msg_id
+
     def _send_email(
         self,
         to_addr: str,
@@ -1311,32 +1345,12 @@ class EmailAdapter(BasePlatformAdapter):
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        metadata = metadata or {}
-        explicit_subject = metadata.get("subject")
-        suppress_threading = bool(metadata.get("suppress_threading"))
-        thread_anchor_key = metadata.get("thread_anchor_key")
-
-        # Thread context for replies unless the caller supplied a notification
-        # subject/thread contract.
-        ctx = self._thread_context.get(to_addr, {})
-        if explicit_subject:
-            subject = str(explicit_subject)
-        else:
-            subject = ctx.get("subject", "Hermes Agent")
-            if not subject.startswith("Re:"):
-                subject = f"Re: {subject}"
-        msg["Subject"] = subject
-
-        # Threading headers
-        anchor = _stable_thread_message_id(
-            str(thread_anchor_key or ""), self._message_id_domain()
+        self._apply_notification_headers(
+            msg,
+            to_addr,
+            reply_to_msg_id=reply_to_msg_id,
+            metadata=metadata,
         )
-        original_msg_id = anchor or (
-            None if suppress_threading else (reply_to_msg_id or ctx.get("message_id"))
-        )
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
 
         msg["Date"] = formatdate(localtime=True)
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
@@ -1356,7 +1370,7 @@ class EmailAdapter(BasePlatformAdapter):
             except Exception:
                 smtp.close()
 
-        logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, subject)
+        logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, msg["Subject"])
         return msg_id
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
@@ -1372,12 +1386,12 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send an image URL as part of an email body.
 
-        ``metadata`` is accepted to honor the base-class contract; the
-        email body send doesn't use it.
+        Notification metadata is forwarded so URL-image emails use the same
+        subject/thread contract as text and attachment sends.
         """
         text = caption or ""
         text += f"\n\nImage: {image_url}"
-        return await self.send(chat_id, text.strip(), reply_to)
+        return await self.send(chat_id, text.strip(), reply_to, metadata)
 
     async def send_multiple_images(
         self,
@@ -1422,7 +1436,7 @@ class EmailAdapter(BasePlatformAdapter):
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 None,
-                self._send_email_with_attachments,
+                partial(self._send_email_with_attachments, metadata=metadata),
                 chat_id,
                 body,
                 local_paths,
@@ -1436,22 +1450,14 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         file_paths: List[str],
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Send an email with multiple file attachments via SMTP."""
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
-        msg["Subject"] = subject
-
-        original_msg_id = ctx.get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+        self._apply_notification_headers(msg, to_addr, metadata=metadata)
 
         msg["Date"] = formatdate(localtime=True)
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
@@ -1492,6 +1498,7 @@ class EmailAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
         """Send a file as an email attachment."""
@@ -1499,7 +1506,11 @@ class EmailAdapter(BasePlatformAdapter):
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
                 None,
-                self._send_email_with_attachment,
+                partial(
+                    self._send_email_with_attachment,
+                    reply_to_msg_id=reply_to,
+                    metadata=metadata,
+                ),
                 chat_id,
                 caption or "",
                 file_path,
@@ -1516,22 +1527,20 @@ class EmailAdapter(BasePlatformAdapter):
         body: str,
         file_path: str,
         file_name: Optional[str] = None,
+        reply_to_msg_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Send an email with a file attachment via SMTP."""
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
-        msg["Subject"] = subject
-
-        original_msg_id = ctx.get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+        self._apply_notification_headers(
+            msg,
+            to_addr,
+            reply_to_msg_id=reply_to_msg_id,
+            metadata=metadata,
+        )
 
         msg["Date"] = formatdate(localtime=True)
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"

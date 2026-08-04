@@ -95,6 +95,125 @@ def test_live_email_explicit_subject_can_start_fresh_thread(monkeypatch):
     assert "References" not in message
 
 
+def test_email_url_image_preserves_notification_metadata(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    adapter._thread_context["andy@example.net"] = {
+        "subject": "Old conversation",
+        "message_id": "<old@example.net>",
+    }
+    smtp = MagicMock()
+    monkeypatch.setattr(adapter, "_connect_smtp", lambda: smtp)
+
+    asyncio.run(
+        adapter.send_image(
+            "andy@example.net",
+            "https://example.com/report.png",
+            caption="Daily chart",
+            metadata={
+                "subject": "Daily Media Brief",
+                "thread_anchor_key": "daily-media",
+            },
+        )
+    )
+
+    message = smtp.send_message.call_args.args[0]
+    assert message["Subject"] == "Daily Media Brief"
+    assert message["In-Reply-To"] == "<hermes-thread-daily-media@example.com>"
+    assert message["References"] == "<hermes-thread-daily-media@example.com>"
+
+
+def test_email_multiple_images_preserve_notification_metadata(monkeypatch, tmp_path):
+    adapter = _adapter(monkeypatch)
+    adapter._thread_context["andy@example.net"] = {
+        "subject": "Old conversation",
+        "message_id": "<old@example.net>",
+    }
+    image = tmp_path / "chart.png"
+    image.write_bytes(b"fake image")
+    smtp = MagicMock()
+    monkeypatch.setattr(adapter, "_connect_smtp", lambda: smtp)
+
+    asyncio.run(
+        adapter.send_multiple_images(
+            "andy@example.net",
+            [(image.as_uri(), "Daily chart")],
+            metadata={
+                "subject": "Daily Media Brief",
+                "suppress_threading": True,
+            },
+        )
+    )
+
+    message = smtp.send_message.call_args.args[0]
+    assert message["Subject"] == "Daily Media Brief"
+    assert "In-Reply-To" not in message
+    assert "References" not in message
+
+
+def test_email_document_preserves_notification_metadata(monkeypatch, tmp_path):
+    adapter = _adapter(monkeypatch)
+    adapter._thread_context["andy@example.net"] = {
+        "subject": "Old conversation",
+        "message_id": "<old@example.net>",
+    }
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"fake pdf")
+    smtp = MagicMock()
+    monkeypatch.setattr(adapter, "_connect_smtp", lambda: smtp)
+
+    result = asyncio.run(
+        adapter.send_document(
+            "andy@example.net",
+            str(document),
+            caption="Daily report",
+            metadata={
+                "subject": "Daily Media Brief",
+                "thread_anchor_key": "daily-media",
+            },
+        )
+    )
+
+    assert result.success is True
+    message = smtp.send_message.call_args.args[0]
+    assert message["Subject"] == "Daily Media Brief"
+    assert message["In-Reply-To"] == "<hermes-thread-daily-media@example.com>"
+    assert message["References"] == "<hermes-thread-daily-media@example.com>"
+
+
+def test_email_media_fallbacks_preserve_notification_metadata(monkeypatch, tmp_path):
+    adapter = _adapter(monkeypatch)
+    adapter._thread_context["andy@example.net"] = {
+        "subject": "Old conversation",
+        "message_id": "<old@example.net>",
+    }
+    media = tmp_path / "media.bin"
+    media.write_bytes(b"media")
+    smtp = MagicMock()
+    monkeypatch.setattr(adapter, "_connect_smtp", lambda: smtp)
+
+    methods = (
+        (adapter.send_image_file, {"image_path": str(media)}),
+        (adapter.send_voice, {"audio_path": str(media)}),
+        (adapter.send_video, {"video_path": str(media)}),
+    )
+    for method, media_arg in methods:
+        smtp.send_message.reset_mock()
+        asyncio.run(
+            method(
+                chat_id="andy@example.net",
+                metadata={
+                    "subject": "Fallback Media Brief",
+                    "suppress_threading": True,
+                },
+                **media_arg,
+            )
+        )
+        message = smtp.send_message.call_args.args[0]
+        assert message["Subject"] == "Fallback Media Brief"
+        assert "In-Reply-To" not in message
+        assert "References" not in message
+
+
 def test_standalone_html_is_multipart_with_plain_fallback_and_thread_anchor(monkeypatch):
     monkeypatch.setenv("EMAIL_PASSWORD", "test-password")
     smtp = MagicMock()
