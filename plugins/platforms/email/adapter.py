@@ -1610,6 +1610,7 @@ async def _standalone_send(
     standalone_sender_fn contract; replaces the legacy _send_email helper."""
     import smtplib
     import ssl as _ssl
+    from gateway.platforms.base import BasePlatformAdapter
 
     extra = getattr(pconfig, "extra", {}) or {}
     address = extra.get("address") or _get_secret("EMAIL_ADDRESS", "")
@@ -1623,8 +1624,17 @@ async def _standalone_send(
     if not all([address, password, smtp_host]):
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
+    safe_media = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    if media_files and not safe_media:
+        return {"error": "Email media delivery rejected all attachment paths as unsafe"}
+
     try:
-        msg = MIMEMultipart("alternative")
+        if safe_media:
+            msg = MIMEMultipart("mixed")
+            body_container = MIMEMultipart("alternative")
+        else:
+            msg = MIMEMultipart("alternative")
+            body_container = msg
         msg["From"] = address
         msg["To"] = chat_id
         thread_anchor_key = None
@@ -1642,8 +1652,21 @@ async def _standalone_send(
         msg["Message-ID"] = msg_id
 
         plain_body, html_body = _render_email_bodies(message or "")
-        msg.attach(MIMEText(plain_body, "plain", "utf-8"))
-        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        body_container.attach(MIMEText(plain_body, "plain", "utf-8"))
+        body_container.attach(MIMEText(html_body, "html", "utf-8"))
+        if safe_media:
+            msg.attach(body_container)
+            for file_path, _is_voice in safe_media:
+                with open(file_path, "rb") as file_handle:
+                    attachment = MIMEBase("application", "octet-stream")
+                    attachment.set_payload(file_handle.read())
+                encoders.encode_base64(attachment)
+                attachment.add_header(
+                    "Content-Disposition",
+                    "attachment",
+                    filename=os.path.basename(file_path),
+                )
+                msg.attach(attachment)
 
         server = smtplib.SMTP(smtp_host, smtp_port)
         server.starttls(context=_ssl.create_default_context())

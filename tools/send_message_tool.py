@@ -1475,6 +1475,29 @@ async def _send_to_platform(
             last_result = result
         return last_result
 
+    # --- Email: preserve attachments for out-of-process cron delivery. ---
+    # The registry sender is the only available path when no live gateway
+    # adapter exists. Attach media to the final chunk, matching the other
+    # chunked platform senders, and keep the cron subject/thread payload.
+    if platform == Platform.EMAIL:
+        last_result = None
+        for i, chunk in enumerate(chunks or [""]):
+            is_last = i == len(chunks or [""]) - 1
+            result = await _registry_standalone_send(
+                "email",
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id,
+                media_files=media_files if is_last else [],
+                force_document=force_document,
+                subject=subject,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- Non-media platforms ---
     # Buzz is a plugin platform with verified native media delivery through
     # _send_via_adapter below, including valid media-only sends.
@@ -1498,10 +1521,6 @@ async def _send_to_platform(
             result = await _registry_standalone_send("whatsapp", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.SIGNAL:
             result = await _send_signal(pconfig.extra, chat_id, chunk)
-        elif platform == Platform.EMAIL:
-            result = await _registry_standalone_send(
-                "email", pconfig, chat_id, chunk, thread_id, subject=subject
-            )
         elif platform == Platform.SMS:
             result = await _registry_standalone_send("sms", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.DINGTALK:
