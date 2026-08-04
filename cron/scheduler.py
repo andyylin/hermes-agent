@@ -3678,6 +3678,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             if email_subject:
                 route_metadata = dict(route_metadata or {})
                 route_metadata.update(email_subject)
+                media_metadata = dict(media_metadata or {})
+                media_metadata.update(email_subject)
 
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
