@@ -513,6 +513,64 @@ class TestDeliverResultWrapping:
         voice_call = adapter.send_voice.call_args
         assert voice_call[1]["audio_path"] == str(media_path)
 
+    def test_email_cron_metadata_reaches_media_attachment(self, tmp_path, monkeypatch):
+        """Cron email media must use the same subject/thread contract as its text."""
+        from concurrent.futures import Future
+        from datetime import datetime
+
+        from gateway.config import Platform
+
+        media_path = self._safe_media_path(tmp_path, monkeypatch, "daily-report.pdf")
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+        adapter.send_document.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.EMAIL: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            import asyncio as _asyncio
+
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
+
+        job = {
+            "id": "daily-media",
+            "name": "Daily media",
+            "deliver": "origin",
+            "origin": {"platform": "email", "chat_id": "andy@example.net"},
+            "email_subject_template": "{job_name} — {date}",
+            "email_thread_key": "daily-media",
+        }
+
+        with (
+            patch("gateway.config.load_gateway_config", return_value=mock_cfg),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch("cron.scheduler._hermes_now", return_value=datetime(2026, 8, 4, 9, 0)),
+            patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro),
+        ):
+            result = _deliver_result(
+                job,
+                f"Daily report\nMEDIA:{media_path}",
+                adapters={Platform.EMAIL: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        adapter.send_document.assert_awaited_once()
+        assert adapter.send_document.await_args.kwargs["metadata"] == {
+            "subject": "Daily media — 2026-08-04",
+            "thread_anchor_key": "daily-media",
+        }
+
 
 class TestDeliverResultErrorReturns:
     """Verify _deliver_result returns error strings on failure, None on success."""
