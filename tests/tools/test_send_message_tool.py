@@ -1024,6 +1024,42 @@ class TestEmailHomeChannelErrorHint:
         assert "EMAIL_HOME_ADDRESS" in result["error"]
         assert "EMAIL_HOME_CHANNEL" not in result["error"]
 
+
+class TestEmailStandaloneMediaRouting:
+    def test_media_only_email_reaches_registry_sender(self, tmp_path):
+        media = tmp_path / "daily-report.pdf"
+        media.write_bytes(b"fake pdf")
+        sender = AsyncMock(return_value={"success": True, "message_id": "email-1"})
+        pconfig = SimpleNamespace(enabled=True, token="", extra={})
+        subject = {
+            "subject": "Daily Media Brief",
+            "thread_anchor_key": "daily-media",
+        }
+
+        with patch("tools.send_message_tool._registry_standalone_send", new=sender):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.EMAIL,
+                    pconfig,
+                    "andy@example.net",
+                    "",
+                    media_files=[(str(media), False)],
+                    subject=subject,
+                )
+            )
+
+        assert result["success"] is True
+        sender.assert_awaited_once_with(
+            "email",
+            pconfig,
+            "andy@example.net",
+            "",
+            None,
+            media_files=[(str(media), False)],
+            force_document=False,
+            subject=subject,
+        )
+
 class TestResolveSlackUserTargets:
     """_resolve_slack_user_target opens user targets as DMs before sending.
 
