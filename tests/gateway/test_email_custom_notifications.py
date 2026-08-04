@@ -260,6 +260,46 @@ def test_standalone_detects_common_html_fragments(monkeypatch):
     assert "&lt;a" not in html_body
 
 
+def test_standalone_email_sends_media_only_attachment_with_notification_headers(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("EMAIL_PASSWORD", "test-password")
+    media = tmp_path / "daily-report.pdf"
+    media.write_bytes(b"fake pdf")
+    smtp = MagicMock()
+
+    with patch.object(_email.smtplib, "SMTP", return_value=smtp):
+        result = asyncio.run(
+            _email._standalone_send(
+                MagicMock(
+                    extra={
+                        "address": "hermes@example.com",
+                        "smtp_host": "smtp.example.com",
+                    }
+                ),
+                "andy@example.net",
+                "",
+                media_files=[(str(media), False)],
+                subject={
+                    "subject": "Daily Media Brief",
+                    "thread_anchor_key": "daily-media",
+                },
+            )
+        )
+
+    assert result["success"] is True
+    message = smtp.send_message.call_args.args[0]
+    assert message["Subject"] == "Daily Media Brief"
+    assert message["In-Reply-To"] == "<hermes-thread-daily-media@example.com>"
+    attachments = [
+        part
+        for part in message.walk()
+        if part.get_content_disposition() == "attachment"
+    ]
+    assert len(attachments) == 1
+    assert attachments[0].get_filename() == "daily-report.pdf"
+
+
 def test_cron_email_subject_template_and_thread_payload(monkeypatch):
     from cron import scheduler
 
