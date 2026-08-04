@@ -258,7 +258,11 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # ``Path`` permits embedded NULs, but ``os.open`` rejects them with
+        # ValueError. Such paths can surface when recursive shell-token
+        # scanning encounters malformed/junk input; the safety guard must not
+        # crash the entire terminal call while inspecting an unopenable path.
         return None, False
     try:
         metadata = os.fstat(descriptor)

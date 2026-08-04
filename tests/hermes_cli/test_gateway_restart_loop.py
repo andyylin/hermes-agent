@@ -695,6 +695,19 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_embedded_nul_referenced_path_does_not_crash_guard(self):
+        """Malformed recursive tokens must not escape as ValueError.
+
+        ``Path.resolve`` already tolerates this case in the caller, but the
+        subsequent ``os.open`` also raises ``ValueError: embedded null byte``.
+        Treat the impossible-to-open token like any other missing reference.
+        """
+        from pathlib import Path
+
+        from cron.lifecycle_guard import _read_referenced_script
+
+        assert _read_referenced_script(Path("bad\x00script.sh")) == (None, False)
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""
