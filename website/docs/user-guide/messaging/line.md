@@ -170,7 +170,7 @@ Cron jobs with `deliver: line` route to `LINE_HOME_CHANNEL`. The adapter ships a
 | `LINE_READ_ONLY_GROUPS` | no | — | Group IDs archived locally without agent dispatch |
 | `LINE_ARCHIVE_GROUPS` | no | — | Group IDs archived locally while normal dispatch remains enabled |
 | `LINE_REQUIRE_PREFIX_GROUPS` | no | — | Group IDs requiring one of `LINE_GROUP_PREFIXES` before dispatch |
-| `LINE_GROUP_PREFIXES` | no | `Hermes:,Joi:` | Comma-separated accepted prefixes for prefix-gated groups |
+| `LINE_GROUP_PREFIXES` | no | `Hermes:` | Comma-separated accepted prefixes for prefix-gated groups |
 | `LINE_ALLOWED_ROOMS` | one of | — | Comma-separated room IDs (R-prefixed) |
 | `LINE_ALLOW_ALL_USERS` | dev only | `false` | Skip allowlist entirely |
 | `LINE_HOME_CHANNEL` | no | — | Default cron / notification delivery target |
