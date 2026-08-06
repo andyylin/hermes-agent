@@ -747,6 +747,80 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, info)
 
 
+@method("session.workspace.move")
+def _(rid, params: dict) -> dict:
+    """Re-home a STORED session's workspace into another folder/project.
+
+    Unlike ``session.cwd.set`` (which acts on a live runtime session by its UI
+    id), this targets a persisted row by ``session_key`` so the desktop can fix
+    a session that was created in the wrong directory — no live agent required.
+    The git branch/root columns are REPLACED (not merely enriched), because the
+    whole point of the move is to change which project claims the session; a
+    stale ``git_repo_root`` would keep it grouped under the project it left.
+
+    A live agent bound to the row follows through the runtime path too, so its
+    terminal/file tools re-anchor immediately; a mid-turn session refuses the
+    move rather than yanking the workspace out from under its tools.
+    """
+    target = str(params.get("session_key") or "").strip()
+    if not target:
+        return _err(rid, 4007, "session_key required")
+    raw = str(params.get("cwd", "") or "").strip()
+    if not raw:
+        return _err(rid, 4016, "cwd required")
+    from hermes_constants import translate_cwd_for_wsl_backend
+
+    resolved = os.path.abspath(os.path.expanduser(translate_cwd_for_wsl_backend(raw)))
+    if not os.path.isdir(resolved):
+        return _err(rid, 4017, f"working directory does not exist: {raw}")
+
+    # Snapshot under the lock — concurrent RPCs mutate _sessions (same pattern
+    # as _cwd_for_session_key).
+    live = None
+    live_sid = ""
+    with _sessions_lock:
+        for sid, sess in list(_sessions.items()):
+            if sess.get("session_key") == target:
+                live, live_sid = sess, sid
+                break
+    if live is not None and live.get("running"):
+        return _err(rid, 4009, "session busy")
+
+    branch = _git_branch_for_cwd(resolved)
+    root = _git_common_repo_root_for_cwd(resolved)
+    with _profile_db(params) as db:
+        if db is None:
+            return _db_unavailable_error(rid, code=5007)
+        # A brand-new draft has no persisted row yet; the live re-home below
+        # still applies and the row inherits the cwd when it is first written.
+        row_exists = bool(db.get_session(target))
+        if not row_exists and live is None:
+            return _err(rid, 4007, "session not found")
+        if row_exists:
+            try:
+                db.update_session_cwd(
+                    target, resolved, branch, root, replace_git_meta=True
+                )
+            except Exception as e:
+                return _err(rid, 5007, f"move failed: {e}")
+
+    if live is not None:
+        try:
+            _set_session_cwd(live, resolved)
+        except ValueError as e:
+            return _err(rid, 4017, str(e))
+        agent = live.get("agent")
+        info = _session_info(agent, live) if agent is not None else {
+            "cwd": resolved,
+            "branch": branch,
+            "project": _project_info_for_cwd(resolved),
+            "lazy": True,
+        }
+        _emit("session.info", live_sid, info)
+
+    return _ok(rid, {"cwd": resolved, "branch": branch, "git_repo_root": root})
+
+
 @method("session.active_list")
 def _(rid, params: dict) -> dict:
     """Return live TUI sessions in this gateway process.
@@ -2858,6 +2932,52 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4000, "subagent_id required")
     ok = interrupt_subagent(subagent_id)
     return _ok(rid, {"found": ok, "subagent_id": subagent_id})
+
+
+@method("subagent.steer")
+def _(rid, params: dict) -> dict:
+    """Queue steering text into a live delegated child without stopping it.
+
+    The redirection-side mirror of subagent.interrupt: resolves the child in
+    the delegation registry and calls AIAgent.steer(), which appends the text
+    to the child's last tool result at its next iteration boundary — the
+    in-flight tool call is never cut. "queued" is not "delivered": a child
+    already past its final tool batch has no boundary left to drain into,
+    and that race surfaces as ``missed_steer`` on the parent's completion
+    entry instead of being silently dropped.
+    """
+    from tools.delegate_tool import steer_subagent
+
+    subagent_id = str(params.get("subagent_id") or "").strip()
+    if not subagent_id:
+        return _err(rid, 4000, "subagent_id required")
+    text = (params.get("text") or "").strip()
+    if not text:
+        return _err(rid, 4002, "text is required")
+    _invoking_session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    invoking_session_id = str(params.get("session_id") or "").strip()
+    invoking_transport, invoking_session = _current_session_steer_authority(
+        invoking_session_id
+    )
+    queued = False
+    if invoking_transport is not None and invoking_session is not None:
+        queued = steer_subagent(
+            subagent_id,
+            text,
+            owner_session_id=invoking_session_id,
+            owner_transport=invoking_transport,
+            owner_session_record=invoking_session,
+        )
+    return _ok(
+        rid,
+        {
+            "status": "queued" if queued else "rejected",
+            "subagent_id": subagent_id,
+            "text": text,
+        },
+    )
 
 
 @method("spawn_tree.save")

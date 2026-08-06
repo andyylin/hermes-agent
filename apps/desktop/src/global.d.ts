@@ -129,6 +129,12 @@ declare global {
       }
       readFileText: (filePath: string) => Promise<HermesReadFileTextResult>
       selectPaths: (options?: HermesSelectPathsOptions) => Promise<string[]>
+      /** Native save dialog; returns the chosen path or null on cancel. */
+      selectSavePath?: (options?: {
+        defaultPath?: string
+        filters?: Array<{ extensions: string[]; name: string }>
+        title?: string
+      }) => Promise<null | string>
       writeClipboard: (text: string) => Promise<boolean>
       readClipboard: () => Promise<string>
       saveImageFromUrl: (url: string) => Promise<boolean>
@@ -193,7 +199,8 @@ declare global {
           options?: { force?: boolean }
         ) => Promise<{ removed: string }>
         branchSwitch: (repoPath: string, branch: string) => Promise<{ branch: string }>
-        // Local branches for the "convert a branch into a worktree" picker.
+        // The local branches, plus the remote-tracking refs that have no local
+        // branch, for the "convert a branch into a worktree" picker.
         branchList: (repoPath: string) => Promise<HermesGitBranch[]>
         // Local + remote-tracking branches for the "base branch" picker in the
         // new-worktree dialog. The remote default (origin/HEAD) is flagged so
@@ -769,6 +776,8 @@ export interface HermesNotification {
   silent?: boolean
   kind?: string
   sessionId?: string
+  /** Dedupe discriminator for session-less notifications (e.g. plugin id). */
+  tag?: string
   actions?: { id: string; text: string }[]
 }
 
@@ -781,7 +790,7 @@ export interface HermesPreviewTarget {
   language?: string
   mimeType?: string
   path?: string
-  previewKind?: 'binary' | 'html' | 'image' | 'text'
+  previewKind?: 'binary' | 'html' | 'image' | 'pdf' | 'text'
   renderMode?: 'preview' | 'source'
   source: string
   url: string
@@ -812,13 +821,17 @@ export interface HermesGitWorktree {
   locked: boolean
 }
 
-// A local branch as offered by the "convert a branch into a worktree" picker.
-// `checkedOut` means selecting opens that checkout; `isDefault` means selecting
-// switches the main checkout instead of creating `.worktrees/main`.
+// A branch that the "convert a branch into a worktree" picker offers: the local
+// heads, plus the remote-tracking refs that have no local branch yet.
+// `checkedOut` means that a selection opens that checkout. `isDefault` means
+// that a selection switches the main checkout, and does not make
+// `.worktrees/main`. `isRemote` means that a selection first makes a local
+// branch that tracks the remote one.
 export interface HermesGitBranch {
   name: string
   checkedOut: boolean
   isDefault: boolean
+  isRemote: boolean
   worktreePath: null | string
 }
 

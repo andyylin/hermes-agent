@@ -387,6 +387,10 @@ export const zh: Translations = {
         credits: {
           label: '额度提醒',
           description: '额度访问被暂停或恢复。'
+        },
+        plugin: {
+          label: '插件通知',
+          description: 'Hermes 在后台时，桌面插件发送了通知。'
         }
       },
       test: '发送测试通知',
@@ -1753,6 +1757,12 @@ export const zh: Translations = {
     search: '搜索配置档案…',
     loading: '正在加载配置档案…',
     newProfile: '新建配置档案',
+    importProfile: '导入配置档案…',
+    exportProfile: '导出配置档案…',
+    imported: '配置档案已导入',
+    exported: '配置档案已导出',
+    failedImport: '导入配置档案失败',
+    failedExport: '导出配置档案失败',
     allProfiles: '全部配置档案',
     showAllProfiles: '显示全部配置档案',
     switchToProfile: name => `切换到 ${name}`,
@@ -2066,6 +2076,11 @@ export const zh: Translations = {
       menuAddFolder: '添加文件夹',
       menuSetActive: '设为活动',
       menuDelete: '删除',
+      moveToProject: '移动到项目',
+      movedTo: name => `已移动到 ${name}`,
+      moveFailed: '无法移动会话',
+      moveNoFolder: '该项目没有可移入的文件夹',
+      moveNoProjects: '没有其他项目',
       reveal: '在文件夹中显示',
       copyPath: '复制路径',
       removeFromSidebar: '从侧边栏移除',
@@ -2080,6 +2095,9 @@ export const zh: Translations = {
       baseBranchPlaceholder: '搜索分支…',
       baseBranchNone: '未找到分支',
       startWorkFailed: '无法创建工作树',
+      worktreeProjectLabel: '项目',
+      worktreeProjectPlaceholder: '搜索项目…',
+      worktreeProjectNone: '没有包含文件夹的项目',
       convertBranch: '转换分支…',
       convertBranchTitle: '转换分支',
       convertBranchDesc: '打开已检出的分支，或为可用分支创建工作树。',
@@ -2088,6 +2106,7 @@ export const zh: Translations = {
       branchOpenExisting: '打开',
       branchSwitchHome: '切回主检出',
       branchCreateWorktree: '新工作树',
+      branchTrackRemote: '跟踪远程',
       branchesLoading: '正在加载分支…',
       noBranches: '未找到分支',
       removeWorktree: '移除工作树',
@@ -2743,10 +2762,6 @@ export const zh: Translations = {
 
   preview: {
     tab: '预览',
-    closeTab: label => `关闭 ${label}`,
-    closeOthers: '关闭其他',
-    closeToRight: '关闭右侧',
-    closeAll: '全部关闭',
     closePane: '关闭预览面板',
     loading: '正在加载预览',
     unavailable: '预览不可用',
@@ -2871,7 +2886,8 @@ export const zh: Translations = {
     layoutNamePlaceholder: fallback => `布局名称（${fallback}）`,
     saveApply: '保存并应用',
     notExpressible: '此排列互相咬合（风车形）——暂无法表示为嵌套拆分',
-    zoneCount: count => `${count} 个区域`
+    zoneCount: count => `${count} 个区域`,
+    tabCount: count => `${count} 个标签页`
   },
 
   assistant: {

@@ -22,6 +22,7 @@ import {
   $sessions,
   idsShareLineage,
   sessionMatchesStoredId,
+  setSessions,
   workspaceCwdForNewSession
 } from '@/store/session'
 import { $focusedSessionState, $focusedStoredSessionId } from '@/store/session-states'
@@ -173,7 +174,7 @@ export function exitProjectScope(): void {
 // one. Empty for the path-less Home bucket. (The sidebar's `projectTreeCwd` is
 // the same rule over the same tree — this is the store-side copy so the store
 // doesn't reach into the sidebar's React module.)
-const projectRootCwd = (project: SidebarProjectTree | undefined): string =>
+export const projectRootCwd = (project: SidebarProjectTree | undefined): string =>
   (project?.path || project?.repos.find(repo => repo.path)?.path || '').trim()
 
 // ⌘K "go to project": flip the sidebar into grouped mode and enter the project
@@ -518,6 +519,45 @@ export async function fetchProjectSessions(projectId: string): Promise<SidebarPr
   } catch {
     return null
   }
+}
+
+interface WorkspaceMovePayload {
+  branch?: null | string
+  cwd?: string
+  git_repo_root?: null | string
+}
+
+// Re-home a stored session into another project's root folder — the fix for a
+// chat created in the wrong directory. The backend replaces cwd + git identity
+// (so the tree's grouping follows) and re-anchors any live agent bound to the
+// row; here we mirror the move into the `$sessions` cache so both the flat list
+// and the grouped tree reflect it before the next authoritative refresh.
+export async function moveSessionToProject(
+  sessionId: string,
+  projectId: string,
+  profile?: null | string
+): Promise<void> {
+  const cwd = projectRootCwd($projectTree.get().find(node => node.id === projectId))
+
+  if (!cwd) {
+    throw new Error(translateNow('sidebar.projects.moveNoFolder'))
+  }
+
+  const res = await gatewayRequest<WorkspaceMovePayload>('session.workspace.move', {
+    cwd,
+    session_key: sessionId,
+    ...(profile ? { profile } : {})
+  })
+
+  const moved = res.cwd || cwd
+  setSessions(prev =>
+    prev.map(s =>
+      sessionMatchesStoredId(s, sessionId)
+        ? { ...s, cwd: moved, git_branch: res.branch ?? null, git_repo_root: res.git_repo_root ?? null }
+        : s
+    )
+  )
+  void refreshProjectTree()
 }
 
 export interface RepoDiscoveryPolicy {
@@ -1046,8 +1086,11 @@ export async function startWorkInRepo(
   return { branch: result.branch, path: result.path }
 }
 
-// Local branches for the composer's "convert a branch into a worktree" picker.
-// Empty on a remote backend / non-repo (the Electron probe can't run).
+// Branches for the composer's "convert a branch into a worktree" picker: the
+// local heads, plus the remote-tracking refs that have no local branch yet. A
+// teammate's branch is therefore reachable, and the user does not check it out
+// by hand first.
+// Empty on a remote backend or a non-repo, where the Electron probe cannot run.
 export async function listRepoBranches(repoPath: string): Promise<HermesGitBranch[]> {
   const git = desktopGit()
 
@@ -1098,15 +1141,26 @@ export interface StartWorkSessionRequest {
 
 export const $startWorkSessionRequest = atom<StartWorkSessionRequest | null>(null)
 
-// Keyboard-driven "spin up a new worktree" intent. The composer's coding rail
-// owns the name dialog (it has the active repo + branch context), so a global
-// hotkey just bumps this token; the rail opens its branch-off dialog in
-// response. A monotonic token re-fires even on repeat presses. No-ops off a
-// repo (the rail isn't mounted), which is the right "nothing to branch" outcome.
-export const $newWorktreeRequest = atom(0)
+// The "make a new worktree" intent, from the keyboard or a menu. One dialog is
+// mounted, in the sidebar beside ProjectDialog, and it reads this atom. This
+// mirrors $projectDialog. This atom was a monotonic token that every mounted
+// coding rail subscribed to. N composers on screen therefore gave N stacked
+// dialogs for one ⌘⇧B, and the dialog the user dismissed showed an identical
+// empty one behind it. One mount cannot double-open.
+//
+// `repoPath` is resolved when the dialog opens (see resolveWorktreeRepoPath).
+// It is not read from the rail that received the key, so the dialog always
+// targets the surface the user looks at.
+export interface WorktreeDialogState {
+  repoPath: string
+  /** The base branch selected in a "branch off from X" menu. */
+  base?: string
+}
 
-export function requestNewWorktree(): void {
-  $newWorktreeRequest.set($newWorktreeRequest.get() + 1)
+export const $worktreeDialog = atom<null | WorktreeDialogState>(null)
+
+export function closeWorktreeDialog(): void {
+  $worktreeDialog.set(null)
 }
 
 let startWorkToken = 0
