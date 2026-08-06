@@ -17,7 +17,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, ci/harness-fa673f39d]
 
 permissions:
   contents: read
