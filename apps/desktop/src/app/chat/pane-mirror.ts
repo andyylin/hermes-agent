@@ -11,6 +11,7 @@ import type { ReactElement, ReactNode, PointerEvent as ReactPointerEvent } from 
 
 import type { DoubleTapContext } from '@/components/pane-shell/tree/renderer/drag-session'
 import { registerPaneCloser, removeTreePane, treePanesWithPrefix } from '@/components/pane-shell/tree/store'
+import type { PaneStripTool } from '@/components/ui/pane-tab'
 import { registry } from '@/contrib/registry'
 import type { TileDock } from '@/store/session-states'
 
@@ -31,9 +32,19 @@ export interface PaneMirror<T> {
   before?: (tile: T) => null | string | undefined
   minWidth: string
   title: (key: string) => string
-  /** Lead-dot color for the tile's tab (e.g. a session's project color). Re-read
-   *  on every `also` change, so pass the color source in `also` to keep it live. */
-  accent?: (key: string) => string | undefined
+  /** Custom lead NODE for the tile's tab (rendered before the label). A live,
+   *  self-subscribing component (e.g. a session's status dot) so the strip needn't
+   *  re-sync on status/color change — only `title` drives re-registration. */
+  tabLead?: (key: string) => ReactNode
+  /** Custom label NODE for the tile's tab, self-subscribing for the same reason
+   *  as `tabLead` — a name that moves faster than re-registration (see
+   *  PaneChrome.tabTitle). Falls back to `title`. */
+  tabTitle?: (key: string) => ReactNode
+  /** Glyph buttons the tile contributes to the strip, after the last tab (where
+   *  "+" sits), while it is the ACTIVE pane — e.g. a preview's console /
+   *  DevTools toggles. DATA, not markup: the strip's `PaneStripGlyph` owns the
+   *  styling so every glyph on every strip matches. */
+  stripTools?: (key: string) => readonly PaneStripTool[]
   render: (key: string) => ReactNode
   /** Wrap the tile's TAB (domain context menu — session verbs). */
   tabWrap?: (key: string, tab: ReactElement) => ReactNode
@@ -52,7 +63,7 @@ export interface PaneMirror<T> {
 /** Build a `watch*` fn: syncs once, then re-syncs on every source/also change.
  *  Module-level state lives in the returned closure, so call it once per app. */
 export function paneMirror<T>(cfg: PaneMirror<T>): () => void {
-  const registered = new Map<string, { dispose: () => void; title: string; accent?: string }>()
+  const registered = new Map<string, { dispose: () => void; title: string }>()
   const paneId = (key: string) => `${cfg.prefix}:${key}`
 
   const sync = () => {
@@ -62,11 +73,10 @@ export function paneMirror<T>(cfg: PaneMirror<T>): () => void {
     for (const tile of tiles) {
       const key = cfg.key(tile)
       const title = cfg.title(key)
-      const accent = cfg.accent?.(key)
       const current = registered.get(key)
 
-      // register() replaces same-id in place — safe for live title/accent refreshes.
-      if (current && current.title === title && current.accent === accent) {
+      // register() replaces same-id in place — safe for live title refreshes.
+      if (current && current.title === title) {
         continue
       }
 
@@ -75,13 +85,18 @@ export function paneMirror<T>(cfg: PaneMirror<T>): () => void {
         area: 'panes',
         title,
         data: {
-          accent,
+          tabLead: cfg.tabLead ? () => cfg.tabLead!(key) : undefined,
+          tabTitle: cfg.tabTitle ? () => cfg.tabTitle!(key) : undefined,
+          stripTools: cfg.stripTools ? () => cfg.stripTools!(key) : undefined,
           dock: {
             before: cfg.before?.(tile),
             pane: cfg.anchor?.(tile) ?? 'workspace',
             pos: cfg.dir?.(tile) ?? 'right'
           },
           minWidth: cfg.minWidth,
+          // Every mirrored tile is a full workspace surface docked beside main —
+          // and closeable, which is what keeps its tab when it lands in a zone of
+          // its own (see lone-header.ts).
           placement: 'main',
           tabDrag: cfg.tabDrag
             ? (event: ReactPointerEvent<HTMLElement>, onTap: () => void, double?: DoubleTapContext) =>
@@ -92,7 +107,7 @@ export function paneMirror<T>(cfg: PaneMirror<T>): () => void {
         render: () => cfg.render(key)
       })
 
-      registered.set(key, { dispose, title, accent })
+      registered.set(key, { dispose, title })
 
       if (!current) {
         registerPaneCloser(paneId(key), () => cfg.close(key))

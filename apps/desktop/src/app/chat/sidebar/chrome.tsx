@@ -8,13 +8,9 @@ import { cn } from '@/lib/utils'
 // sections and the project/workspace tree, so it lives outside either to keep
 // imports one-directional (no index <-> projects cycle).
 
-/** `loaded/total` when there's more on the server, else just the loaded count. */
-export const countLabel = (loaded: number, total: number): string =>
-  total > loaded ? `${loaded}/${total}` : String(loaded)
-
-/** The muted count chip next to a section/workspace label. */
-export function SidebarCount({ children }: { children: React.ReactNode }) {
-  return <span className="text-[0.6875rem] font-medium text-(--ui-text-quaternary)">{children}</span>
+/** The muted slot beside a section label (loading glyph, status hint). */
+export function SidebarSectionMeta({ children }: { children: React.ReactNode }) {
+  return <span className="shrink-0 text-[0.6875rem] font-medium text-(--ui-text-quaternary)">{children}</span>
 }
 
 // ── Row geometry (session row is canonical — everything composes these) ─────
@@ -40,10 +36,36 @@ export function SidebarRowStack({ className, ...props }: React.ComponentProps<'d
 
 /** Nested rows (session previews, worktree bodies). */
 export function SidebarRowNest({ className, ...props }: React.ComponentProps<'div'>) {
-  return <SidebarRowStack className={cn('pb-1 pl-4', className)} {...props} />
+  return <SidebarRowStack className={cn('pb-1 pl-2', className)} {...props} />
 }
 
-/** Outer grid — sole owner of row height. */
+/**
+ * Chronological date-bucket separator ("Yesterday" / "Last week" / "June") for
+ * the session list. One flat row — a small caption plus a hairline rule — so it
+ * groups sessions by recency without adding a level of indentation.
+ */
+export function SidebarDateDivider({
+  action,
+  className,
+  label,
+  ...props
+}: React.ComponentProps<'div'> & { action?: React.ReactNode; label: string }) {
+  return (
+    // group/workspace: a divider heads a group the same way a repo header does,
+    // so it borrows the header's hover-revealed "+" verbatim.
+    <div className={cn('group/workspace flex select-none items-center gap-2 px-2 pb-0.5 pt-2', className)} {...props}>
+      <span className="shrink-0 text-[0.64rem] font-semibold uppercase tracking-[0.12em] text-(--ui-text-quaternary)">
+        {label}
+      </span>
+      <span aria-hidden="true" className="h-px flex-1 bg-(--ui-stroke-tertiary)" />
+      {action}
+    </div>
+  )
+}
+
+/** Outer grid — sole owner of row height. The trailing `actions` slot is
+ *  marked `data-row-actions` so a row-wide drag gesture can exclude it with
+ *  one selector: it holds real controls, never grab surface. */
 export function SidebarRowShell({
   actions,
   children,
@@ -53,7 +75,11 @@ export function SidebarRowShell({
   return (
     <div className={cn(rowMinH, 'grid grid-cols-[minmax(0,1fr)_auto] items-stretch rounded-md', className)} {...props}>
       {children}
-      {actions ? <div className="flex shrink-0 items-center self-center">{actions}</div> : null}
+      {actions ? (
+        <div className="flex shrink-0 items-center self-center" data-row-actions>
+          {actions}
+        </div>
+      ) : null}
     </div>
   )
 }

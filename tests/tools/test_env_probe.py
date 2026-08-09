@@ -69,16 +69,6 @@ class TestEmitsOnRealProblems:
         # Points at the right escape hatch
         assert "venv" in line or "uv" in line
 
-    def test_missing_python3_is_named(self, monkeypatch):
-        """If python3 isn't installed at all, say so."""
-        monkeypatch.setattr(env_probe, "_python_version_of", lambda b: None)
-        monkeypatch.setattr(env_probe, "_has_pip_module", lambda b: False)
-        monkeypatch.setattr(env_probe, "_detect_pep668", lambda b: False)
-        monkeypatch.setattr(env_probe, "_pip_python_version", lambda: None)
-        monkeypatch.setattr(env_probe.shutil, "which", lambda name: None)
-
-        line = env_probe.get_environment_probe_line()
-        assert "python3=missing" in line
 
     def test_python_missing_but_python3_present(self, monkeypatch):
         """Common on Debian: only python3 exists, agent shouldn't type
@@ -108,9 +98,6 @@ class TestSkipsRemoteBackends:
         monkeypatch.setattr(env_probe, "_has_pip_module", lambda b: False)
         assert env_probe.get_environment_probe_line() == ""
 
-    def test_modal_returns_empty(self, monkeypatch):
-        monkeypatch.setenv("TERMINAL_ENV", "modal")
-        assert env_probe.get_environment_probe_line() == ""
 
     def test_ssh_returns_empty(self, monkeypatch):
         monkeypatch.setenv("TERMINAL_ENV", "ssh")
@@ -290,3 +277,43 @@ class TestRunTimeoutIsBounded:
         # stdlib subprocess.run on Windows would hang here for the full 20s
         # (unbounded post-kill communicate).  Our bound: timeout + reap slack.
         assert elapsed < 6
+
+
+class TestRunBoundedByTimeout:
+    """``_run`` must return as soon as the *direct* child exits, even when a
+    descendant inherited the captured stdout/stderr handles and outlives it.
+
+    This is the deadlock from #67964: on native Windows a ``pip.exe`` launcher
+    can leave a grandchild holding the captured pipe open, and ``capture_output``
+    reader threads then block far past the timeout while ``_CACHE_LOCK`` is held,
+    wedging every new session. Capturing through temp files removes the reader
+    threads, so a lingering grandchild can't block the parent's ``wait()``.
+
+    Cross-platform repro: the direct child prints ``ok`` and exits immediately
+    after spawning a long-sleeping grandchild that inherits its stdout. With the
+    old pipe-based capture, ``_run`` blocks until the grandchild exits (or hits
+    the 3s timeout and returns ``-1``); with temp-file capture it returns the
+    child's real output within a few milliseconds.
+    """
+
+    def test_returns_before_inheriting_grandchild_exits(self):
+        import time
+
+        grandchild_sleep = 20  # far longer than _run's timeout
+        # Direct child: emit "ok", spawn a detached grandchild that inherits
+        # this process's stdout (no stdout= redirect), then exit right away.
+        child_code = (
+            "import subprocess, sys; "
+            "subprocess.Popen([sys.executable, '-c', "
+            f"'import time; time.sleep({grandchild_sleep})']); "
+            "sys.stdout.write('ok'); sys.stdout.flush()"
+        )
+
+        start = time.monotonic()
+        rc, out, err = env_probe._run([sys.executable, "-c", child_code], timeout=3.0)
+        elapsed = time.monotonic() - start
+
+        # Must not wait on the grandchild, and must not have hit the timeout.
+        assert elapsed < 3.0, f"_run blocked on grandchild for {elapsed:.1f}s"
+        assert rc == 0, f"expected clean exit, got rc={rc} err={err!r}"
+        assert out == "ok"

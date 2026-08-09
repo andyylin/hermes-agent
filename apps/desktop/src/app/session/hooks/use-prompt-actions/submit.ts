@@ -7,27 +7,47 @@ import { optimisticAttachmentRef } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { setMutableRef } from '@/lib/mutable-ref'
 import {
+  isVoicePlaybackActive,
+  markVoicePlaybackInterrupted,
+  stopVoicePlayback,
+  takeVoicePlaybackInterrupted
+} from '@/lib/voice-playback'
+import {
   $composerAttachments,
   clearComposerAttachments,
   type ComposerAttachment,
   terminalContextBlocksFromDraft
 } from '@/store/composer'
+import { $hudMode } from '@/store/hud'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
-import { setAwaitingResponse, setBusy, setMessages } from '@/store/session'
+import {
+  $sessions,
+  resolveComposerSessionKey,
+  setActiveSessionId,
+  setAwaitingResponse,
+  setBusy,
+  setMessages,
+  touchSessionActivity
+} from '@/store/session'
+import { $sessionStates } from '@/store/session-states'
 
 import type { ClientSessionState } from '../../../types'
+import { sessionContextDrift } from '../session-context-drift'
+import { resolveSessionProfile } from '../use-session-actions/utils'
 
+import { finalizeInterruptedMessages } from './rewind'
 import {
   _submitInFlight,
   type GatewayRequest,
   inlineErrorMessage,
-  isGatewayTimeoutError,
   isProviderSetupError,
   isSessionBusyError,
-  isSessionNotFoundError,
+  isTargetSessionBusy,
+  SessionRecoveryAborted,
   type SubmitTextOptions,
-  withSessionBusyRetry
+  withSessionBusyRetry,
+  withSessionNotFoundResume
 } from './utils'
 
 interface SubmitPromptDeps {
@@ -45,7 +65,7 @@ interface SubmitPromptDeps {
     sessionId: string,
     attachments: ComposerAttachment[],
     options?: { updateComposerAttachments?: boolean }
-  ) => Promise<ComposerAttachment[]>
+  ) => Promise<{ attachments: ComposerAttachment[]; sessionId: string }>
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
@@ -135,11 +155,31 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // from $busy by a separate effect) may still read true — honoring it would
       // bounce the drained send. The drain lock serializes them; the user path
       // keeps the guard so a stray Enter mid-turn can't double-submit.
+      //
+      // The guard reads the TARGET session's busy state (isTargetSessionBusy),
+      // not the foreground flag: an explicit target (tile, queue drain) is
+      // frequently not the session on screen, so the foreground flag would gate
+      // one session's send on another session's turn.
       const hasSendable = Boolean(visibleText || terminalContextBlocks || attachments.length || hasImage)
 
-      if (!hasSendable || (!options?.fromQueue && busyRef.current)) {
+      const guardSessionId = options?.sessionId ?? activeSessionIdRef.current
+
+      if (
+        !hasSendable ||
+        (!options?.fromQueue && isTargetSessionBusy($sessionStates.get(), guardSessionId, busyRef.current))
+      ) {
         return false
       }
+
+      // Typing barge-in: a new send silences any in-flight spoken reply.
+      if (isVoicePlaybackActive()) {
+        markVoicePlaybackInterrupted()
+        stopVoicePlayback()
+      }
+
+      // Barged mid-speech (here or via the voice loop's VAD)? Flag the submit
+      // so the backend notes the interruption to the model.
+      const interrupted = takeVoicePlaybackInterrupted()
 
       // Queue drains carry their source session explicitly. A background drain
       // must never inherit the currently selected session after the user moves
@@ -149,7 +189,51 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       const targetStartedInCurrentView =
         !targetStoredSessionId || targetStoredSessionId === selectedStoredSessionIdRef.current
 
-      let sessionId: null | string = options?.sessionId ?? activeSessionIdRef.current
+      // A queued/background drain whose runtime binding was reaped must NOT
+      // inherit the foreground runtime id when its storedSessionId targets a
+      // different session — that would land the queued prompt in whichever
+      // session the user happens to be viewing (cross-session leak). When the
+      // drain is for the current view (no storedSessionId, or it matches the
+      // foreground), the foreground runtime is correct and must be kept.
+      const isBackgroundQueueDrain = Boolean(
+        options?.fromQueue && options?.storedSessionId && options.storedSessionId !== selectedStoredSessionIdRef.current
+      )
+
+      let sessionId: null | string = options?.sessionId ?? (isBackgroundQueueDrain ? null : activeSessionIdRef.current)
+
+      // A QUEUED runtime id is authoritative ONLY while it still belongs to its
+      // stored session. On a session switch the composer's queue key flips with
+      // the route while the foreground runtime id lags a resume behind, so a
+      // drain can fire with storedSessionId=B but sessionId=A-runtime — and the
+      // prompt.submit below would land B's queued prompt (and its whole answer
+      // turn) inside A. Verify the pair against the central binding and drop a
+      // stale queued id: the targetStoredSessionId resume path below then
+      // rebinds the right runtime, exactly as a background drain with an
+      // unknown binding does.
+      //
+      // Scoped to fromQueue on purpose. Only a drain pairs identifiers from two
+      // different clocks; every other explicit-target caller resolves both ids
+      // in the same tick and is authoritative by construction. A slash skill
+      // dispatch into a fresh ⌘T tab (slash.ts) passes exactly this shape —
+      // sessionId=tab-runtime, storedSessionId=tab-stored, no central binding
+      // recorded yet — so an unscoped check would null the target and silently
+      // drop the kickoff.
+      //
+      // The identity pair (storedSessionId === sessionId) is the fresh-chat
+      // fallback — an unpersisted conversation's queue key IS its runtime id,
+      // so it has no central binding to check against and is left untouched.
+      if (
+        options?.fromQueue &&
+        options.sessionId &&
+        options.storedSessionId &&
+        options.storedSessionId !== options.sessionId
+      ) {
+        const boundRuntimeId = getRuntimeIdForStoredSession(options.storedSessionId)
+
+        if (boundRuntimeId !== options.sessionId) {
+          sessionId = boundRuntimeId
+        }
+      }
 
       // Pin the foreground session context for the whole async submit pipeline.
       // Without this, a fast session switch during session.resume / file.attach
@@ -175,11 +259,36 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       let startingRouteToken = getRouteToken()
 
-      const sessionContextDrifted = (): boolean =>
-        targetStartedInCurrentView &&
-        (selectedStoredSessionIdRef.current !== startingStoredSessionId || getRouteToken() !== startingRouteToken)
+      // Reason string (or null) for why the session context genuinely drifted
+      // under this in-flight submit. sessionContextDrift ignores the churn a
+      // busy gateway produces (selection null-resets on a gateway/profile
+      // switch, search/hash-only route changes, background active-ref
+      // retargets) so a second-session send doesn't silently abort — it fires
+      // only on a real move to a DIFFERENT chat. Reads the live refs/route each
+      // call and measures against the (mutable) baseline, which is re-pinned to
+      // the created chat after createBackendSessionForSend. submitTargetStoredId
+      // is the stored session this submit targets, so a move ONTO it (the
+      // pipeline's own re-home) is never counted as drift.
+      const sessionDriftReason = (): string | null =>
+        targetStartedInCurrentView
+          ? sessionContextDrift({
+              startRouteToken: startingRouteToken,
+              nowRouteToken: getRouteToken(),
+              startSelectedStoredId: startingStoredSessionId,
+              nowSelectedStoredId: selectedStoredSessionIdRef.current,
+              submitTargetStoredId: startingStoredSessionId,
+              composerScope: options?.composerScope,
+              // The composer keys drafts/attachments on the durable lineage
+              // root (survives auto-compression tip rotation), while
+              // startingStoredSessionId is the live tip — resolve the target
+              // into the same lineage-root domain before comparing, or every
+              // submit into a session that has ever compressed would
+              // false-positive-abort.
+              submitTargetComposerScope: resolveComposerSessionKey(startingStoredSessionId, $sessions.get())
+            })
+          : null
 
-      const targetIsCurrentView = (): boolean => targetStartedInCurrentView && !sessionContextDrifted()
+      const targetIsCurrentView = (): boolean => targetStartedInCurrentView && !sessionDriftReason()
 
       // One submit in flight per session — drop any concurrent re-fire so a
       // stalled turn can't stack the same prompt into multiple real turns. The
@@ -203,10 +312,16 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       const optimisticId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
+      // What the bubble shows. A `/skill` send carries the whole expanded
+      // skill body as its text — model-facing scaffolding — so the dispatcher
+      // hands us the invocation to render instead. Everything else shows what
+      // was typed.
+      const bubbleText = options?.displayText ?? visibleText
+
       const buildUserMessage = (): ChatMessage => ({
         id: optimisticId,
         role: 'user',
-        parts: [textPart(visibleText || (attachmentRefs.length ? '' : attachments.map(a => a.label).join(', ')))],
+        parts: [textPart(bubbleText || (attachmentRefs.length ? '' : attachments.map(a => a.label).join(', ')))],
         attachmentRefs
       })
 
@@ -222,18 +337,31 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       // Idempotent optimistic insert — re-running with the resolved sessionId
       // after createBackendSessionForSend just overwrites with the same id.
-      const seedOptimistic = (sid: string) =>
+      const seedOptimistic = (sid: string) => {
+        // Recents jump on send — not stream start, not turn resolve.
+        const activity = bubbleText.trim() ? { preview: bubbleText.trim() } : undefined
+        touchSessionActivity(sid, activity)
+
+        if (targetStoredSessionId && targetStoredSessionId !== sid) {
+          touchSessionActivity(targetStoredSessionId, activity)
+        }
+
         updateSessionState(
           sid,
           state => ({
             ...state,
+            // A fresh user message may never land after a still-pending
+            // assistant bubble — settle any leftover (drop it when empty)
+            // before appending, or a stale spinner gets stranded
+            // mid-transcript above this message forever.
             messages: state.messages.some(m => m.id === optimisticId)
               ? state.messages
-              : [...state.messages, buildUserMessage()],
+              : [...finalizeInterruptedMessages(state.messages, state.streamId), buildUserMessage()],
             busy: true,
             awaitingResponse: true,
             pendingBranchGroup: null,
             sawAssistantPayload: false,
+            streamId: null,
             // Fresh submit = new turn — clear any leftover interrupt flag, else
             // mutateStream/completeAssistantMessage drop every delta of this turn
             // (what made drained-after-interrupt sends go silent).
@@ -241,6 +369,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           }),
           targetStoredSessionId
         )
+      }
 
       // After sync rewrites refs, refresh the optimistic message in place so the
       // transcript shows the resolved @file: ref rather than the local path.
@@ -317,7 +446,11 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           return abortForSessionSwitch(null)
         }
 
-        if (sessionContextDrifted()) {
+        const routedResumeDrift = sessionDriftReason()
+
+        if (routedResumeDrift) {
+          console.warn('[submit-drift-abort]', routedResumeDrift, { phase: 'post-routed-resume' })
+
           return abortForSessionSwitch(null)
         }
 
@@ -346,12 +479,22 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // background queue drain only has the durable id). Continue that target
         // conversation; only a genuine new-chat draft may create a new session.
         try {
+          // Re-register on the session's OWNING profile — resuming on whichever
+          // profile is live would fork the conversation into the wrong DB (#67603).
+          const resumeProfile = await resolveSessionProfile(targetStoredSessionId)
+
           const resumed = await requestGateway<{ session_id: string }>('session.resume', {
             session_id: targetStoredSessionId,
-            source: 'desktop'
+            source: 'desktop',
+            omit_messages: true,
+            ...(resumeProfile ? { profile: resumeProfile } : {})
           })
 
-          if (sessionContextDrifted()) {
+          const resumeDrift = sessionDriftReason()
+
+          if (resumeDrift) {
+            console.warn('[submit-drift-abort]', resumeDrift, { phase: 'post-resume' })
+
             return abortForSessionSwitch(sessionId)
           }
 
@@ -371,7 +514,11 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           return abortForSessionSwitch(null)
         }
 
-        if (sessionContextDrifted()) {
+        const resumeSettleDrift = sessionDriftReason()
+
+        if (resumeSettleDrift) {
+          console.warn('[submit-drift-abort]', resumeSettleDrift, { phase: 'post-resume-settle' })
+
           return abortForSessionSwitch(sessionId)
         }
 
@@ -384,7 +531,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       if (!sessionId) {
         try {
-          sessionId = await createBackendSessionForSend(visibleText)
+          sessionId = await createBackendSessionForSend(bubbleText)
         } catch (err) {
           dropOptimistic(null)
           releaseBusy()
@@ -400,7 +547,11 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           // createBackendSessionForSend returns null when the user switched
           // sessions mid-create (it closes the orphaned session itself) —
           // abort silently. Anything else is a real failure worth a toast.
-          if (sessionContextDrifted()) {
+          const createNullDrift = sessionDriftReason()
+
+          if (createNullDrift) {
+            console.warn('[submit-drift-abort]', createNullDrift, { phase: 'post-create-null' })
+
             return abortForSessionSwitch(null)
           }
 
@@ -435,64 +586,92 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       }
 
       try {
-        const syncedAttachments = await syncAttachmentsForSubmit(sessionId, attachments, {
+        // Attach runs BEFORE prompt.submit, so a stale runtime id fails there
+        // first and submit's own recovery never runs — that asymmetry is why
+        // plain text survived sleep/wake but images reported "session not
+        // found". The attach path recovers and reports the live id back here.
+        const attachResult = await syncAttachmentsForSubmit(sessionId, attachments, {
           updateComposerAttachments: usingComposerAttachments
         })
 
-        if (sessionContextDrifted()) {
-          return abortForSessionSwitch(sessionId)
+        const syncedAttachments = attachResult.attachments
+        // Always a live string; pin it so TS narrows past the outer
+        // `string | null` sessionId binding for prompt.submit.
+        const liveSessionId = attachResult.sessionId
+
+        sessionId = liveSessionId
+
+        const attachmentsDrift = sessionDriftReason()
+
+        if (attachmentsDrift) {
+          console.warn('[submit-drift-abort]', attachmentsDrift, { phase: 'post-attachments' })
+
+          return abortForSessionSwitch(liveSessionId)
         }
 
         // Rewrite the optimistic message + prompt text with the synced refs so
         // the gateway receives @file: paths that resolve in its workspace.
         // (Images keep their inline base64 preview — see optimisticAttachmentRef.)
         attachmentRefs = syncedAttachments.map(optimisticAttachmentRef).filter((r): r is string => Boolean(r))
-        rewriteOptimistic(sessionId)
+        rewriteOptimistic(liveSessionId)
         const text = buildContextText(syncedAttachments)
 
+        const submitParams = (targetId: string) => ({
+          session_id: targetId,
+          text,
+          ...(interrupted && { interrupted }),
+          // Typed into the floating HUD, so the user is looking at another app
+          // rather than at Hermes. The gateway turns this into a per-turn hint
+          // to read the window underneath and work in it.
+          ...($hudMode.get() && { surface: 'hud' }),
+          // A queue drain is a "run after" message, never a live-turn
+          // correction. The flag tells the gateway's busy path to hold it for
+          // the next turn untouched — without it, losing the settle race
+          // (client saw idle, server still unwinding) redirects or interrupts
+          // the live turn with text the user explicitly queued.
+          ...(options?.fromQueue && { queued: true })
+        })
+
         // On sleep/wake the gateway's in-memory session may have been cleared
-        // while the desktop app still holds the old session ID. Detect this,
-        // resume the stored session to re-register it, and retry once.
+        // while the desktop app still holds the old session ID. The shared
+        // resolver re-registers the stored session and retries once; every
+        // other session-scoped RPC (attach, /compress, rewind, interrupt) goes
+        // through the same helper so one policy covers the whole bug class.
         let submitErr: unknown = null
 
         try {
-          await withSessionBusyRetry(() =>
-            requestGateway('prompt.submit', { session_id: sessionId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
-          )
-        } catch (firstErr) {
           const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
 
-          if ((isSessionNotFoundError(firstErr) || isGatewayTimeoutError(firstErr)) && recoverStoredSessionId) {
-            // Re-register the session in the gateway and get a fresh live ID.
-            // Timeouts recover the same way as "session not found": a starved
-            // backend loop (#55578 symptom d) rejects the submit even though
-            // the stored session is fine — resume + retry instead of erroring
-            // out and losing the session binding.
-            const resumed = await requestGateway<{ session_id: string }>('session.resume', {
-              session_id: recoverStoredSessionId,
-              source: 'desktop'
-            })
-
-            if (sessionContextDrifted()) {
-              return abortForSessionSwitch(sessionId)
-            }
-
-            const recoveredId = resumed?.session_id
-
-            if (recoveredId) {
-              if (targetIsCurrentView()) {
-                activeSessionIdRef.current = recoveredId
+          await withSessionNotFoundResume(
+            sessionId,
+            recoverStoredSessionId,
+            liveId =>
+              withSessionBusyRetry(() =>
+                requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+              ),
+            {
+              requestGateway,
+              driftReason: sessionDriftReason,
+              onRecovered: recoveredId => {
+                if (targetIsCurrentView()) {
+                  activeSessionIdRef.current = recoveredId
+                  setActiveSessionId(recoveredId)
+                }
               }
+            },
+            // A starved backend loop (#55578 symptom d) rejects the submit even
+            // though the stored session is fine — recover it like a dead id
+            // instead of erroring out and losing the session binding.
+            { alsoTimeout: true }
+          )
+        } catch (firstErr) {
+          if (firstErr instanceof SessionRecoveryAborted) {
+            console.warn('[submit-drift-abort]', firstErr.reason, { phase: 'post-resume-retry' })
 
-              await withSessionBusyRetry(() =>
-                requestGateway('prompt.submit', { session_id: recoveredId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
-              )
-            } else {
-              submitErr = firstErr
-            }
-          } else {
-            submitErr = firstErr
+            return abortForSessionSwitch(sessionId)
           }
+
+          submitErr = firstErr
         }
 
         if (submitErr !== null) {

@@ -1,26 +1,41 @@
 import { useStore } from '@nanostores/react'
+import { memo } from 'react'
 import type * as React from 'react'
 
+import { PrTag } from '@/app/chat/pr-tag'
 import { ProfileTag } from '@/app/chat/profile-tag'
 import { startSessionDrag } from '@/app/chat/session-drag'
 import { PlatformAvatar } from '@/app/messaging/platform-icon'
+import { openSession } from '@/app/open-session'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
 import type { SessionInfo } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
+import { compactNumber } from '@/lib/format'
 import { triggerHaptic } from '@/lib/haptics'
+import { middleClickHandlers } from '@/lib/middle-click'
 import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
+import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
-import { $backgroundRunningSessionIds } from '@/store/composer-status'
-import { $unreadFinishedSessionIds } from '@/store/session'
-import { $sessionColorById } from '@/store/session-color'
-import { $attentionSessionIds, openSessionTile } from '@/store/session-states'
-import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
+import { $sidebarRowMeta } from '@/store/layout'
+import { normalizeProfileKey } from '@/store/profile'
+import { $pullRequestsByBranch, sessionPrKey } from '@/store/pull-requests'
+import { $sessionDotStateById, hasLiveTurn, showsRunningArc } from '@/store/session-dot-state'
+import { sessionCostUsd } from '@/store/sidebar-archive'
 
-import { SidebarRowBody, SidebarRowGrab, SidebarRowLabel, SidebarRowLead, SidebarRowShell } from './chrome'
+import { SessionStatusDot } from '../session-status-dot'
+
+import {
+  SidebarRowBody,
+  SidebarRowGrab,
+  SidebarRowLabel,
+  SidebarRowLead,
+  SidebarRowLeadGlyph,
+  SidebarRowShell
+} from './chrome'
 import { SessionActionsMenu, SessionContextMenu } from './session-actions-menu'
 import { useProfilePrewarm } from './use-profile-prewarm'
 
@@ -30,7 +45,6 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   branchStem?: string
   isPinned: boolean
   isSelected: boolean
-  isWorking: boolean
   onArchive: () => void
   onBranch?: () => void
   onDelete: () => void
@@ -54,12 +68,11 @@ function formatAge(seconds: number, r: Translations['sidebar']['row']): string {
   return unit === 'second' ? r.ageNow : `${value}${r[AGE_KEY[unit]]}`
 }
 
-export function SidebarSessionRow({
+function SidebarSessionRowImpl({
   session,
   branchStem,
   isPinned,
   isSelected,
-  isWorking,
   onArchive,
   onBranch,
   onDelete,
@@ -80,34 +93,66 @@ export function SidebarSessionRow({
   const title = sessionTitle(session)
   const age = formatAge(session.last_active || session.started_at, r)
   const handleLabel = `Reorder ${title}`
+  // Opt-in row metadata from the sidebar's filter menu. Read from the store
+  // rather than threaded as props: the subscription re-renders past the memo
+  // below, and a toggle should repaint every row at once anyway.
+  const rowMeta = useStore($sidebarRowMeta)
+  // Pinned metadata occupies the actions slot and swaps out for the kebab on
+  // hover, so the row reserves the same width either way and never reflows.
+  const pinnedAge = rowMeta.includes('updated')
+  // The default profile has no mark worth spending a row slot on — a chip on
+  // every row that says "the normal one" is noise. Named profiles only.
+  const hasProfileTag = normalizeProfileKey(session.profile) !== 'default'
+  const pinnedProfile = hasProfileTag && rowMeta.includes('profile')
+  // The branch's PR, if the row was asked to show one. A selector, not a plain
+  // useStore: a repo's PRs land as a single map write, and only the rows on
+  // those branches should repaint.
+  const prKey = sessionPrKey(session)
+  const pr = useStoreSelector($pullRequestsByBranch, prs => (rowMeta.includes('pr') && prKey ? prs[prKey] : undefined))
+  const totalTokens = session.input_tokens + session.output_tokens
+  const cost = sessionCostUsd(session)
+
+  // Tokens, cost and age share the one trailing slot rather than each claiming
+  // their own column: several switched on read as one figure, not as a
+  // widening gutter.
+  const pinnedFacts = [
+    rowMeta.includes('tokens') && totalTokens > 0 ? compactNumber(totalTokens) : null,
+    // Sub-cent spend rounds to "$0.00", which reads as a bug rather than as a
+    // cheap session — below a cent the row says nothing at all.
+    rowMeta.includes('cost') && cost >= 0.01 ? `$${cost.toFixed(2)}` : null,
+    pinnedAge ? age : null
+  ].filter(Boolean) as string[]
+
+  // The kebab covers the END of the slot, so only the last fact steps aside for
+  // it. With tokens and age both on, hovering costs you the age and keeps the
+  // number you switched on to read.
+  const pinnedTail = pinnedFacts.at(-1) ?? ''
+  const pinnedHead = pinnedFacts.slice(0, -1).join(' · ')
+  const pinnedLabel = pinnedFacts.join(' · ')
+  // Chips that ride in the BODY, beside the title. The kebab lifts out of the
+  // actions slot, so it only ever covers what's in there — a body chip has no
+  // reason to step aside, and the hover-age (which does overlay the body) is
+  // dropped rather than made to fight them.
+  const bodyChip = Boolean(pr) || pinnedProfile || (showProfile && hasProfileTag)
+  const pinnedMeta = Boolean(pinnedLabel) || bodyChip
   // A handed-off session's live source is local, but it originated on a
   // messaging platform — surface that origin as a small badge so e.g. a
   // Telegram thread continued here still reads as Telegram.
   const handoffSource = handoffOriginSource(session.handoff_state, session.handoff_platform)
   const handoffLabel = handoffSource ? (sessionSourceLabel(handoffSource) ?? handoffSource) : null
-  // True when a clarify prompt in this session is waiting on the user.
-  const needsInput = useStore($attentionSessionIds).includes(session.id)
-  // True when the session's most recent turn finished in the background (while
-  // the user was viewing a different session) and hasn't been opened since.
-  const isUnread = useStore($unreadFinishedSessionIds).includes(session.id)
-  // True when a terminal(background=true) process is alive in this session.
-  const hasBackground = useStore($backgroundRunningSessionIds).includes(session.id)
-  // The session's resolved color (idle dot tint), read from the ONE shared map
-  // the pane tabs also read — an O(1) lookup, never re-derived per render.
-  const projectColor = useStore($sessionColorById)[session.id] ?? null
+  // The same resolved state the row's dot paints, so the arc and the dot cannot
+  // contradict each other. A selector, not a plain useStore: the map is rebuilt
+  // whenever any session's status changes, but a row only repaints on its own.
+  const dotState = useStoreSelector($sessionDotStateById, states => states[session.id] ?? 'idle')
+  const liveTurn = hasLiveTurn(dotState)
 
-  // Resolve the dot's display state once — the four signals are mutually
-  // exclusive by priority, so threading them as booleans through wrappers just
-  // to collapse them at the leaf is backwards.
-  const dotState: SessionDotState = needsInput
-    ? 'needs-input'
-    : isWorking
-      ? 'working'
-      : hasBackground
-        ? 'background'
-        : isUnread
-          ? 'unread'
-          : 'idle'
+  // An archived session has no live status to paint, so the archive glyph takes
+  // the lead slot the dot would occupy instead of adding a column of its own.
+  const lead = session.archived ? (
+    <SidebarRowLeadGlyph className="text-(--ui-text-quaternary)">
+      <Codicon name="archive" size="0.75rem" />
+    </SidebarRowLeadGlyph>
+  ) : null
 
   return (
     <SessionContextMenu
@@ -122,10 +167,36 @@ export function SidebarSessionRow({
     >
       <SidebarRowShell
         actions={
-          <div className="relative z-2 grid w-[1.375rem] place-items-center" data-row-actions>
-            {!isWorking && (
-              <span className="pointer-events-none absolute right-6 top-1/2 min-w-6 -translate-y-1/2 text-right text-[0.625rem] leading-none text-(--ui-text-tertiary) opacity-0 transition-opacity group-hover:opacity-100">
-                {age}
+          // Pinned metadata sits in normal flow and the kebab lifts out of it,
+          // so this slot's intrinsic width IS the metadata's — the row's
+          // `auto` actions column measures it and the title truncates against
+          // whatever is switched on, with no width to hand-maintain.
+          <div className="relative z-2 flex items-center justify-end" data-row-actions>
+            {/* Pinned metadata stays put through a turn — it was switched on to
+                be read. Only the tail hands its slot to the kebab; anything
+                ahead of it stays legible while you hover. The hover-only age is
+                an overlay instead, so it needs the row to open up 48px of right
+                padding — which beside a body chip reads as a hole. A row that
+                already shows a chip skips it. */}
+            {(pinnedLabel || (!liveTurn && !bodyChip)) && (
+              <span
+                className={cn(
+                  'pointer-events-none whitespace-nowrap text-right text-[0.625rem] leading-none text-(--ui-text-tertiary)',
+                  !pinnedLabel && 'absolute right-6 opacity-0 transition-opacity group-hover:opacity-100'
+                )}
+              >
+                {pinnedLabel ? (
+                  <>
+                    {pinnedHead}
+                    {/* Never narrower than the kebab that has to cover it. */}
+                    <span className="inline-block min-w-5 transition-opacity group-hover:opacity-0">
+                      {pinnedHead && ' · '}
+                      {pinnedTail}
+                    </span>
+                  </>
+                ) : (
+                  age
+                )}
               </span>
             )}
             <SessionActionsMenu
@@ -139,8 +210,11 @@ export function SidebarSessionRow({
               title={title}
             >
               <Button
-                aria-label={r.actionsFor(title)}
-                className="size-5 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!"
+                aria-label={r.sessionActions}
+                className={cn(
+                  'size-5 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!',
+                  pinnedLabel && 'absolute right-0'
+                )}
                 size="icon"
                 variant="ghost"
               >
@@ -152,26 +226,33 @@ export function SidebarSessionRow({
         className={cn(
           'group row-hover relative',
           isSelected && 'bg-(--ui-row-active-background)',
-          isWorking && 'text-foreground',
+          liveTurn && 'text-foreground',
           // Opaque surface while lifted so the dragged row erases what's under
           // it (translucency let the rows below bleed through).
           dragging && 'z-10 cursor-grabbing bg-(--ui-sidebar-surface-background)',
           className
         )}
-        data-working={isWorking ? 'true' : undefined}
+        data-working={liveTurn ? 'true' : undefined}
+        // The row runs BOTH drags off one press, and each declines outside its
+        // own region — so no timing/arbitration rule is needed and neither can
+        // steal the other's gesture. Over the sidebar only the reorder has a
+        // target (the session drop denies: side chrome hosts no main tile);
+        // over the tree only the session drop does (no sortable row there).
+        // Whichever one the release lands on is the one that commits.
+        {...dragHandleProps}
         onPointerDown={event => {
-          // Reorder drags belong to dnd-kit (the grab handle); the ⋯ actions
-          // cluster keeps its own gestures. Everything else on the row —
-          // including the row-body BUTTON, the natural grab surface — is a
-          // session drag source: a POINTER drag on the shared drag session
-          // (never native HTML5 DnD: no macOS snap-back, Esc aborts
-          // instantly). Sub-threshold releases stay ordinary clicks, so
-          // resume / pin / open-in-window are untouched.
+          // The grabber already carries these same listeners, and the ⋯
+          // cluster keeps its own gestures.
           if ((event.target as HTMLElement).closest('[data-reorder-handle], [data-row-actions]')) {
             return
           }
 
+          // A POINTER drag on the shared drag session (never native HTML5 DnD:
+          // no macOS snap-back, Esc aborts instantly). Sub-threshold releases
+          // stay ordinary clicks, so resume / pin / open-in-window are
+          // untouched.
           startSessionDrag({ id: session.id, profile: session.profile || 'default', title }, event)
+          dragHandleProps?.onPointerDown?.(event)
         }}
         // Hovering a row from another profile (the all-profiles view) telegraphs
         // a cross-profile resume — start that backend's spawn now so the click
@@ -183,28 +264,26 @@ export function SidebarSessionRow({
         style={style}
         {...rest}
       >
-        {isWorking && !needsInput && <span aria-hidden="true" className="arc-border" />}
+        {showsRunningArc(dotState) && <span aria-hidden="true" className="arc-border arc-row" />}
         <SidebarRowBody
-          className={cn('z-0 group-hover:pr-12', branchStem && 'pl-3.5')}
-          // Middle-click = open in a new tab (browser muscle memory). Swallow
-          // the mousedown so Chromium doesn't enter autoscroll mode.
-          onAuxClick={event => {
-            if (event.button === 1) {
-              event.preventDefault()
-              event.stopPropagation()
-              triggerHaptic('selection')
-              openSessionTile(session.id, 'center')
-            }
-          }}
+          // Pinned metadata already sits in the actions slot, so the title only
+          // needs a gap from it — and the same gap on hover, or the row would
+          // jump every time the kebab took over.
+          className={cn('z-0', pinnedMeta ? 'pr-2' : 'group-hover:pr-12', branchStem && 'pl-3.5')}
+          // Middle-click = open in a new tab (browser muscle memory).
+          {...middleClickHandlers(() => {
+            triggerHaptic('selection')
+            openSession(session.id, () => undefined, 'tab')
+          })}
           onClick={event => {
             const mod = event.metaKey || event.ctrlKey
 
             // ⇧⌘-click → pop into its own window (needs standalone windows).
-            if (mod && event.shiftKey && canOpenSessionWindow()) {
+            if (mod && event.shiftKey) {
               event.preventDefault()
               event.stopPropagation()
               triggerHaptic('selection')
-              void openSessionInNewWindow(session.id)
+              openSession(session.id, () => undefined, 'window')
 
               return
             }
@@ -214,7 +293,7 @@ export function SidebarSessionRow({
               event.preventDefault()
               event.stopPropagation()
               triggerHaptic('selection')
-              openSessionTile(session.id, 'center')
+              openSession(session.id, () => undefined, 'tab')
 
               return
             }
@@ -231,25 +310,21 @@ export function SidebarSessionRow({
 
             onResume()
           }}
-          onMouseDown={event => event.button === 1 && event.preventDefault()}
         >
           {reorderable ? (
-            <SidebarRowGrab
-              ariaLabel={handleLabel}
-              dragging={dragging}
-              dragHandleProps={dragHandleProps}
-              leadClassName={needsInput ? 'overflow-visible' : undefined}
-            >
-              <SessionRowLeadDot
-                branchStem={branchStem}
-                className="transition-opacity group-hover/handle:opacity-0 group-focus-within/handle:opacity-0"
-                dotState={dotState}
-                projectColor={projectColor}
-              />
+            <SidebarRowGrab ariaLabel={handleLabel} dragging={dragging} dragHandleProps={dragHandleProps}>
+              {lead ?? (
+                <SessionStatusDot
+                  branchStem={branchStem}
+                  className="transition-opacity group-hover/handle:opacity-0 group-focus-within/handle:opacity-0"
+                  session={session}
+                  storedSessionId={session.id}
+                />
+              )}
             </SidebarRowGrab>
           ) : (
-            <SidebarRowLead className={needsInput ? 'overflow-visible' : 'overflow-hidden'}>
-              <SessionRowLeadDot branchStem={branchStem} dotState={dotState} projectColor={projectColor} />
+            <SidebarRowLead className="overflow-hidden">
+              {lead ?? <SessionStatusDot branchStem={branchStem} session={session} storedSessionId={session.id} />}
             </SidebarRowLead>
           )}
           {handoffSource && handoffLabel ? (
@@ -264,131 +339,41 @@ export function SidebarSessionRow({
           <SidebarRowLabel className="flex-1 font-normal group-hover:text-foreground group-data-[working=true]:text-foreground/90">
             {title}
           </SidebarRowLabel>
-          {showProfile && <ProfileTag profile={session.profile} />}
+          {/* Stays put on hover, unlike the other chips: it's a link, and the
+              kebab lives in its own column rather than over this one. */}
+          {pr && <PrTag pr={pr} />}
+          {(showProfile || pinnedProfile) && hasProfileTag && <ProfileTag profile={session.profile} />}
         </SidebarRowBody>
       </SidebarRowShell>
     </SessionContextMenu>
   )
 }
 
-/** The session's display state for the sidebar lead dot. The call site
- *  resolves this from the four underlying signals (needs-input, working,
- *  background, unread) so the dot component itself is a pure lookup. */
-type SessionDotState = 'background' | 'idle' | 'needs-input' | 'unread' | 'working'
-
-function SessionRowLeadDot({
-  branchStem,
-  dotState = 'idle',
-  className,
-  projectColor
-}: {
-  branchStem?: string
-  dotState?: SessionDotState
-  className?: string
-  projectColor?: null | string
-}) {
+// The sidebar re-renders on every stream tick ($sessions/$workingSessionIds
+// churn), and it stays mounted beneath every overlay — so an unmemoized row
+// re-rendered the whole list (and its Codicon/label/status-dot subtree) on each
+// delta, bleeding churn into Settings, Cron, Profiles, Artifacts, etc.
+//
+// The callback props (onArchive/onResume/…) are fresh closures every render by
+// design (they close over the row's session id), so a default memo never bails.
+// They're pure id-forwarders, though — identical behavior for a given row — so
+// the comparator deliberately ignores them and compares only the DATA that
+// changes what the row paints. A row whose session/selection/pin state is
+// unchanged now bails out, even while a sibling session streams; its own status
+// arrives through a store subscription, which re-renders it past this bail.
+function rowPropsEqual(a: SidebarSessionRowProps, b: SidebarSessionRowProps): boolean {
   return (
-    <span className={cn('flex items-center gap-0.5', className)}>
-      {branchStem ? (
-        <span aria-hidden className="shrink-0 font-mono text-[0.625rem] leading-none text-(--ui-text-quaternary)">
-          {branchStem}
-        </span>
-      ) : null}
-      <SidebarRowDot dotState={dotState} projectColor={projectColor} />
-    </span>
+    a.session === b.session &&
+    a.isPinned === b.isPinned &&
+    a.isSelected === b.isSelected &&
+    a.branchStem === b.branchStem &&
+    a.reorderable === b.reorderable &&
+    a.dragging === b.dragging &&
+    a.showProfile === b.showProfile &&
+    a.dragHandleProps === b.dragHandleProps &&
+    a.className === b.className &&
+    a.style === b.style
   )
 }
 
-// A pure lookup table: each state maps to its className, aria-label, and
-// title. No priority resolution here — the call site already picked one.
-// Label/title are resolved from sidebar.row translations, keyed by name.
-type DotVariant = {
-  ariaLabel?: (r: Translations['sidebar']['row']) => string
-  className: string
-  role?: 'status'
-  title?: (r: Translations['sidebar']['row']) => string
-}
-
-// Shared base for every active dot; idle is smaller and uses its own class.
-const DOT_BASE = 'relative size-1.5 rounded-full'
-
-// Pseudo-element ping ring that scales outward and fades — shared scaffold for
-// the two pulsing dots. The `before:bg-*` color is written inline per variant
-// (NOT interpolated here): Tailwind only generates utilities it can see as
-// complete static strings, so a `before:bg-${color}` template never emits.
-const PING = "before:absolute before:inset-0 before:animate-ping before:rounded-full before:content-['']"
-
-const DOT_VARIANTS: Record<SessionDotState, DotVariant> = {
-  // Amber steady — a clarify/approval is blocking the turn. Steady (not
-  // pulsing) reads as "your turn", distinct from the accent pulse of a turn.
-  'needs-input': {
-    ariaLabel: r => r.needsInput,
-    className: `${DOT_BASE} quest-glow bg-amber-500`,
-    role: 'status',
-    title: r => r.waitingForAnswer
-  },
-  // Accent pulse — the LLM turn is actively running.
-  working: {
-    ariaLabel: r => r.sessionRunning,
-    className: `${DOT_BASE} bg-(--ui-accent) shadow-[0_0_0.625rem_color-mix(in_srgb,var(--ui-accent)_55%,transparent)] ${PING} before:bg-(--ui-accent) before:opacity-70`,
-    role: 'status'
-  },
-  // Pulsing gray — a terminal(background=true) process is alive while the LLM
-  // is idle. Gray (not accent) reads as "something chugging along". Brighter
-  // than muted-foreground so it's visible against the sidebar surface.
-  background: {
-    ariaLabel: r => r.backgroundRunning,
-    className: `${DOT_BASE} bg-muted-foreground/80 ${PING} before:bg-muted-foreground/80 before:opacity-60`,
-    role: 'status',
-    title: r => r.backgroundRunning
-  },
-  // Steady green — a background session's turn completed and the user hasn't
-  // opened it since. "Something new here, go look."
-  unread: {
-    ariaLabel: r => r.finishedUnread,
-    className: `${DOT_BASE} bg-emerald-500`,
-    role: 'status',
-    title: r => r.finishedUnread
-  },
-  idle: {
-    className: 'size-1 rounded-full bg-(--ui-text-quaternary) opacity-80'
-  }
-}
-
-function SidebarRowDot({
-  dotState,
-  className,
-  projectColor
-}: {
-  dotState: SessionDotState
-  className?: string
-  projectColor?: null | string
-}) {
-  const { t } = useI18n()
-  const r = t.sidebar.row
-
-  // An idle session inherits its project's color (a quiet marker matching the
-  // project row's own color dot). The active states (working / needs-input /
-  // background / unread) own the dot and keep their semantic color, so the
-  // inherited tint never competes with an attention cue.
-  if (dotState === 'idle' && projectColor) {
-    return (
-      <span
-        aria-hidden="true"
-        className={cn('size-1 rounded-full', className)}
-        style={{ backgroundColor: projectColor }}
-      />
-    )
-  }
-
-  const variant = DOT_VARIANTS[dotState]
-
-  return (
-    <span
-      aria-label={variant.ariaLabel?.(r)}
-      className={cn(variant.className, className)}
-      role={variant.role}
-      title={variant.title?.(r)}
-    />
-  )
-}
+export const SidebarSessionRow = memo(SidebarSessionRowImpl, rowPropsEqual)
