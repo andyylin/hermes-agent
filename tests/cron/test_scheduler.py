@@ -1333,7 +1333,8 @@ class TestSendMediaViaAdapter:
         )
 
         assert len(errors) == 1
-        assert "upload rejected" in errors[0]
+        assert errors[0][:2] == (str(photo_path), False)
+        assert "upload rejected" in errors[0][2]
 
     def test_media_only_live_failure_is_not_reported_as_delivery_success(
         self, tmp_path, monkeypatch
@@ -1359,7 +1360,10 @@ class TestSendMediaViaAdapter:
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("cron.scheduler._send_media_via_adapter", return_value=["media upload rejected"]), \
+             patch(
+                 "cron.scheduler._send_media_via_adapter",
+                 return_value=[(str(photo_path), False, "media upload rejected")],
+             ), \
              patch("tools.send_message_tool._send_to_platform", new=standalone_send):
             result = _deliver_result(
                 job,
@@ -1403,7 +1407,10 @@ class TestSendMediaViaAdapter:
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule), \
-             patch("cron.scheduler._send_media_via_adapter", return_value=["media upload rejected"]), \
+             patch(
+                 "cron.scheduler._send_media_via_adapter",
+                 return_value=[(str(photo_path), False, "media upload rejected")],
+             ), \
              patch("tools.send_message_tool._send_to_platform", new=standalone_send):
             result = _deliver_result(
                 job,
@@ -1415,6 +1422,43 @@ class TestSendMediaViaAdapter:
         assert result is None
         standalone_send.assert_awaited_once()
         assert standalone_send.await_args.args[3] == ""
+
+    def test_media_fallback_retries_only_failed_attachments(self, tmp_path, monkeypatch):
+        from gateway.config import Platform
+
+        first = self._safe_media_path(tmp_path, monkeypatch, "sent.jpg")
+        second = self._safe_media_path(tmp_path, monkeypatch, "failed.jpg")
+        adapter = AsyncMock()
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        standalone_send = AsyncMock(return_value={"success": True})
+        job = {
+            "id": "media-partial-list",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch(
+                 "cron.scheduler._send_media_via_adapter",
+                 return_value=[(str(second), False, "second upload rejected")],
+             ), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            result = _deliver_result(
+                job,
+                f"MEDIA:{first}\nMEDIA:{second}",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        standalone_send.assert_awaited_once()
+        assert standalone_send.await_args.kwargs["media_files"] == [(str(second), False)]
 
 
 class TestParallelTick:

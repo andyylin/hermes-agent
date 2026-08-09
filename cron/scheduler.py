@@ -1642,7 +1642,7 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> list[str]:
+) -> list[tuple[str, bool, str]]:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
     Routes each file to the appropriate adapter method (send_voice, send_image_file,
@@ -1654,7 +1654,7 @@ def _send_media_via_adapter(
     from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-    errors: list[str] = []
+    failures: list[tuple[str, bool, str]] = []
 
     for media_path, _is_voice in media_files:
         try:
@@ -1674,7 +1674,7 @@ def _send_media_via_adapter(
             if future is None:
                 msg = f"cannot send media {media_path}, gateway loop unavailable"
                 logger.warning("Job '%s': %s", job.get("id", "?"), msg)
-                errors.append(msg)
+                failures.append((media_path, _is_voice, msg))
                 continue
             try:
                 result = future.result(timeout=30)
@@ -1687,12 +1687,12 @@ def _send_media_via_adapter(
                     f"{getattr(result, 'error', 'unconfirmed adapter result')}"
                 )
                 logger.warning("Job '%s': %s", job.get("id", "?"), msg)
-                errors.append(msg)
+                failures.append((media_path, _is_voice, msg))
         except Exception as e:
             msg = f"failed to send media {media_path}: {e}"
             logger.warning("Job '%s': %s", job.get("id", "?"), msg)
-            errors.append(msg)
-    return errors
+            failures.append((media_path, _is_voice, msg))
+    return failures
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
@@ -2274,7 +2274,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 routed_media_metadata["user_id"] = logical_home.user_id
                             if logical_home.scope_id:
                                 routed_media_metadata["scope_id"] = logical_home.scope_id
-                    media_errors = _send_media_via_adapter(
+                    media_failures = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
                         media_files,
@@ -2283,8 +2283,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         job,
                         platform=platform,
                     )
-                    if media_errors:
-                        target_errors.extend(media_errors)
+                    if media_failures:
+                        target_errors.extend(
+                            error for _path, _is_voice, error in media_failures
+                        )
+                        media_files = [
+                            (path, is_voice)
+                            for path, is_voice, _error in media_failures
+                        ]
                         adapter_ok = False
                         # The live text send already succeeded. Retry only the
                         # failed attachments through standalone delivery; sending
