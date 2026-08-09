@@ -114,3 +114,61 @@ def test_post_write_plaintext_purge_failure_is_not_swallowed(monkeypatch, tmp_pa
             entry=entry,
             home_path=tmp_path,
         )
+
+
+def test_encrypted_fallback_repurges_plaintext_recreated_during_fetch(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("", encoding="utf-8")
+    token = "0.fake-token"
+    project = "project"
+    cache_key = (bw._token_fingerprint(token), project, "")
+    bw._reset_cache_for_tests(home)
+    bw._write_encrypted_disk_cache(
+        cache_key=cache_key,
+        access_token=token,
+        entry=bw._CachedFetch(secrets={"TOKEN": "encrypted"}, fetched_at=bw.time.time()),
+        home_path=home,
+    )
+    plaintext_path = bw._disk_cache_path(home)
+
+    def fail_after_legacy_reappears(*_args, **_kwargs):
+        _write_plaintext_cache(home)
+        raise RuntimeError("NETWORK: network is unreachable")
+
+    monkeypatch.setattr(bw, "_run_bws_list", fail_after_legacy_reappears)
+
+    secrets, warnings = bw.fetch_bitwarden_secrets(
+        access_token=token,
+        project_id=project,
+        binary=fake_binary,
+        cache_ttl_seconds=0,
+        encrypted_cache_enabled=True,
+        encrypted_cache_max_stale_seconds=3600,
+        home_path=home,
+    )
+
+    assert secrets == {"TOKEN": "encrypted"}
+    assert warnings
+    assert not plaintext_path.exists()
+
+
+def test_failed_encrypted_write_repurges_plaintext_recreated_mid_write(monkeypatch, tmp_path):
+    entry = bw._CachedFetch(secrets={"TOKEN": "secret"}, fetched_at=1.0)
+    plaintext_path = bw._disk_cache_path(tmp_path)
+
+    def fail_replace(*_args, **_kwargs):
+        _write_plaintext_cache(tmp_path)
+        raise OSError("simulated encrypted cache replace failure")
+
+    monkeypatch.setattr(bw.os, "replace", fail_replace)
+
+    bw._write_encrypted_disk_cache(
+        cache_key=("fingerprint", "project", ""),
+        access_token="0.fake-token",
+        entry=entry,
+        home_path=tmp_path,
+    )
+
+    assert not plaintext_path.exists()

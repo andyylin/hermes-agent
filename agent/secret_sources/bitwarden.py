@@ -449,11 +449,14 @@ def _write_encrypted_disk_cache(
                 pass
             raise
     except Exception:  # noqa: BLE001 — best-effort cache only
-        return
-    # Cache persistence is best-effort; plaintext exclusion is not. Keep this
-    # outside the broad cache-write handler so a concurrent reappearance or
-    # deletion failure propagates fail-closed to the caller.
-    _purge_plaintext_disk_cache(home_path)
+        pass
+    finally:
+        # Cache persistence is best-effort; plaintext exclusion is not. A
+        # legacy writer can recreate the plaintext file while this write is in
+        # flight, including immediately before an encrypted-write failure.
+        # Always make the encrypted-mode boundary exclusive, and let a purge
+        # failure propagate fail-closed.
+        _purge_plaintext_disk_cache(home_path)
 
 
 def _read_encrypted_disk_cache(
@@ -502,7 +505,7 @@ def _read_encrypted_disk_cache(
         return None
 
 
-def fetch_bitwarden_secrets(
+def _fetch_bitwarden_secrets_impl(
     *,
     access_token: str,
     project_id: str,
@@ -644,6 +647,40 @@ def fetch_bitwarden_secrets(
         elif cache_ttl_seconds > 0:
             _DISK_CACHE.write(cache_key, entry, cache_ttl_seconds, home_path)
     return secrets, warnings
+
+
+def fetch_bitwarden_secrets(
+    *,
+    access_token: str,
+    project_id: str,
+    binary: Optional[Path] = None,
+    cache_ttl_seconds: float = 300,
+    use_cache: bool = True,
+    server_url: str = "",
+    home_path: Optional[Path] = None,
+    encrypted_cache_enabled: bool = False,
+    encrypted_cache_max_stale_seconds: float = 0,
+) -> Tuple[Dict[str, str], List[str]]:
+    """Fetch secrets while enforcing encrypted-cache plaintext exclusivity."""
+    if encrypted_cache_enabled:
+        _purge_plaintext_disk_cache(home_path)
+    try:
+        return _fetch_bitwarden_secrets_impl(
+            access_token=access_token,
+            project_id=project_id,
+            binary=binary,
+            cache_ttl_seconds=cache_ttl_seconds,
+            use_cache=use_cache,
+            server_url=server_url,
+            home_path=home_path,
+            encrypted_cache_enabled=encrypted_cache_enabled,
+            encrypted_cache_max_stale_seconds=encrypted_cache_max_stale_seconds,
+        )
+    finally:
+        # Cover every return and exception path, including an encrypted stale
+        # fallback after another process recreated the legacy plaintext cache.
+        if encrypted_cache_enabled:
+            _purge_plaintext_disk_cache(home_path)
 
 
 def _summarize_bws_stderr(raw: str) -> str:

@@ -1302,9 +1302,119 @@ class TestSendMediaViaAdapter:
         voice_path = self._safe_media_path(tmp_path, monkeypatch, "voice.mp3")
         photo_path = self._safe_media_path(tmp_path, monkeypatch, "photo.jpg")
         media_files = [(str(voice_path), False), (str(photo_path), False)]
-        self._run_with_loop(adapter, "123", media_files, None, {"id": "j3"})
+        errors = self._run_with_loop(adapter, "123", media_files, None, {"id": "j3"})
+        assert errors is None or errors == []
         adapter.send_voice.assert_called_once()
         adapter.send_image_file.assert_called_once()
+
+    def test_failed_media_result_is_returned_to_caller(self, tmp_path, monkeypatch):
+        from concurrent.futures import Future
+
+        adapter = MagicMock()
+        adapter.send_image_file = AsyncMock()
+        photo_path = self._safe_media_path(tmp_path, monkeypatch, "failed.jpg")
+        completed = Future()
+        completed.set_result(MagicMock(success=False, error="upload rejected"))
+
+        def fake_schedule(coro, _loop):
+            coro.close()
+            return completed
+
+        monkeypatch.setattr(
+            "agent.async_utils.safe_schedule_threadsafe", fake_schedule
+        )
+        errors = _send_media_via_adapter(
+            adapter,
+            "123",
+            [(str(photo_path), False)],
+            None,
+            MagicMock(),
+            {"id": "media-fail"},
+        )
+
+        assert len(errors) == 1
+        assert "upload rejected" in errors[0]
+
+    def test_media_only_live_failure_is_not_reported_as_delivery_success(
+        self, tmp_path, monkeypatch
+    ):
+        from gateway.config import Platform
+
+        photo_path = self._safe_media_path(tmp_path, monkeypatch, "only.jpg")
+        adapter = AsyncMock()
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        job = {
+            "id": "media-only-fail",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+        standalone_send = AsyncMock(
+            return_value={"error": "standalone media upload rejected"}
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("cron.scheduler._send_media_via_adapter", return_value=["media upload rejected"]), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            result = _deliver_result(
+                job,
+                f"MEDIA:{photo_path}",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is not None
+        assert "media upload rejected" in result
+        standalone_send.assert_awaited_once()
+
+    def test_live_text_is_not_duplicated_when_media_falls_back(
+        self, tmp_path, monkeypatch
+    ):
+        from concurrent.futures import Future
+        from gateway.config import Platform
+
+        photo_path = self._safe_media_path(tmp_path, monkeypatch, "partial.jpg")
+        adapter = AsyncMock()
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        completed = Future()
+        completed.set_result(MagicMock(success=True, raw_response=None))
+
+        def fake_schedule(coro, _loop):
+            coro.close()
+            return completed
+
+        standalone_send = AsyncMock(return_value={"success": True})
+        job = {
+            "id": "media-partial-fail",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule), \
+             patch("cron.scheduler._send_media_via_adapter", return_value=["media upload rejected"]), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            result = _deliver_result(
+                job,
+                f"Hello once\nMEDIA:{photo_path}",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        standalone_send.assert_awaited_once()
+        assert standalone_send.await_args.args[3] == ""
 
 
 class TestParallelTick:

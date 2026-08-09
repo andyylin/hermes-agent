@@ -49,12 +49,17 @@ if $run_tests; then
   fi
   "$python_bin" -m pytest -q \
     tests/gateway/test_discord_free_response.py \
+    tests/gateway/test_discord_send.py \
     tests/gateway/test_discord_slash_commands.py \
+    tests/plugins/platforms/test_discord_gate_isolation.py \
     tests/tools/test_discord_tool.py \
+    tests/tools/test_send_message_tool.py \
     tests/test_bitwarden_encrypted_cache_fail_closed.py \
     tests/gateway/test_line_group_authorization.py \
     tests/gateway/test_line_group_policies.py \
     tests/cron/test_discord_delivery_format.py \
+    tests/cron/test_scheduler.py \
+    tests/gateway/relay/test_relay_threads.py \
     tests/gateway/test_email_custom_notifications.py
 fi
 

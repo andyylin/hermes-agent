@@ -373,6 +373,30 @@ class TestYamlBridgeSeeding:
         assert a._get_allowed_channels() == {"111"}
         assert b._get_allowed_channels() == {"222"}
 
+    def test_thread_retention_is_seeded_and_isolated_per_profile(self, monkeypatch):
+        from agent import secret_scope
+        from plugins.platforms.discord.adapter import (
+            _apply_yaml_config,
+            _discord_thread_auto_archive_minutes,
+        )
+
+        # Profile A already bridged its value into the process environment.
+        monkeypatch.setenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", "60")
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+        token = secret_scope.set_secret_scope({})
+        try:
+            seeded_b = _apply_yaml_config(
+                {}, {"thread_auto_archive_minutes": 1440},
+            )
+            adapter_b = _adapter(seeded_b)
+            resolved_b = _discord_thread_auto_archive_minutes(adapter_b.config)
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+        assert seeded_b["thread_auto_archive_minutes"] == 1440
+        assert resolved_b == 1440
+        assert os.environ["DISCORD_THREAD_AUTO_ARCHIVE_MINUTES"] == "60"
+
 
 class TestTelegramGateIsolation:
     """Telegram mirror (reported by @yournetworkplug-ctrl in #72348)."""

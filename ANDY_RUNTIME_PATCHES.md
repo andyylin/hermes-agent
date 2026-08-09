@@ -3,6 +3,10 @@
 `andy-runtime` is a deliberately small, linear patch queue rebased on current
 `upstream/main`. It is the only supported custom runtime branch.
 
+Current frozen upstream cutoff: `1527a81b5eee6631e5bbec8d7fb0ce69db6a166d`
+(integrated 2026-08-10). Candidate and release receipts must record this exact
+cutoff; a later refresh replaces it only after freezing and reviewing a new SHA.
+
 ## Retained behavior
 
 1. **Discord free-response auto-threading** — free-response controls mention
@@ -12,8 +16,9 @@
    and table-to-bullet conversion, while mixed email/Discord fan-out is rendered
    independently and unwrapped output remains literal.
 3. **Bitwarden plaintext-cache purge** — encrypted-cache mode removes obsolete
-   plaintext cache data before validation or fetch. The encrypted AES-GCM
-   network-failure-only fallback remains upstream-owned.
+   plaintext cache data before validation/fetch and again at every success or
+   failure boundary, closing concurrent legacy-writer reappearance races. The
+   encrypted AES-GCM network-failure-only fallback remains upstream-owned.
 4. **Discord thread retention** — Hermes-created threads default to one-week
    auto-archive, configurable with `discord.thread_auto_archive_minutes`.
 5. **LINE group collection policy** — supports allowed, read-only, archived, and
@@ -23,6 +28,9 @@
 6. **Email notifications** — standalone email sends multipart HTML plus plain
    fallback; cron jobs can use `email_subject_template` and
    `email_thread_key` for dated subjects and stable RFC threading.
+7. **Cron media delivery integrity** — live-adapter attachment failures are
+   propagated, retried through standalone delivery without duplicating text,
+   and never recorded as successful media-only deliveries.
 
 ## Explicitly retired
 

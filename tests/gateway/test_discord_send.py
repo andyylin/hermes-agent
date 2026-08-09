@@ -218,7 +218,8 @@ async def test_forum_post_file_creates_thread_with_attachment():
 
 
 @pytest.mark.asyncio
-async def test_forum_post_file_uses_profile_thread_retention():
+async def test_forum_post_file_uses_profile_thread_retention(monkeypatch):
+    monkeypatch.delenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", raising=False)
     adapter = DiscordAdapter(
         PlatformConfig(
             enabled=True,

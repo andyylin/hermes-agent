@@ -80,13 +80,16 @@ def _get_bot_token() -> Optional[str]:
 
 def _load_thread_auto_archive_minutes_config() -> int:
     """Read this profile's default Discord thread retention."""
+    scoped_env = (get_secret("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", "") or "").strip()
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
-        raw = (cfg.get("discord") or {}).get("thread_auto_archive_minutes")
+        configured = (cfg.get("discord") or {}).get("thread_auto_archive_minutes")
     except Exception as exc:
         logger.debug("discord: could not load thread retention config (%s).", exc)
-        return DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES
+        configured = None
+
+    raw = scoped_env if scoped_env else configured
 
     if raw in (None, ""):
         return DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES

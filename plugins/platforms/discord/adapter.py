@@ -378,10 +378,11 @@ def _discord_thread_auto_archive_minutes(
     configured = None
     if config is not None and isinstance(config.extra, dict):
         configured = config.extra.get("thread_auto_archive_minutes")
+    scoped_env = _scoped_gate_env("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", "")
     raw = str(
-        configured
-        if configured not in (None, "")
-        else os.getenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", "")
+        scoped_env
+        if scoped_env
+        else configured if configured not in (None, "") else ""
     ).strip()
     try:
         value = int(raw) if raw else DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES
@@ -10031,8 +10032,17 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
     if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
-    if "thread_auto_archive_minutes" in discord_cfg and not os.getenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES"):
-        os.environ["DISCORD_THREAD_AUTO_ARCHIVE_MINUTES"] = str(discord_cfg["thread_auto_archive_minutes"])
+    if "thread_auto_archive_minutes" in discord_cfg:
+        seeded_extra["thread_auto_archive_minutes"] = discord_cfg[
+            "thread_auto_archive_minutes"
+        ]
+        if (
+            not _skip_env_bridge
+            and not os.getenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES")
+        ):
+            os.environ["DISCORD_THREAD_AUTO_ARCHIVE_MINUTES"] = str(
+                discord_cfg["thread_auto_archive_minutes"]
+            )
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
         os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
     backfill_cfg = discord_cfg.get("missed_message_backfill")

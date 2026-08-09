@@ -312,6 +312,7 @@ class TestCreateThread:
         self, mock_load_config, mock_req, monkeypatch
     ):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        monkeypatch.delenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", raising=False)
         mock_load_config.return_value = {
             "discord": {"thread_auto_archive_minutes": 1440}
         }
@@ -325,6 +326,28 @@ class TestCreateThread:
         mock_req.assert_called_once_with(
             "POST", "/channels/11/threads", "test-token",
             body={"name": "Configured", "auto_archive_duration": 1440, "type": 11},
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    @patch("hermes_cli.config.load_config")
+    def test_create_thread_profile_env_overrides_profile_config(
+        self, mock_load_config, mock_req, monkeypatch
+    ):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        monkeypatch.setenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", "60")
+        mock_load_config.return_value = {
+            "discord": {"thread_auto_archive_minutes": 1440}
+        }
+        mock_req.return_value = {"id": "803", "name": "Overridden"}
+
+        result = json.loads(
+            discord_core(action="create_thread", channel_id="11", name="Overridden")
+        )
+
+        assert result["success"] is True
+        mock_req.assert_called_once_with(
+            "POST", "/channels/11/threads", "test-token",
+            body={"name": "Overridden", "auto_archive_duration": 60, "type": 11},
         )
 
 
