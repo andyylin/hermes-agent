@@ -52,6 +52,7 @@ if $run_tests; then
     tests/gateway/test_discord_send.py \
     tests/gateway/test_discord_slash_commands.py \
     tests/gateway/test_multiplex_profile_authz.py \
+    tests/gateway/test_qqbot_scope_paths.py \
     tests/plugins/platforms/test_discord_gate_isolation.py \
     tests/gateway/test_line_plugin.py \
     tests/tools/test_discord_tool.py \
