@@ -1519,9 +1519,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             if other_bots_mentioned and not raw_self_mention:
                 return False, False
-            ignore_no_mention = os.getenv(
-                "DISCORD_IGNORE_NO_MENTION", "true"
-            ).lower() in {"true", "1", "yes"}
+            ignore_no_mention = self._discord_ignore_no_mention()
             if ignore_no_mention and not raw_self_mention and not other_bots_mentioned:
                 parent_id = None
                 if hasattr(message.channel, "parent_id") and message.channel.parent_id:
@@ -2142,7 +2140,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if isinstance(value, str):
                 return value.strip().lower() in ("true", "1", "yes", "on")
             return bool(value)
-        raw = os.getenv("DISCORD_MISSED_MESSAGE_BACKFILL", "false")
+        raw = _scoped_gate_env("DISCORD_MISSED_MESSAGE_BACKFILL", "false")
         return str(raw).strip().lower() in ("true", "1", "yes", "on")
 
     def _missed_message_backfill_channels(self) -> set[str]:
@@ -2172,7 +2170,7 @@ class DiscordAdapter(BasePlatformAdapter):
         raw = (
             configured.get("window_seconds", 21600)
             if isinstance(configured, dict)
-            else os.getenv("DISCORD_MISSED_MESSAGE_BACKFILL_WINDOW_SECONDS", "21600")
+            else _scoped_gate_env("DISCORD_MISSED_MESSAGE_BACKFILL_WINDOW_SECONDS", "21600")
         )
         try:
             value = float(raw)
@@ -2185,7 +2183,7 @@ class DiscordAdapter(BasePlatformAdapter):
         raw = (
             configured.get("limit", 100)
             if isinstance(configured, dict)
-            else os.getenv("DISCORD_MISSED_MESSAGE_BACKFILL_LIMIT", "100")
+            else _scoped_gate_env("DISCORD_MISSED_MESSAGE_BACKFILL_LIMIT", "100")
         )
         try:
             value = int(raw)
@@ -2198,7 +2196,7 @@ class DiscordAdapter(BasePlatformAdapter):
         raw = (
             configured.get("max_dispatches", 10)
             if isinstance(configured, dict)
-            else os.getenv("DISCORD_MISSED_MESSAGE_BACKFILL_MAX_DISPATCHES", "10")
+            else _scoped_gate_env("DISCORD_MISSED_MESSAGE_BACKFILL_MAX_DISPATCHES", "10")
         )
         try:
             value = int(raw)
@@ -2786,7 +2784,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._with_discord_recovery_db(_op)
 
     def _get_discord_command_sync_policy(self) -> str:
-        raw = str(os.getenv("DISCORD_COMMAND_SYNC_POLICY", "safe") or "").strip().lower()
+        raw = str(_scoped_gate_env("DISCORD_COMMAND_SYNC_POLICY", "safe") or "").strip().lower()
         if raw in _DISCORD_COMMAND_SYNC_POLICIES:
             return raw
         if raw:
@@ -3004,7 +3002,14 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
-        return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
+        configured = self.config.extra.get("reactions")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in {"false", "0", "no"}
+            return bool(configured)
+        return _scoped_gate_env("DISCORD_REACTIONS", "true").lower() not in {
+            "false", "0", "no"
+        }
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction and record durable handling state."""
@@ -5779,7 +5784,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # UX so users don't see commands they can't invoke. Off by default
         # to preserve the slash UX for deployments that intentionally allow
         # everyone in the guild.
-        if os.getenv("DISCORD_HIDE_SLASH_COMMANDS", "false").strip().lower() in {
+        if _scoped_gate_env("DISCORD_HIDE_SLASH_COMMANDS", "false").strip().lower() in {
             "true", "1", "yes", "on",
         }:
             self._apply_owner_only_visibility(tree)
@@ -6182,7 +6187,15 @@ class DiscordAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
-        return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
+        return _scoped_gate_env("DISCORD_REQUIRE_MENTION", "true").lower() not in {
+            "false", "0", "no", "off"
+        }
+
+    def _discord_ignore_no_mention(self) -> bool:
+        """Return the profile-scoped policy for non-inline mention handling."""
+        return _scoped_gate_env("DISCORD_IGNORE_NO_MENTION", "true").lower() in {
+            "true", "1", "yes"
+        }
 
     def _discord_allow_any_attachment(self) -> bool:
         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.
@@ -6197,7 +6210,9 @@ class DiscordAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() not in {"false", "0", "no", "off", ""}
             return bool(configured)
-        return os.getenv("DISCORD_ALLOW_ANY_ATTACHMENT", "false").lower() in {"true", "1", "yes", "on"}
+        return _scoped_gate_env("DISCORD_ALLOW_ANY_ATTACHMENT", "false").lower() in {
+            "true", "1", "yes", "on"
+        }
 
     def _discord_max_attachment_bytes(self) -> int:
         """Return the per-attachment byte cap. 0 means unlimited.
@@ -6208,7 +6223,7 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         configured = self.config.extra.get("max_attachment_bytes")
         if configured is None:
-            configured = os.getenv("DISCORD_MAX_ATTACHMENT_BYTES")
+            configured = _scoped_gate_env("DISCORD_MAX_ATTACHMENT_BYTES", "")
         if configured is None or configured == "":
             return 32 * 1024 * 1024
         try:
@@ -6410,7 +6425,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION", "false").lower() in {
+        return _scoped_gate_env("DISCORD_BOTS_REQUIRE_INLINE_MENTION", "false").lower() in {
             "true",
             "1",
             "yes",
@@ -6478,7 +6493,20 @@ class DiscordAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
-        return os.getenv("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
+        return _scoped_gate_env("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in {
+            "true", "1", "yes", "on"
+        }
+
+    def _discord_auto_thread(self) -> bool:
+        """Return whether this profile auto-threads qualifying messages."""
+        configured = self.config.extra.get("auto_thread")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return _scoped_gate_env("DISCORD_AUTO_THREAD", "true").lower() in {
+            "true", "1", "yes"
+        }
 
     def _discord_history_backfill(self) -> bool:
         """Return whether history backfill is enabled for shared sessions."""
@@ -6487,7 +6515,9 @@ class DiscordAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
-        return os.getenv("DISCORD_HISTORY_BACKFILL", "true").lower() in {"true", "1", "yes"}
+        return _scoped_gate_env("DISCORD_HISTORY_BACKFILL", "true").lower() in {
+            "true", "1", "yes"
+        }
 
     def _discord_history_backfill_limit(self) -> int:
         """Return the max number of messages to scan backwards for context.
@@ -6503,7 +6533,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 return int(configured)
             except (ValueError, TypeError):
                 pass
-        raw = os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT", "50")
+        raw = _scoped_gate_env("DISCORD_HISTORY_BACKFILL_LIMIT", "50")
         try:
             return int(raw)
         except (ValueError, TypeError):
@@ -7802,7 +7832,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
             skip_thread = bool(channel_keys & no_thread_channels)
-            auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
+            auto_thread = self._discord_auto_thread()
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
                 thread = await self._auto_create_thread(message)
@@ -9969,12 +9999,6 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     remains only for existing callers that construct adapters without config
     extras. Returns canonical WebSocket liveness settings to seed that extra.
     """
-    if "require_mention" in discord_cfg and not os.getenv("DISCORD_REQUIRE_MENTION"):
-        os.environ["DISCORD_REQUIRE_MENTION"] = str(discord_cfg["require_mention"]).lower()
-    if "thread_require_mention" in discord_cfg and not os.getenv("DISCORD_THREAD_REQUIRE_MENTION"):
-        os.environ["DISCORD_THREAD_REQUIRE_MENTION"] = str(discord_cfg["thread_require_mention"]).lower()
-    if "bots_require_inline_mention" in discord_cfg and not os.getenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION"):
-        os.environ["DISCORD_BOTS_REQUIRE_INLINE_MENTION"] = str(discord_cfg["bots_require_inline_mention"]).lower()
     platforms_cfg = yaml_cfg.get("platforms")
     platform_extra_cfg = {}
     if isinstance(platforms_cfg, dict):
@@ -9991,6 +10015,21 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     # a secondary profile's gates must never land in process-global env where
     # they'd become another profile's policy.
     _skip_env_bridge = _profile_scoped_config_load()
+    for yaml_key, env_key in (
+        ("require_mention", "DISCORD_REQUIRE_MENTION"),
+        ("thread_require_mention", "DISCORD_THREAD_REQUIRE_MENTION"),
+        ("bots_require_inline_mention", "DISCORD_BOTS_REQUIRE_INLINE_MENTION"),
+        ("auto_thread", "DISCORD_AUTO_THREAD"),
+        ("history_backfill", "DISCORD_HISTORY_BACKFILL"),
+        ("history_backfill_limit", "DISCORD_HISTORY_BACKFILL_LIMIT"),
+        ("reactions", "DISCORD_REACTIONS"),
+    ):
+        if yaml_key not in discord_cfg:
+            continue
+        value = discord_cfg[yaml_key]
+        seeded_extra[yaml_key] = value
+        if not _skip_env_bridge and not os.getenv(env_key):
+            os.environ[env_key] = str(value).lower()
     allowed_users_cfg = (
         discord_cfg["allow_from"] if "allow_from" in discord_cfg
         else platform_extra_cfg.get("allow_from")
@@ -10032,8 +10071,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         seeded_extra["free_response_channels"] = str(frc)
         if not _skip_env_bridge and not os.getenv("DISCORD_FREE_RESPONSE_CHANNELS"):
             os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
-    if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
-        os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
+
     if "thread_auto_archive_minutes" in discord_cfg:
         seeded_extra["thread_auto_archive_minutes"] = discord_cfg[
             "thread_auto_archive_minutes"
@@ -10045,8 +10083,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             os.environ["DISCORD_THREAD_AUTO_ARCHIVE_MINUTES"] = str(
                 discord_cfg["thread_auto_archive_minutes"]
             )
-    if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
-        os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
+
     backfill_cfg = discord_cfg.get("missed_message_backfill")
     if isinstance(backfill_cfg, dict):
         seeded_extra["missed_message_backfill"] = dict(backfill_cfg)
@@ -10077,11 +10114,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     # history_backfill: recover missed channel messages for shared sessions
     # when require_mention is active.  Fetches messages between bot turns
     # and prepends them to the user message for context.
-    if "history_backfill" in discord_cfg and not os.getenv("DISCORD_HISTORY_BACKFILL"):
-        os.environ["DISCORD_HISTORY_BACKFILL"] = str(discord_cfg["history_backfill"]).lower()
-    hbl = discord_cfg.get("history_backfill_limit")
-    if hbl is not None and not os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT"):
-        os.environ["DISCORD_HISTORY_BACKFILL_LIMIT"] = str(hbl)
+
     # allow_mentions: granular control over what the bot can ping.
     # Safe defaults (no @everyone/roles) are applied in the adapter;
     # these YAML keys only override when set and let users opt back

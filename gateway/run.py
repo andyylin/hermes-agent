@@ -2474,6 +2474,8 @@ _OWN_POLICY_OPEN_ENV = {
 
 def _own_policy_open_startup_violation(config) -> Optional[str]:
     """Return a startup-abort reason when open policy lacks allow-all opt-in."""
+    from gateway.authz_mixin import _platform_gate_env
+
     for platform, platform_config in getattr(config, "platforms", {}).items():
         if not getattr(platform_config, "enabled", False):
             continue
@@ -2484,20 +2486,20 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
         extra = getattr(platform_config, "extra", None) or {}
         dm_policy = str(
             extra.get("dm_policy")
-            or (_getenv(dm_env, "pairing") if dm_env else "pairing")
+            or (_platform_gate_env(dm_env, "pairing") if dm_env else "pairing")
         ).strip().lower()
         group_policy = str(
             extra.get("group_policy")
-            or (_getenv(group_env, "pairing") if group_env else "pairing")
+            or (_platform_gate_env(group_env, "pairing") if group_env else "pairing")
         ).strip().lower()
         if dm_policy != "open" and group_policy != "open":
             continue
-        gateway_allow_all = os.getenv(
+        gateway_allow_all = _platform_gate_env(
             "GATEWAY_ALLOW_ALL_USERS", ""
         ).lower() in {"true", "1", "yes"}
         platform_opted_in = gateway_allow_all or (
             allow_all_env
-            and _getenv(allow_all_env, "").lower() in {"true", "1", "yes"}
+            and _platform_gate_env(allow_all_env, "").lower() in {"true", "1", "yes"}
         )
         if platform_opted_in:
             continue

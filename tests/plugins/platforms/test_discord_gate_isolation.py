@@ -37,6 +37,11 @@ GATE_VARS = [
     "DISCORD_FREE_RESPONSE_CHANNELS",
     "DISCORD_ALLOW_BOTS",
     "DISCORD_THREAD_AUTO_ARCHIVE_MINUTES",
+    "DISCORD_IGNORE_NO_MENTION",
+    "DISCORD_REQUIRE_MENTION",
+    "DISCORD_BOTS_REQUIRE_INLINE_MENTION",
+    "DISCORD_THREAD_REQUIRE_MENTION",
+    "DISCORD_AUTO_THREAD",
 ]
 
 
@@ -127,6 +132,41 @@ class TestTwoAdapterChannelIsolation:
         finally:
             ss.reset_secret_scope(token)
             ss.set_multiplex_active(False)
+
+    @pytest.mark.parametrize("scope", [None, {}])
+    def test_multiplex_routing_policy_ignores_poisoned_globals(self, monkeypatch, scope):
+        from agent import secret_scope as ss
+
+        monkeypatch.setenv("DISCORD_IGNORE_NO_MENTION", "false")
+        monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+        monkeypatch.setenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION", "true")
+        monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "true")
+        monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+        adapter = _adapter()
+        token = ss.set_secret_scope(scope)
+        ss.set_multiplex_active(True)
+        try:
+            assert adapter._discord_ignore_no_mention() is True
+            assert adapter._discord_require_mention() is True
+            assert adapter._discord_bots_require_inline_mention() is False
+            assert adapter._discord_thread_require_mention() is False
+            assert adapter._discord_auto_thread() is True
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
+    def test_single_profile_routing_policy_env_unchanged(self, monkeypatch):
+        monkeypatch.setenv("DISCORD_IGNORE_NO_MENTION", "false")
+        monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+        monkeypatch.setenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION", "true")
+        monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "true")
+        monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+        adapter = _adapter()
+        assert adapter._discord_ignore_no_mention() is False
+        assert adapter._discord_require_mention() is False
+        assert adapter._discord_bots_require_inline_mention() is True
+        assert adapter._discord_thread_require_mention() is True
+        assert adapter._discord_auto_thread() is False
 
 
 class TestTwoAdapterUserRoleIsolation:
@@ -352,6 +392,57 @@ class TestYamlBridgeSeeding:
         # ...but process-global env stays clean: no cross-profile leak.
         assert os.getenv("DISCORD_ALLOWED_CHANNELS") is None
         assert os.getenv("DISCORD_ALLOWED_USERS") is None
+
+    def test_profile_scoped_policy_load_seeds_extra_without_global_writes(self, monkeypatch):
+        from agent import secret_scope
+        from plugins.platforms.discord.adapter import _apply_yaml_config
+
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+        policy_env_names = (
+            "DISCORD_REQUIRE_MENTION",
+            "DISCORD_THREAD_REQUIRE_MENTION",
+            "DISCORD_BOTS_REQUIRE_INLINE_MENTION",
+            "DISCORD_AUTO_THREAD",
+            "DISCORD_HISTORY_BACKFILL",
+            "DISCORD_HISTORY_BACKFILL_LIMIT",
+            "DISCORD_REACTIONS",
+        )
+        for name in policy_env_names:
+            monkeypatch.delenv(name, raising=False)
+        token = secret_scope.set_secret_scope({})
+        try:
+            seeded = _apply_yaml_config(
+                {},
+                {
+                    "require_mention": False,
+                    "thread_require_mention": True,
+                    "bots_require_inline_mention": True,
+                    "auto_thread": False,
+                    "history_backfill": False,
+                    "history_backfill_limit": 17,
+                    "reactions": False,
+                },
+            )
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+        assert seeded["require_mention"] is False
+        assert seeded["thread_require_mention"] is True
+        assert seeded["bots_require_inline_mention"] is True
+        assert seeded["auto_thread"] is False
+        assert seeded["history_backfill"] is False
+        assert seeded["history_backfill_limit"] == 17
+        assert seeded["reactions"] is False
+        for name in (
+            "DISCORD_REQUIRE_MENTION",
+            "DISCORD_THREAD_REQUIRE_MENTION",
+            "DISCORD_BOTS_REQUIRE_INLINE_MENTION",
+            "DISCORD_AUTO_THREAD",
+            "DISCORD_HISTORY_BACKFILL",
+            "DISCORD_HISTORY_BACKFILL_LIMIT",
+            "DISCORD_REACTIONS",
+        ):
+            assert os.getenv(name) is None
 
     def test_first_writer_env_does_not_mask_second_profile_extras(self, monkeypatch):
         """End-to-end shape of the original repro: profile A bridges env first;

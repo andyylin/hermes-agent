@@ -168,7 +168,10 @@ def _resolve_qq_secret(name: str, default: str = "") -> str:
     try:
         val = get_secret(name, default)
     except UnscopedSecretError:
-        val = os.getenv(name)
+        # ``UnscopedSecretError`` means multiplexing is active but no profile
+        # scope is installed.  Borrowing process-global configuration here
+        # would let one profile authorize another, so fail closed.
+        val = default
     return val if val is not None else default
 
 
@@ -3195,7 +3198,7 @@ class QQAdapter(BasePlatformAdapter):
         return stripped
 
     def _open_dm_opted_in(self) -> bool:
-        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+        if _resolve_qq_secret("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
             return True
         return _resolve_qq_secret("QQ_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
 
