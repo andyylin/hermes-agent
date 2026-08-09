@@ -132,3 +132,35 @@ def test_secondary_open_policy_fails_startup_guard(monkeypatch):
     assert violation is not None
     assert "wecom" in violation
     assert "open policy" in violation
+
+
+def test_unscoped_multiplex_authz_ignores_poisoned_global_allowlist(monkeypatch):
+    """An absent profile scope must deny, never borrow process-global auth."""
+    from agent import secret_scope as ss
+    from gateway.run import GatewayRunner
+
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "poisoned-user")
+    token = ss.set_secret_scope(None)
+    ss.set_multiplex_active(True)
+    try:
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.adapters = {}
+        runner._profile_adapters = {}
+        runner.pairing_store = MagicMock()
+        runner.pairing_store.is_approved.return_value = False
+
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            user_id="poisoned-user",
+            chat_id="dm-chat",
+            user_name="poisoned-user",
+            chat_type="dm",
+            profile=None,
+        )
+
+        assert runner._is_user_authorized(source) is False
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)

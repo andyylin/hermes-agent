@@ -36,6 +36,7 @@ GATE_VARS = [
     "DISCORD_NO_THREAD_CHANNELS",
     "DISCORD_FREE_RESPONSE_CHANNELS",
     "DISCORD_ALLOW_BOTS",
+    "DISCORD_THREAD_AUTO_ARCHIVE_MINUTES",
 ]
 
 
@@ -113,6 +114,19 @@ class TestTwoAdapterChannelIsolation:
         _snapshot(b, {"DISCORD_IGNORED_CHANNELS": "322"})
         assert a._get_ignored_channels() == {"311"}
         assert b._get_ignored_channels() == {"322"}
+
+    def test_unscoped_multiplex_retention_ignores_poisoned_global(self, monkeypatch):
+        from agent import secret_scope as ss
+        from plugins.platforms.discord.adapter import _discord_thread_auto_archive_minutes
+
+        monkeypatch.setenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", "60")
+        token = ss.set_secret_scope(None)
+        ss.set_multiplex_active(True)
+        try:
+            assert _discord_thread_auto_archive_minutes(None) == 10080
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
 
 
 class TestTwoAdapterUserRoleIsolation:

@@ -430,6 +430,8 @@ def _scoped_gate_env(name: str, default: str = "") -> str:
 
         return _platform_gate_env(name, default)
     except Exception:
+        if _multiplex_active():
+            return default
         return (os.getenv(name) or default).strip()
 
 

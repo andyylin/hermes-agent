@@ -51,7 +51,9 @@ if $run_tests; then
     tests/gateway/test_discord_free_response.py \
     tests/gateway/test_discord_send.py \
     tests/gateway/test_discord_slash_commands.py \
+    tests/gateway/test_multiplex_profile_authz.py \
     tests/plugins/platforms/test_discord_gate_isolation.py \
+    tests/gateway/test_line_plugin.py \
     tests/tools/test_discord_tool.py \
     tests/tools/test_send_message_tool.py \
     tests/test_bitwarden_encrypted_cache_fail_closed.py \

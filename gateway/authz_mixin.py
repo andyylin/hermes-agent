@@ -33,13 +33,21 @@ def _auth_env(name: str, default: str = "") -> str:
     if not name:
         return default
     try:
-        from agent.secret_scope import get_secret
+        from agent.secret_scope import get_secret, is_multiplex_active
 
         val = get_secret(name)
         if val is not None and str(val).strip():
             return str(val).strip()
+        if is_multiplex_active():
+            return default
     except Exception:
-        pass
+        try:
+            from agent.secret_scope import is_multiplex_active
+
+            if is_multiplex_active():
+                return default
+        except Exception:
+            pass
     return (os.getenv(name) or default).strip()
 
 
@@ -62,13 +70,21 @@ def _platform_gate_env(name: str, default: str = "") -> str:
         from agent.secret_scope import current_secret_scope, is_multiplex_active
 
         scope = current_secret_scope()
-        if scope is not None and is_multiplex_active():
+        if is_multiplex_active():
+            if scope is None:
+                return default
             val = scope.get(name)
             if val is None:
                 return default
             return str(val).strip()
     except Exception:
-        pass
+        try:
+            from agent.secret_scope import is_multiplex_active
+
+            if is_multiplex_active():
+                return default
+        except Exception:
+            pass
     return (os.getenv(name) or default).strip()
 
 
