@@ -1777,6 +1777,45 @@ class TestSendMediaTimeoutCancelsFuture:
         adapter.send_video.assert_called_once()
         assert adapter.send_video.call_args[1]["video_path"] == str(fast.resolve())
 
+    def test_in_flight_media_timeout_is_not_retried(self, tmp_path, monkeypatch):
+        """A timeout after dispatch cannot be safely retried: cancel() == False
+        means the adapter coroutine is already in flight and may still send."""
+        adapter = MagicMock()
+        adapter.send_image_file = AsyncMock()
+
+        in_flight = MagicMock()
+        in_flight.result.side_effect = TimeoutError("timed out")
+        in_flight.cancel.return_value = False
+
+        def fake_run_coro(coro, _loop):
+            coro.close()
+            return in_flight
+
+        root = tmp_path / "media-cache"
+        image = root / "in-flight.png"
+        image.parent.mkdir(parents=True)
+        image.write_bytes(b"image")
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+            (root,),
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            failures = _send_media_via_adapter(
+                adapter,
+                "chat-1",
+                [(str(image), False)],
+                None,
+                MagicMock(),
+                {"id": "media-in-flight-timeout"},
+            )
+
+        in_flight.cancel.assert_called_once_with()
+        assert failures == [], (
+            "already-dispatched media must be assumed delivered so the outer "
+            "standalone fallback cannot duplicate it"
+        )
+
 
 class TestCronDeliveryTargets:
     """``cron_delivery_targets`` powers the dashboard delivery dropdown.

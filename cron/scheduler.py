@@ -1679,8 +1679,16 @@ def _send_media_via_adapter(
             try:
                 result = future.result(timeout=30)
             except TimeoutError:
-                future.cancel()
-                raise
+                cancelled = future.cancel()
+                if cancelled:
+                    raise
+                logger.warning(
+                    "Job '%s': media send for %s timed out after dispatch; "
+                    "assuming delivered and skipping fallback to avoid duplicate",
+                    job.get("id", "?"),
+                    media_path,
+                )
+                continue
             if not _confirm_adapter_delivery(result):
                 msg = (
                     f"media send failed for {media_path}: "
