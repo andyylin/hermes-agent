@@ -168,11 +168,18 @@ def _resolve_qq_secret(name: str, default: str = "") -> str:
     try:
         val = get_secret(name, default)
     except UnscopedSecretError:
-        # ``UnscopedSecretError`` means multiplexing is active but no profile
-        # scope is installed.  Borrowing process-global configuration here
-        # would let one profile authorize another, so fail closed.
-        val = default
+        # The active/primary profile is initialized without a secret scope and
+        # owns process environment credentials. Authorization policy uses the
+        # fail-closed resolver below instead.
+        val = os.getenv(name)
     return val if val is not None else default
+
+
+def _resolve_qq_policy(name: str, default: str = "") -> str:
+    """Resolve QQ authorization policy without cross-profile env fallback."""
+    from gateway.authz_mixin import _platform_gate_env
+
+    return _platform_gate_env(name, default)
 
 
 # ---------------------------------------------------------------------------
@@ -3198,9 +3205,9 @@ class QQAdapter(BasePlatformAdapter):
         return stripped
 
     def _open_dm_opted_in(self) -> bool:
-        if _resolve_qq_secret("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+        if _resolve_qq_policy("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
             return True
-        return _resolve_qq_secret("QQ_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+        return _resolve_qq_policy("QQ_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
 
     def _is_dm_allowed(self, user_id: str) -> bool:
         if self._dm_policy == "disabled":

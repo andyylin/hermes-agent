@@ -224,13 +224,13 @@ class TestQQAdapterOpenPolicyScope:
             ss.reset_secret_scope(tok)
 
     def test_unscoped_multiplex_qq_setting_does_not_fall_back(self, monkeypatch):
-        from gateway.platforms.qqbot.adapter import _resolve_qq_secret
+        from gateway.platforms.qqbot.adapter import _resolve_qq_policy
 
         monkeypatch.setenv("QQ_ALLOW_ALL_USERS", "true")
         ss.set_multiplex_active(True)
         tok = ss.set_secret_scope(None)
         try:
-            assert _resolve_qq_secret("QQ_ALLOW_ALL_USERS", "") == ""
+            assert _resolve_qq_policy("QQ_ALLOW_ALL_USERS", "") == ""
         finally:
             ss.reset_secret_scope(tok)
 
