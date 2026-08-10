@@ -138,6 +138,77 @@ class TestStartupPlatformIsolation:
         assert Platform.TELEGRAM not in runner.adapters
         assert runner._create_adapter.call_count == 2
 
+    @pytest.mark.asyncio
+    async def test_real_start_scopes_primary_creation_and_connect(
+        self, tmp_path, monkeypatch
+    ):
+        from agent import secret_scope
+        from plugins.platforms.discord import adapter as discord_adapter
+
+        runner = _make_runner()
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(enabled=True, token="test")
+            },
+            sessions_dir=tmp_path,
+            multiplex_profiles=True,
+        )
+        runner.hooks = MagicMock()
+        runner.hooks.loaded_hooks = []
+        runner.hooks.emit = AsyncMock()
+        runner._suspend_stuck_loop_sessions = MagicMock(return_value=0)
+        runner._update_runtime_status = MagicMock()
+        runner._update_platform_runtime_status = MagicMock()
+        runner._sync_voice_mode_state_to_adapter = MagicMock()
+        runner._send_update_notification = AsyncMock(return_value=True)
+        runner._send_restart_notification = AsyncMock()
+        (tmp_path / ".env").write_text(
+            "DISCORD_THREAD_REQUIRE_MENTION=true\n", encoding="utf-8"
+        )
+        monkeypatch.setattr("gateway.run.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "false")
+        secret_scope.set_multiplex_active(True)
+        policy_seen = []
+
+        def current_policy():
+            return discord_adapter._scoped_gate_env(
+                "DISCORD_THREAD_REQUIRE_MENTION", "false"
+            )
+
+        adapter = StubAdapter(platform=Platform.TELEGRAM)
+
+        def create_adapter(_platform, _config):
+            policy_seen.append(("create", current_policy()))
+            return adapter
+
+        async def connect_adapter(_adapter, _platform, *, is_reconnect=False):
+            policy_seen.append(("connect", current_policy()))
+            return True
+
+        runner._create_adapter = MagicMock(side_effect=create_adapter)
+        runner._connect_adapter_with_timeout = AsyncMock(side_effect=connect_adapter)
+
+        def fake_create_task(coro):
+            coro.close()
+            return MagicMock()
+
+        with patch("gateway.status.write_runtime_status"), \
+             patch("hermes_cli.plugins.discover_plugins"), \
+             patch("hermes_cli.config.load_config", return_value={}), \
+             patch("agent.shell_hooks.register_from_config"), \
+             patch(
+                 "tools.process_registry.process_registry.recover_from_checkpoint",
+                 return_value=0,
+             ), \
+             patch(
+                 "gateway.channel_directory.build_channel_directory",
+                 new=AsyncMock(return_value={"platforms": {}}),
+             ), \
+             patch("gateway.run.asyncio.create_task", side_effect=fake_create_task):
+            assert await runner.start() is True
+
+        assert policy_seen == [("create", "true"), ("connect", "true")]
+
 
 class TestStartupFailureQueuing:
     """Verify that failed platforms are queued during startup."""
@@ -198,6 +269,63 @@ class TestPlatformReconnectWatcher:
             f"watcher must pass is_reconnect=True; got {succeed_adapter.connect_calls!r}"
         )
         assert Platform.TELEGRAM in runner.adapters
+
+    @pytest.mark.asyncio
+    async def test_real_reconnect_scopes_primary_creation_and_connect(
+        self, tmp_path, monkeypatch
+    ):
+        from agent import secret_scope
+        from plugins.platforms.discord import adapter as discord_adapter
+
+        runner = _make_runner()
+        runner.config.multiplex_profiles = True
+        runner._sync_voice_mode_state_to_adapter = MagicMock()
+        runner._failed_platforms[Platform.TELEGRAM] = {
+            "config": PlatformConfig(enabled=True, token="test"),
+            "attempts": 1,
+            "next_retry": time.monotonic() - 1,
+        }
+        (tmp_path / ".env").write_text(
+            "DISCORD_THREAD_REQUIRE_MENTION=true\n", encoding="utf-8"
+        )
+        monkeypatch.setattr("gateway.run.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "false")
+        secret_scope.set_multiplex_active(True)
+        policy_seen = []
+
+        def current_policy():
+            return discord_adapter._scoped_gate_env(
+                "DISCORD_THREAD_REQUIRE_MENTION", "false"
+            )
+
+        adapter = StubAdapter(succeed=True)
+
+        def create_adapter(_platform, _config):
+            policy_seen.append(("create", current_policy()))
+            return adapter
+
+        async def connect(*, is_reconnect=False):
+            policy_seen.append(("connect", current_policy()))
+            assert is_reconnect is True
+            return True
+
+        adapter.connect = connect
+        real_sleep = asyncio.sleep
+        runner._create_adapter = MagicMock(side_effect=create_adapter)
+        call_count = 0
+
+        async def fake_sleep(_seconds):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 1:
+                runner._running = False
+            await real_sleep(0)
+
+        with patch("gateway.run.build_channel_directory", create=True), \
+             patch("asyncio.sleep", side_effect=fake_sleep):
+            await runner._platform_reconnect_watcher()
+
+        assert policy_seen == [("create", "true"), ("connect", "true")]
 
     @pytest.mark.asyncio
     async def test_cold_connect_defaults_to_is_reconnect_false(self):
