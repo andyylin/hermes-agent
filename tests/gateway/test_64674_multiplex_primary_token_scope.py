@@ -33,6 +33,17 @@ def _reset_multiplex_flag():
 
 
 class TestLoadGatewayConfigForRunner:
+    def test_multiplex_scope_reload_failure_is_fatal(self, monkeypatch):
+        from gateway import run as run_mod
+
+        cfg = GatewayConfig(multiplex_profiles=True)
+        monkeypatch.setattr(run_mod, "load_gateway_config", lambda: cfg)
+        monkeypatch.setattr(
+            run_mod, "get_hermes_home", MagicMock(side_effect=RuntimeError("no home"))
+        )
+        with pytest.raises(RuntimeError, match="multiplex default-profile scope"):
+            run_mod.load_gateway_config_for_runner()
+
     def test_unscoped_when_multiplex_off(self, tmp_path, monkeypatch):
         from gateway import run as run_mod
 

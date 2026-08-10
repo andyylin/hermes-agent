@@ -19,6 +19,20 @@ def _clear_auth_env(monkeypatch) -> None:
         monkeypatch.delenv(key, raising=False)
 
 
+def test_gateway_config_unscoped_multiplex_ignores_process_global_policy(monkeypatch):
+    from agent import secret_scope
+    from gateway.config import _getenv
+
+    monkeypatch.setenv("QQ_ALLOW_ALL_USERS", "true")
+    secret_scope.set_multiplex_active(True)
+    token = secret_scope.set_secret_scope(None)
+    try:
+        assert _getenv("QQ_ALLOW_ALL_USERS", "") == ""
+    finally:
+        secret_scope.reset_secret_scope(token)
+        secret_scope.set_multiplex_active(False)
+
+
 def _make_multiplex_runner(monkeypatch):
     """Runner with default allowlist WeCom and secondary open-policy WeCom."""
     from gateway.run import GatewayRunner

@@ -2023,17 +2023,13 @@ def load_gateway_config_for_runner() -> "GatewayConfig":
         return cfg
     try:
         home = get_hermes_home()
-    except Exception:
-        return cfg
+    except Exception as exc:
+        raise RuntimeError("multiplex default-profile scope is unavailable") from exc
     try:
         with _profile_runtime_scope(Path(home)):
             return load_gateway_config()
-    except Exception:
-        logger.debug(
-            "multiplex default-scope config reload failed; using unscoped load",
-            exc_info=True,
-        )
-        return cfg
+    except Exception as exc:
+        raise RuntimeError("multiplex default-profile scope reload failed") from exc
 
 
 def _platform_has_bot_credential(platform: "Platform", platform_config: "PlatformConfig") -> bool:

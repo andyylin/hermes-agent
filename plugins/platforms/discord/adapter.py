@@ -503,7 +503,7 @@ def check_discord_requirements() -> bool:
     return True
 
 
-def _build_allowed_mentions():
+def _build_allowed_mentions(config: Optional[PlatformConfig] = None):
     """Build Discord ``AllowedMentions`` with safe defaults, overridable via env.
 
     Discord bots default to parsing ``@everyone``, ``@here``, role pings, and
@@ -524,17 +524,28 @@ def _build_allowed_mentions():
     if not DISCORD_AVAILABLE:
         return None
 
-    def _b(name: str, default: bool) -> bool:
-        raw = os.getenv(name, "").strip().lower()
+    mention_cfg = {}
+    if config is not None and isinstance(config.extra, dict):
+        candidate = config.extra.get("allow_mentions")
+        if isinstance(candidate, dict):
+            mention_cfg = candidate
+
+    def _b(yaml_key: str, name: str, default: bool) -> bool:
+        if yaml_key in mention_cfg:
+            value = mention_cfg[yaml_key]
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in {"true", "1", "yes", "on"}
+        raw = _scoped_gate_env(name).strip().lower()
         if not raw:
             return default
         return raw in {"true", "1", "yes", "on"}
 
     return discord.AllowedMentions(
-        everyone=_b("DISCORD_ALLOW_MENTION_EVERYONE", False),
-        roles=_b("DISCORD_ALLOW_MENTION_ROLES", False),
-        users=_b("DISCORD_ALLOW_MENTION_USERS", True),
-        replied_user=_b("DISCORD_ALLOW_MENTION_REPLIED_USER", True),
+        everyone=_b("everyone", "DISCORD_ALLOW_MENTION_EVERYONE", False),
+        roles=_b("roles", "DISCORD_ALLOW_MENTION_ROLES", False),
+        users=_b("users", "DISCORD_ALLOW_MENTION_USERS", True),
+        replied_user=_b("replied_user", "DISCORD_ALLOW_MENTION_REPLIED_USER", True),
     )
 
 
@@ -1139,7 +1150,11 @@ class DiscordAdapter(BasePlatformAdapter):
         self._dedup = MessageDeduplicator()
         # Reply threading mode: "off" (no replies), "first" (reply on first
         # chunk only, default), "all" (reply-reference on every chunk).
-        self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
+        self._reply_to_mode: str = (
+            self.config.extra.get("reply_to_mode")
+            if isinstance(self.config.extra, dict) and "reply_to_mode" in self.config.extra
+            else getattr(config, "reply_to_mode", "first")
+        ) or "first"
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
         # In-memory cache of the bot's last message ID per channel, used by
         # history backfill to skip the full scan on hot paths.  Falls back to
@@ -1360,7 +1375,7 @@ class DiscordAdapter(BasePlatformAdapter):
             self._client = commands.Bot(
                 command_prefix="!",  # Not really used, we handle raw messages
                 intents=intents,
-                allowed_mentions=_build_allowed_mentions(),
+                allowed_mentions=_build_allowed_mentions(self.config),
                 **proxy_kwargs_for_bot(proxy_url),
             )
             adapter_self = self  # capture for closure
@@ -7112,7 +7127,15 @@ class DiscordAdapter(BasePlatformAdapter):
         ``DISCORD_APPROVAL_MENTIONS`` env var). Only numeric allowlist entries
         can be mentioned; default off avoids surprise pings.
         """
-        if not _env_bool("DISCORD_APPROVAL_MENTIONS", False):
+        configured = self.config.extra.get("approval_mentions")
+        if configured is None:
+            configured = _scoped_gate_env("DISCORD_APPROVAL_MENTIONS")
+        enabled = (
+            configured
+            if isinstance(configured, bool)
+            else str(configured or "").strip().lower() in {"true", "1", "yes", "on"}
+        )
+        if not enabled:
             return None
         user_ids = sorted(uid for uid in self._allowed_user_ids if str(uid).isdigit())
         if not user_ids:
@@ -10062,8 +10085,10 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         discord_cfg["approval_mentions"] if "approval_mentions" in discord_cfg
         else platform_extra_cfg.get("approval_mentions")
     )
-    if approval_mentions_cfg is not None and not os.getenv("DISCORD_APPROVAL_MENTIONS"):
-        os.environ["DISCORD_APPROVAL_MENTIONS"] = str(approval_mentions_cfg).lower()
+    if approval_mentions_cfg is not None:
+        seeded_extra["approval_mentions"] = approval_mentions_cfg
+        if not _skip_env_bridge and not os.getenv("DISCORD_APPROVAL_MENTIONS"):
+            os.environ["DISCORD_APPROVAL_MENTIONS"] = str(approval_mentions_cfg).lower()
     frc = discord_cfg.get("free_response_channels")
     if frc is not None:
         if isinstance(frc, list):
@@ -10121,13 +10146,18 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     # into unsafe modes (e.g. roles=true) if they actually want it.
     allow_mentions_cfg = discord_cfg.get("allow_mentions")
     if isinstance(allow_mentions_cfg, dict):
+        seeded_extra["allow_mentions"] = dict(allow_mentions_cfg)
         for yaml_key, env_key in (
             ("everyone", "DISCORD_ALLOW_MENTION_EVERYONE"),
             ("roles", "DISCORD_ALLOW_MENTION_ROLES"),
             ("users", "DISCORD_ALLOW_MENTION_USERS"),
             ("replied_user", "DISCORD_ALLOW_MENTION_REPLIED_USER"),
         ):
-            if yaml_key in allow_mentions_cfg and not os.getenv(env_key):
+            if (
+                yaml_key in allow_mentions_cfg
+                and not _skip_env_bridge
+                and not os.getenv(env_key)
+            ):
                 os.environ[env_key] = str(allow_mentions_cfg[yaml_key]).lower()
     # reply_to_mode: top-level preferred, falls back to extra.reply_to_mode.
     # YAML 1.1 parses bare 'off' as boolean False — coerce to string "off".
@@ -10136,9 +10166,11 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         discord_cfg["reply_to_mode"] if "reply_to_mode" in discord_cfg
         else _discord_extra.get("reply_to_mode")
     )
-    if _discord_rtm is not None and not os.getenv("DISCORD_REPLY_TO_MODE"):
+    if _discord_rtm is not None:
         _rtm_str = "off" if _discord_rtm is False else str(_discord_rtm).lower()
-        os.environ["DISCORD_REPLY_TO_MODE"] = _rtm_str
+        seeded_extra["reply_to_mode"] = _rtm_str
+        if not _skip_env_bridge and not os.getenv("DISCORD_REPLY_TO_MODE"):
+            os.environ["DISCORD_REPLY_TO_MODE"] = _rtm_str
     _websocket_extra_cfg = discord_cfg.get("extra")
     if not isinstance(_websocket_extra_cfg, dict):
         _websocket_extra_cfg = {}

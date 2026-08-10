@@ -42,6 +42,12 @@ GATE_VARS = [
     "DISCORD_BOTS_REQUIRE_INLINE_MENTION",
     "DISCORD_THREAD_REQUIRE_MENTION",
     "DISCORD_AUTO_THREAD",
+    "DISCORD_APPROVAL_MENTIONS",
+    "DISCORD_ALLOW_MENTION_EVERYONE",
+    "DISCORD_ALLOW_MENTION_ROLES",
+    "DISCORD_ALLOW_MENTION_USERS",
+    "DISCORD_ALLOW_MENTION_REPLIED_USER",
+    "DISCORD_REPLY_TO_MODE",
 ]
 
 
@@ -406,6 +412,12 @@ class TestYamlBridgeSeeding:
             "DISCORD_HISTORY_BACKFILL",
             "DISCORD_HISTORY_BACKFILL_LIMIT",
             "DISCORD_REACTIONS",
+            "DISCORD_APPROVAL_MENTIONS",
+            "DISCORD_ALLOW_MENTION_EVERYONE",
+            "DISCORD_ALLOW_MENTION_ROLES",
+            "DISCORD_ALLOW_MENTION_USERS",
+            "DISCORD_ALLOW_MENTION_REPLIED_USER",
+            "DISCORD_REPLY_TO_MODE",
         )
         for name in policy_env_names:
             monkeypatch.delenv(name, raising=False)
@@ -421,6 +433,14 @@ class TestYamlBridgeSeeding:
                     "history_backfill": False,
                     "history_backfill_limit": 17,
                     "reactions": False,
+                    "approval_mentions": True,
+                    "allow_mentions": {
+                        "everyone": True,
+                        "roles": True,
+                        "users": False,
+                        "replied_user": False,
+                    },
+                    "reply_to_mode": "all",
                 },
             )
         finally:
@@ -433,16 +453,48 @@ class TestYamlBridgeSeeding:
         assert seeded["history_backfill"] is False
         assert seeded["history_backfill_limit"] == 17
         assert seeded["reactions"] is False
-        for name in (
-            "DISCORD_REQUIRE_MENTION",
-            "DISCORD_THREAD_REQUIRE_MENTION",
-            "DISCORD_BOTS_REQUIRE_INLINE_MENTION",
-            "DISCORD_AUTO_THREAD",
-            "DISCORD_HISTORY_BACKFILL",
-            "DISCORD_HISTORY_BACKFILL_LIMIT",
-            "DISCORD_REACTIONS",
-        ):
+        assert seeded["approval_mentions"] is True
+        assert seeded["allow_mentions"] == {
+            "everyone": True,
+            "roles": True,
+            "users": False,
+            "replied_user": False,
+        }
+        assert seeded["reply_to_mode"] == "all"
+        for name in policy_env_names:
             assert os.getenv(name) is None
+
+    def test_outbound_mentions_and_reply_policy_use_adapter_extra_not_global(self, monkeypatch):
+        from plugins.platforms.discord import adapter as discord_adapter
+
+        monkeypatch.setenv("DISCORD_ALLOW_MENTION_EVERYONE", "true")
+        monkeypatch.setenv("DISCORD_ALLOW_MENTION_ROLES", "true")
+        monkeypatch.setenv("DISCORD_APPROVAL_MENTIONS", "true")
+        monkeypatch.setenv("DISCORD_REPLY_TO_MODE", "all")
+
+        cfg = PlatformConfig(
+            enabled=True,
+            token="x",
+            reply_to_mode="all",
+            extra={
+                "allow_mentions": {"everyone": False, "roles": False},
+                "approval_mentions": False,
+                "reply_to_mode": "off",
+            },
+        )
+        discord_adapter.discord.AllowedMentions.reset_mock()
+        discord_adapter._build_allowed_mentions(cfg)
+        mention_kwargs = discord_adapter.discord.AllowedMentions.call_args.kwargs
+        assert mention_kwargs["everyone"] is False
+        assert mention_kwargs["roles"] is False
+
+        adapter = _adapter(cfg.extra)
+        adapter._reply_to_mode = adapter.config.extra.get(
+            "reply_to_mode", adapter.config.reply_to_mode
+        )
+        adapter._allowed_user_ids = {"123"}
+        assert adapter._approval_mention_content() is None
+        assert adapter._reply_to_mode == "off"
 
     def test_first_writer_env_does_not_mask_second_profile_extras(self, monkeypatch):
         """End-to-end shape of the original repro: profile A bridges env first;
