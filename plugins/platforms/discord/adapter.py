@@ -7127,7 +7127,8 @@ class DiscordAdapter(BasePlatformAdapter):
         ``DISCORD_APPROVAL_MENTIONS`` env var). Only numeric allowlist entries
         can be mentioned; default off avoids surprise pings.
         """
-        configured = self.config.extra.get("approval_mentions")
+        config_extra = self.config.extra if isinstance(self.config.extra, dict) else {}
+        configured = config_extra.get("approval_mentions")
         if configured is None:
             configured = _scoped_gate_env("DISCORD_APPROVAL_MENTIONS")
         enabled = (

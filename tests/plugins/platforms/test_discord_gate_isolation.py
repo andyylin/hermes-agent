@@ -482,6 +482,9 @@ class TestYamlBridgeSeeding:
                 "reply_to_mode": "off",
             },
         )
+        fake_discord = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+        monkeypatch.setattr(discord_adapter, "DISCORD_AVAILABLE", True)
+        monkeypatch.setattr(discord_adapter, "discord", fake_discord)
         discord_adapter.discord.AllowedMentions.reset_mock()
         discord_adapter._build_allowed_mentions(cfg)
         mention_kwargs = discord_adapter.discord.AllowedMentions.call_args.kwargs

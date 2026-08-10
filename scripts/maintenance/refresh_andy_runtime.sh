@@ -49,6 +49,7 @@ if $run_tests; then
   fi
   "$python_bin" -m pytest -q \
     tests/gateway/test_discord_free_response.py \
+    tests/gateway/test_discord_approval_mentions.py \
     tests/gateway/test_discord_send.py \
     tests/gateway/test_discord_slash_commands.py \
     tests/gateway/test_multiplex_profile_authz.py \
