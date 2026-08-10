@@ -218,6 +218,38 @@ async def test_forum_post_file_creates_thread_with_attachment():
 
 
 @pytest.mark.asyncio
+async def test_forum_post_file_uses_profile_thread_retention(monkeypatch):
+    monkeypatch.delenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", raising=False)
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"thread_auto_archive_minutes": 1440},
+        )
+    )
+    thread = SimpleNamespace(
+        id=777,
+        message=SimpleNamespace(
+            id=800,
+            attachments=[SimpleNamespace(filename="photo.png")],
+        ),
+        thread=SimpleNamespace(id=777, send=AsyncMock()),
+    )
+    forum_channel = _discord_mod.ForumChannel()
+    forum_channel.id = 999
+    forum_channel.create_thread = AsyncMock(return_value=thread)
+
+    result = await adapter._forum_post_file(
+        forum_channel,
+        content="photo",
+        file=SimpleNamespace(filename="photo.png"),
+    )
+
+    assert result.success is True
+    assert forum_channel.create_thread.await_args.kwargs["auto_archive_duration"] == 1440
+
+
+@pytest.mark.asyncio
 async def test_forum_post_file_fails_when_starter_has_no_attachments():
     """Forum create_thread can succeed yet return an attachmentless starter (#66797)."""
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))

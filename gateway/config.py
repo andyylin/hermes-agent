@@ -17,7 +17,11 @@ from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
 
 from hermes_cli.config import get_hermes_home
-from agent.secret_scope import current_secret_scope, get_secret as _get_secret
+from agent.secret_scope import (
+    current_secret_scope,
+    get_secret as _get_secret,
+    is_multiplex_active,
+)
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -243,6 +247,8 @@ def _getenv(name: str, default: Optional[str] = None) -> Optional[str]:
     if current_secret_scope() is not None:
         scope_val = _get_secret(name, None)
         return scope_val if scope_val is not None else default
+    if is_multiplex_active():
+        return default
     env_val = os.environ.get(name)
     if env_val is not None:
         return env_val
@@ -1681,6 +1687,7 @@ def load_gateway_config() -> GatewayConfig:
             # ``apply_yaml_config_fn`` hook (see plugins/platforms/slack/
             # adapter.py::_apply_yaml_config), dispatched in the
             # ``apply_yaml_config_fn`` loop above. #41112 / #3823.
+
 
             # Bridge top-level require_mention to Telegram when the telegram: section
             # does not already provide one.  Users often write "require_mention: true"

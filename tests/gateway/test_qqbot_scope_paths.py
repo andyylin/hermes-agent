@@ -97,16 +97,6 @@ class TestAuthzAllowAllScope:
         finally:
             ss.reset_secret_scope(tok)
 
-    @pytest.mark.xfail(
-        reason=(
-            "gateway/authz_mixin.py still reads the platform allow-all flag via "
-            "_auth_env, which falls through to os.environ on a scoped miss; the "
-            "scope-authoritative gate (_platform_gate_env semantics) for the "
-            "remaining authz_mixin reads lands in a separate PR. Flips green "
-            "when that PR converts the allow-all read."
-        ),
-        strict=True,
-    )
     def test_scope_does_not_inherit_environ_opt_in(self, monkeypatch):
         # The PRIMARY profile opted in via os.environ; the secondary profile's
         # scope has no opt-in. The secondary must NOT inherit the primary's
@@ -196,12 +186,61 @@ class TestStartupValidatorScope:
         assert violation is not None
         assert "qqbot" in violation
 
+    def test_scope_does_not_inherit_global_gateway_opt_in(self, monkeypatch):
+        from gateway.run import _own_policy_open_startup_violation
+
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        ss.set_multiplex_active(True)
+        tok = ss.set_secret_scope({})
+        try:
+            violation = _own_policy_open_startup_violation(self._open_dm_config())
+        finally:
+            ss.reset_secret_scope(tok)
+        assert violation is not None
+        assert "qqbot" in violation
+
     def test_unscoped_environ_unchanged(self, monkeypatch):
         # Single-profile startup (no scope installed) keeps reading environ.
         from gateway.run import _own_policy_open_startup_violation
 
         monkeypatch.setenv("QQ_ALLOW_ALL_USERS", "true")
         assert _own_policy_open_startup_violation(self._open_dm_config()) is None
+
+
+class TestQQAdapterOpenPolicyScope:
+    @pytest.mark.parametrize("scope", [None, {}])
+    def test_multiplex_does_not_inherit_global_gateway_opt_in(self, monkeypatch, scope):
+        from gateway.platforms.qqbot.adapter import QQAdapter
+
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        adapter = object.__new__(QQAdapter)
+        adapter._dm_policy = "open"
+        ss.set_multiplex_active(True)
+        tok = ss.set_secret_scope(scope)
+        try:
+            assert adapter._is_dm_allowed("secondary-user") is False
+            assert adapter._is_dm_intake_allowed("secondary-user") is False
+        finally:
+            ss.reset_secret_scope(tok)
+
+    def test_unscoped_multiplex_qq_setting_does_not_fall_back(self, monkeypatch):
+        from gateway.platforms.qqbot.adapter import _resolve_qq_policy
+
+        monkeypatch.setenv("QQ_ALLOW_ALL_USERS", "true")
+        ss.set_multiplex_active(True)
+        tok = ss.set_secret_scope(None)
+        try:
+            assert _resolve_qq_policy("QQ_ALLOW_ALL_USERS", "") == ""
+        finally:
+            ss.reset_secret_scope(tok)
+
+    def test_single_profile_global_gateway_opt_in_unchanged(self, monkeypatch):
+        from gateway.platforms.qqbot.adapter import QQAdapter
+
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        adapter = object.__new__(QQAdapter)
+        adapter._dm_policy = "open"
+        assert adapter._is_dm_allowed("legacy-user") is True
 
 
 class TestDirectSendScope:

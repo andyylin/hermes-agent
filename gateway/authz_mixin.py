@@ -33,13 +33,21 @@ def _auth_env(name: str, default: str = "") -> str:
     if not name:
         return default
     try:
-        from agent.secret_scope import get_secret
+        from agent.secret_scope import get_secret, is_multiplex_active
 
         val = get_secret(name)
         if val is not None and str(val).strip():
             return str(val).strip()
+        if is_multiplex_active():
+            return default
     except Exception:
-        pass
+        try:
+            from agent.secret_scope import is_multiplex_active
+
+            if is_multiplex_active():
+                return default
+        except Exception:
+            pass
     return (os.getenv(name) or default).strip()
 
 
@@ -62,13 +70,21 @@ def _platform_gate_env(name: str, default: str = "") -> str:
         from agent.secret_scope import current_secret_scope, is_multiplex_active
 
         scope = current_secret_scope()
-        if scope is not None and is_multiplex_active():
+        if is_multiplex_active():
+            if scope is None:
+                return default
             val = scope.get(name)
             if val is None:
                 return default
             return str(val).strip()
     except Exception:
-        pass
+        try:
+            from agent.secret_scope import is_multiplex_active
+
+            if is_multiplex_active():
+                return default
+        except Exception:
+            pass
     return (os.getenv(name) or default).strip()
 
 
@@ -82,7 +98,7 @@ def _coerce_allow_set(raw) -> set[str]:
     """
     if raw is None:
         return set()
-    if isinstance(raw, list):
+    if isinstance(raw, (list, tuple, set, frozenset)):
         return {str(part).strip() for part in raw if str(part).strip()}
     return {part.strip() for part in str(raw).split(",") if part.strip()}
 
@@ -455,7 +471,14 @@ class GatewayAuthorizationMixin:
                 Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
                 Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
             }.get(source.platform, "")
-            if chat_allowlist_env:
+            chat_allowlist_envs = (chat_allowlist_env,) if chat_allowlist_env else ()
+            is_line = bool(source.platform and source.platform.value == "line")
+            if is_line:
+                # LINE authorization must use the profile-selected live adapter,
+                # not process-global env. In multiplex mode another profile may
+                # use different group grants in the same gateway process.
+                chat_allowlist_envs = ()
+            for chat_allowlist_env in chat_allowlist_envs:
                 raw_chat_allowlist = _platform_gate_env(chat_allowlist_env)
                 if raw_chat_allowlist:
                     allowed_group_ids = {
@@ -475,12 +498,22 @@ class GatewayAuthorizationMixin:
             try:
                 adapter = self._adapter_for_source(source)
                 if adapter is not None:
-                    extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
-                    adapter_group_allowed = extra.get("group_allowed_chats")
-                    if adapter_group_allowed:
-                        allowed = _coerce_allow_set(adapter_group_allowed)
-                        if "*" in allowed or source.chat_id in allowed:
-                            return True
+                    if is_line:
+                        # The adapter already merged profile-scoped YAML with
+                        # its environment bridge. Read-only groups are omitted:
+                        # they archive and return before creating MessageEvent.
+                        adapter_group_allowlists = [
+                            getattr(adapter, "allowed_groups", set()),
+                            getattr(adapter, "archive_groups", set()),
+                        ]
+                    else:
+                        extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
+                        adapter_group_allowlists = [extra.get("group_allowed_chats")]
+                    for adapter_group_allowed in adapter_group_allowlists:
+                        if adapter_group_allowed:
+                            allowed = _coerce_allow_set(adapter_group_allowed)
+                            if "*" in allowed or source.chat_id in allowed:
+                                return True
             except Exception:
                 pass
 
@@ -850,6 +883,21 @@ class GatewayAuthorizationMixin:
         # if any allowlist is configured for this platform, silently drop
         # unauthorized messages instead of sending pairing codes.
         if platform:
+            # LINE policy is already resolved by the profile-owned adapter.
+            # Never re-read its env vars here: this message path can run outside
+            # a profile secret scope in multiplex mode, where os.environ may
+            # contain another profile's policy.
+            if platform.value == "line":
+                adapter = self._authorization_adapter(platform, profile)
+                for attr in (
+                    "allowed_users",
+                    "allowed_groups",
+                    "archive_groups",
+                    "allowed_rooms",
+                ):
+                    if _coerce_allow_set(getattr(adapter, attr, None)):
+                        return "ignore"
+
             platform_env_map = {
                 Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",
                 Platform.DISCORD:  "DISCORD_ALLOWED_USERS",

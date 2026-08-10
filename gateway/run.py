@@ -2021,19 +2021,22 @@ def load_gateway_config_for_runner() -> "GatewayConfig":
     cfg = load_gateway_config()
     if not getattr(cfg, "multiplex_profiles", False):
         return cfg
+    # Activate multiplex semantics before the scoped reload. Platform config
+    # bridges use this flag to keep behavioral policy profile-local; setting it
+    # only after this helper returned allowed the primary reload to mutate
+    # process-global policy.
+    from agent.secret_scope import set_multiplex_active
+
+    set_multiplex_active(True)
     try:
         home = get_hermes_home()
-    except Exception:
-        return cfg
+    except Exception as exc:
+        raise RuntimeError("multiplex default-profile scope is unavailable") from exc
     try:
         with _profile_runtime_scope(Path(home)):
             return load_gateway_config()
-    except Exception:
-        logger.debug(
-            "multiplex default-scope config reload failed; using unscoped load",
-            exc_info=True,
-        )
-        return cfg
+    except Exception as exc:
+        raise RuntimeError("multiplex default-profile scope reload failed") from exc
 
 
 def _platform_has_bot_credential(platform: "Platform", platform_config: "PlatformConfig") -> bool:
@@ -2474,6 +2477,8 @@ _OWN_POLICY_OPEN_ENV = {
 
 def _own_policy_open_startup_violation(config) -> Optional[str]:
     """Return a startup-abort reason when open policy lacks allow-all opt-in."""
+    from gateway.authz_mixin import _platform_gate_env
+
     for platform, platform_config in getattr(config, "platforms", {}).items():
         if not getattr(platform_config, "enabled", False):
             continue
@@ -2484,20 +2489,20 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
         extra = getattr(platform_config, "extra", None) or {}
         dm_policy = str(
             extra.get("dm_policy")
-            or (_getenv(dm_env, "pairing") if dm_env else "pairing")
+            or (_platform_gate_env(dm_env, "pairing") if dm_env else "pairing")
         ).strip().lower()
         group_policy = str(
             extra.get("group_policy")
-            or (_getenv(group_env, "pairing") if group_env else "pairing")
+            or (_platform_gate_env(group_env, "pairing") if group_env else "pairing")
         ).strip().lower()
         if dm_policy != "open" and group_policy != "open":
             continue
-        gateway_allow_all = os.getenv(
+        gateway_allow_all = _platform_gate_env(
             "GATEWAY_ALLOW_ALL_USERS", ""
         ).lower() in {"true", "1", "yes"}
         platform_opted_in = gateway_allow_all or (
             allow_all_env
-            and _getenv(allow_all_env, "").lower() in {"true", "1", "yes"}
+            and _platform_gate_env(allow_all_env, "").lower() in {"true", "1", "yes"}
         )
         if platform_opted_in:
             continue
@@ -6694,6 +6699,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if platform == Platform.TELEGRAM:
             return _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT
         return _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT
+
+    def _primary_adapter_runtime_scope(self):
+        """Scope primary adapter lifecycle operations to the default profile."""
+        from contextlib import nullcontext
+
+        if not bool(getattr(self.config, "multiplex_profiles", False)):
+            return nullcontext()
+        return _profile_runtime_scope(Path(get_hermes_home()))
+
+    def _create_primary_adapter(self, platform, platform_config):
+        with self._primary_adapter_runtime_scope():
+            return self._create_adapter(platform, platform_config)
+
+    async def _connect_primary_adapter_with_timeout(
+        self, adapter, platform, *, is_reconnect: bool = False
+    ) -> bool:
+        with self._primary_adapter_runtime_scope():
+            if is_reconnect:
+                return await self._connect_adapter_with_timeout(
+                    adapter, platform, is_reconnect=True
+                )
+            return await self._connect_initial_adapter_with_timeout(adapter, platform)
 
     async def _connect_adapter_with_timeout(
         self, adapter, platform, *, is_reconnect: bool = False
@@ -11312,7 +11339,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             enabled_platform_count += 1
             
-            adapter = self._create_adapter(platform, platform_config)
+            adapter = self._create_primary_adapter(platform, platform_config)
             if not adapter:
                 # Distinguish between missing builtin deps and missing plugin
                 _pval = platform.value
@@ -11351,7 +11378,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 error_message=None,
             )
             try:
-                success = await self._connect_initial_adapter_with_timeout(
+                success = await self._connect_primary_adapter_with_timeout(
                     adapter, platform
                 )
                 if await self._abort_startup_if_shutdown_requested(adapter, platform):
@@ -12705,7 +12732,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 adapter = None
                 try:
-                    adapter = self._create_adapter(platform, platform_config)
+                    adapter = self._create_primary_adapter(platform, platform_config)
                     if not adapter:
                         logger.warning(
                             "Reconnect %s: adapter creation returned None, removing from retry queue",
@@ -12728,7 +12755,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reconnect after an outage: preserve the platform's
                     # server-side update queue so messages sent while the bot
                     # was offline are delivered rather than dropped (#46621).
-                    success = await self._connect_adapter_with_timeout(
+                    success = await self._connect_primary_adapter_with_timeout(
                         adapter, platform, is_reconnect=True
                     )
                     if success:
@@ -20528,12 +20555,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_name,
         )
         try:
+            rename_options: Dict[str, Any] = {
+                "only_if_current_name": guard_name,
+            }
+            if use_connector_guard:
+                rename_options["prefer_connector_created"] = True
+                rename_options["parent_chat_id"] = parent_chat_id
             renamed = await rename_thread(
                 target_thread_id,
                 thread_name,
-                prefer_connector_created=use_connector_guard,
-                only_if_current_name=guard_name,
-                parent_chat_id=parent_chat_id,
+                **rename_options,
             )
             logger.info(
                 "discord auto-thread rename result: thread=%s applied=%s",

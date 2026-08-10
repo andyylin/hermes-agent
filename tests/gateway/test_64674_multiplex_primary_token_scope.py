@@ -14,6 +14,7 @@ this suite locks the complementary primary-path fixes:
 """
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -33,6 +34,41 @@ def _reset_multiplex_flag():
 
 
 class TestLoadGatewayConfigForRunner:
+    def test_enables_multiplex_before_scoped_reload(self, monkeypatch):
+        from agent import secret_scope as ss
+        from gateway import run as run_mod
+
+        cfg = GatewayConfig(multiplex_profiles=True)
+        calls = 0
+
+        def fake_load():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                assert ss.is_multiplex_active() is True, (
+                    "the scoped reload must already be in multiplex mode so "
+                    "YAML bridges cannot write process-global policy"
+                )
+            return cfg
+
+        monkeypatch.setattr(run_mod, "load_gateway_config", fake_load)
+        monkeypatch.setattr(run_mod, "get_hermes_home", lambda: Path("/tmp/default"))
+        monkeypatch.setattr(run_mod, "_profile_runtime_scope", lambda _home: nullcontext())
+
+        assert run_mod.load_gateway_config_for_runner() is cfg
+        assert calls == 2
+
+    def test_multiplex_scope_reload_failure_is_fatal(self, monkeypatch):
+        from gateway import run as run_mod
+
+        cfg = GatewayConfig(multiplex_profiles=True)
+        monkeypatch.setattr(run_mod, "load_gateway_config", lambda: cfg)
+        monkeypatch.setattr(
+            run_mod, "get_hermes_home", MagicMock(side_effect=RuntimeError("no home"))
+        )
+        with pytest.raises(RuntimeError, match="multiplex default-profile scope"):
+            run_mod.load_gateway_config_for_runner()
+
     def test_unscoped_when_multiplex_off(self, tmp_path, monkeypatch):
         from gateway import run as run_mod
 
@@ -234,3 +270,68 @@ class TestReconnectDropsEmptyToken:
         # Simulate watcher drop
         del failed[platform]
         assert failed == {}
+
+
+class TestPrimaryAdapterRuntimeScope:
+    def _runner(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        return runner
+
+    def test_creation_runs_in_default_profile_scope(self, tmp_path, monkeypatch):
+        from agent import secret_scope
+        from gateway import run as run_mod
+        from plugins.platforms.discord import adapter as discord_adapter
+
+        runner = self._runner()
+        (tmp_path / ".env").write_text(
+            "DISCORD_THREAD_REQUIRE_MENTION=true\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(run_mod, "get_hermes_home", lambda: tmp_path)
+        monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "false")
+        secret_scope.set_multiplex_active(True)
+        runner._create_adapter = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda *_args: discord_adapter._scoped_gate_env(
+                "DISCORD_THREAD_REQUIRE_MENTION", "false"
+            )
+        )
+
+        assert runner._create_primary_adapter(
+            Platform.DISCORD, PlatformConfig()
+        ) == "true"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_reconnect", [False, True])
+    async def test_initial_and_reconnect_run_in_default_profile_scope(
+        self, tmp_path, monkeypatch, is_reconnect
+    ):
+        from gateway import run as run_mod
+
+        runner = self._runner()
+        entered = []
+
+        @contextmanager
+        def fake_scope(home):
+            entered.append(Path(home))
+            yield
+
+        async def initial(_adapter, _platform):
+            assert entered == [tmp_path]
+            return True
+
+        async def reconnect(_adapter, _platform, *, is_reconnect=False):
+            assert entered == [tmp_path]
+            assert is_reconnect is True
+            return True
+
+        monkeypatch.setattr(run_mod, "get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(run_mod, "_profile_runtime_scope", fake_scope)
+        runner._connect_initial_adapter_with_timeout = initial  # type: ignore[method-assign]
+        runner._connect_adapter_with_timeout = reconnect  # type: ignore[method-assign]
+
+        assert await runner._connect_primary_adapter_with_timeout(
+            MagicMock(), Platform.DISCORD, is_reconnect=is_reconnect
+        ) is True
+        assert entered == [tmp_path]
