@@ -2021,6 +2021,13 @@ def load_gateway_config_for_runner() -> "GatewayConfig":
     cfg = load_gateway_config()
     if not getattr(cfg, "multiplex_profiles", False):
         return cfg
+    # Activate multiplex semantics before the scoped reload. Platform config
+    # bridges use this flag to keep behavioral policy profile-local; setting it
+    # only after this helper returned allowed the primary reload to mutate
+    # process-global policy.
+    from agent.secret_scope import set_multiplex_active
+
+    set_multiplex_active(True)
     try:
         home = get_hermes_home()
     except Exception as exc:
@@ -6693,6 +6700,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT
         return _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT
 
+    def _primary_adapter_runtime_scope(self):
+        """Scope primary adapter lifecycle operations to the default profile."""
+        from contextlib import nullcontext
+
+        if not bool(getattr(self.config, "multiplex_profiles", False)):
+            return nullcontext()
+        return _profile_runtime_scope(Path(get_hermes_home()))
+
+    def _create_primary_adapter(self, platform, platform_config):
+        with self._primary_adapter_runtime_scope():
+            return self._create_adapter(platform, platform_config)
+
+    async def _connect_primary_adapter_with_timeout(
+        self, adapter, platform, *, is_reconnect: bool = False
+    ) -> bool:
+        with self._primary_adapter_runtime_scope():
+            if is_reconnect:
+                return await self._connect_adapter_with_timeout(
+                    adapter, platform, is_reconnect=True
+                )
+            return await self._connect_initial_adapter_with_timeout(adapter, platform)
+
     async def _connect_adapter_with_timeout(
         self, adapter, platform, *, is_reconnect: bool = False
     ) -> bool:
@@ -11310,7 +11339,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             enabled_platform_count += 1
             
-            adapter = self._create_adapter(platform, platform_config)
+            adapter = self._create_primary_adapter(platform, platform_config)
             if not adapter:
                 # Distinguish between missing builtin deps and missing plugin
                 _pval = platform.value
@@ -11349,7 +11378,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 error_message=None,
             )
             try:
-                success = await self._connect_initial_adapter_with_timeout(
+                success = await self._connect_primary_adapter_with_timeout(
                     adapter, platform
                 )
                 if await self._abort_startup_if_shutdown_requested(adapter, platform):
@@ -12703,7 +12732,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 adapter = None
                 try:
-                    adapter = self._create_adapter(platform, platform_config)
+                    adapter = self._create_primary_adapter(platform, platform_config)
                     if not adapter:
                         logger.warning(
                             "Reconnect %s: adapter creation returned None, removing from retry queue",
@@ -12726,7 +12755,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reconnect after an outage: preserve the platform's
                     # server-side update queue so messages sent while the bot
                     # was offline are delivered rather than dropped (#46621).
-                    success = await self._connect_adapter_with_timeout(
+                    success = await self._connect_primary_adapter_with_timeout(
                         adapter, platform, is_reconnect=True
                     )
                     if success:
