@@ -167,7 +167,7 @@ class TestStartupPlatformIsolation:
         )
         monkeypatch.setattr("gateway.run.get_hermes_home", lambda: tmp_path)
         monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "false")
-        secret_scope.set_multiplex_active(True)
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
         policy_seen = []
 
         def current_policy():
@@ -290,7 +290,7 @@ class TestPlatformReconnectWatcher:
         )
         monkeypatch.setattr("gateway.run.get_hermes_home", lambda: tmp_path)
         monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "false")
-        secret_scope.set_multiplex_active(True)
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
         policy_seen = []
 
         def current_policy():
