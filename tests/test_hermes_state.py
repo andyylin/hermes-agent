@@ -702,38 +702,38 @@ class TestFTS5Search:
         db.append_message("s1", role="user", content="after")
 
         statements = []
-        read_conn = db._get_read_conn() or db._conn
-        traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
-            conn.set_trace_callback(statements.append)
-
-        def context_query_count():
-            normalized = (" ".join(sql.upper().split()) for sql in statements)
-            return sum("WITH TARGET AS (" in sql for sql in normalized)
-
-        try:
-            projected = db.search_messages(
-                "projectionneedle", fields=("session_id", "snippet")
-            )
-            assert len(projected) == 1
-            assert context_query_count() == 0
-
-            full = db.search_messages(
-                "projectionneedle", fields=("session_id", "context")
-            )
-            assert len(full) == 1
-            assert full[0]["context"]
-            assert context_query_count() == 1
-
-            default = db.search_messages("projectionneedle")
-            assert len(default) == 1
-            assert default[0]["context"]
-            assert context_query_count() == 2
-        finally:
+        with db._read_ctx() as read_conn:
+            traced_connections = [db._conn]
+            if read_conn is not db._conn:
+                traced_connections.append(read_conn)
             for conn in traced_connections:
-                conn.set_trace_callback(None)
+                conn.set_trace_callback(statements.append)
+
+            def context_query_count():
+                normalized = (" ".join(sql.upper().split()) for sql in statements)
+                return sum("WITH TARGET AS (" in sql for sql in normalized)
+
+            try:
+                projected = db.search_messages(
+                    "projectionneedle", fields=("session_id", "snippet")
+                )
+                assert len(projected) == 1
+                assert context_query_count() == 0
+
+                full = db.search_messages(
+                    "projectionneedle", fields=("session_id", "context")
+                )
+                assert len(full) == 1
+                assert full[0]["context"]
+                assert context_query_count() == 1
+
+                default = db.search_messages("projectionneedle")
+                assert len(default) == 1
+                assert default[0]["context"]
+                assert context_query_count() == 2
+            finally:
+                for conn in traced_connections:
+                    conn.set_trace_callback(None)
 
     def test_sanitize_fts5_query_strips_dangerous_chars(self):
         """Unit test for _sanitize_fts5_query static method."""
@@ -4468,10 +4468,10 @@ class TestPerformancePragmasEndToEnd:
         try:
             # Writer connection.
             assert self._read(db._conn) == self.CONFIGURED
-            # WAL per-thread reader.
-            rconn = db._get_read_conn()
-            assert rconn is not None, "WAL reader expected on local filesystem"
-            assert self._read(rconn) == self.CONFIGURED
+            # WAL per-thread reader, held through the lifecycle lease.
+            with db._read_ctx() as rconn:
+                assert rconn is not db._conn, "WAL reader expected on local filesystem"
+                assert self._read(rconn) == self.CONFIGURED
         finally:
             db.close()
 
@@ -4492,8 +4492,7 @@ class TestPerformancePragmasEndToEnd:
         db = SessionDB(db_path=db_path)
         try:
             assert self._read(db._conn) == defaults
-            rconn = db._get_read_conn()
-            if rconn is not None:
+            with db._read_ctx() as rconn:
                 assert self._read(rconn) == defaults
         finally:
             db.close()
