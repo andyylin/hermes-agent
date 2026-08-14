@@ -2653,46 +2653,41 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> list:
-    """Send extracted MEDIA files as native platform attachments via a live adapter.
+) -> list[tuple[str, bool, str]]:
+    """Send native attachments and return only failures eligible for fallback.
 
-    Routes each file to the appropriate adapter method (send_voice, send_image_file,
-    send_video, send_document) based on file extension — mirroring the routing logic
-    in ``BasePlatformAdapter._process_message_background``.
-
-    Returns a list of per-file error strings (empty when every attachment
-    delivered). Callers surface these into the job's delivery errors so a
-    dropped attachment is visible in ``last_error``/run status instead of
-    only in the gateway log (the silent-drop half of the manual-run
-    attachment bug: text delivered, file vanished, job marked ok).
+    A timeout is fallback-eligible only when cancellation proves dispatch never
+    started. If cancellation fails, the send is already in flight and retrying
+    could duplicate the attachment.
     """
     from pathlib import Path
 
     from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
-    errors: list = []
-    requested = [(str(p), v) for p, v in (media_files or [])]
+    requested = [(str(path), value) for path, value in (media_files or [])]
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-    # Report paths the safety filter dropped: the model referenced them in
-    # MEDIA: tags but they will never be sent (missing file, denied prefix,
-    # or strict-mode policy miss).
-    kept = {p for p, _ in media_files}
-    for raw_path, _v in requested:
+    failures: list[tuple[str, bool, str]] = []
+    # Surface paths rejected by the current safety policy without allowing them
+    # back into a fallback send.
+    kept = {path for path, _value in media_files}
+    for raw_path, _value in requested:
         try:
             from gateway.platforms.base import validate_media_delivery_path
 
             if validate_media_delivery_path(raw_path) not in kept:
-                errors.append(
-                    f"attachment dropped by media path policy: {raw_path}"
+                failures.append(
+                    (raw_path, False, f"attachment dropped by media path policy: {raw_path}")
                 )
         except Exception:
-            errors.append(f"attachment dropped by media path policy: {raw_path}")
+            failures.append(
+                (raw_path, False, f"attachment dropped by media path policy: {raw_path}")
+            )
 
-    for media_path, _is_voice in media_files:
+    for media_path, is_voice in media_files:
         try:
             ext = Path(media_path).suffix.lower()
             route_platform = platform if platform is not None else getattr(adapter, "platform", None)
-            if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
+            if should_send_media_as_audio(route_platform, ext, is_voice=is_voice):
                 coro = adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=metadata)
             elif ext in _VIDEO_EXTS:
                 coro = adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=metadata)
@@ -2702,39 +2697,38 @@ def _send_media_via_adapter(
                 coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=metadata)
 
             from agent.async_utils import safe_schedule_threadsafe
+
             future = safe_schedule_threadsafe(coro, loop)
             if future is None:
                 msg = f"cannot send media {media_path}: gateway loop unavailable"
                 logger.warning("Job '%s': %s", job.get("id", "?"), msg)
-                errors.append(msg)
-                return errors
+                failures.append((media_path, is_voice, msg))
+                continue
             try:
-                # Large attachments (long TTS audio, concatenated recordings,
-                # big exports) can legitimately exceed a fixed 30s upload
-                # window. Configurable, matching the other cron timeouts
-                # (cron.media_send_timeout_seconds in config.yaml, or the
-                # HERMES_CRON_MEDIA_SEND_TIMEOUT env override).
+                # Large attachments can exceed a fixed upload window.
                 result = future.result(timeout=_get_media_send_timeout())
             except TimeoutError:
-                future.cancel()
-                raise
-            if result and not getattr(result, "success", True):
+                if future.cancel():
+                    raise
+                logger.warning(
+                    "Job '%s': media send for %s timed out after dispatch; "
+                    "skipping fallback to avoid duplicate delivery",
+                    job.get("id", "?"),
+                    media_path,
+                )
+                continue
+            if not _confirm_adapter_delivery(result):
                 msg = (
                     f"media send failed for {media_path}: "
-                    f"{getattr(result, 'error', 'unknown')}"
+                    f"{getattr(result, 'error', 'unconfirmed adapter result')}"
                 )
                 logger.warning("Job '%s': %s", job.get("id", "?"), msg)
-                errors.append(msg)
-        except Exception as e:
-            # Argument-less exceptions (notably TimeoutError, the most likely
-            # failure on this path) have an empty str(), which would render
-            # the reason as nothing at all. Fall back to the class name.
-            msg = (
-                f"failed to send media {media_path}: {str(e) or type(e).__name__}"
-            )
+                failures.append((media_path, is_voice, msg))
+        except Exception as exc:
+            msg = f"failed to send media {media_path}: {str(exc) or type(exc).__name__}"
             logger.warning("Job '%s': %s", job.get("id", "?"), msg)
-            errors.append(msg)
-    return errors
+            failures.append((media_path, is_voice, msg))
+    return failures
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
@@ -3387,7 +3381,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 routed_media_metadata["user_id"] = logical_home.user_id
                             if logical_home.scope_id:
                                 routed_media_metadata["scope_id"] = logical_home.scope_id
-                    _media_errors = _send_media_via_adapter(
+                    media_failures = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
                         media_files,
@@ -3396,12 +3390,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         job,
                         platform=platform,
                     )
-                    # Surface per-file failures into the run status (parity
-                    # with the standalone lane): text delivered but an
-                    # attachment didn't is a visible partial failure, not ok.
-                    for _me in _media_errors:
-                        _msg = f"{_me} (target {platform_name}:{chat_id})"
-                        delivery_errors.append(_msg)
+                    if media_failures:
+                        target_errors.extend(
+                            f"{error} (target {platform_name}:{chat_id})"
+                            for _path, _is_voice, error in media_failures
+                        )
+                        # Retry only attachments whose live send is confirmed
+                        # not to have completed; in-flight timeouts are omitted
+                        # by _send_media_via_adapter to avoid duplicates.
+                        media_files = [
+                            (path, is_voice)
+                            for path, is_voice, _error in media_failures
+                        ]
+                        adapter_ok = False
                 elif timed_out and media_files:
                     msg = (
                         f"{len(media_files)} media attachment(s) not delivered to "
