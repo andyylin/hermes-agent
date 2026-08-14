@@ -1875,6 +1875,57 @@ class TestSendMediaViaAdapter:
         adapter.send_voice.assert_called_once()
         adapter.send_image_file.assert_called_once()
 
+    def test_failed_media_result_preserves_retry_identity(self, tmp_path, monkeypatch):
+        from concurrent.futures import Future
+
+        adapter = MagicMock()
+        adapter.send_image_file = AsyncMock()
+        photo_path = self._safe_media_path(tmp_path, monkeypatch, "failed.jpg")
+        completed = Future()
+        completed.set_result(MagicMock(success=False, error="upload rejected"))
+
+        def fake_schedule(coro, _loop):
+            coro.close()
+            return completed
+
+        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule):
+            failures = _send_media_via_adapter(
+                adapter,
+                "123",
+                [(str(photo_path), False)],
+                None,
+                MagicMock(),
+                {"id": "media-failure"},
+            )
+
+        assert failures[0][:2] == (str(photo_path), False)
+        assert "upload rejected" in failures[0][2]
+
+    def test_in_flight_timeout_is_not_fallback_eligible(self, tmp_path, monkeypatch):
+        adapter = MagicMock()
+        adapter.send_image_file = AsyncMock()
+        photo_path = self._safe_media_path(tmp_path, monkeypatch, "in-flight.jpg")
+        in_flight = MagicMock()
+        in_flight.result.side_effect = TimeoutError("timed out")
+        in_flight.cancel.return_value = False
+
+        def fake_schedule(coro, _loop):
+            coro.close()
+            return in_flight
+
+        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule):
+            failures = _send_media_via_adapter(
+                adapter,
+                "123",
+                [(str(photo_path), False)],
+                None,
+                MagicMock(),
+                {"id": "media-in-flight"},
+            )
+
+        in_flight.cancel.assert_called_once_with()
+        assert failures == []
+
 
 class TestParallelTick:
     """Verify that tick() runs due jobs concurrently and isolates ContextVars."""
