@@ -511,6 +511,8 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        adapters_by_profile=None,
+        profile_scope_factory=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -535,9 +537,11 @@ class InProcessCronScheduler(CronScheduler):
                 stop_event,
                 profile_homes=profile_homes,
                 adapters=adapters,
+                adapters_by_profile=adapters_by_profile,
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
+                profile_scope_factory=profile_scope_factory,
             )
             return
 
@@ -606,9 +610,11 @@ class InProcessCronScheduler(CronScheduler):
         *,
         profile_homes,
         adapters=None,
+        adapters_by_profile=None,
         loop=None,
         interval=60,
         can_dispatch=None,
+        profile_scope_factory=None,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -627,6 +633,24 @@ class InProcessCronScheduler(CronScheduler):
             use_cron_store,
         )
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        from contextlib import nullcontext
+
+        def _entry_parts(entry):
+            if isinstance(entry, tuple):
+                return str(entry[0]), entry[1]
+            return "", entry
+
+        def _profile_scope(name, home):
+            if profile_scope_factory is None:
+                return nullcontext()
+            return profile_scope_factory(name, home)
+
+        def _profile_adapters(name):
+            if adapters_by_profile is None:
+                return adapters
+            # A missing named map must fail closed rather than borrowing the
+            # primary profile's authenticated live transport.
+            return adapters_by_profile.get(name, {})
 
         logger = logging.getLogger("cron.scheduler_provider")
         logger.info(
@@ -637,10 +661,10 @@ class InProcessCronScheduler(CronScheduler):
 
         # Recovery + initial heartbeat for every profile.
         for entry in profile_homes:
-            home = entry[1] if isinstance(entry, tuple) else entry
+            name, home = _entry_parts(entry)
             home_token = set_hermes_home_override(str(home))
             try:
-                with use_cron_store(home):
+                with _profile_scope(name, home), use_cron_store(home):
                     recovered = self.recover_interrupted()
                     if recovered:
                         logger.warning(
@@ -661,13 +685,13 @@ class InProcessCronScheduler(CronScheduler):
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
                     for entry in profile_homes:
-                        home = entry[1] if isinstance(entry, tuple) else entry
+                        name, home = _entry_parts(entry)
                         home_token = set_hermes_home_override(str(home))
                         try:
-                            with use_cron_store(home):
+                            with _profile_scope(name, home), use_cron_store(home):
                                 cron_tick(
                                     verbose=False,
-                                    adapters=adapters,
+                                    adapters=_profile_adapters(name),
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,
@@ -684,10 +708,10 @@ class InProcessCronScheduler(CronScheduler):
                 _tick_error = None
             # Record per-profile heartbeat after each tick cycle.
             for entry in profile_homes:
-                home = entry[1] if isinstance(entry, tuple) else entry
+                name, home = _entry_parts(entry)
                 home_token = set_hermes_home_override(str(home))
                 try:
-                    with use_cron_store(home):
+                    with _profile_scope(name, home), use_cron_store(home):
                         record_ticker_heartbeat(success=ok)
                         # Surface the failure reason (or clear it) per profile
                         # so `hermes cron status` can show WHY ticks fail
