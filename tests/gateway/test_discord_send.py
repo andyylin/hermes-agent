@@ -47,6 +47,17 @@ _ensure_discord_mock()
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 
+def test_thread_retention_env_does_not_cross_multiplex_profiles(monkeypatch):
+    from plugins.platforms.discord import adapter as discord_adapter
+
+    monkeypatch.setenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", "60")
+    monkeypatch.setattr(discord_adapter, "_multiplex_active", lambda: True)
+
+    assert discord_adapter._discord_thread_auto_archive_minutes(
+        PlatformConfig(enabled=True, token="***", extra={})
+    ) == discord_adapter.DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES
+
+
 @pytest.mark.asyncio
 async def test_send_rejects_whitespace_and_records_failed_final_reply(
     caplog, monkeypatch, tmp_path

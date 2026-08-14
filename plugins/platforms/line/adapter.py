@@ -500,6 +500,15 @@ def _allowed_for_source(
 # LINE Reply / Push HTTP client
 # ---------------------------------------------------------------------------
 
+class _LineAPIError(RuntimeError):
+    """Definite HTTP rejection from LINE (as opposed to indeterminate I/O)."""
+
+    def __init__(self, operation: str, status: int, body: str) -> None:
+        self.operation = operation
+        self.status = status
+        super().__init__(f"LINE {operation} {status}: {body[:200]}")
+
+
 class _LineClient:
     """Thin async wrapper around the LINE Messaging API.
 
@@ -527,7 +536,7 @@ class _LineClient:
             ) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
-                    raise RuntimeError(f"LINE reply {resp.status}: {body[:200]}")
+                    raise _LineAPIError("reply", resp.status, body)
 
     async def push(self, chat_id: str, messages: List[Dict[str, Any]]) -> None:
         import aiohttp
@@ -540,7 +549,7 @@ class _LineClient:
             ) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
-                    raise RuntimeError(f"LINE push {resp.status}: {body[:200]}")
+                    raise _LineAPIError("push", resp.status, body)
 
     async def loading(self, chat_id: str, seconds: int = 60) -> None:
         """Loading indicator (DM only). LINE rejects this for groups/rooms."""
@@ -1042,7 +1051,12 @@ class LineAdapter(BasePlatformAdapter):
             source,
             allow_all=self.allow_all,
             user_ids=self.allowed_users,
-            group_ids=self.allowed_groups | self.read_only_groups | self.archive_groups,
+            group_ids=(
+                self.allowed_groups
+                | self.read_only_groups
+                | self.archive_groups
+                | self.require_prefix_groups
+            ),
             room_ids=self.allowed_rooms,
         ):
             logger.info("LINE: rejecting unauthorized source %s", source)
@@ -1409,9 +1423,17 @@ class LineAdapter(BasePlatformAdapter):
             try:
                 await self._client.reply(token, messages)
                 return SendResult(success=True, message_id=token)
+            except _LineAPIError as exc:
+                if exc.status != 400:
+                    return SendResult(success=False, error=str(exc))
+                logger.info("LINE: reply token definitely rejected (%s); falling back to push", exc)
+                # HTTP 400 proves LINE rejected the reply; push cannot duplicate it.
             except Exception as exc:
-                logger.info("LINE: reply token rejected (%s); falling back to push", exc)
-                # fall through to push
+                logger.warning("LINE: reply outcome indeterminate; refusing duplicate push: %s", exc)
+                return SendResult(
+                    success=False,
+                    error=f"LINE reply outcome indeterminate; push not attempted: {exc}",
+                )
 
         try:
             await self._client.push(chat_id, messages)
@@ -1736,12 +1758,20 @@ class LineAdapter(BasePlatformAdapter):
         if used_reply:
             try:
                 await self._client.reply(token, first_batch)
-            except Exception as exc:
-                logger.info("LINE: reply token rejected (%s); falling back to push", exc)
+            except _LineAPIError as exc:
+                if exc.status != 400:
+                    return SendResult(success=False, error=str(exc))
+                logger.info("LINE: reply token definitely rejected (%s); falling back to push", exc)
                 try:
                     await self._client.push(chat_id, first_batch)
                 except Exception as exc2:
                     return SendResult(success=False, error=str(exc2))
+            except Exception as exc:
+                logger.warning("LINE: reply outcome indeterminate; refusing duplicate push: %s", exc)
+                return SendResult(
+                    success=False,
+                    error=f"LINE reply outcome indeterminate; push not attempted: {exc}",
+                )
         else:
             try:
                 await self._client.push(chat_id, first_batch)
@@ -1860,13 +1890,17 @@ async def _standalone_send(
     if not token or not chat_id:
         return {"error": "LINE standalone send: missing token or chat_id"}
 
+    if media_files:
+        return {
+            "error": (
+                "LINE standalone media delivery is unsupported; "
+                "a live adapter is required"
+            )
+        }
+
     plain = strip_markdown_preserving_urls(message or "")
     chunks = split_for_line(plain) or [""]
     messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
-    if media_files:
-        # Tack on a hint so the recipient knows media was generated but not delivered.
-        messages.append(_text_message(f"[{len(media_files)} attachment(s) generated; not deliverable from cron]"))
-        messages = messages[:LINE_MAX_MESSAGES_PER_CALL]
 
     client = _LineClient(token)
     try:
