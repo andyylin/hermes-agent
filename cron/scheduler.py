@@ -2306,24 +2306,25 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> None:
-    """Send extracted MEDIA files as native platform attachments via a live adapter.
+) -> list[tuple[str, bool, str]]:
+    """Send native attachments and return only failures eligible for fallback.
 
-    Routes each file to the appropriate adapter method (send_voice, send_image_file,
-    send_video, send_document) based on file extension — mirroring the routing logic
-    in ``BasePlatformAdapter._process_message_background``.
+    A timeout is fallback-eligible only when cancellation proves dispatch never
+    started.  If cancellation fails, the send is already in flight and retrying
+    could duplicate the attachment.
     """
     from pathlib import Path
 
     from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    failures: list[tuple[str, bool, str]] = []
 
-    for media_path, _is_voice in media_files:
+    for media_path, is_voice in media_files:
         try:
             ext = Path(media_path).suffix.lower()
             route_platform = platform if platform is not None else getattr(adapter, "platform", None)
-            if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
+            if should_send_media_as_audio(route_platform, ext, is_voice=is_voice):
                 coro = adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=metadata)
             elif ext in _VIDEO_EXTS:
                 coro = adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=metadata)
@@ -2333,25 +2334,37 @@ def _send_media_via_adapter(
                 coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=metadata)
 
             from agent.async_utils import safe_schedule_threadsafe
+
             future = safe_schedule_threadsafe(coro, loop)
             if future is None:
-                logger.warning(
-                    "Job '%s': cannot send media %s, gateway loop unavailable",
-                    job.get("id", "?"), media_path,
-                )
-                return
+                msg = f"cannot send media {media_path}, gateway loop unavailable"
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                failures.append((media_path, is_voice, msg))
+                continue
             try:
                 result = future.result(timeout=30)
             except TimeoutError:
-                future.cancel()
-                raise
-            if result and not getattr(result, "success", True):
+                if future.cancel():
+                    raise
                 logger.warning(
-                    "Job '%s': media send failed for %s: %s",
-                    job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
+                    "Job '%s': media send for %s timed out after dispatch; "
+                    "skipping fallback to avoid duplicate delivery",
+                    job.get("id", "?"),
+                    media_path,
                 )
-        except Exception as e:
-            logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+                continue
+            if not _confirm_adapter_delivery(result):
+                msg = (
+                    f"media send failed for {media_path}: "
+                    f"{getattr(result, 'error', 'unconfirmed adapter result')}"
+                )
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                failures.append((media_path, is_voice, msg))
+        except Exception as exc:
+            msg = f"failed to send media {media_path}: {exc}"
+            logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+            failures.append((media_path, is_voice, msg))
+    return failures
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
@@ -2944,7 +2957,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 routed_media_metadata["user_id"] = logical_home.user_id
                             if logical_home.scope_id:
                                 routed_media_metadata["scope_id"] = logical_home.scope_id
-                    _send_media_via_adapter(
+                    media_failures = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
                         media_files,
@@ -2953,6 +2966,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         job,
                         platform=platform,
                     )
+                    if media_failures:
+                        target_errors.extend(
+                            error for _path, _is_voice, error in media_failures
+                        )
+                        media_files = [
+                            (path, is_voice)
+                            for path, is_voice, _error in media_failures
+                        ]
+                        adapter_ok = False
                 elif timed_out and media_files:
                     msg = (
                         f"{len(media_files)} media attachment(s) not delivered to "
