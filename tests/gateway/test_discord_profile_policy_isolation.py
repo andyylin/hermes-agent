@@ -81,6 +81,8 @@ def test_scoped_yaml_seeds_sibling_policies_without_env_writes(monkeypatch):
         "auto_thread": "DISCORD_AUTO_THREAD",
         "history_backfill": "DISCORD_HISTORY_BACKFILL",
         "history_backfill_limit": "DISCORD_HISTORY_BACKFILL_LIMIT",
+        "ignore_no_mention": "DISCORD_IGNORE_NO_MENTION",
+        "reactions": "DISCORD_REACTIONS",
     }
     for env_name in policy_env.values():
         monkeypatch.delenv(env_name, raising=False)
@@ -94,6 +96,8 @@ def test_scoped_yaml_seeds_sibling_policies_without_env_writes(monkeypatch):
         "auto_thread": False,
         "history_backfill": False,
         "history_backfill_limit": 7,
+        "ignore_no_mention": False,
+        "reactions": False,
     }
     seeded = _apply_yaml_config({}, configured)
     profile = PlatformConfig(enabled=True, extra=seeded)
@@ -127,3 +131,25 @@ def test_profile_scoped_sibling_policies_ignore_poisoned_env(monkeypatch):
     assert _discord_profile_bool(
         profile, "auto_thread", "DISCORD_AUTO_THREAD", True
     ) is False
+
+
+def test_profile_scoped_admission_and_reactions_ignore_poisoned_env(monkeypatch):
+    monkeypatch.setenv("DISCORD_IGNORE_NO_MENTION", "true")
+    monkeypatch.setenv("DISCORD_REACTIONS", "true")
+    profile = PlatformConfig(
+        enabled=True,
+        extra={
+            "_profile_scoped_policies": True,
+            "ignore_no_mention": "false",
+            "reactions": "false",
+        },
+    )
+    adapter = discord_adapter.DiscordAdapter(profile)
+
+    assert _discord_profile_bool(
+        profile,
+        "ignore_no_mention",
+        "DISCORD_IGNORE_NO_MENTION",
+        True,
+    ) is False
+    assert adapter._reactions_enabled() is False
