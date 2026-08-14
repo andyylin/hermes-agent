@@ -22,11 +22,12 @@ def _runner() -> GatewayRunner:
     return runner
 
 
-def _line_adapter(*, allowed=(), archive=(), read_only=()) -> Any:
+def _line_adapter(*, allowed=(), archive=(), read_only=(), require_prefix=()) -> Any:
     return SimpleNamespace(
         allowed_groups=set(allowed),
         archive_groups=set(archive),
         read_only_groups=set(read_only),
+        require_prefix_groups=set(require_prefix),
         config=PlatformConfig(enabled=True, extra={}),
     )
 
@@ -105,6 +106,29 @@ def test_line_archive_group_uses_profile_scoped_adapter_config(monkeypatch):
     runner = _runner()
     adapter = _line_adapter(archive={"Cprofile"})
     runner.adapters = {platform: adapter}
+
+    assert runner._is_user_authorized(source) is True
+
+
+def test_line_prefix_group_is_authorized_from_profile_scoped_adapter(monkeypatch):
+    monkeypatch.delenv("LINE_ALLOWED_GROUPS", raising=False)
+    monkeypatch.delenv("LINE_ARCHIVE_GROUPS", raising=False)
+    monkeypatch.setenv("LINE_ALLOWED_USERS", "Uandy")
+    monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+
+    platform = Platform("line")
+    source = SessionSource(
+        platform=platform,
+        chat_id="Cprefix-only",
+        chat_type="group",
+        user_id="Uother",
+        user_name="Uother",
+    )
+    runner = _runner()
+    runner.adapters = {
+        platform: _line_adapter(require_prefix={"Cprefix-only"})
+    }
 
     assert runner._is_user_authorized(source) is True
 

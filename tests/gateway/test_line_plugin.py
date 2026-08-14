@@ -264,6 +264,18 @@ class TestSendRouting:
         assert "**" not in out
         assert "https://x.com" in out
 
+    def test_indeterminate_reply_failure_does_not_fall_back_to_push(self, adapter):
+        import time
+
+        adapter._reply_tokens["Uchat"] = ("reply-token", time.time() + 60)
+        adapter._client.reply.side_effect = TimeoutError("response lost")
+
+        result = asyncio.run(adapter.send("Uchat", "hello"))
+
+        assert result.success is False
+        assert "indeterminate" in result.error
+        adapter._client.push.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # 9. Register() metadata + plugin entry points
@@ -322,6 +334,18 @@ class TestStandaloneSend:
         cfg = PlatformConfig(enabled=True, extra={})
         result = asyncio.run(_standalone_send(cfg, "Uchat", "hi"))
         assert "error" in result
+
+    def test_media_is_rejected_instead_of_silently_dropped(self, monkeypatch):
+        monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
+        from gateway.config import PlatformConfig
+
+        cfg = PlatformConfig(enabled=True, extra={"channel_access_token": "tok"})
+        result = asyncio.run(
+            _standalone_send(cfg, "Uchat", "caption", media_files=["/tmp/a.png"])
+        )
+
+        assert "error" in result
+        assert "live adapter is required" in result["error"]
 
 
 class TestPostbackButtonShape:

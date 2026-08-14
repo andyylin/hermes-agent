@@ -173,6 +173,22 @@ def test_prefix_required_group_drops_unprefixed_text():
     assert "Cprefix" not in adapter._reply_tokens
 
 
+def test_prefix_required_group_is_admitted_without_allowed_group_duplication():
+    adapter = _adapter(
+        require_prefix_groups=["Cprefix-only"],
+        group_prefixes=["Hermes:"],
+    )
+
+    asyncio.run(
+        adapter._dispatch_event(
+            _event(chat_id="Cprefix-only", text="Hermes: summarize")
+        )
+    )
+
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args.args[0].text == "summarize"
+
+
 def test_prefix_required_group_drops_non_text_message():
     adapter = _adapter(
         allowed_groups=["Cprefix"],

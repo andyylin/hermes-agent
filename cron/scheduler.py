@@ -1880,8 +1880,8 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> list[tuple[str, bool, str]]:
-    """Send native attachments and return only failures eligible for fallback.
+) -> tuple[list[tuple[str, bool, str]], list[str]]:
+    """Return retryable failures separately from indeterminate outcomes.
 
     A timeout is fallback-eligible only when cancellation proves dispatch never
     started.  If cancellation fails, the send is already in flight and retrying
@@ -1893,6 +1893,7 @@ def _send_media_via_adapter(
 
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
     failures: list[tuple[str, bool, str]] = []
+    uncertain: list[str] = []
 
     for media_path, is_voice in media_files:
         try:
@@ -1920,12 +1921,12 @@ def _send_media_via_adapter(
             except TimeoutError:
                 if future.cancel():
                     raise
-                logger.warning(
-                    "Job '%s': media send for %s timed out after dispatch; "
-                    "skipping fallback to avoid duplicate delivery",
-                    job.get("id", "?"),
-                    media_path,
+                msg = (
+                    f"media send for {media_path} timed out after dispatch; "
+                    "outcome indeterminate and fallback suppressed to avoid duplicate delivery"
                 )
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                uncertain.append(msg)
                 continue
             if not _confirm_adapter_delivery(result):
                 msg = (
@@ -1938,7 +1939,7 @@ def _send_media_via_adapter(
             msg = f"failed to send media {media_path}: {exc}"
             logger.warning("Job '%s': %s", job.get("id", "?"), msg)
             failures.append((media_path, is_voice, msg))
-    return failures
+    return failures, uncertain
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
@@ -2113,6 +2114,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_content = content
         media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
         media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        standalone_content = cleaned_delivery_content
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -2531,7 +2533,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 routed_media_metadata["user_id"] = logical_home.user_id
                             if logical_home.scope_id:
                                 routed_media_metadata["scope_id"] = logical_home.scope_id
-                    media_failures = _send_media_via_adapter(
+                    media_failures, media_uncertain = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
                         media_files,
@@ -2548,7 +2550,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             (path, is_voice)
                             for path, is_voice, _error in media_failures
                         ]
+                        # Live text already succeeded. Standalone fallback retries
+                        # only failed attachments, never the delivered text.
+                        standalone_content = ""
                         adapter_ok = False
+                    if media_uncertain:
+                        delivery_errors.extend(
+                            f"{error} (target {platform_name}:{chat_id})"
+                            for error in media_uncertain
+                        )
                 elif timed_out and media_files:
                     msg = (
                         f"{len(media_files)} media attachment(s) not delivered to "
@@ -2625,7 +2635,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 platform,
                 pconfig,
                 chat_id,
-                cleaned_delivery_content,
+                standalone_content,
                 thread_id=thread_id,
                 media_files=media_files,
                 subject=email_subject,
@@ -2664,7 +2674,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                     platform,
                                     pconfig,
                                     chat_id,
-                                    cleaned_delivery_content,
+                                    standalone_content,
                                     thread_id=thread_id,
                                     media_files=media_files,
                                     subject=email_subject,
@@ -3639,6 +3649,27 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
     return None
 
 
+def _own_late_session_db_future(
+    future: concurrent.futures.Future | None,
+    job_id: str,
+) -> None:
+    """Cancel a pending SessionDB init or close the late result exactly once."""
+    if future is None or future.cancel():
+        return
+
+    def _close_late(completed):
+        try:
+            late_db = completed.result()
+        except Exception:
+            return
+        try:
+            late_db.close()
+        except Exception as exc:
+            logger.warning("Job '%s': failed to close late SessionDB init: %s", job_id, exc)
+
+    future.add_done_callback(_close_late)
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
@@ -4052,6 +4083,7 @@ def run_job(
         # the whole gateway process is restarted, silently skipping every
         # scheduled fire in between with "already running — skipping".
         _session_db_timeout: float | None = None
+        _session_db_future: concurrent.futures.Future | None = None
         try:
             from hermes_state import SessionDB
 
@@ -4085,7 +4117,8 @@ def run_job(
             if _session_db_timeout > 0:
                 _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 try:
-                    _session_db = _session_db_pool.submit(SessionDB).result(timeout=_session_db_timeout)
+                    _session_db_future = _session_db_pool.submit(SessionDB)
+                    _session_db = _session_db_future.result(timeout=_session_db_timeout)
                 finally:
                     # Don't wait for a wedged connect() to unwind — abandon the
                     # worker thread (same pattern as the agent inactivity timeout
@@ -4095,6 +4128,13 @@ def run_job(
                 # 0 = unlimited (legacy behavior, opt-in for debugging)
                 _session_db = SessionDB()
         except concurrent.futures.TimeoutError:
+            # If construction had not started, cancellation prevents it.  If it
+            # is already running, attach ownership cleanup so a late-created DB
+            # is never discarded with an open SQLite connection.
+            _own_late_session_db_future(
+                _session_db_future,
+                str(job.get("id", "?")),
+            )
             logger.error(
                 "Job '%s': SessionDB init did not return within %.0fs — proceeding "
                 "without a session store for this run instead of blocking it "
