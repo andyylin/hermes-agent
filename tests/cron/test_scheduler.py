@@ -737,6 +737,28 @@ class TestRunJobSessionPersistence:
         assert fake_db.method_calls[-1][0] == "close"
         fake_db.close.assert_called_once()
 
+    def test_late_session_db_initialization_is_closed(self):
+        from cron.scheduler import _own_late_session_db_future
+
+        late_db = MagicMock()
+        future = MagicMock()
+        future.cancel.return_value = False
+        callback = None
+
+        def capture_callback(fn):
+            nonlocal callback
+            callback = fn
+
+        future.add_done_callback.side_effect = capture_callback
+        future.result.return_value = late_db
+
+        _own_late_session_db_future(future, "late-db-job")
+
+        future.cancel.assert_called_once_with()
+        assert callback is not None
+        callback(future)
+        late_db.close.assert_called_once_with()
+
 
     @contextlib.contextmanager
     def _run_job_patches(self, tmp_path, extra=()):
@@ -1983,7 +2005,7 @@ class TestSendMediaViaAdapter:
             return completed
 
         with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule):
-            failures = _send_media_via_adapter(
+            failures, uncertain = _send_media_via_adapter(
                 adapter,
                 "123",
                 [(str(photo_path), False)],
@@ -1994,6 +2016,7 @@ class TestSendMediaViaAdapter:
 
         assert failures[0][:2] == (str(photo_path), False)
         assert "upload rejected" in failures[0][2]
+        assert uncertain == []
 
     def test_in_flight_timeout_is_not_fallback_eligible(self, tmp_path, monkeypatch):
         adapter = MagicMock()
@@ -2008,7 +2031,7 @@ class TestSendMediaViaAdapter:
             return in_flight
 
         with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule):
-            failures = _send_media_via_adapter(
+            failures, uncertain = _send_media_via_adapter(
                 adapter,
                 "123",
                 [(str(photo_path), False)],
@@ -2019,6 +2042,60 @@ class TestSendMediaViaAdapter:
 
         in_flight.cancel.assert_called_once_with()
         assert failures == []
+        assert len(uncertain) == 1
+        assert "outcome indeterminate" in uncertain[0]
+
+    def test_media_fallback_retries_failed_attachment_without_resending_text(
+        self, tmp_path, monkeypatch
+    ):
+        from concurrent.futures import Future
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+
+        first = self._safe_media_path(tmp_path, monkeypatch, "sent.jpg")
+        second = self._safe_media_path(tmp_path, monkeypatch, "failed.jpg")
+        adapter = AsyncMock()
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        standalone_send = AsyncMock(return_value={"success": True})
+        live_text = Future()
+        live_text.set_result(SendResult(success=True, message_id="live-text"))
+
+        def schedule_live_text(coro, _loop):
+            coro.close()
+            return live_text
+
+        job = {
+            "id": "media-partial-list",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch(
+                 "cron.scheduler._send_media_via_adapter",
+                 return_value=([(str(second), False, "second upload rejected")], []),
+             ), \
+             patch(
+                 "agent.async_utils.safe_schedule_threadsafe",
+                 side_effect=schedule_live_text,
+             ), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            result = _deliver_result(
+                job,
+                f"already delivered text\nMEDIA:{first}\nMEDIA:{second}",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        standalone_send.assert_awaited_once()
+        assert standalone_send.await_args.args[3] == ""
+        assert standalone_send.await_args.kwargs["media_files"] == [(str(second), False)]
 
 
 class TestParallelTick:
