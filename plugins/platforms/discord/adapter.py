@@ -565,7 +565,10 @@ def _discord_profile_policy_value(
     profile_scoped = bool(
         config is not None
         and isinstance(config.extra, dict)
-        and config.extra.get("_profile_scoped_policies")
+        and (
+            config.extra.get("_profile_scoped_policies")
+            or (_multiplex_active() and key in config.extra)
+        )
     )
     if not profile_scoped:
         raw_env = os.getenv(env_name)
