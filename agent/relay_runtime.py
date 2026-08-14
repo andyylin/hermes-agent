@@ -11,7 +11,7 @@ import logging
 import threading
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable, cast
 
 from hermes_constants import get_hermes_home
 
@@ -24,6 +24,36 @@ RUNTIME_SCHEMA_KEY = "hermes.relay.schema_version"
 RUNTIME_SCHEMA_VERSION = "hermes.relay.runtime.v1"
 RUNTIME_INSTANCE_KEY = "hermes.relay.runtime_instance"
 _PROFILE_KEY_CACHE: dict[str, str] = {}
+
+
+def _report_async_subscriber_flush(task: asyncio.Future[Any]) -> None:
+    """Surface subscriber failures from a flush scheduled on a live loop."""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        logger.debug("Hermes Relay asynchronous subscriber flush was cancelled")
+    except Exception:
+        logger.warning("Hermes Relay asynchronous subscriber flush failed", exc_info=True)
+
+
+def _flush_relay_subscribers(relay: Any) -> None:
+    """Flush subscribers without blocking the caller's running event loop."""
+    subscribers = relay.subscribers
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        subscribers.flush()
+        return
+
+    flush_async = getattr(subscribers, "flush_async", None)
+    if not callable(flush_async):
+        subscribers.flush()
+        return
+    task = asyncio.ensure_future(
+        cast(Awaitable[Any], flush_async()),
+        loop=loop,
+    )
+    task.add_done_callback(_report_async_subscriber_flush)
 
 
 @dataclass
@@ -327,7 +357,7 @@ class RelayRuntime:
                 except Exception as exc:
                     failures.append(f"session scope close failed: {exc}")
         try:
-            self.relay.subscribers.flush()
+            _flush_relay_subscribers(self.relay)
         except Exception as exc:
             failures.append(f"subscriber flush failed: {exc}")
         with self._sessions_lock:
