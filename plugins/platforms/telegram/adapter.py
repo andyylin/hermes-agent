@@ -52,7 +52,7 @@ def _scoped_gate_env(name: str, default: str = "") -> str:
         from gateway.authz_mixin import _platform_gate_env
 
         return _platform_gate_env(name, default)
-    except Exception:
+    except (ImportError, AttributeError):
         return (os.getenv(name) or default).strip()
 
 
@@ -8643,7 +8643,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
+        return _scoped_gate_env("TELEGRAM_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
 
     def _telegram_observe_unmentioned_group_messages(self) -> bool:
         """Return whether skipped unmentioned group messages are stored as context.
@@ -8660,7 +8660,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false").lower() in {"true", "1", "yes", "on"}
+        return _scoped_gate_env("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false").lower() in {"true", "1", "yes", "on"}
 
     def _telegram_guest_mode(self) -> bool:
         """Return whether non-allowlisted groups may trigger via direct @mention."""
@@ -8669,7 +8669,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_GUEST_MODE", "false").lower() in {"true", "1", "yes", "on"}
+        return _scoped_gate_env("TELEGRAM_GUEST_MODE", "false").lower() in {"true", "1", "yes", "on"}
 
     def _telegram_exclusive_bot_mentions(self) -> bool:
         """Return whether explicit @...bot mentions exclusively route group messages."""
@@ -8678,7 +8678,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_EXCLUSIVE_BOT_MENTIONS", "true").lower() in {"true", "1", "yes", "on"}
+        return _scoped_gate_env("TELEGRAM_EXCLUSIVE_BOT_MENTIONS", "true").lower() in {"true", "1", "yes", "on"}
 
     def _telegram_free_response_chats(self) -> set[str]:
         raw = self.config.extra.get("free_response_chats")
@@ -8793,7 +8793,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Compile optional regex wake-word patterns for group triggers."""
         patterns = self.config.extra.get("mention_patterns")
         if patterns is None:
-            raw = os.getenv("TELEGRAM_MENTION_PATTERNS", "").strip()
+            raw = _scoped_gate_env("TELEGRAM_MENTION_PATTERNS").strip()
             if raw:
                 try:
                     loaded = json.loads(raw)
@@ -10703,7 +10703,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
-        return os.getenv("TELEGRAM_REACTIONS", "false").lower() not in {"false", "0", "no"}
+        configured = self.config.extra.get("reactions")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in {"false", "0", "no"}
+            return bool(configured)
+        return _scoped_gate_env("TELEGRAM_REACTIONS", "false").lower() not in {
+            "false", "0", "no"
+        }
 
     async def _set_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Set a single emoji reaction on a Telegram message."""
@@ -10925,17 +10932,21 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         extras.setdefault("disable_topic_auto_rename", telegram_cfg["disable_topic_auto_rename"])
 
     _effective_rm = telegram_cfg.get("require_mention", yaml_cfg.get("require_mention"))
-    if _effective_rm is not None and not os.getenv("TELEGRAM_REQUIRE_MENTION"):
+    if _effective_rm is not None:
+        extras.setdefault("require_mention", _effective_rm)
+    if _effective_rm is not None and not _skip_env_bridge and not os.getenv("TELEGRAM_REQUIRE_MENTION"):
         os.environ["TELEGRAM_REQUIRE_MENTION"] = str(_effective_rm).lower()
-    if "mention_patterns" in telegram_cfg and not os.getenv("TELEGRAM_MENTION_PATTERNS"):
+    if "mention_patterns" in telegram_cfg and not _skip_env_bridge and not os.getenv("TELEGRAM_MENTION_PATTERNS"):
         os.environ["TELEGRAM_MENTION_PATTERNS"] = _json.dumps(telegram_cfg["mention_patterns"])
-    if "exclusive_bot_mentions" in telegram_cfg and not os.getenv("TELEGRAM_EXCLUSIVE_BOT_MENTIONS"):
+    if "exclusive_bot_mentions" in telegram_cfg and not _skip_env_bridge and not os.getenv("TELEGRAM_EXCLUSIVE_BOT_MENTIONS"):
         os.environ["TELEGRAM_EXCLUSIVE_BOT_MENTIONS"] = str(telegram_cfg["exclusive_bot_mentions"]).lower()
-    if "allow_bots" in telegram_cfg and not os.getenv("TELEGRAM_ALLOW_BOTS"):
+    if "allow_bots" in telegram_cfg:
+        extras.setdefault("allow_bots", telegram_cfg["allow_bots"])
+    if "allow_bots" in telegram_cfg and not _skip_env_bridge and not os.getenv("TELEGRAM_ALLOW_BOTS"):
         os.environ["TELEGRAM_ALLOW_BOTS"] = str(telegram_cfg["allow_bots"]).lower()
-    if "guest_mode" in telegram_cfg and not os.getenv("TELEGRAM_GUEST_MODE"):
+    if "guest_mode" in telegram_cfg and not _skip_env_bridge and not os.getenv("TELEGRAM_GUEST_MODE"):
         os.environ["TELEGRAM_GUEST_MODE"] = str(telegram_cfg["guest_mode"]).lower()
-    if "observe_unmentioned_group_messages" in telegram_cfg and not os.getenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES"):
+    if "observe_unmentioned_group_messages" in telegram_cfg and not _skip_env_bridge and not os.getenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES"):
         os.environ["TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES"] = str(telegram_cfg["observe_unmentioned_group_messages"]).lower()
     frc = telegram_cfg.get("free_response_chats")
     if frc is not None:
@@ -10973,7 +10984,9 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
             ignored_threads = ",".join(str(v) for v in ignored_threads)
         if not _skip_env_bridge and not os.getenv("TELEGRAM_IGNORED_THREADS"):
             os.environ["TELEGRAM_IGNORED_THREADS"] = str(ignored_threads)
-    if "reactions" in telegram_cfg and not os.getenv("TELEGRAM_REACTIONS"):
+    if "reactions" in telegram_cfg:
+        extras.setdefault("reactions", telegram_cfg["reactions"])
+    if "reactions" in telegram_cfg and not _skip_env_bridge and not os.getenv("TELEGRAM_REACTIONS"):
         os.environ["TELEGRAM_REACTIONS"] = str(telegram_cfg["reactions"]).lower()
     if "proxy_url" in telegram_cfg and not os.getenv("TELEGRAM_PROXY"):
         os.environ["TELEGRAM_PROXY"] = str(telegram_cfg["proxy_url"]).strip()
