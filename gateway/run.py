@@ -29987,6 +29987,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             profile_homes = _multiplex_profile_homes(runner.config)
             if profile_homes:
                 cron_start_kwargs["profile_homes"] = profile_homes
+                _primary_profile = runner._active_profile_name()
+                _cron_adapters_by_profile = {
+                    _primary_profile: runner.adapters,
+                    **getattr(runner, "_profile_adapters", {}),
+                }
+                cron_start_kwargs["adapters_by_profile"] = _cron_adapters_by_profile
+                cron_start_kwargs["profile_scope_factory"] = (
+                    lambda _profile_name, profile_home: _profile_runtime_scope(
+                        Path(profile_home)
+                    )
+                )
                 logger.info(
                     "Cron scheduler will tick %d profile(s) under multiplex: %s",
                     len(profile_homes),
