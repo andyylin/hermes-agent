@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # Rebase Andy's small runtime patch queue onto current upstream/main.
-# Usage: scripts/maintenance/refresh_andy_runtime.sh [--push] [--no-tests]
+# Usage: scripts/maintenance/refresh_andy_runtime.sh [--push] [--tests]
 
 push=false
-run_tests=true
+run_tests=false
 for arg in "$@"; do
   case "$arg" in
     --push) push=true ;;
-    --no-tests) run_tests=false ;;
+    --tests) run_tests=true ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done

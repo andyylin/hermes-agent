@@ -3,6 +3,9 @@
 `andy-runtime` is a deliberately small, linear patch queue rebased on current
 `upstream/main`. It is the only supported custom runtime branch.
 
+Frozen upstream cutoff: `c896c09c42910c584c4c7d2325b58c14713ea42c`
+(2026-08-14). Exact-SHA CI and review evidence must name this object.
+
 ## Retained behavior
 
 1. **Discord free-response auto-threading** — free-response controls mention
@@ -23,6 +26,9 @@
 6. **Email notifications** — standalone email sends multipart HTML plus plain
    fallback; cron jobs can use `email_subject_template` and
    `email_thread_key` for dated subjects and stable RFC threading.
+7. **Cron delivery integrity** — pre-agent exits close their session store;
+   attachment fallback retries only confirmed failures, and an already
+   in-flight timeout is not retried because that could duplicate delivery.
 
 ## Explicitly retired
 
@@ -41,9 +47,9 @@ scripts/maintenance/refresh_andy_runtime.sh --push
 ```
 
 The script fetches `upstream/main`, creates a timestamped backup branch, rebases
-the patch queue, runs the focused regression suite, and publishes to Andy's
-fork only when `--push` is requested. Rebase conflicts stop fail-closed with
-the backup intact.
+the patch queue, and publishes to Andy's fork only when `--push` is requested.
+Pi-side tests are opt-in; broad verification belongs to exact-SHA GitHub CI.
+Rebase conflicts stop fail-closed with the backup intact.
 
 After hosted CI is green, deploy the exact immutable SHA using the established
 Dad → Wife → Default staged gateway rollout. Never build a broad release on the
