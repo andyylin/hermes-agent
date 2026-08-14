@@ -243,11 +243,13 @@ async def test_secondary_adapter_busy_guard_stamps_profile_before_resolving_mode
     """Per-profile adapters route busy events before the message wrapper runs."""
     monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
     runner = _runner(default_mode="interrupt")
-    adapter = await _load_profile_snapshot(
-        runner,
-        tmp_path / "research",
-        "steer",
-    )
+    profile_home = tmp_path / "research"
+    with patch("hermes_cli.profiles.get_profile_dir", return_value=profile_home):
+        adapter = await _load_profile_snapshot(
+            runner,
+            profile_home,
+            "steer",
+        )
     event = _event(profile=None)
     # Seed the lane the adapter itself derives. A profile-owned adapter keys its
     # own _active_sessions in its own namespace (agent:research:...) — see
@@ -389,3 +391,42 @@ async def test_effective_mode_uses_startup_snapshot_without_rereading_config(
     assert runner._effective_busy_input_mode(source) == "steer"
     assert runner._effective_busy_input_mode(source) == "steer"
     assert runner._effective_busy_text_mode(source) == "interrupt"
+
+
+@pytest.mark.asyncio
+async def test_secondary_busy_handler_runs_authorization_inside_profile_scope(
+    tmp_path,
+):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._session_key_for_source = MagicMock(return_value="routed-key")
+    event = _event(profile=None)
+    profile_home = tmp_path / "research"
+    active_scope = False
+
+    class Scope:
+        def __enter__(self):
+            nonlocal active_scope
+            active_scope = True
+
+        def __exit__(self, *_exc):
+            nonlocal active_scope
+            active_scope = False
+
+    def scoped(home):
+        assert home == profile_home
+        return Scope()
+
+    async def handle_busy(routed_event, routed_key):
+        assert active_scope is True
+        assert routed_event.source.profile == "research"
+        assert routed_key == "routed-key"
+        return True
+
+    runner._handle_active_session_busy_message = handle_busy
+    with patch("hermes_cli.profiles.get_profile_dir", return_value=profile_home), patch(
+        "gateway.run._profile_runtime_scope", side_effect=scoped
+    ):
+        handler = runner._make_profile_busy_session_handler("research")
+        assert await handler(event, "unscoped-key") is True
+
+    assert active_scope is False

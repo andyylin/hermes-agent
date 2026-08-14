@@ -1698,9 +1698,12 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             if other_bots_mentioned and not raw_self_mention:
                 return False, False
-            ignore_no_mention = os.getenv(
-                "DISCORD_IGNORE_NO_MENTION", "true"
-            ).lower() in {"true", "1", "yes"}
+            ignore_no_mention = _discord_profile_bool(
+                self.config,
+                "ignore_no_mention",
+                "DISCORD_IGNORE_NO_MENTION",
+                True,
+            )
             if ignore_no_mention and not raw_self_mention and not other_bots_mentioned:
                 parent_id = None
                 if hasattr(message.channel, "parent_id") and message.channel.parent_id:
@@ -3433,7 +3436,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
-        return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
+        return _discord_profile_bool(
+            self.config, "reactions", "DISCORD_REACTIONS", True
+        )
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction and record durable handling state."""
@@ -10508,6 +10513,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         ("auto_thread", "DISCORD_AUTO_THREAD"),
         ("history_backfill", "DISCORD_HISTORY_BACKFILL"),
         ("history_backfill_limit", "DISCORD_HISTORY_BACKFILL_LIMIT"),
+        ("ignore_no_mention", "DISCORD_IGNORE_NO_MENTION"),
+        ("reactions", "DISCORD_REACTIONS"),
     ):
         _seed_profile_policy(_policy_key, _policy_env)
     allowed_users_cfg = (
@@ -10553,8 +10560,6 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             os.environ["DISCORD_THREAD_AUTO_ARCHIVE_MINUTES"] = str(
                 discord_cfg["thread_auto_archive_minutes"]
             )
-    if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
-        os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
     backfill_cfg = discord_cfg.get("missed_message_backfill")
     if isinstance(backfill_cfg, dict):
         seeded_extra["missed_message_backfill"] = dict(backfill_cfg)
