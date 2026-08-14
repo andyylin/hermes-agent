@@ -542,8 +542,8 @@ def check_discord_requirements() -> bool:
     return True
 
 
-def _build_allowed_mentions():
-    """Build Discord ``AllowedMentions`` with safe defaults, overridable via env.
+def _build_allowed_mentions(config: Optional[PlatformConfig] = None):
+    """Build profile-local Discord ``AllowedMentions`` with safe defaults.
 
     Discord bots default to parsing ``@everyone``, ``@here``, role pings, and
     user pings when ``allowed_mentions`` is unset on the client — any LLM
@@ -563,17 +563,31 @@ def _build_allowed_mentions():
     if not DISCORD_AVAILABLE:
         return None
 
-    def _b(name: str, default: bool) -> bool:
-        raw = os.getenv(name, "").strip().lower()
+    configured = {}
+    if config is not None and isinstance(config.extra, dict):
+        raw_configured = config.extra.get("allow_mentions")
+        if isinstance(raw_configured, dict):
+            configured = raw_configured
+
+    def _b(key: str, name: str, default: bool) -> bool:
+        if key in configured:
+            raw = str(configured[key]).strip().lower()
+        elif _multiplex_active():
+            # Process-global env may belong to another profile.
+            return default
+        else:
+            raw = os.getenv(name, "").strip().lower()
         if not raw:
             return default
         return raw in {"true", "1", "yes", "on"}
 
     return discord.AllowedMentions(
-        everyone=_b("DISCORD_ALLOW_MENTION_EVERYONE", False),
-        roles=_b("DISCORD_ALLOW_MENTION_ROLES", False),
-        users=_b("DISCORD_ALLOW_MENTION_USERS", True),
-        replied_user=_b("DISCORD_ALLOW_MENTION_REPLIED_USER", True),
+        everyone=_b("everyone", "DISCORD_ALLOW_MENTION_EVERYONE", False),
+        roles=_b("roles", "DISCORD_ALLOW_MENTION_ROLES", False),
+        users=_b("users", "DISCORD_ALLOW_MENTION_USERS", True),
+        replied_user=_b(
+            "replied_user", "DISCORD_ALLOW_MENTION_REPLIED_USER", True
+        ),
     )
 
 
@@ -1397,7 +1411,7 @@ class DiscordAdapter(BasePlatformAdapter):
             self._client = commands.Bot(
                 command_prefix="!",  # Not really used, we handle raw messages
                 intents=intents,
-                allowed_mentions=_build_allowed_mentions(),
+                allowed_mentions=_build_allowed_mentions(self.config),
                 **proxy_kwargs_for_bot(proxy_url),
             )
             adapter_self = self  # capture for closure
@@ -10462,13 +10476,18 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     # into unsafe modes (e.g. roles=true) if they actually want it.
     allow_mentions_cfg = discord_cfg.get("allow_mentions")
     if isinstance(allow_mentions_cfg, dict):
+        seeded_extra["allow_mentions"] = dict(allow_mentions_cfg)
         for yaml_key, env_key in (
             ("everyone", "DISCORD_ALLOW_MENTION_EVERYONE"),
             ("roles", "DISCORD_ALLOW_MENTION_ROLES"),
             ("users", "DISCORD_ALLOW_MENTION_USERS"),
             ("replied_user", "DISCORD_ALLOW_MENTION_REPLIED_USER"),
         ):
-            if yaml_key in allow_mentions_cfg and not os.getenv(env_key):
+            if (
+                yaml_key in allow_mentions_cfg
+                and not _skip_env_bridge
+                and not os.getenv(env_key)
+            ):
                 os.environ[env_key] = str(allow_mentions_cfg[yaml_key]).lower()
     # reply_to_mode: top-level preferred, falls back to extra.reply_to_mode.
     # YAML 1.1 parses bare 'off' as boolean False — coerce to string "off".
