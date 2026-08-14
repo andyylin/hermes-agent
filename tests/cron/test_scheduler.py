@@ -622,6 +622,100 @@ class TestRunJobSessionPersistence:
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
 
+    def test_wake_false_does_not_open_session_db(self):
+        import cron.scheduler as scheduler
+
+        job = {
+            "id": "wake-false-no-db",
+            "name": "wake false",
+            "prompt": "do not run",
+            "script": "check.py",
+        }
+        with patch.object(
+            scheduler,
+            "_run_job_script",
+            return_value=(True, '{"wakeAgent": false}'),
+        ), patch("hermes_state.SessionDB") as session_db_cls, patch(
+            "run_agent.AIAgent"
+        ) as agent_cls:
+            success, _, final_response, error = scheduler.run_job(job)
+
+        assert success is True
+        assert final_response == scheduler.SILENT_MARKER
+        assert error is None
+        session_db_cls.assert_not_called()
+        agent_cls.assert_not_called()
+
+    def test_empty_prompt_does_not_open_session_db(self):
+        import cron.scheduler as scheduler
+
+        job = {
+            "id": "empty-prompt-no-db",
+            "name": "empty prompt",
+            "prompt": "",
+        }
+        with patch.object(scheduler, "_build_job_prompt", return_value=None), patch(
+            "hermes_state.SessionDB"
+        ) as session_db_cls, patch("run_agent.AIAgent") as agent_cls:
+            success, output, final_response, error = scheduler.run_job(job)
+
+        assert success is True
+        assert output == ""
+        assert final_response == scheduler.SILENT_MARKER
+        assert error is None
+        session_db_cls.assert_not_called()
+        agent_cls.assert_not_called()
+
+    def test_prompt_injection_block_does_not_open_session_db(self):
+        import cron.scheduler as scheduler
+
+        job = {
+            "id": "blocked-no-db",
+            "name": "blocked",
+            "prompt": "unsafe",
+        }
+        blocked = scheduler.CronPromptInjectionBlocked("blocked")
+        with patch.object(
+            scheduler, "_build_job_prompt", side_effect=blocked
+        ), patch("hermes_state.SessionDB") as session_db_cls, patch(
+            "run_agent.AIAgent"
+        ) as agent_cls:
+            success, _, final_response, error = scheduler.run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert error == "blocked"
+        session_db_cls.assert_not_called()
+        agent_cls.assert_not_called()
+
+    def test_normal_execution_closes_session_db_once_after_agent_use(self, tmp_path):
+        events = []
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            fake_db.get_compression_tip.side_effect = (
+                lambda session_id: events.append("get_compression_tip") or None
+            )
+            fake_db.end_session.side_effect = (
+                lambda *args: events.append("end_session")
+            )
+            fake_db.close.side_effect = lambda: events.append("close")
+            mock_agent = mock_agent_cls.return_value
+            mock_agent.run_conversation.side_effect = (
+                lambda *args, **kwargs: events.append("agent")
+                or {"final_response": "ok"}
+            )
+
+            success, _, final_response, error = run_job(
+                {"id": "normal-close", "name": "normal", "prompt": "hello"}
+            )
+
+        assert success is True
+        assert final_response == "ok"
+        assert error is None
+        assert events.index("agent") < events.index("close")
+        assert events.count("close") == 1
+        assert fake_db.method_calls[-1][0] == "close"
+        fake_db.close.assert_called_once()
+
 
     @contextlib.contextmanager
     def _run_job_patches(self, tmp_path, extra=()):
