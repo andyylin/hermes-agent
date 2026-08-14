@@ -1851,6 +1851,15 @@ def load_gateway_config() -> GatewayConfig:
             # ``apply_yaml_config_fn`` loop above. #41112 / #3823.
 
 
+            try:
+                from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+                _profile_scoped_config_load = bool(
+                    is_multiplex_active() and current_secret_scope() is not None
+                )
+            except Exception:
+                _profile_scoped_config_load = False
+
             # Bridge top-level require_mention to Telegram when the telegram: section
             # does not already provide one.  Users often write "require_mention: true"
             # at the top level alongside group_sessions_per_user, expecting it to work
@@ -1868,7 +1877,10 @@ def load_gateway_config() -> GatewayConfig:
                     # require_mention (not a telegram: block), so the telegram plugin's
                     # apply_yaml_config_fn hook — which only runs when a telegram config
                     # block exists — can't cover the no-telegram-block case (#3979).
-                    if not os.getenv("TELEGRAM_REQUIRE_MENTION"):
+                    if (
+                        not _profile_scoped_config_load
+                        and not os.getenv("TELEGRAM_REQUIRE_MENTION")
+                    ):
                         os.environ["TELEGRAM_REQUIRE_MENTION"] = str(_tl_require_mention).lower()
 
             # Telegram settings → env vars / extra: migrated to the telegram
@@ -1882,7 +1894,11 @@ def load_gateway_config() -> GatewayConfig:
             # Signal settings → env vars (env vars take precedence)
             signal_cfg = yaml_cfg.get("signal", {})
             if isinstance(signal_cfg, dict):
-                if "require_mention" in signal_cfg and not os.getenv("SIGNAL_REQUIRE_MENTION"):
+                if (
+                    "require_mention" in signal_cfg
+                    and not _profile_scoped_config_load
+                    and not os.getenv("SIGNAL_REQUIRE_MENTION")
+                ):
                     os.environ["SIGNAL_REQUIRE_MENTION"] = str(signal_cfg["require_mention"]).lower()
 
             # DingTalk settings → env vars: migrated to the dingtalk plugin's
