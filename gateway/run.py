@@ -15001,6 +15001,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _make_profile_busy_session_handler(self, profile_name: str):
         """Stamp an owning adapter's profile before resolving busy policy."""
+        from hermes_cli.profiles import get_profile_dir
+
+        try:
+            profile_home = get_profile_dir(profile_name)
+        except Exception:
+            profile_home = None
+
         async def _handler(event, _session_key):
             try:
                 if getattr(event, "source", None) is not None and not event.source.profile:
@@ -15008,6 +15015,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
             routed_session_key = self._session_key_for_source(event.source)
+            if profile_home is not None:
+                with _profile_runtime_scope(profile_home):
+                    return await self._handle_active_session_busy_message(
+                        event, routed_session_key
+                    )
             return await self._handle_active_session_busy_message(
                 event, routed_session_key
             )
