@@ -93,6 +93,26 @@ class TestStateMachine:
         _record()
         assert _row("ob-1")["state"] == "pending"
 
+    @pytest.mark.parametrize("terminal", ["delivered", "failed"])
+    def test_duplicate_record_preserves_terminal_state(self, terminal):
+        _record(content="original")
+        if terminal == "delivered":
+            dl.mark_delivered("ob-1")
+        else:
+            dl.mark_failed("ob-1", "definitive rejection")
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET attempts=3 WHERE obligation_id=?",
+                ("ob-1",),
+            )
+
+        _record(content="replacement must not reopen")
+
+        row = _row("ob-1")
+        assert row["state"] == terminal
+        assert row["attempts"] == 3
+        assert row["content"] == "original"
+
 
 class TestObligationId:
     def test_stable_and_distinct(self):

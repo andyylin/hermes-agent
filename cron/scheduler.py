@@ -1701,6 +1701,171 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     return targets[0] if targets else None
 
 
+def _markdown_tables_to_bullets(markdown_text: str) -> str:
+    """Best-effort conversion of simple Markdown tables into bullet lists.
+
+    Discord's Markdown table rendering is inconsistent and hard to read in
+    alert channels. This keeps cron alerts Discord-friendly even when a
+    no-agent script or LLM slips a table into the body.
+    """
+    lines = markdown_text.splitlines()
+    output: list[str] = []
+    i = 0
+    fence_char: str | None = None
+    fence_width = 0
+
+    def _fence_marker(line: str) -> tuple[str, int, str] | None:
+        stripped = line.lstrip()
+        if not stripped or stripped[0] not in ("`", "~"):
+            return None
+        char = stripped[0]
+        width = len(stripped) - len(stripped.lstrip(char))
+        if width < 3:
+            return None
+        return char, width, stripped[width:]
+
+    def _table_cells(line: str) -> list[str]:
+        r"""Split a Markdown table row without treating ``\|`` as a boundary."""
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            stripped = stripped[1:]
+        if stripped.endswith("|") and not stripped.endswith(r"\|"):
+            stripped = stripped[:-1]
+
+        cells: list[str] = []
+        current: list[str] = []
+        escaped = False
+        for char in stripped:
+            if escaped:
+                if char == "|":
+                    current.append("|")
+                else:
+                    current.extend(("\\", char))
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == "|":
+                cells.append("".join(current).strip())
+                current = []
+            else:
+                current.append(char)
+        if escaped:
+            current.append("\\")
+        cells.append("".join(current).strip())
+        return cells
+
+    def _is_separator(line: str) -> bool:
+        cells = _table_cells(line)
+        if not cells:
+            return False
+        return all(cell and set(cell.replace(":", "").replace("-", "")) == set() and "-" in cell for cell in cells)
+
+    while i < len(lines):
+        marker = _fence_marker(lines[i])
+        if fence_char is not None:
+            output.append(lines[i])
+            if (
+                marker is not None
+                and marker[0] == fence_char
+                and marker[1] >= fence_width
+                and not marker[2].strip()
+            ):
+                fence_char = None
+                fence_width = 0
+            i += 1
+            continue
+        if marker is not None:
+            fence_char, fence_width, _ = marker
+            output.append(lines[i])
+            i += 1
+            continue
+        if "|" in lines[i] and i + 1 < len(lines) and _is_separator(lines[i + 1]):
+            headers = _table_cells(lines[i])
+            separators = _table_cells(lines[i + 1])
+            if len(headers) != len(separators):
+                output.append(lines[i])
+                i += 1
+                continue
+            rows: list[list[str]] = []
+            i += 2
+            while i < len(lines) and "|" in lines[i] and lines[i].strip():
+                row = _table_cells(lines[i])
+                if len(row) != len(headers):
+                    break
+                rows.append(row)
+                i += 1
+            if not rows:
+                output.extend((lines[i - 2], lines[i - 1]))
+                continue
+            if output and output[-1].strip():
+                output.append("")
+            for row in rows:
+                pairs = []
+                for idx, value in enumerate(row):
+                    header = headers[idx] if idx < len(headers) and headers[idx] else f"Column {idx + 1}"
+                    if value:
+                        pairs.append(f"**{header}:** {value}")
+                if pairs:
+                    output.append(f"- {'; '.join(pairs)}")
+            if i < len(lines) and lines[i].strip():
+                output.append("")
+            continue
+        output.append(lines[i])
+        i += 1
+
+    return "\n".join(output)
+
+
+def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool) -> str:
+    """Apply the cron wrapper, using Discord-native Markdown when relevant."""
+    task_name = job.get("name", job["id"])
+    job_id = job.get("id", "")
+    body = _markdown_tables_to_bullets(content) if for_discord else content
+    if for_discord:
+        return (
+            f"# Cron Alert: {task_name}\n\n"
+            f"**Job ID:** `{job_id}`\n\n"
+            f"## Report\n\n"
+            f"{body}\n\n"
+            f"## Manage\n\n"
+            f"To stop or manage this job, send me a new message, e.g. `stop reminder {task_name}`."
+        )
+    return (
+        f"Cronjob Response: {task_name}\n"
+        f"(job_id: {job_id})\n"
+        f"-------------\n\n"
+        f"{body}\n\n"
+        f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+    )
+
+
+def _format_cron_email_subject(job: dict):
+    """Build an optional email subject and stable recurring-thread anchor."""
+    template = job.get("email_subject_template") or job.get("delivery_subject_template")
+    if not template:
+        return None
+    now = _hermes_now()
+    try:
+        subject = str(template).format(
+            date=now.strftime("%Y-%m-%d"),
+            date_compact=now.strftime("%Y%m%d"),
+            job_name=job.get("name", job.get("id", "")),
+            job_id=job.get("id", ""),
+        )
+    except (IndexError, KeyError, ValueError) as exc:
+        logger.warning(
+            "Job '%s': invalid email subject template %r: %s",
+            job.get("id", "?"),
+            template,
+            exc,
+        )
+        return None
+    thread_key = str(job.get("email_thread_key") or "").strip()
+    if thread_key:
+        return {"subject": subject, "thread_anchor_key": thread_key}
+    return {"subject": subject, "suppress_threading": True}
+
+
 # Media extension sets — audio routing is centralized in gateway.platforms.base
 # via should_send_media_as_audio() so Telegram-specific rules stay in one place.
 _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
@@ -1715,24 +1880,26 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> None:
-    """Send extracted MEDIA files as native platform attachments via a live adapter.
+) -> tuple[list[tuple[str, bool, str]], list[str]]:
+    """Return retryable failures separately from indeterminate outcomes.
 
-    Routes each file to the appropriate adapter method (send_voice, send_image_file,
-    send_video, send_document) based on file extension — mirroring the routing logic
-    in ``BasePlatformAdapter._process_message_background``.
+    A timeout is fallback-eligible only when cancellation proves dispatch never
+    started.  If cancellation fails, the send is already in flight and retrying
+    could duplicate the attachment.
     """
     from pathlib import Path
 
     from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    failures: list[tuple[str, bool, str]] = []
+    uncertain: list[str] = []
 
-    for media_path, _is_voice in media_files:
+    for media_path, is_voice in media_files:
         try:
             ext = Path(media_path).suffix.lower()
             route_platform = platform if platform is not None else getattr(adapter, "platform", None)
-            if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
+            if should_send_media_as_audio(route_platform, ext, is_voice=is_voice):
                 coro = adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=metadata)
             elif ext in _VIDEO_EXTS:
                 coro = adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=metadata)
@@ -1742,25 +1909,37 @@ def _send_media_via_adapter(
                 coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=metadata)
 
             from agent.async_utils import safe_schedule_threadsafe
+
             future = safe_schedule_threadsafe(coro, loop)
             if future is None:
-                logger.warning(
-                    "Job '%s': cannot send media %s, gateway loop unavailable",
-                    job.get("id", "?"), media_path,
-                )
-                return
+                msg = f"cannot send media {media_path}, gateway loop unavailable"
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                failures.append((media_path, is_voice, msg))
+                continue
             try:
                 result = future.result(timeout=30)
             except TimeoutError:
-                future.cancel()
-                raise
-            if result and not getattr(result, "success", True):
-                logger.warning(
-                    "Job '%s': media send failed for %s: %s",
-                    job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
+                if future.cancel():
+                    raise
+                msg = (
+                    f"media send for {media_path} timed out after dispatch; "
+                    "outcome indeterminate and fallback suppressed to avoid duplicate delivery"
                 )
-        except Exception as e:
-            logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                uncertain.append(msg)
+                continue
+            if not _confirm_adapter_delivery(result):
+                msg = (
+                    f"media send failed for {media_path}: "
+                    f"{getattr(result, 'error', 'unconfirmed adapter result')}"
+                )
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                failures.append((media_path, is_voice, msg))
+        except Exception as exc:
+            msg = f"failed to send media {media_path}: {exc}"
+            logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+            failures.append((media_path, is_voice, msg))
+    return failures, uncertain
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
@@ -1887,23 +2066,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception:
         pass
 
-    if wrap_response:
-        task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
-    else:
-        delivery_content = content
-
-    # Extract MEDIA: tags so attachments are forwarded as files, not raw text
+    # Extracting and platform-specific formatting happen per target below.
+    # A fan-out may include Discord plus email/Telegram, and one shared payload
+    # would leak Discord's table-to-bullet rendering into every sibling target.
     from gateway.platforms.base import BasePlatformAdapter
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
@@ -1931,6 +2097,24 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+
+        for_discord = str(platform_name).lower() == "discord"
+        email_subject = (
+            _format_cron_email_subject(job)
+            if str(platform_name).lower() == "email"
+            else None
+        )
+        if wrap_response:
+            delivery_content = _format_cron_delivery_content(
+                job,
+                content,
+                for_discord=for_discord,
+            )
+        else:
+            delivery_content = content
+        media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        standalone_content = cleaned_delivery_content
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -2176,6 +2360,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
 
+            if email_subject:
+                route_metadata = dict(route_metadata or {})
+                route_metadata.update(email_subject)
+                media_metadata = dict(media_metadata or {})
+                media_metadata.update(email_subject)
+
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
                 # Route through the gateway's DeliveryRouter so the live send
@@ -2343,7 +2533,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 routed_media_metadata["user_id"] = logical_home.user_id
                             if logical_home.scope_id:
                                 routed_media_metadata["scope_id"] = logical_home.scope_id
-                    _send_media_via_adapter(
+                    media_failures, media_uncertain = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
                         media_files,
@@ -2352,6 +2542,23 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         job,
                         platform=platform,
                     )
+                    if media_failures:
+                        target_errors.extend(
+                            error for _path, _is_voice, error in media_failures
+                        )
+                        media_files = [
+                            (path, is_voice)
+                            for path, is_voice, _error in media_failures
+                        ]
+                        # Live text already succeeded. Standalone fallback retries
+                        # only failed attachments, never the delivered text.
+                        standalone_content = ""
+                        adapter_ok = False
+                    if media_uncertain:
+                        delivery_errors.extend(
+                            f"{error} (target {platform_name}:{chat_id})"
+                            for error in media_uncertain
+                        )
                 elif timed_out and media_files:
                     msg = (
                         f"{len(media_files)} media attachment(s) not delivered to "
@@ -2424,7 +2631,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                standalone_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                subject=email_subject,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -2453,7 +2668,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(
+                            lambda: asyncio.run(
+                                _send_to_platform(
+                                    platform,
+                                    pconfig,
+                                    chat_id,
+                                    standalone_content,
+                                    thread_id=thread_id,
+                                    media_files=media_files,
+                                    subject=email_subject,
+                                )
+                            )
+                        )
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -3422,6 +3649,27 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
     return None
 
 
+def _own_late_session_db_future(
+    future: concurrent.futures.Future | None,
+    job_id: str,
+) -> None:
+    """Cancel a pending SessionDB init or close the late result exactly once."""
+    if future is None or future.cancel():
+        return
+
+    def _close_late(completed):
+        try:
+            late_db = completed.result()
+        except Exception:
+            return
+        try:
+            late_db.close()
+        except Exception as exc:
+            logger.warning("Job '%s': failed to close late SessionDB init: %s", job_id, exc)
+
+    future.add_done_callback(_close_late)
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
@@ -3632,73 +3880,6 @@ def run_job(
     # ---------------------------------------------------------------
     from run_agent import AIAgent
 
-    # Initialize SQLite session store so cron job messages are persisted
-    # and discoverable via session_search (same pattern as gateway/run.py).
-    #
-    # Bounded with its own timeout (separate from HERMES_CRON_TIMEOUT, which
-    # only watches the agent's run_conversation below): SessionDB.__init__
-    # opens/migrates state.db synchronously and has no timeout of its own
-    # against a wedged sqlite3.connect (e.g. a stale flock left by a crashed
-    # sibling process). An unbounded hang here is invisible to every other
-    # cron safeguard, because it happens BEFORE _submit_with_guard's future
-    # exists — the finally block that releases the job from
-    # _running_job_ids never runs, so the job stays wedged "running" until
-    # the whole gateway process is restarted, silently skipping every
-    # scheduled fire in between with "already running — skipping".
-    _session_db = None
-    try:
-        from hermes_state import SessionDB
-
-        # Resolve timeout: env override → config.yaml → default 10s.
-        # Mirrors the script_timeout_seconds resolution pattern.
-        _session_db_timeout: float | None = None
-        _raw_env_timeout = os.getenv("HERMES_CRON_SESSION_DB_TIMEOUT", "").strip()
-        if _raw_env_timeout:
-            try:
-                _session_db_timeout = float(_raw_env_timeout)
-            except (ValueError, TypeError):
-                logger.warning(
-                    "Invalid HERMES_CRON_SESSION_DB_TIMEOUT=%r; using config/default",
-                    _raw_env_timeout,
-                )
-        if _session_db_timeout is None:
-            try:
-                from hermes_cli.config import load_config
-                _cfg = load_config() or {}
-                _cron_cfg = _cfg.get("cron", {}) if isinstance(_cfg, dict) else {}
-                _configured = _cron_cfg.get("session_db_timeout_seconds")
-                if _configured is not None:
-                    _session_db_timeout = float(_configured)
-            except Exception as exc:
-                logger.debug(
-                    "Failed to load cron.session_db_timeout_seconds from config: %s",
-                    exc,
-                )
-        if _session_db_timeout is None:
-            _session_db_timeout = 10.0
-
-        if _session_db_timeout > 0:
-            _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            try:
-                _session_db = _session_db_pool.submit(SessionDB).result(timeout=_session_db_timeout)
-            finally:
-                # Don't wait for a wedged connect() to unwind — abandon the
-                # worker thread (same pattern as the agent inactivity timeout
-                # further down) rather than blocking shutdown on it too.
-                _session_db_pool.shutdown(wait=False)
-        else:
-            # 0 = unlimited (legacy behavior, opt-in for debugging)
-            _session_db = SessionDB()
-    except concurrent.futures.TimeoutError:
-        logger.error(
-            "Job '%s': SessionDB init did not return within %.0fs — proceeding "
-            "without a session store for this run instead of blocking it "
-            "forever",
-            job.get("id", "?"), _session_db_timeout,
-        )
-    except Exception as e:
-        logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
-
     # Wake-gate: if this job has a pre-check script, run it BEFORE building
     # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
     # the whole agent run. We pass the result into _build_job_prompt so
@@ -3751,6 +3932,8 @@ def run_job(
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
+
+    _session_db = None
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
@@ -3884,6 +4067,83 @@ def run_job(
                 f"holder, stagger its schedule or remove its workdir to "
                 f"unblock this job (#79768)."
             )
+
+        # Initialize SQLite session store after all pre-agent exits above
+        # (wakeAgent=false, blocked prompt, and empty/None prompt) have returned
+        # and inside this try/finally so normal execution closes it exactly once.
+        #
+        # Bounded with its own timeout (separate from HERMES_CRON_TIMEOUT, which
+        # only watches the agent's run_conversation below): SessionDB.__init__
+        # opens/migrates state.db synchronously and has no timeout of its own
+        # against a wedged sqlite3.connect (e.g. a stale flock left by a crashed
+        # sibling process). An unbounded hang here is invisible to every other
+        # cron safeguard, because it happens BEFORE _submit_with_guard's future
+        # exists — the finally block that releases the job from
+        # _running_job_ids never runs, so the job stays wedged "running" until
+        # the whole gateway process is restarted, silently skipping every
+        # scheduled fire in between with "already running — skipping".
+        _session_db_timeout: float | None = None
+        _session_db_future: concurrent.futures.Future | None = None
+        try:
+            from hermes_state import SessionDB
+
+            # Resolve timeout: env override → config.yaml → default 10s.
+            # Mirrors the script_timeout_seconds resolution pattern.
+            _raw_env_timeout = os.getenv("HERMES_CRON_SESSION_DB_TIMEOUT", "").strip()
+            if _raw_env_timeout:
+                try:
+                    _session_db_timeout = float(_raw_env_timeout)
+                except (ValueError, TypeError):
+                    logger.warning(
+                        "Invalid HERMES_CRON_SESSION_DB_TIMEOUT=%r; using config/default",
+                        _raw_env_timeout,
+                    )
+            if _session_db_timeout is None:
+                try:
+                    from hermes_cli.config import load_config
+                    _cfg = load_config() or {}
+                    _cron_cfg = _cfg.get("cron", {}) if isinstance(_cfg, dict) else {}
+                    _configured = _cron_cfg.get("session_db_timeout_seconds")
+                    if _configured is not None:
+                        _session_db_timeout = float(_configured)
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to load cron.session_db_timeout_seconds from config: %s",
+                        exc,
+                    )
+            if _session_db_timeout is None:
+                _session_db_timeout = 10.0
+
+            if _session_db_timeout > 0:
+                _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                try:
+                    _session_db_future = _session_db_pool.submit(SessionDB)
+                    _session_db = _session_db_future.result(timeout=_session_db_timeout)
+                finally:
+                    # Don't wait for a wedged connect() to unwind — abandon the
+                    # worker thread (same pattern as the agent inactivity timeout
+                    # further down) rather than blocking shutdown on it too.
+                    _session_db_pool.shutdown(wait=False)
+            else:
+                # 0 = unlimited (legacy behavior, opt-in for debugging)
+                _session_db = SessionDB()
+        except concurrent.futures.TimeoutError:
+            # If construction had not started, cancellation prevents it.  If it
+            # is already running, attach ownership cleanup so a late-created DB
+            # is never discarded with an open SQLite connection.
+            _own_late_session_db_future(
+                _session_db_future,
+                str(job.get("id", "?")),
+            )
+            logger.error(
+                "Job '%s': SessionDB init did not return within %.0fs — proceeding "
+                "without a session store for this run instead of blocking it "
+                "forever",
+                job.get("id", "?"), _session_db_timeout,
+            )
+        except Exception as e:
+            logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
+
         # Scope cron approval policy to this job. Keep the token so the finally
         # restores the pre-job state instead of pinning an explicit empty value,
         # which would suppress the legacy os.environ fallback used by standalone

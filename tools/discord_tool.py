@@ -42,6 +42,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
+DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES = 10080
+VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
 _DISCORD_RESPONSE_BODY_MAX_BYTES = 4 * 1024 * 1024
 _DISCORD_ERROR_BODY_MAX_BYTES = 64 * 1024
 
@@ -74,6 +76,32 @@ def _read_limited_response_body(source: Any, limit: int, *, label: str) -> bytes
 def _get_bot_token() -> Optional[str]:
     """Resolve the Discord bot token under the active profile secret scope."""
     return (get_secret("DISCORD_BOT_TOKEN", "") or "").strip() or None
+
+
+def _load_thread_auto_archive_minutes_config() -> int:
+    """Read this profile's default Discord thread retention."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        raw = (cfg.get("discord") or {}).get("thread_auto_archive_minutes")
+    except Exception as exc:
+        logger.debug("discord: could not load thread retention config (%s).", exc)
+        return DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES
+
+    if raw in (None, ""):
+        return DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES
+    if value not in VALID_THREAD_AUTO_ARCHIVE_MINUTES:
+        logger.warning(
+            "discord.thread_auto_archive_minutes=%r is invalid; using %s.",
+            raw,
+            DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES,
+        )
+        return DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES
+    return value
 
 
 def _discord_request(
@@ -586,10 +614,12 @@ def _delete_message(token: str, channel_id: str, message_id: str, **_kwargs: Any
 def _create_thread(
     token: str, channel_id: str, name: str,
     message_id: Optional[str] = None,
-    auto_archive_duration: int = 1440,
+    auto_archive_duration: Optional[int] = None,
     **_kwargs: Any,
 ) -> str:
     """Create a thread in a channel."""
+    if auto_archive_duration is None:
+        auto_archive_duration = _load_thread_auto_archive_minutes_config()
     if message_id:
         # Create thread from an existing message
         path = f"/channels/{channel_id}/messages/{message_id}/threads"
@@ -869,7 +899,10 @@ def _build_schema(
         "auto_archive_duration": {
             "type": "integer",
             "enum": [60, 1440, 4320, 10080],
-            "description": "Thread archive duration in minutes (create_thread, default 1440).",
+            "description": (
+                "Thread archive duration in minutes (create_thread; defaults to "
+                "discord.thread_auto_archive_minutes, normally 10080)."
+            ),
         },
     }
 
@@ -997,7 +1030,7 @@ def _run_discord_action(
     limit: int = 50,
     before: str = "",
     after: str = "",
-    auto_archive_duration: int = 1440,
+    auto_archive_duration: Optional[int] = None,
 ) -> str:
     """Shared handler logic for both discord tools."""
     token = _get_bot_token()
@@ -1079,7 +1112,7 @@ def discord_admin_handler(action: str, **kwargs) -> str:
 _HANDLER_DEFAULTS = {
     "action": "", "guild_id": "", "channel_id": "", "user_id": "",
     "role_id": "", "message_id": "", "query": "", "name": "",
-    "limit": 50, "before": "", "after": "", "auto_archive_duration": 1440,
+    "limit": 50, "before": "", "after": "", "auto_archive_duration": None,
 }
 
 

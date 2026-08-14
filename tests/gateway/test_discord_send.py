@@ -47,6 +47,17 @@ _ensure_discord_mock()
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 
+def test_thread_retention_env_does_not_cross_multiplex_profiles(monkeypatch):
+    from plugins.platforms.discord import adapter as discord_adapter
+
+    monkeypatch.setenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", "60")
+    monkeypatch.setattr(discord_adapter, "_multiplex_active", lambda: True)
+
+    assert discord_adapter._discord_thread_auto_archive_minutes(
+        PlatformConfig(enabled=True, token="***", extra={})
+    ) == discord_adapter.DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES
+
+
 @pytest.mark.asyncio
 async def test_send_rejects_whitespace_and_records_failed_final_reply(
     caplog, monkeypatch, tmp_path
@@ -215,6 +226,37 @@ async def test_forum_post_file_creates_thread_with_attachment():
     assert call_kwargs["content"] == "here is a photo"
     # Thread name derived from content's first line
     assert call_kwargs["name"] == "here is a photo"
+
+
+@pytest.mark.asyncio
+async def test_forum_post_file_uses_profile_thread_retention():
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={"thread_auto_archive_minutes": 1440},
+        )
+    )
+    thread = SimpleNamespace(
+        id=777,
+        message=SimpleNamespace(
+            id=800,
+            attachments=[SimpleNamespace(filename="photo.png")],
+        ),
+        thread=SimpleNamespace(id=777, send=AsyncMock()),
+    )
+    forum_channel = _discord_mod.ForumChannel()
+    forum_channel.id = 999
+    forum_channel.create_thread = AsyncMock(return_value=thread)
+
+    result = await adapter._forum_post_file(
+        forum_channel,
+        content="photo",
+        file=SimpleNamespace(filename="photo.png"),
+    )
+
+    assert result.success is True
+    assert forum_channel.create_thread.await_args.kwargs["auto_archive_duration"] == 1440
 
 
 @pytest.mark.asyncio

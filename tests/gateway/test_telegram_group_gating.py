@@ -617,6 +617,51 @@ def test_top_level_require_mention_bridges_to_telegram(monkeypatch, tmp_path):
         assert tg_cfg.extra.get("require_mention") is True
 
 
+def test_profile_scoped_top_level_require_mention_does_not_write_global_env(
+    monkeypatch, tmp_path
+):
+    from agent import secret_scope
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "require_mention: true\ngateway:\n  multiplex_profiles: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("TELEGRAM_REQUIRE_MENTION", raising=False)
+    secret_scope.set_multiplex_active(True)
+    token = secret_scope.set_secret_scope({})
+    try:
+        config = load_gateway_config()
+    finally:
+        secret_scope.reset_secret_scope(token)
+        secret_scope.set_multiplex_active(False)
+
+    assert "TELEGRAM_REQUIRE_MENTION" not in __import__("os").environ
+    assert config.platforms[Platform.TELEGRAM].extra["require_mention"] is True
+
+
+def test_telegram_policy_fallback_is_profile_scoped(monkeypatch):
+    from agent import secret_scope
+
+    monkeypatch.setenv("TELEGRAM_REQUIRE_MENTION", "true")
+    adapter = _make_adapter()
+    secret_scope.set_multiplex_active(True)
+    token = secret_scope.set_secret_scope({})
+    try:
+        assert adapter._telegram_require_mention() is False
+    finally:
+        secret_scope.reset_secret_scope(token)
+
+    token = secret_scope.set_secret_scope({"TELEGRAM_REQUIRE_MENTION": "true"})
+    try:
+        assert adapter._telegram_require_mention() is True
+    finally:
+        secret_scope.reset_secret_scope(token)
+        secret_scope.set_multiplex_active(False)
+
+
 # ---------------------------------------------------------------------------
 # Helpers for location / media observe+attribution tests
 # ---------------------------------------------------------------------------

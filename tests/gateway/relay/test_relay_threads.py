@@ -528,6 +528,45 @@ async def test_title_rename_waits_for_feedback_that_arrives_late():
 
 
 @pytest.mark.asyncio
+async def test_native_title_rename_omits_relay_only_guard():
+    """Native Discord's strict rename signature must not receive relay kwargs."""
+    from types import SimpleNamespace
+
+    renames: list = []
+
+    async def rename_thread(
+        thread_id,
+        name,
+        *,
+        only_if_current_name=None,
+    ):
+        renames.append((thread_id, name, only_if_current_name))
+        return True
+
+    adapter = SimpleNamespace(rename_thread=rename_thread)
+    runner = _mk_runner_stub()(adapter)
+    source = SimpleNamespace(
+        platform=Platform.DISCORD,
+        chat_id="thread-native",
+        chat_type="thread",
+        thread_id="thread-native",
+        delivered_via_upstream_relay=False,
+        auto_thread_created=True,
+        auto_thread_initial_name="raw user prompt",
+    )
+
+    await runner._rename_discord_auto_thread_for_session_title(
+        source,  # type: ignore[arg-type]
+        "sess-native",
+        "Semantic Native Thread Title",
+    )
+
+    assert renames == [
+        ("thread-native", "Semantic Native Thread Title", "raw user prompt")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_title_rename_true_miss_noops():
     """The connector didn't auto-thread this reply, so there is nothing to rename."""
     import asyncio
