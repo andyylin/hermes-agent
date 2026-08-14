@@ -494,6 +494,7 @@ class GatewayAuthorizationMixin:
                         adapter_group_allowlists = [
                             getattr(adapter, "allowed_groups", set()),
                             getattr(adapter, "archive_groups", set()),
+                            getattr(adapter, "require_prefix_groups", set()),
                         ]
                     else:
                         extra = getattr(getattr(adapter, "config", None), "extra", None) or {}

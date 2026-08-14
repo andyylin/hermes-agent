@@ -425,11 +425,13 @@ def _discord_thread_auto_archive_minutes(
     configured = None
     if config is not None and isinstance(config.extra, dict):
         configured = config.extra.get("thread_auto_archive_minutes")
-    raw = str(
-        configured
-        if configured not in (None, "")
-        else os.getenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", "")
-    ).strip()
+    # Behavioral configuration is profile-local.  The legacy env fallback is
+    # safe only outside multiplex, where process-global state cannot leak one
+    # profile's value into another adapter.
+    fallback = "" if _multiplex_active() else os.getenv(
+        "DISCORD_THREAD_AUTO_ARCHIVE_MINUTES", ""
+    )
+    raw = str(configured if configured not in (None, "") else fallback).strip()
     try:
         value = int(raw) if raw else DEFAULT_THREAD_AUTO_ARCHIVE_MINUTES
     except ValueError:
@@ -10273,10 +10275,16 @@ async def _standalone_send(
                 return {"error": error, "warnings": warnings}
             return {"error": error}
 
-        result = {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": last_data.get("id")}
         if warnings:
-            result["warnings"] = warnings
-        return result
+            return {
+                "error": "Discord delivery was partial; one or more attachments failed",
+                "partial_success": True,
+                "warnings": warnings,
+                "platform": "discord",
+                "chat_id": chat_id,
+                "message_id": last_data.get("id"),
+            }
+        return {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": last_data.get("id")}
     except Exception as e:
         # Include the exception type: TimeoutError().str() is empty, so
         # "Discord send failed: " alone gave no diagnostic signal.
@@ -10478,8 +10486,14 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
     if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
-    if "thread_auto_archive_minutes" in discord_cfg and not os.getenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES"):
-        os.environ["DISCORD_THREAD_AUTO_ARCHIVE_MINUTES"] = str(discord_cfg["thread_auto_archive_minutes"])
+    if "thread_auto_archive_minutes" in discord_cfg:
+        seeded_extra["thread_auto_archive_minutes"] = str(
+            discord_cfg["thread_auto_archive_minutes"]
+        )
+        if not _skip_env_bridge and not os.getenv("DISCORD_THREAD_AUTO_ARCHIVE_MINUTES"):
+            os.environ["DISCORD_THREAD_AUTO_ARCHIVE_MINUTES"] = str(
+                discord_cfg["thread_auto_archive_minutes"]
+            )
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
         os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
     backfill_cfg = discord_cfg.get("missed_message_backfill")
