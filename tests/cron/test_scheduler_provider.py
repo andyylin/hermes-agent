@@ -640,3 +640,57 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+def test_multiplex_ticker_routes_profile_adapters_inside_profile_scope(
+    tmp_path,
+):
+    """Each profile tick gets only its own adapters and runtime scope."""
+    from contextlib import contextmanager
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    p1 = tmp_path / "default"
+    p2 = tmp_path / "ops"
+    for home in (p1, p2):
+        (home / "cron").mkdir(parents=True)
+    profile_homes = [("default", p1), ("ops", p2)]
+    adapters_by_profile = {
+        "default": {"discord": object()},
+        "ops": {"telegram": object()},
+    }
+    active_scope = []
+    calls = []
+    stop = threading.Event()
+
+    @contextmanager
+    def scope_factory(name, home):
+        active_scope.append((name, home))
+        try:
+            yield
+        finally:
+            active_scope.pop()
+
+    def tracking_tick(*args, **kwargs):
+        assert len(active_scope) == 1
+        calls.append((active_scope[0][0], kwargs["adapters"]))
+        if len(calls) >= len(profile_homes):
+            stop.set()
+        return 0
+
+    provider = InProcessCronScheduler()
+    with patch("cron.scheduler.tick", side_effect=tracking_tick), patch(
+        "cron.jobs.record_ticker_heartbeat", lambda **kw: None
+    ):
+        provider.start(
+            stop,
+            interval=0,
+            profile_homes=profile_homes,
+            adapters={"wrong-primary": object()},
+            adapters_by_profile=adapters_by_profile,
+            profile_scope_factory=scope_factory,
+        )
+
+    assert calls == [
+        ("default", adapters_by_profile["default"]),
+        ("ops", adapters_by_profile["ops"]),
+    ]
+
+
