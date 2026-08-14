@@ -82,6 +82,7 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from plugins.platforms.discord.adapter import _build_allowed_mentions  # noqa: E402
+from gateway.config import PlatformConfig  # noqa: E402
 
 
 # The four DISCORD_ALLOW_MENTION_* env vars that _build_allowed_mentions reads.
@@ -116,5 +117,37 @@ def test_env_var_opts_back_into_everyone(monkeypatch):
     assert am.roles is False
     assert am.users is True
     assert am.replied_user is True
+
+
+def test_multiplex_uses_profile_config_not_other_profiles_env(monkeypatch):
+    from plugins.platforms.discord import adapter as discord_adapter
+
+    monkeypatch.setenv("DISCORD_ALLOW_MENTION_EVERYONE", "true")
+    monkeypatch.setenv("DISCORD_ALLOW_MENTION_ROLES", "true")
+    monkeypatch.setattr(discord_adapter, "_multiplex_active", lambda: True)
+
+    safe_profile = _build_allowed_mentions(
+        PlatformConfig(enabled=True, extra={"allow_mentions": {}})
+    )
+    explicit_profile = _build_allowed_mentions(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "allow_mentions": {
+                    "everyone": True,
+                    "roles": False,
+                    "users": False,
+                    "replied_user": False,
+                }
+            },
+        )
+    )
+
+    assert safe_profile.everyone is False
+    assert safe_profile.roles is False
+    assert explicit_profile.everyone is True
+    assert explicit_profile.roles is False
+    assert explicit_profile.users is False
+    assert explicit_profile.replied_user is False
 
 
