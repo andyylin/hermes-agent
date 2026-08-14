@@ -79,6 +79,48 @@ class TestSignalAdapterInit:
         assert adapter.account == "+15551234567"
         assert "group123" in adapter.group_allow_from
 
+    def test_profile_scoped_policy_does_not_inherit_poisoned_global(self, monkeypatch):
+        from agent import secret_scope
+        from gateway.platforms.signal import SignalAdapter
+
+        monkeypatch.setenv("SIGNAL_REQUIRE_MENTION", "true")
+        monkeypatch.setenv("SIGNAL_ALLOWED_USERS", "default-user")
+        monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", "default-group-user")
+        secret_scope.set_multiplex_active(True)
+        token = secret_scope.set_secret_scope({})
+        try:
+            adapter = SignalAdapter(PlatformConfig(extra={}))
+        finally:
+            secret_scope.reset_secret_scope(token)
+            secret_scope.set_multiplex_active(False)
+
+        assert adapter.require_mention is False
+        assert adapter.dm_allow_from == {"*"}
+        assert adapter.group_allow_from == set()
+
+    def test_profile_scoped_policy_reads_scoped_values(self, monkeypatch):
+        from agent import secret_scope
+        from gateway.platforms.signal import SignalAdapter
+
+        monkeypatch.setenv("SIGNAL_REQUIRE_MENTION", "false")
+        secret_scope.set_multiplex_active(True)
+        token = secret_scope.set_secret_scope(
+            {
+                "SIGNAL_REQUIRE_MENTION": "true",
+                "SIGNAL_ALLOWED_USERS": "secondary-user",
+                "SIGNAL_GROUP_ALLOWED_USERS": "secondary-group-user",
+            }
+        )
+        try:
+            adapter = SignalAdapter(PlatformConfig(extra={}))
+        finally:
+            secret_scope.reset_secret_scope(token)
+            secret_scope.set_multiplex_active(False)
+
+        assert adapter.require_mention is True
+        assert adapter.dm_allow_from == {"secondary-user"}
+        assert adapter.group_allow_from == {"secondary-group-user"}
+
 
 class TestSignalConnectCleanup:
     """Regression coverage for failed connect() cleanup."""
