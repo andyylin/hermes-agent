@@ -123,6 +123,19 @@ def _disk_cache_path(home_path: Optional[Path] = None) -> Path:
     return _DISK_CACHE.path(home_path)
 
 
+def _purge_plaintext_disk_cache(home_path: Optional[Path] = None) -> None:
+    """Remove the legacy plaintext cache or fail closed."""
+    path = _disk_cache_path(home_path)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise RuntimeError(
+            f"Encrypted Bitwarden cache could not remove legacy plaintext cache: {path}"
+        ) from exc
+
+
 def _encrypted_disk_cache_path(home_path: Optional[Path] = None) -> Path:
     """Return the encrypted disk cache path under hermes_home/cache/."""
     from agent.secret_sources._cache import resolve_cache_home
@@ -429,14 +442,6 @@ def _write_encrypted_disk_cache(
                 json.dump(payload, f)
             os.chmod(tmp, 0o600)
             os.replace(tmp, path)
-            # A successful encrypted write completes migration; remove the
-            # legacy plaintext cache so stale secrets cannot remain on disk.
-            try:
-                _disk_cache_path(home_path).unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -445,6 +450,10 @@ def _write_encrypted_disk_cache(
             raise
     except Exception:  # noqa: BLE001 — best-effort cache only
         return
+    # Cache persistence is best-effort; plaintext exclusion is not. Keep this
+    # outside the broad cache-write handler so a concurrent reappearance or
+    # deletion failure propagates fail-closed to the caller.
+    _purge_plaintext_disk_cache(home_path)
 
 
 def _read_encrypted_disk_cache(
@@ -528,6 +537,12 @@ def fetch_bitwarden_secrets(
     catch this and emit a single warning; callers in the user-facing
     setup wizard let it propagate.
     """
+    # Encrypted mode is exclusive even when the network fetch fails. Remove a
+    # legacy plaintext cache before validation, reads, or fetches so even an
+    # invalid direct call cannot leave raw credentials parked on disk.
+    if encrypted_cache_enabled:
+        _purge_plaintext_disk_cache(home_path)
+
     if not access_token:
         raise RuntimeError("Bitwarden access token is empty")
     if not project_id:
@@ -782,6 +797,13 @@ def apply_bitwarden_secrets(
     if not enabled:
         return result
 
+    if encrypted_cache_enabled:
+        try:
+            _purge_plaintext_disk_cache(home_path)
+        except RuntimeError as exc:
+            result.error = str(exc)
+            return result
+
     access_token = os.environ.get(access_token_env, "").strip()
     if not access_token:
         result.error = (
@@ -913,6 +935,21 @@ class BitwardenSource(SecretSource):
         cfg = cfg if isinstance(cfg, dict) else {}
         result = FetchResult()
 
+        encrypted_cfg = cfg.get("encrypted_cache")
+        encrypted_cfg = encrypted_cfg if isinstance(encrypted_cfg, dict) else {}
+        encrypted_enabled = bool(encrypted_cfg.get("enabled", False))
+        try:
+            encrypted_max_stale = float(encrypted_cfg.get("max_stale_seconds", 0))
+        except (TypeError, ValueError):
+            encrypted_max_stale = 0.0
+        if encrypted_enabled:
+            try:
+                _purge_plaintext_disk_cache(home_path)
+            except RuntimeError as exc:
+                result.error = str(exc)
+                result.error_kind = ErrorKind.INTERNAL
+                return result
+
         access_token_env = str(cfg.get("access_token_env") or "BWS_ACCESS_TOKEN")
         access_token = get_source_environment().get(access_token_env, "").strip()
         if not access_token:
@@ -947,14 +984,6 @@ class BitwardenSource(SecretSource):
             ttl = float(cfg.get("cache_ttl_seconds", 300))
         except (TypeError, ValueError):
             ttl = 300.0
-
-        encrypted_cfg = cfg.get("encrypted_cache")
-        encrypted_cfg = encrypted_cfg if isinstance(encrypted_cfg, dict) else {}
-        encrypted_enabled = bool(encrypted_cfg.get("enabled", False))
-        try:
-            encrypted_max_stale = float(encrypted_cfg.get("max_stale_seconds", 0))
-        except (TypeError, ValueError):
-            encrypted_max_stale = 0.0
 
         try:
             secrets, warnings = fetch_bitwarden_secrets(

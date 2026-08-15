@@ -2127,6 +2127,171 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     return targets[0] if targets else None
 
 
+def _markdown_tables_to_bullets(markdown_text: str) -> str:
+    """Best-effort conversion of simple Markdown tables into bullet lists.
+
+    Discord's Markdown table rendering is inconsistent and hard to read in
+    alert channels. This keeps cron alerts Discord-friendly even when a
+    no-agent script or LLM slips a table into the body.
+    """
+    lines = markdown_text.splitlines()
+    output: list[str] = []
+    i = 0
+    fence_char: str | None = None
+    fence_width = 0
+
+    def _fence_marker(line: str) -> tuple[str, int, str] | None:
+        stripped = line.lstrip()
+        if not stripped or stripped[0] not in ("`", "~"):
+            return None
+        char = stripped[0]
+        width = len(stripped) - len(stripped.lstrip(char))
+        if width < 3:
+            return None
+        return char, width, stripped[width:]
+
+    def _table_cells(line: str) -> list[str]:
+        r"""Split a Markdown table row without treating ``\|`` as a boundary."""
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            stripped = stripped[1:]
+        if stripped.endswith("|") and not stripped.endswith(r"\|"):
+            stripped = stripped[:-1]
+
+        cells: list[str] = []
+        current: list[str] = []
+        escaped = False
+        for char in stripped:
+            if escaped:
+                if char == "|":
+                    current.append("|")
+                else:
+                    current.extend(("\\", char))
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == "|":
+                cells.append("".join(current).strip())
+                current = []
+            else:
+                current.append(char)
+        if escaped:
+            current.append("\\")
+        cells.append("".join(current).strip())
+        return cells
+
+    def _is_separator(line: str) -> bool:
+        cells = _table_cells(line)
+        if not cells:
+            return False
+        return all(cell and set(cell.replace(":", "").replace("-", "")) == set() and "-" in cell for cell in cells)
+
+    while i < len(lines):
+        marker = _fence_marker(lines[i])
+        if fence_char is not None:
+            output.append(lines[i])
+            if (
+                marker is not None
+                and marker[0] == fence_char
+                and marker[1] >= fence_width
+                and not marker[2].strip()
+            ):
+                fence_char = None
+                fence_width = 0
+            i += 1
+            continue
+        if marker is not None:
+            fence_char, fence_width, _ = marker
+            output.append(lines[i])
+            i += 1
+            continue
+        if "|" in lines[i] and i + 1 < len(lines) and _is_separator(lines[i + 1]):
+            headers = _table_cells(lines[i])
+            separators = _table_cells(lines[i + 1])
+            if len(headers) != len(separators):
+                output.append(lines[i])
+                i += 1
+                continue
+            rows: list[list[str]] = []
+            i += 2
+            while i < len(lines) and "|" in lines[i] and lines[i].strip():
+                row = _table_cells(lines[i])
+                if len(row) != len(headers):
+                    break
+                rows.append(row)
+                i += 1
+            if not rows:
+                output.extend((lines[i - 2], lines[i - 1]))
+                continue
+            if output and output[-1].strip():
+                output.append("")
+            for row in rows:
+                pairs = []
+                for idx, value in enumerate(row):
+                    header = headers[idx] if idx < len(headers) and headers[idx] else f"Column {idx + 1}"
+                    if value:
+                        pairs.append(f"**{header}:** {value}")
+                if pairs:
+                    output.append(f"- {'; '.join(pairs)}")
+            if i < len(lines) and lines[i].strip():
+                output.append("")
+            continue
+        output.append(lines[i])
+        i += 1
+
+    return "\n".join(output)
+
+
+def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool) -> str:
+    """Apply the cron wrapper, using Discord-native Markdown when relevant."""
+    task_name = job.get("name", job["id"])
+    job_id = job.get("id", "")
+    body = _markdown_tables_to_bullets(content) if for_discord else content
+    if for_discord:
+        return (
+            f"# Cron Alert: {task_name}\n\n"
+            f"**Job ID:** `{job_id}`\n\n"
+            f"## Report\n\n"
+            f"{body}\n\n"
+            f"## Manage\n\n"
+            f"To stop or manage this job, send me a new message, e.g. `stop reminder {task_name}`."
+        )
+    return (
+        f"Cronjob Response: {task_name}\n"
+        f"(job_id: {job_id})\n"
+        f"-------------\n\n"
+        f"{body}\n\n"
+        f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+    )
+
+
+def _format_cron_email_subject(job: dict):
+    """Build an optional email subject and stable recurring-thread anchor."""
+    template = job.get("email_subject_template") or job.get("delivery_subject_template")
+    if not template:
+        return None
+    now = _hermes_now()
+    try:
+        subject = str(template).format(
+            date=now.strftime("%Y-%m-%d"),
+            date_compact=now.strftime("%Y%m%d"),
+            job_name=job.get("name", job.get("id", "")),
+            job_id=job.get("id", ""),
+        )
+    except (IndexError, KeyError, ValueError) as exc:
+        logger.warning(
+            "Job '%s': invalid email subject template %r: %s",
+            job.get("id", "?"),
+            template,
+            exc,
+        )
+        return None
+    thread_key = str(job.get("email_thread_key") or "").strip()
+    if thread_key:
+        return {"subject": subject, "thread_anchor_key": thread_key}
+    return {"subject": subject, "suppress_threading": True}
+
+
 # Media extension sets — audio routing is centralized in gateway.platforms.base
 # via should_send_media_as_audio() so Telegram-specific rules stay in one place.
 _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
@@ -2313,23 +2478,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception:
         pass
 
-    if wrap_response:
-        task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
-    else:
-        delivery_content = content
-
-    # Extract MEDIA: tags so attachments are forwarded as files, not raw text
+    # Extracting and platform-specific formatting happen per target below.
+    # A fan-out may include Discord plus email/Telegram, and one shared payload
+    # would leak Discord's table-to-bullet rendering into every sibling target.
     from gateway.platforms.base import BasePlatformAdapter
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
@@ -2357,6 +2509,23 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+
+        for_discord = str(platform_name).lower() == "discord"
+        email_subject = (
+            _format_cron_email_subject(job)
+            if str(platform_name).lower() == "email"
+            else None
+        )
+        if wrap_response:
+            delivery_content = _format_cron_delivery_content(
+                job,
+                content,
+                for_discord=for_discord,
+            )
+        else:
+            delivery_content = content
+        media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -2601,6 +2770,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
+
+            if email_subject:
+                route_metadata = dict(route_metadata or {})
+                route_metadata.update(email_subject)
 
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
@@ -2850,7 +3023,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                subject=email_subject,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -2879,7 +3060,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(
+                            lambda: asyncio.run(
+                                _send_to_platform(
+                                    platform,
+                                    pconfig,
+                                    chat_id,
+                                    cleaned_delivery_content,
+                                    thread_id=thread_id,
+                                    media_files=media_files,
+                                    subject=email_subject,
+                                )
+                            )
+                        )
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
