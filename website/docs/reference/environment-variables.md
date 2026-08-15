@@ -621,6 +621,10 @@ Used by the bundled LINE platform plugin (`plugins/platforms/line/`). See [Messa
 | `LINE_PUBLIC_URL` | Public HTTPS base URL (e.g. `https://my-tunnel.example.com`). Required for image / audio / video sends — LINE only accepts HTTPS-reachable URLs. |
 | `LINE_ALLOWED_USERS` | Comma-separated user IDs allowed to DM the bot (`U`-prefixed). |
 | `LINE_ALLOWED_GROUPS` | Comma-separated group IDs the bot will respond in (`C`-prefixed). |
+| `LINE_READ_ONLY_GROUPS` | Comma-separated group IDs archived locally without agent dispatch. |
+| `LINE_ARCHIVE_GROUPS` | Comma-separated group IDs archived while normal dispatch remains enabled. |
+| `LINE_REQUIRE_PREFIX_GROUPS` | Comma-separated group IDs requiring an accepted prefix before dispatch. |
+| `LINE_GROUP_PREFIXES` | Comma-separated accepted prefixes for prefix-gated groups. |
 | `LINE_ALLOWED_ROOMS` | Comma-separated room IDs the bot will respond in (`R`-prefixed). |
 | `LINE_ALLOW_ALL_USERS` | Dev-only escape hatch — accepts any source. Default: `false`. |
 | `LINE_HOME_CHANNEL` | Default delivery target for cron jobs with `deliver: line`. |

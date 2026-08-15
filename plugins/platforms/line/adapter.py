@@ -23,7 +23,9 @@ button and always Push-fallback instead.
 
 **Three-allowlist gating.** Separate allowlists for users (U-prefixed),
 groups (C-prefixed), and rooms (R-prefixed). ``LINE_ALLOW_ALL_USERS=true``
-is a dev-only escape hatch.
+is a dev-only escape hatch. ``LINE_READ_ONLY_GROUPS`` archives selected
+groups without dispatching, while ``LINE_ARCHIVE_GROUPS`` archives selected
+groups while preserving normal reply/prefix behavior.
 
 **Media via public HTTPS.** LINE's Messaging API does *not* accept
 binary uploads — images, audio, and video must be reachable HTTPS URLs.
@@ -122,7 +124,7 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
     cache_video_from_bytes,
 )
-from gateway.config import Platform
+from gateway.config import Platform, _getenv
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +142,8 @@ LINE_PER_BUBBLE_CHARS = 5000  # Hard limit per text message object
 LINE_SAFE_BUBBLE_CHARS = 4500  # Conservative limit for chunking
 LINE_MAX_MESSAGES_PER_CALL = 5  # API rejects >5 messages per Reply/Push
 LINE_REPLY_TOKEN_TTL_SECONDS = 50  # Conservative cap below LINE's ~60s
+LINE_ARCHIVE_MAX_BYTES = 10 * 1024 * 1024
+LINE_ARCHIVE_BACKUP_COUNT = 3
 
 # Webhook hardening
 WEBHOOK_BODY_MAX_BYTES = 1_048_576  # 1 MiB — webhooks are tiny JSON
@@ -677,8 +681,14 @@ def _csv_set(value: str) -> Set[str]:
     return {x.strip() for x in value.split(",") if x.strip()}
 
 
+def _csv_list(value: str) -> List[str]:
+    if not value:
+        return []
+    return [x.strip() for x in value.split(",") if x.strip()]
+
+
 def _truthy_env(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
+    v = _getenv(name)
     if v is None:
         return default
     return v.strip().lower() in {"1", "true", "yes", "on"}
@@ -737,13 +747,25 @@ class LineAdapter(BasePlatformAdapter):
             "LINE_ALLOW_ALL_USERS", bool(extra.get("allow_all_users", False))
         )
         self.allowed_users = _csv_set(
-            os.getenv("LINE_ALLOWED_USERS", "")
+            _getenv("LINE_ALLOWED_USERS", "") or ""
         ) | set(extra.get("allowed_users", []))
         self.allowed_groups = _csv_set(
-            os.getenv("LINE_ALLOWED_GROUPS", "")
+            _getenv("LINE_ALLOWED_GROUPS", "") or ""
         ) | set(extra.get("allowed_groups", []))
+        self.read_only_groups = _csv_set(
+            _getenv("LINE_READ_ONLY_GROUPS", "") or ""
+        ) | set(extra.get("read_only_groups", []))
+        self.archive_groups = _csv_set(
+            _getenv("LINE_ARCHIVE_GROUPS", "") or ""
+        ) | set(extra.get("archive_groups", []))
+        self.require_prefix_groups = _csv_set(
+            _getenv("LINE_REQUIRE_PREFIX_GROUPS", "") or ""
+        ) | set(extra.get("require_prefix_groups", []))
+        self.group_prefixes = _csv_list(
+            _getenv("LINE_GROUP_PREFIXES", "") or ""
+        ) or list(extra.get("group_prefixes", [])) or ["Hermes:"]
         self.allowed_rooms = _csv_set(
-            os.getenv("LINE_ALLOWED_ROOMS", "")
+            _getenv("LINE_ALLOWED_ROOMS", "") or ""
         ) | set(extra.get("allowed_rooms", []))
 
         # Slow-LLM postback button threshold
@@ -984,12 +1006,14 @@ class LineAdapter(BasePlatformAdapter):
         if self._bot_user_id and sender_user_id == self._bot_user_id:
             return
 
-        # Allowlist gate.
+        # Allowlist gate. Read-only/archive groups are intentionally admitted
+        # here, then short-circuited in _handle_message_event before agent
+        # dispatch when appropriate.
         if not _allowed_for_source(
             source,
             allow_all=self.allow_all,
             user_ids=self.allowed_users,
-            group_ids=self.allowed_groups,
+            group_ids=self.allowed_groups | self.read_only_groups | self.archive_groups,
             room_ids=self.allowed_rooms,
         ):
             logger.info("LINE: rejecting unauthorized source %s", source)
@@ -1003,6 +1027,76 @@ class LineAdapter(BasePlatformAdapter):
             logger.info("LINE: lifecycle event %s from %s", event_type, source)
         else:
             logger.debug("LINE: ignoring event type %r", event_type)
+
+    def _archive_read_only_message(
+        self,
+        event: Dict[str, Any],
+        *,
+        text: str,
+        msg_type: str,
+        media_urls: List[str],
+        media_types: List[str],
+    ) -> None:
+        """Persist a LINE group message without necessarily dispatching it.
+
+        Media messages are downloaded before read-only dispatch is short-circuited;
+        keep their local cache paths so downstream digest jobs can run OCR/vision
+        instead of seeing only opaque ``[image]`` placeholders.
+        """
+        source = event.get("source") or {}
+        chat_id, chat_type = _resolve_chat(source)
+        try:
+            from hermes_constants import get_hermes_home
+
+            hermes_home = Path(get_hermes_home()).resolve()
+        except Exception:
+            hermes_home = Path.home().joinpath(".hermes").resolve()
+
+        archive_dir = hermes_home / "data" / "line-read-only"
+        archive_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(archive_dir, 0o700)
+        safe_chat_id = re.sub(r"[^A-Za-z0-9_.-]", "_", chat_id or "unknown")
+        record = {
+            "received_at": time.time(),
+            "event_timestamp": event.get("timestamp"),
+            "webhook_event_id": event.get("webhookEventId", ""),
+            "chat_id": chat_id,
+            "chat_type": chat_type,
+            "user_id": source.get("userId", ""),
+            "message_id": (event.get("message") or {}).get("id", ""),
+            "message_type": msg_type,
+            "text": text,
+            "media_urls": media_urls,
+            "media_types": media_types,
+        }
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        archive_path = archive_dir / f"{safe_chat_id}.jsonl"
+        if (
+            archive_path.exists()
+            and archive_path.stat().st_size + len(line.encode("utf-8")) > LINE_ARCHIVE_MAX_BYTES
+        ):
+            oldest = archive_path.with_name(
+                f"{archive_path.name}.{LINE_ARCHIVE_BACKUP_COUNT}"
+            )
+            oldest.unlink(missing_ok=True)
+            for index in range(LINE_ARCHIVE_BACKUP_COUNT - 1, 0, -1):
+                source_path = archive_path.with_name(f"{archive_path.name}.{index}")
+                if source_path.exists():
+                    source_path.replace(
+                        archive_path.with_name(f"{archive_path.name}.{index + 1}")
+                    )
+            archive_path.replace(archive_path.with_name(f"{archive_path.name}.1"))
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(archive_path, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as fh:
+                fd = -1
+                fh.write(line)
+        finally:
+            if fd >= 0:
+                os.close(fd)
 
     async def _handle_message_event(self, event: Dict[str, Any]) -> None:
         msg = event.get("message") or {}
@@ -1047,6 +1141,74 @@ class LineAdapter(BasePlatformAdapter):
             text = f"[location: {title} {address}]".strip()
         else:
             text = f"[unsupported message type: {msg_type}]"
+
+        if (
+            chat_type == "group"
+            and chat_id in self.archive_groups
+            and chat_id not in self.read_only_groups
+        ):
+            self._archive_read_only_message(
+                event,
+                text=text,
+                msg_type=msg_type,
+                media_urls=media_urls,
+                media_types=media_types,
+            )
+            logger.info(
+                "LINE: archived group message chat=%s user=%s type=%s",
+                chat_id,
+                user_id,
+                msg_type,
+            )
+
+        if chat_type == "group" and chat_id in self.read_only_groups:
+            self._reply_tokens.pop(chat_id, None)
+            self._archive_read_only_message(
+                event,
+                text=text,
+                msg_type=msg_type,
+                media_urls=media_urls,
+                media_types=media_types,
+            )
+            logger.info(
+                "LINE: archived read-only group message chat=%s user=%s type=%s",
+                chat_id,
+                user_id,
+                msg_type,
+            )
+            return
+
+        if chat_type == "group" and chat_id in self.require_prefix_groups:
+            if msg_type != "text":
+                self._reply_tokens.pop(chat_id, None)
+                logger.info(
+                    "LINE: ignoring non-text group message without prefix chat=%s user=%s type=%s",
+                    chat_id,
+                    user_id,
+                    msg_type,
+                )
+                return
+            matched_prefix = next(
+                (prefix for prefix in self.group_prefixes if text.startswith(prefix)),
+                "",
+            )
+            if not matched_prefix:
+                self._reply_tokens.pop(chat_id, None)
+                logger.info(
+                    "LINE: ignoring group message without required prefix chat=%s user=%s",
+                    chat_id,
+                    user_id,
+                )
+                return
+            text = text[len(matched_prefix):].lstrip()
+            if not text:
+                self._reply_tokens.pop(chat_id, None)
+                logger.info(
+                    "LINE: ignoring empty group message after required prefix chat=%s user=%s",
+                    chat_id,
+                    user_id,
+                )
+                return
 
         # Best-effort typing indicator (DM only).
         if chat_type == "dm" and self._client:
