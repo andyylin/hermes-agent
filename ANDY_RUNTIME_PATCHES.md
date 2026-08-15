@@ -52,5 +52,16 @@ Pi-side tests are opt-in; broad verification belongs to exact-SHA GitHub CI.
 Rebase conflicts stop fail-closed with the backup intact.
 
 After hosted CI is green, deploy the exact immutable SHA using the established
-Dad → Wife → Default staged gateway rollout. Never build a broad release on the
-Pi, and never restart a healthy profile without explicit approval.
+Dad → Wife → Default staged gateway rollout, then pin **Dashboard to that same
+SHA**. Default gateway and Dashboard both open `/home/pi/.hermes/state.db`; a
+mixed source or SQLite build recorrupted FTS and blocked cron. After the
+release directory exists (including `hermes_cli/web_dist` for `--skip-build`):
+
+```bash
+/home/pi/.hermes/scripts/pin-shared-hermes-runtime.sh --sha <40-hex> --write
+```
+
+That writes `92-andy-runtime-current.conf` for dad, wife, default, **and**
+`hermes-dashboard.service`. Restart Dashboard only after the gateways on that
+SHA are healthy. Never build a broad release on the Pi, and never restart a
+healthy profile without explicit approval.
