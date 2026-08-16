@@ -361,6 +361,113 @@ class TestThreadContext(unittest.TestCase):
         return adapter
 
 
+    def test_distinct_email_threads_from_same_sender_use_distinct_sessions(self):
+        """Independent emails from one sender must not share a busy/session lane."""
+        import asyncio
+        from gateway.session import build_session_key
+
+        adapter = self._make_adapter()
+        captured = []
+
+        async def capture_handle(event):
+            captured.append(event)
+
+        adapter.handle_message = capture_handle
+
+        def message(message_id, subject, *, in_reply_to="", references=""):
+            return {
+                "uid": message_id.encode(),
+                "sender_addr": "user@test.com",
+                "sender_name": "User",
+                "subject": subject,
+                "message_id": message_id,
+                "in_reply_to": in_reply_to,
+                "references": references,
+                "body": subject,
+                "attachments": [],
+                "date": "",
+            }
+
+        asyncio.run(adapter._dispatch_message(message("<first@test.com>", "First")))
+        asyncio.run(adapter._dispatch_message(message("<second@test.com>", "Second")))
+        asyncio.run(adapter._dispatch_message(
+            message(
+                "<reply@test.com>",
+                "Re: First",
+                in_reply_to="<hermes-email-placeholder@test.com>",
+                references="<first@test.com> <hermes-email-placeholder@test.com>",
+            )
+        ))
+
+        first_thread = captured[0].source.thread_id
+        second_thread = captured[1].source.thread_id
+        reply_thread = captured[2].source.thread_id
+        self.assertTrue(first_thread)
+        self.assertNotEqual(first_thread, second_thread)
+        self.assertEqual(reply_thread, first_thread)
+        self.assertNotEqual(
+            build_session_key(captured[0].source),
+            build_session_key(captured[1].source),
+        )
+        self.assertEqual(
+            build_session_key(captured[0].source),
+            build_session_key(captured[2].source),
+        )
+
+    def test_hermes_reply_id_recovers_thread_after_restart(self):
+        """In-Reply-To alone can recover a Hermes email lane after restart."""
+        from plugins.platforms.email.adapter import _email_thread_id
+
+        adapter = self._make_adapter()
+        thread_id = _email_thread_id("<original@test.com>")
+        adapter._thread_context[f"user@test.com\x00{thread_id}"] = {
+            "subject": "Project question",
+            "message_id": "<original@test.com>",
+        }
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+            outbound_id = adapter._send_email(
+                "user@test.com",
+                "Here is the answer.",
+                "<original@test.com>",
+                {"thread_id": thread_id},
+            )
+
+        recovered = _email_thread_id("<reply@test.com>", outbound_id)
+        self.assertEqual(recovered, thread_id)
+
+    def test_parallel_email_threads_keep_their_own_subjects(self):
+        """A second inbound email cannot overwrite the first reply's subject."""
+        adapter = self._make_adapter()
+        first_thread = "email-111111111111111111111111"
+        second_thread = "email-222222222222222222222222"
+        adapter._thread_context[f"user@test.com\x00{first_thread}"] = {
+            "subject": "First project",
+            "message_id": "<first@test.com>",
+        }
+        adapter._thread_context[f"user@test.com\x00{second_thread}"] = {
+            "subject": "Second project",
+            "message_id": "<second@test.com>",
+        }
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+            adapter._send_email(
+                "user@test.com", "First answer", None, {"thread_id": first_thread}
+            )
+            adapter._send_email(
+                "user@test.com", "Second answer", None, {"thread_id": second_thread}
+            )
+
+        sent = [call.args[0] for call in mock_server.send_message.call_args_list]
+        self.assertEqual([msg["Subject"] for msg in sent], [
+            "Re: First project",
+            "Re: Second project",
+        ])
+
     def test_reply_uses_re_prefix(self):
         """Reply subject should have Re: prefix."""
         adapter = self._make_adapter()
