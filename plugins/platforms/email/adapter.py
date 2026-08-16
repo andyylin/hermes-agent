@@ -671,6 +671,47 @@ def _stable_thread_message_id(key: str, domain: str) -> Optional[str]:
     return f"<hermes-thread-{safe_key}@{safe_domain}>"
 
 
+_MESSAGE_ID_RE = re.compile(r"<[^<>\s]+>")
+_HERMES_EMAIL_THREAD_RE = re.compile(
+    r"^<hermes-(email-[0-9a-f]{24})-[0-9a-f]+@", re.IGNORECASE
+)
+
+
+def _message_ids(value: str) -> List[str]:
+    """Extract RFC Message-ID tokens from a header value in wire order."""
+    return _MESSAGE_ID_RE.findall(str(value or ""))
+
+
+def _email_thread_id(
+    message_id: str,
+    in_reply_to: str = "",
+    references: str = "",
+    fallback: str = "",
+) -> str:
+    """Return a stable, opaque session lane for one RFC email thread.
+
+    The first References entry is the conversation root when available. A
+    minimal client may send only In-Reply-To; Hermes outbound Message-IDs embed
+    the opaque lane so those replies remain recoverable after a gateway restart.
+    """
+    reference_ids = _message_ids(references)
+    if reference_ids:
+        anchor = reference_ids[0]
+    else:
+        parent_ids = _message_ids(in_reply_to)
+        if parent_ids:
+            hermes_parent = _HERMES_EMAIL_THREAD_RE.match(parent_ids[0])
+            if hermes_parent:
+                return hermes_parent.group(1).lower()
+            anchor = parent_ids[0]
+        else:
+            own_ids = _message_ids(message_id)
+            anchor = own_ids[0] if own_ids else str(message_id or fallback)
+
+    digest = hashlib.sha256(anchor.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return f"email-{digest}"
+
+
 class EmailAdapter(BasePlatformAdapter):
     """Email gateway adapter using IMAP (receive) and SMTP (send)."""
 
@@ -747,8 +788,10 @@ class EmailAdapter(BasePlatformAdapter):
         self._last_fetch_failed: bool = False
         self._last_fetch_error: str = ""
 
-        # Map chat_id (sender email) -> last subject + message-id for threading
+        # Map sender+email-thread -> subject + message-id for reply threading.
+        # Legacy sender-only entries remain readable for notifications/tests.
         self._thread_context: Dict[str, Dict[str, str]] = {}
+        self._thread_context_max: int = 2000
 
         logger.info("[Email] Adapter initialized for %s", self._address)
 
@@ -1096,6 +1139,7 @@ class EmailAdapter(BasePlatformAdapter):
         subject = _decode_header_value(msg.get("Subject", "(no subject)"))
         message_id = msg.get("Message-ID", "")
         in_reply_to = msg.get("In-Reply-To", "")
+        references = msg.get("References", "")
         # Skip automated/noreply senders before any processing
         msg_headers = dict(msg.items())
         if _is_automated_sender(sender_addr, msg_headers):
@@ -1122,6 +1166,7 @@ class EmailAdapter(BasePlatformAdapter):
             "subject": subject,
             "message_id": message_id,
             "in_reply_to": in_reply_to,
+            "references": references,
             "body": body,
             "attachments": attachments,
             "date": msg.get("Date", ""),
@@ -1223,6 +1268,12 @@ class EmailAdapter(BasePlatformAdapter):
         subject = msg_data["subject"]
         body = msg_data["body"].strip()
         attachments = msg_data["attachments"]
+        thread_id = _email_thread_id(
+            msg_data.get("message_id", ""),
+            msg_data.get("in_reply_to", ""),
+            msg_data.get("references", ""),
+            fallback=str(msg_data.get("uid", "")),
+        )
 
         # Build message text: include subject as context
         text = body
@@ -1248,10 +1299,14 @@ class EmailAdapter(BasePlatformAdapter):
                 msg_type = MessageType.DOCUMENT
 
         # Store thread context for reply threading
-        self._thread_context[sender_addr] = {
+        self._thread_context[f"{sender_addr}\x00{thread_id}"] = {
             "subject": subject,
             "message_id": msg_data["message_id"],
         }
+        if len(self._thread_context) > self._thread_context_max:
+            trim = self._thread_context_max // 2
+            for old_key in list(self._thread_context)[:trim]:
+                self._thread_context.pop(old_key, None)
 
         source = self.build_source(
             chat_id=sender_addr,
@@ -1259,6 +1314,7 @@ class EmailAdapter(BasePlatformAdapter):
             chat_type="dm",
             user_id=sender_addr,
             user_name=msg_data["sender_name"] or sender_addr,
+            thread_id=thread_id,
         )
 
         event = MessageEvent(
@@ -1316,7 +1372,10 @@ class EmailAdapter(BasePlatformAdapter):
         suppress_threading = bool(metadata.get("suppress_threading"))
         thread_anchor_key = metadata.get("thread_anchor_key")
 
-        ctx = self._thread_context.get(to_addr, {})
+        thread_id = str(metadata.get("thread_id") or "")
+        ctx = self._thread_context.get(f"{to_addr}\x00{thread_id}", {})
+        if not ctx:
+            ctx = self._thread_context.get(to_addr, {})
         if explicit_subject:
             subject = str(explicit_subject)
         else:
@@ -1355,7 +1414,14 @@ class EmailAdapter(BasePlatformAdapter):
         )
 
         msg["Date"] = formatdate(localtime=True)
-        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
+        thread_id = str((metadata or {}).get("thread_id") or "").lower()
+        if re.fullmatch(r"email-[0-9a-f]{24}", thread_id):
+            msg_id = (
+                f"<hermes-{thread_id}-{uuid.uuid4().hex[:12]}@"
+                f"{self._message_id_domain()}>"
+            )
+        else:
+            msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
         msg["Message-ID"] = msg_id
 
         plain_body, html_body = _render_email_bodies(body)
