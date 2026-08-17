@@ -12979,6 +12979,13 @@ def main():
         logging.getLogger(__name__).debug("pets CLI wiring failed: %s", _exc)
 
     # =========================================================================
+    # memory-tree command — manual retrieval from generated local packs
+    # =========================================================================
+    from hermes_cli.memory_tree import add_memory_tree_parser
+
+    add_memory_tree_parser(subparsers)
+
+    # =========================================================================
     # journey command — learned skills + memories over time, in the terminal
     # =========================================================================
     journey_parser = subparsers.add_parser(
