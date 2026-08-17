@@ -327,9 +327,14 @@ def collect_verified_archive_records(
 
     records: list[SourceRecord] = []
     for entry in entries:
+        archive_format = str(entry.get("format") or "").lower()
+        if archive_format not in {"md", "qmd"}:
+            continue
         archive = _archive_path(manifest, entry.get("path"))
+        if archive is None or archive.suffix.lower() != f".{archive_format}":
+            continue
         expected_sha = str(entry.get("sha256") or "").lower()
-        if archive is None or len(expected_sha) != 64:
+        if len(expected_sha) != 64:
             continue
         try:
             archive_bytes = archive.read_bytes()

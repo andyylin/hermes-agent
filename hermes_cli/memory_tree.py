@@ -105,6 +105,12 @@ def memory_tree_status(*, json_mode: bool = False, verbose: bool = False, home: 
     packs = resolve_pack_paths(config.get("packs"), home=home)
     raw_counts = state.get("counts")
     counts: dict[str, Any] = raw_counts if isinstance(raw_counts, dict) else {}
+    has_archive_counts = "session_archives" in counts or "legacy_sessions" in counts
+    session_archives = int(counts.get("session_archives", 0) or 0)
+    legacy_sessions = int(
+        (counts.get("legacy_sessions", 0) if has_archive_counts else counts.get("sessions", 0))
+        or 0
+    )
     payload = {
         "schema": "memory-tree-status-v1",
         "updated_at": state.get("updated_at"),
@@ -116,9 +122,9 @@ def memory_tree_status(*, json_mode: bool = False, verbose: bool = False, home: 
         },
         "build": {
             "records_total": counts.get("records_total", 0),
-            "sessions": counts.get("sessions", 0),
-            "session_archives": counts.get("session_archives", counts.get("sessions", 0)),
-            "legacy_sessions": counts.get("legacy_sessions", 0),
+            "sessions": session_archives,
+            "session_archives": session_archives,
+            "legacy_sessions": legacy_sessions,
             "active_work": counts.get("active_work", 0),
             "cron_outputs": counts.get("cron_outputs", 0),
         },
@@ -136,9 +142,9 @@ def memory_tree_status(*, json_mode: bool = False, verbose: bool = False, home: 
     lines.append(f"context: enabled={payload['context']['enabled']} mode={payload['context']['mode']} auto_injection={payload['context']['auto_injection']}")
     lines.append(f"updated_at: {payload['updated_at'] or 'never'}")
     lines.append(
-        "records: total={records_total} sessions={sessions} active_work={active_work} cron_outputs={cron_outputs}".format(
-            **payload["build"]
-        )
+        "records: total={records_total} session_archives={session_archives} "
+        "legacy_sessions={legacy_sessions} active_work={active_work} "
+        "cron_outputs={cron_outputs}".format(**payload["build"])
     )
     lines.append("packs:")
     for pack in payload["packs"]:
