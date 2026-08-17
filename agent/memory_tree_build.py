@@ -243,7 +243,16 @@ def _archive_message_text(lines: list[str], start: int, *, max_chars: int) -> st
 
     def flush() -> None:
         if role and message_lines:
-            content = "\n".join(message_lines).strip()
+            visible_lines = message_lines
+            if role == "user":
+                visible_lines = [
+                    line
+                    for line in message_lines
+                    if not line.startswith(
+                        "[IMPORTANT: You are running as a scheduled cron job."
+                    )
+                ]
+            content = "\n".join(visible_lines).strip()
             if content:
                 parts.append(f"{role.capitalize()}: {content}")
 

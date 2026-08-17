@@ -4,6 +4,7 @@ from pathlib import Path
 
 from agent.memory_tree_build import (
     BuildOptions,
+    _archive_message_text,
     build_memory_tree_packs,
     collect_cron_records,
     collect_verified_archive_records,
@@ -47,6 +48,24 @@ def test_collect_cron_records_skips_file_removed_after_discovery(tmp_path, monke
     vanished.unlink()
 
     assert collect_cron_records(home, limit=10) == []
+
+
+def test_archive_message_text_strips_cron_delivery_wrapper_but_keeps_task():
+    lines = [
+        "## Messages",
+        "### User",
+        "[IMPORTANT: You are running as a scheduled cron job. DELIVERY: automatic.]",
+        "Prepare the morning brief.",
+        "### Assistant",
+        "Morning brief completed.",
+        "## Export verification",
+    ]
+
+    text = _archive_message_text(lines, 0, max_chars=500)
+
+    assert "scheduled cron job" not in text
+    assert "Prepare the morning brief" in text
+    assert "Morning brief completed" in text
 
 
 def test_collect_verified_archive_records_uses_manifest_sha_and_one_bounded_record(tmp_path):
