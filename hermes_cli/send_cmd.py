@@ -365,10 +365,19 @@ def cmd_send(args: argparse.Namespace) -> None:
         )
         sys.exit(_USAGE_EXIT)
 
-    # Optional: prepend a subject line. Useful for alerting scripts that
-    # want a consistent header without inlining it into every call.
+    # Email uses a real RFC Subject plus an optional deterministic reply anchor
+    # so Apple Mail threads recurring automation streams. Other platforms keep
+    # the historical behavior: ``--subject`` is a visible body header.
     subject = getattr(args, "subject", None)
-    if subject:
+    email_thread_key = getattr(args, "email_thread_key", None)
+    is_email_target = target.lower() == "email" or target.lower().startswith("email:")
+    if email_thread_key and (not is_email_target or not subject):
+        print(
+            "hermes send: --email-thread-key requires an email target and --subject.",
+            file=sys.stderr,
+        )
+        sys.exit(_USAGE_EXIT)
+    if subject and not is_email_target:
         message = f"{subject}\n\n{message.lstrip()}"
 
     # Import lazily so `hermes send --help` stays fast and does not pull in
@@ -380,11 +389,16 @@ def cmd_send(args: argparse.Namespace) -> None:
     # Signal/SMS/WhatsApp; live-adapter path for plugin platforms).
     #
     # It expects the standard tool-call dict and returns a JSON string.
-    tool_args = {
+    tool_args: dict[str, object] = {
         "action": "send",
         "target": target,
         "message": message,
     }
+    if subject and is_email_target:
+        tool_args["_delivery_subject"] = {
+            "subject": subject,
+            "thread_anchor_key": email_thread_key,
+        }
 
     result = send_message_tool(tool_args)
     exit_code = _emit_result(
@@ -467,7 +481,20 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         "--subject",
         metavar="LINE",
         default=None,
-        help="Prepend a subject/header line before the message body.",
+        help=(
+            "Email: set the RFC Subject header. Other platforms: prepend a "
+            "subject/header line to the message body."
+        ),
+    )
+
+    parser.add_argument(
+        "--email-thread-key",
+        metavar="KEY",
+        default=None,
+        help=(
+            "Email only: stable automation-specific key used to generate "
+            "In-Reply-To and References headers. Requires --subject."
+        ),
     )
 
     parser.add_argument(
