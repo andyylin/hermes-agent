@@ -488,6 +488,8 @@ def _handle_send(args):
             "media_files": media_files,
             "force_document": force_document_attachments,
         }
+        if platform_name == "email" and args.get("_delivery_subject"):
+            send_kwargs["subject"] = args["_delivery_subject"]
         # Preserve the exact built-in call contract; only custom handlers need
         # the complete typed request.
         if entry is not None and entry.send_message_handler is not None:
