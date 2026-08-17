@@ -55,6 +55,7 @@ def test_archive_message_text_strips_cron_delivery_wrapper_but_keeps_task():
         "## Messages",
         "### User",
         "[IMPORTANT: You are running as a scheduled cron job. DELIVERY: automatic.]",
+        "[DISCORD FORMAT: This cron output is delivered to Discord.]",
         "Prepare the morning brief.",
         "### Assistant",
         "Morning brief completed.",
@@ -64,6 +65,7 @@ def test_archive_message_text_strips_cron_delivery_wrapper_but_keeps_task():
     text = _archive_message_text(lines, 0, max_chars=500)
 
     assert "scheduled cron job" not in text
+    assert "DISCORD FORMAT" not in text
     assert "Prepare the morning brief" in text
     assert "Morning brief completed" in text
 

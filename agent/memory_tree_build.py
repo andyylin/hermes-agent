@@ -245,12 +245,14 @@ def _archive_message_text(lines: list[str], start: int, *, max_chars: int) -> st
         if role and message_lines:
             visible_lines = message_lines
             if role == "user":
+                scaffold_prefixes = (
+                    "[IMPORTANT: You are running as a scheduled cron job.",
+                    "[DISCORD FORMAT: This cron output is delivered to Discord.",
+                )
                 visible_lines = [
                     line
                     for line in message_lines
-                    if not line.startswith(
-                        "[IMPORTANT: You are running as a scheduled cron job."
-                    )
+                    if not line.startswith(scaffold_prefixes)
                 ]
             content = "\n".join(visible_lines).strip()
             if content:
