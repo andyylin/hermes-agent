@@ -9,6 +9,7 @@ from agent.memory_tree_build import (
     collect_verified_archive_records,
     iter_recent_cron_outputs,
 )
+from agent.memory_tree_lite import search_memory_packs
 
 
 def test_iter_recent_cron_outputs_skips_file_removed_during_scan(tmp_path, monkeypatch):
@@ -142,6 +143,46 @@ def test_collect_verified_archive_records_rejects_manifest_path_outside_export_r
     )
 
     assert collect_verified_archive_records(tmp_path, limit=10) == []
+
+
+def test_archived_conversation_labels_remain_searchable_body_not_metadata(tmp_path):
+    archive_dir = tmp_path / "session-exports"
+    archive_dir.mkdir()
+    archive = archive_dir / "s1.md"
+    archive.write_text(
+        "---\nsession_id: \"s1\"\ntitle: \"Searchable\"\nsource: \"cron\"\n---\n"
+        "## Messages\n### User\nfind this request\n### Assistant\nfound this result\n"
+        "## Export verification\n",
+        encoding="utf-8",
+    )
+    (archive_dir / "manifest.jsonl").write_text(
+        json.dumps(
+            {
+                "session_id": "s1",
+                "path": str(archive),
+                "format": "md",
+                "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                "exported_at": 123.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    build_memory_tree_packs(
+        BuildOptions(hermes_home=tmp_path, session_limit=10, cron_limit=0, ledger_limit=0)
+    )
+
+    results = search_memory_packs(
+        [tmp_path / "data" / "memory-tree-lite" / "recent.md"],
+        "find request",
+        limit=1,
+        max_snippet_chars=300,
+    )
+
+    assert len(results) == 1
+    assert "find this request" in results[0].snippet
+    assert "User" not in results[0].metadata
+    assert "Assistant" not in results[0].metadata
 
 
 def test_build_memory_tree_does_not_use_legacy_jsonl_without_explicit_fallback(tmp_path):

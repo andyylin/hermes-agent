@@ -264,7 +264,10 @@ def _archive_message_text(lines: list[str], start: int, *, max_chars: int) -> st
         if role:
             message_lines.append(line)
     flush()
-    return _bounded_archive_text("\n\n".join(parts), max_chars)
+    conversation = "\n\n".join(parts)
+    if conversation:
+        conversation = "Conversation excerpt\n\n" + conversation
+    return _bounded_archive_text(conversation, max_chars)
 
 
 def _archive_path(manifest: Path, raw_path: Any) -> Path | None:
