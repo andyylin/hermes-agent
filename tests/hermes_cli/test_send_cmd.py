@@ -64,6 +64,60 @@ def fake_tool(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_email_subject_and_thread_key_reach_delivery_metadata(
+    fake_tool, monkeypatch
+):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    args = _parse([
+        "--to", "email:andy@example.com",
+        "--subject", "[Hermes][LINE Digest] TOT",
+        "--email-thread-key", "line-tot-digest",
+        "Digest body.",
+    ])
+
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert fake_tool.calls == [{
+        "action": "send",
+        "target": "email:andy@example.com",
+        "message": "Digest body.",
+        "_delivery_subject": {
+            "subject": "[Hermes][LINE Digest] TOT",
+            "thread_anchor_key": "line-tot-digest",
+        },
+    }]
+
+
+def test_email_thread_key_requires_email_subject(fake_tool, monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    args = _parse([
+        "--to", "email:andy@example.com",
+        "--email-thread-key", "line-tot-digest",
+        "Digest body.",
+    ])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+    assert exc.value.code == 2
+    assert fake_tool.calls == []
+
+
+def test_non_email_subject_remains_body_header(fake_tool, monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    args = _parse(["--to", "telegram", "--subject", "[CI]", "Build passed."])
+
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert fake_tool.calls[0]["message"] == "[CI]\n\nBuild passed."
+    assert "_delivery_subject" not in fake_tool.calls[0]
+
+
 
 
 
