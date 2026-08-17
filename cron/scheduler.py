@@ -5254,12 +5254,9 @@ def run_job(
                 try:
                     _session_db = _session_db_future.result(timeout=_session_db_timeout)
                 except concurrent.futures.TimeoutError:
-                    # The worker is abandoned (shutdown below doesn't wait for it).
-                    # If SessionDB() later completes inside it, the future's result
-                    # would be orphaned and its SQLite FDs (.db, WAL, SHM) leak
-                    # until process exit.  Register a done-callback that retrieves
-                    # and closes any eventual late result (#72782).
-                    _session_db_future.add_done_callback(_close_late_session_db_result)
+                    # Ownership of the abandoned worker is assigned by the
+                    # outer timeout handler below. Registering another callback
+                    # here would close the same late SessionDB result twice.
                     raise
                 finally:
                     # Don't wait for a wedged connect() to unwind — abandon the
