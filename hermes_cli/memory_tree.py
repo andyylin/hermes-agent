@@ -32,14 +32,13 @@ def _load_json(path: Path, default: Any) -> Any:
 
 
 def _load_config(home: Path | None = None) -> dict[str, Any]:
-    path = (home or _home()) / "config.yaml"
     try:
-        import yaml  # type: ignore
+        from hermes_cli.config import load_config_readonly
     except Exception:
         return {}
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError):
+        data = load_config_readonly()
+    except Exception:
         return {}
     return data if isinstance(data, dict) else {}
 
