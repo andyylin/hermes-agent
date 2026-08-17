@@ -786,6 +786,15 @@ def test_get_effective_configurable_toolsets_dedupes_bundled_plugins():
     assert spotify_rows[0][1] == "🎵 Spotify"
 
 
+def test_memory_tree_is_configurable_but_default_off():
+    """Manual Memory Tree retrieval is opt-in, not prompt-auto-enabled."""
+    from hermes_cli.tools_config import _DEFAULT_OFF_TOOLSETS
+
+    keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
+    assert "memory_tree" in keys
+    assert "memory_tree" in _DEFAULT_OFF_TOOLSETS
+
+
 
 
 
