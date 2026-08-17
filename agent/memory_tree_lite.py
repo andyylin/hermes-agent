@@ -67,7 +67,7 @@ def _query_terms(query: str) -> list[str]:
 
 
 def _source_weight(source_type: str) -> int:
-    weights = {"session": 3, "active-work": 2, "cron": 1}
+    weights = {"session-archive": 3, "session": 2, "active-work": 2, "cron": 1}
     return weights.get(source_type, 0)
 
 

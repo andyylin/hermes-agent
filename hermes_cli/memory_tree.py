@@ -117,6 +117,8 @@ def memory_tree_status(*, json_mode: bool = False, verbose: bool = False, home: 
         "build": {
             "records_total": counts.get("records_total", 0),
             "sessions": counts.get("sessions", 0),
+            "session_archives": counts.get("session_archives", counts.get("sessions", 0)),
+            "legacy_sessions": counts.get("legacy_sessions", 0),
             "active_work": counts.get("active_work", 0),
             "cron_outputs": counts.get("cron_outputs", 0),
         },
@@ -253,6 +255,7 @@ def cmd_memory_tree(args: Any) -> int:
                 ledger_limit=getattr(args, "ledger_limit", 80),
                 max_record_chars=getattr(args, "max_record_chars", 4000),
                 include_tools=getattr(args, "include_tools", False),
+                legacy_session_fallback=getattr(args, "legacy_session_fallback", False),
             )
         )
         if getattr(args, "json", False):
@@ -321,6 +324,11 @@ def add_memory_tree_parser(subparsers: Any) -> Any:
     build.add_argument("--ledger-limit", type=int, default=80)
     build.add_argument("--max-record-chars", type=int, default=4000)
     build.add_argument("--include-tools", action="store_true")
+    build.add_argument(
+        "--legacy-session-fallback",
+        action="store_true",
+        help="Explicitly fall back to legacy sessions/*.jsonl when no verified archive exists",
+    )
     build.add_argument("--report", action="store_true", help="Print compact report")
     build.add_argument("--json", action="store_true", help="Emit build state JSON")
 
