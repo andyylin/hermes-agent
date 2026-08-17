@@ -3,8 +3,8 @@
 `andy-runtime` is a deliberately small, linear patch queue rebased on current
 `upstream/main`. It is the only supported custom runtime branch.
 
-Frozen upstream cutoff: `45af7a71fcd420b4422d2c074b1ce58b9ce0d048`
-(2026-08-15, latest origin/main at composition time). Exact-SHA CI and review evidence must name this object.
+Frozen upstream cutoff: `8408edcfb5e086b500b8bc47c5e43b418335b5fd`
+(2026-08-20, latest origin/main at composition time). Exact-SHA CI and review evidence must name this object.
 
 ## Retained behavior
 
@@ -26,6 +26,7 @@ Frozen upstream cutoff: `45af7a71fcd420b4422d2c074b1ce58b9ce0d048`
 6. **Email notifications** — standalone email sends multipart HTML plus plain
    fallback; cron jobs can use `email_subject_template` and
    `email_thread_key` for dated subjects and stable RFC threading.
+   `hermes send` exposes the same threading metadata.
 7. **Cron delivery integrity** — pre-agent exits close their session store;
    attachment fallback retries only confirmed failures, and an already
    in-flight timeout is not retried because that could duplicate delivery.
