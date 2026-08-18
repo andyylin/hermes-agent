@@ -492,6 +492,64 @@ class TestDeliverResultWrapping:
         voice_call = adapter.send_voice.call_args
         assert voice_call[1]["audio_path"] == str(media_path)
 
+    def test_email_cron_metadata_reaches_media_attachment(self, tmp_path, monkeypatch):
+        """Cron email media must use the same subject/thread contract as its text."""
+        from concurrent.futures import Future
+        from datetime import datetime
+
+        from gateway.config import Platform
+
+        media_path = self._safe_media_path(tmp_path, monkeypatch, "daily-report.pdf")
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+        adapter.send_document.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.EMAIL: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            import asyncio as _asyncio
+
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
+
+        job = {
+            "id": "daily-media",
+            "name": "Daily media",
+            "deliver": "origin",
+            "origin": {"platform": "email", "chat_id": "andy@example.net"},
+            "email_subject_template": "{job_name} — {date}",
+            "email_thread_key": "daily-media",
+        }
+
+        with (
+            patch("gateway.config.load_gateway_config", return_value=mock_cfg),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch("cron.scheduler._hermes_now", return_value=datetime(2026, 8, 4, 9, 0)),
+            patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro),
+        ):
+            result = _deliver_result(
+                job,
+                f"Daily report\nMEDIA:{media_path}",
+                adapters={Platform.EMAIL: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        adapter.send_document.assert_awaited_once()
+        assert adapter.send_document.await_args.kwargs["metadata"] == {
+            "subject": "Daily media — 2026-08-04",
+            "thread_anchor_key": "daily-media",
+        }
+
 
 class TestDeliverResultErrorReturns:
     """Verify _deliver_result returns error strings on failure, None on success."""
@@ -563,6 +621,122 @@ class TestRunJobSessionPersistence:
         assert call_args[0][1] == "cron_complete"
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
+
+    def test_wake_false_does_not_open_session_db(self):
+        import cron.scheduler as scheduler
+
+        job = {
+            "id": "wake-false-no-db",
+            "name": "wake false",
+            "prompt": "do not run",
+            "script": "check.py",
+        }
+        with patch.object(
+            scheduler,
+            "_run_job_script",
+            return_value=(True, '{"wakeAgent": false}'),
+        ), patch("hermes_state.SessionDB") as session_db_cls, patch(
+            "run_agent.AIAgent"
+        ) as agent_cls:
+            success, _, final_response, error = scheduler.run_job(job)
+
+        assert success is True
+        assert final_response == scheduler.SILENT_MARKER
+        assert error is None
+        session_db_cls.assert_not_called()
+        agent_cls.assert_not_called()
+
+    def test_empty_prompt_does_not_open_session_db(self):
+        import cron.scheduler as scheduler
+
+        job = {
+            "id": "empty-prompt-no-db",
+            "name": "empty prompt",
+            "prompt": "",
+        }
+        with patch.object(scheduler, "_build_job_prompt", return_value=None), patch(
+            "hermes_state.SessionDB"
+        ) as session_db_cls, patch("run_agent.AIAgent") as agent_cls:
+            success, output, final_response, error = scheduler.run_job(job)
+
+        assert success is True
+        assert output == ""
+        assert final_response == scheduler.SILENT_MARKER
+        assert error is None
+        session_db_cls.assert_not_called()
+        agent_cls.assert_not_called()
+
+    def test_prompt_injection_block_does_not_open_session_db(self):
+        import cron.scheduler as scheduler
+
+        job = {
+            "id": "blocked-no-db",
+            "name": "blocked",
+            "prompt": "unsafe",
+        }
+        blocked = scheduler.CronPromptInjectionBlocked("blocked")
+        with patch.object(
+            scheduler, "_build_job_prompt", side_effect=blocked
+        ), patch("hermes_state.SessionDB") as session_db_cls, patch(
+            "run_agent.AIAgent"
+        ) as agent_cls:
+            success, _, final_response, error = scheduler.run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert error == "blocked"
+        session_db_cls.assert_not_called()
+        agent_cls.assert_not_called()
+
+    def test_normal_execution_closes_session_db_once_after_agent_use(self, tmp_path):
+        events = []
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            fake_db.get_compression_tip.side_effect = (
+                lambda session_id: events.append("get_compression_tip") or None
+            )
+            fake_db.end_session.side_effect = (
+                lambda *args: events.append("end_session")
+            )
+            fake_db.close.side_effect = lambda: events.append("close")
+            mock_agent = mock_agent_cls.return_value
+            mock_agent.run_conversation.side_effect = (
+                lambda *args, **kwargs: events.append("agent")
+                or {"final_response": "ok"}
+            )
+
+            success, _, final_response, error = run_job(
+                {"id": "normal-close", "name": "normal", "prompt": "hello"}
+            )
+
+        assert success is True
+        assert final_response == "ok"
+        assert error is None
+        assert events.index("agent") < events.index("close")
+        assert events.count("close") == 1
+        assert fake_db.method_calls[-1][0] == "close"
+        fake_db.close.assert_called_once()
+
+    def test_late_session_db_initialization_is_closed(self):
+        from cron.scheduler import _own_late_session_db_future
+
+        late_db = MagicMock()
+        future = MagicMock()
+        future.cancel.return_value = False
+        callback = None
+
+        def capture_callback(fn):
+            nonlocal callback
+            callback = fn
+
+        future.add_done_callback.side_effect = capture_callback
+        future.result.return_value = late_db
+
+        _own_late_session_db_future(future, "late-db-job")
+
+        future.cancel.assert_called_once_with()
+        assert callback is not None
+        callback(future)
+        late_db.close.assert_called_once_with()
 
 
     @contextlib.contextmanager
@@ -1796,6 +1970,112 @@ class TestSendMediaViaAdapter:
         self._run_with_loop(adapter, "123", media_files, None, {"id": "j3"})
         adapter.send_voice.assert_called_once()
         adapter.send_image_file.assert_called_once()
+
+    def test_failed_media_result_preserves_retry_identity(self, tmp_path, monkeypatch):
+        from concurrent.futures import Future
+
+        adapter = MagicMock()
+        adapter.send_image_file = AsyncMock()
+        photo_path = self._safe_media_path(tmp_path, monkeypatch, "failed.jpg")
+        completed = Future()
+        completed.set_result(MagicMock(success=False, error="upload rejected"))
+
+        def fake_schedule(coro, _loop):
+            coro.close()
+            return completed
+
+        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule):
+            failures, uncertain = _send_media_via_adapter(
+                adapter,
+                "123",
+                [(str(photo_path), False)],
+                None,
+                MagicMock(),
+                {"id": "media-failure"},
+            )
+
+        assert failures[0][:2] == (str(photo_path), False)
+        assert "upload rejected" in failures[0][2]
+        assert uncertain == []
+
+    def test_in_flight_timeout_is_not_fallback_eligible(self, tmp_path, monkeypatch):
+        adapter = MagicMock()
+        adapter.send_image_file = AsyncMock()
+        photo_path = self._safe_media_path(tmp_path, monkeypatch, "in-flight.jpg")
+        in_flight = MagicMock()
+        in_flight.result.side_effect = TimeoutError("timed out")
+        in_flight.cancel.return_value = False
+
+        def fake_schedule(coro, _loop):
+            coro.close()
+            return in_flight
+
+        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule):
+            failures, uncertain = _send_media_via_adapter(
+                adapter,
+                "123",
+                [(str(photo_path), False)],
+                None,
+                MagicMock(),
+                {"id": "media-in-flight"},
+            )
+
+        in_flight.cancel.assert_called_once_with()
+        assert failures == []
+        assert len(uncertain) == 1
+        assert "outcome indeterminate" in uncertain[0]
+
+    def test_media_fallback_retries_failed_attachment_without_resending_text(
+        self, tmp_path, monkeypatch
+    ):
+        from concurrent.futures import Future
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+
+        first = self._safe_media_path(tmp_path, monkeypatch, "sent.jpg")
+        second = self._safe_media_path(tmp_path, monkeypatch, "failed.jpg")
+        adapter = AsyncMock()
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        standalone_send = AsyncMock(return_value={"success": True})
+        live_text = Future()
+        live_text.set_result(SendResult(success=True, message_id="live-text"))
+
+        def schedule_live_text(coro, _loop):
+            coro.close()
+            return live_text
+
+        job = {
+            "id": "media-partial-list",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch(
+                 "cron.scheduler._send_media_via_adapter",
+                 return_value=([(str(second), False, "second upload rejected")], []),
+             ), \
+             patch(
+                 "agent.async_utils.safe_schedule_threadsafe",
+                 side_effect=schedule_live_text,
+             ), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            result = _deliver_result(
+                job,
+                f"already delivered text\nMEDIA:{first}\nMEDIA:{second}",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        standalone_send.assert_awaited_once()
+        assert standalone_send.await_args.args[3] == ""
+        assert standalone_send.await_args.kwargs["media_files"] == [(str(second), False)]
 
 
 class TestParallelTick:

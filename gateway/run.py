@@ -15375,6 +15375,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _make_profile_busy_session_handler(self, profile_name: str):
         """Stamp an owning adapter's profile before resolving busy policy."""
+        from hermes_cli.profiles import get_profile_dir
+
+        try:
+            profile_home = get_profile_dir(profile_name)
+        except Exception:
+            profile_home = None
+
         async def _handler(event, _session_key):
             try:
                 if getattr(event, "source", None) is not None and not event.source.profile:
@@ -15382,6 +15389,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
             routed_session_key = self._session_key_for_source(event.source)
+            if profile_home is not None:
+                with _profile_runtime_scope(profile_home):
+                    return await self._handle_active_session_busy_message(
+                        event, routed_session_key
+                    )
             return await self._handle_active_session_busy_message(
                 event, routed_session_key
             )
@@ -22592,12 +22604,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_name,
         )
         try:
+            rename_options: Dict[str, Any] = {
+                "only_if_current_name": guard_name,
+            }
+            if use_connector_guard:
+                rename_options["prefer_connector_created"] = True
+                rename_options["parent_chat_id"] = parent_chat_id
             renamed = await rename_thread(
                 target_thread_id,
                 thread_name,
-                prefer_connector_created=use_connector_guard,
-                only_if_current_name=guard_name,
-                parent_chat_id=parent_chat_id,
+                **rename_options,
             )
             logger.info(
                 "discord auto-thread rename result: thread=%s applied=%s",
@@ -30421,6 +30437,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             profile_homes = _multiplex_profile_homes(runner.config)
             if profile_homes:
                 cron_start_kwargs["profile_homes"] = profile_homes
+                _primary_profile = runner._active_profile_name()
+                _cron_adapters_by_profile = {
+                    _primary_profile: runner.adapters,
+                    **getattr(runner, "_profile_adapters", {}),
+                }
+                cron_start_kwargs["adapters_by_profile"] = _cron_adapters_by_profile
+                cron_start_kwargs["profile_scope_factory"] = (
+                    lambda _profile_name, profile_home: _profile_runtime_scope(
+                        Path(profile_home)
+                    )
+                )
                 logger.info(
                     "Cron scheduler will tick %d profile(s) under multiplex: %s",
                     len(profile_homes),
