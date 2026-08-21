@@ -79,12 +79,13 @@ class TestEmptyReasonFallback:
             async def send_voice(self, **kw):  # pragma: no cover - never awaited
                 pass
 
-        errors = _send_media_via_adapter(
+        failures, uncertain = _send_media_via_adapter(
             _Adapter(), "C123", [(str(media), False)], None, loop=object(),
             job={"id": "job-x"},
         )
-        assert len(errors) == 1
-        return errors[0]
+        assert uncertain == []
+        assert len(failures) == 1
+        return failures[0][2]
 
     def test_timeout_error_names_the_class(self, tmp_path, monkeypatch):
         # TimeoutError() has an empty str() — the recorded reason must not
