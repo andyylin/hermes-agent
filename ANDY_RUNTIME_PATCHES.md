@@ -3,8 +3,8 @@
 `andy-runtime` is a deliberately small, linear patch queue rebased on current
 `upstream/main`. It is the only supported custom runtime branch.
 
-Frozen upstream cutoff: `8408edcfb5e086b500b8bc47c5e43b418335b5fd`
-(2026-08-20, latest origin/main at composition time). Exact-SHA CI and review evidence must name this object.
+Frozen upstream cutoff: `930be347f1e3efefae0aa2f98219b3d126abf0ce`
+(2026-08-21, latest origin/main at composition time). Exact-SHA CI and review evidence must name this object.
 
 ## Retained behavior
 
