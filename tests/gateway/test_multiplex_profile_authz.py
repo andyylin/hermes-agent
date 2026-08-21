@@ -132,3 +132,35 @@ def test_secondary_open_policy_fails_startup_guard(monkeypatch):
     assert violation is not None
     assert "wecom" in violation
     assert "open policy" in violation
+
+
+def test_auth_env_does_not_fall_back_across_multiplex_profiles(monkeypatch):
+    from agent import secret_scope
+    from gateway.authz_mixin import _auth_env
+
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "default-profile-user")
+    secret_scope.set_multiplex_active(True)
+    token = secret_scope.set_secret_scope({})
+    try:
+        assert _auth_env("DISCORD_ALLOWED_USERS") == ""
+    finally:
+        secret_scope.reset_secret_scope(token)
+        secret_scope.set_multiplex_active(False)
+
+
+def test_auth_env_reads_scoped_value_and_preserves_single_profile_env(monkeypatch):
+    from agent import secret_scope
+    from gateway.authz_mixin import _auth_env
+
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "default-profile-user")
+    secret_scope.set_multiplex_active(True)
+    token = secret_scope.set_secret_scope(
+        {"DISCORD_ALLOWED_USERS": "secondary-profile-user"}
+    )
+    try:
+        assert _auth_env("DISCORD_ALLOWED_USERS") == "secondary-profile-user"
+    finally:
+        secret_scope.reset_secret_scope(token)
+        secret_scope.set_multiplex_active(False)
+
+    assert _auth_env("DISCORD_ALLOWED_USERS") == "default-profile-user"

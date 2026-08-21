@@ -106,6 +106,7 @@ The adapter polls the IMAP inbox for UNSEEN messages at a configurable interval 
 
 - **Subject line** is included as context (e.g., `[Subject: Deploy to production]`)
 - **Reply emails** (subject starting with `Re:`) skip the subject prefix — the thread context is already established
+- **Each RFC email thread gets its own Hermes session** — a second independent email from the same sender runs separately instead of interrupting the first; replies continue in the original session using `References` / `In-Reply-To`
 - **Attachments** are cached locally:
   - Images (JPEG, PNG, GIF, WebP) → available to the vision tool
   - Documents (PDF, ZIP, etc.) → available for file access

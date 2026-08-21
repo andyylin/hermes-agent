@@ -131,3 +131,29 @@ def test_no_caption_non_forum_keeps_separate_text():
         assert calls[1][0].endswith("/messages")
     finally:
         os.unlink(img)
+
+
+def test_partial_media_failure_is_not_reported_as_success():
+    chat_id = "999000333"
+    _remember_channel_is_forum(chat_id, False)
+    img = _tmpfile(".png")
+    try:
+        session_ctx, calls = _session_with(
+            [_resp(200, {"id": "t1"}), _resp(500, text_data="upload failed")]
+        )
+        with patch("aiohttp.ClientSession", return_value=session_ctx):
+            res = asyncio.run(
+                _standalone_send(
+                    _pconfig(),
+                    chat_id,
+                    "hello",
+                    media_files=[(img, False)],
+                )
+            )
+
+        assert len(calls) == 2
+        assert "error" in res
+        assert res["partial_success"] is True
+        assert res["warnings"]
+    finally:
+        os.unlink(img)

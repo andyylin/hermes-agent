@@ -290,7 +290,7 @@ class TestCreateThread:
         # Verify the API call
         mock_req.assert_called_once_with(
             "POST", "/channels/11/threads", "test-token",
-            body={"name": "New Thread", "auto_archive_duration": 1440, "type": 11},
+            body={"name": "New Thread", "auto_archive_duration": 10080, "type": 11},
         )
 
     @patch("tools.discord_tool._discord_request")
@@ -303,7 +303,28 @@ class TestCreateThread:
         assert result["success"] is True
         mock_req.assert_called_once_with(
             "POST", "/channels/11/messages/1001/threads", "test-token",
-            body={"name": "Discussion", "auto_archive_duration": 1440},
+            body={"name": "Discussion", "auto_archive_duration": 10080},
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    @patch("hermes_cli.config.load_config")
+    def test_create_thread_uses_profile_retention_when_omitted(
+        self, mock_load_config, mock_req, monkeypatch
+    ):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_load_config.return_value = {
+            "discord": {"thread_auto_archive_minutes": 1440}
+        }
+        mock_req.return_value = {"id": "802", "name": "Configured"}
+
+        result = json.loads(
+            discord_core(action="create_thread", channel_id="11", name="Configured")
+        )
+
+        assert result["success"] is True
+        mock_req.assert_called_once_with(
+            "POST", "/channels/11/threads", "test-token",
+            body={"name": "Configured", "auto_archive_duration": 1440, "type": 11},
         )
 
 
