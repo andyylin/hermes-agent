@@ -575,6 +575,137 @@ def test_sessions_export_redact_scrubs_secrets(monkeypatch, tmp_path):
     assert "api key:" in text
 
 
+def test_sessions_export_redact_and_delete_verifies_redacted_file_before_delete(
+    monkeypatch, tmp_path, capsys
+):
+    import hermes_cli.main as main_mod
+    import hermes_state
+
+    secret = "sk-test-secret-value-123456789"
+    captured = {}
+
+    class FakeDB:
+        def resolve_session_id(self, session_id):
+            return "s1"
+
+        def export_session(self, session_id):
+            return {
+                "id": "s1",
+                "title": "Redact Delete",
+                "messages": [{"role": "user", "content": f"token={secret}"}],
+            }
+
+        def get_session_delete_targets(self, session_id):
+            return ["s1"]
+
+        def delete_session(self, session_id, **kwargs):
+            captured.update(session_id=session_id, expected_delete_ids=kwargs["expected_delete_ids"])
+            return True
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda: FakeDB())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermes", "sessions", "export", "--format", "md", "--session-id", "s1",
+            "--redact", "--delete-after-verified", "--yes", str(tmp_path),
+        ],
+    )
+
+    main_mod.main()
+
+    text = next(tmp_path.glob("*.md")).read_text(encoding="utf-8")
+    assert secret not in text
+    assert captured == {"session_id": "s1", "expected_delete_ids": ["s1"]}
+    assert "Deleted exported session 's1'" in capsys.readouterr().out
+
+
+def test_sessions_export_md_collision_does_not_delete_or_overwrite(monkeypatch, tmp_path, capsys):
+    import hermes_cli.main as main_mod
+    import hermes_state
+
+    existing = tmp_path / "s1-collision.md"
+    existing.write_text("keep this archive", encoding="utf-8")
+    captured = {"deleted": False}
+
+    class FakeDB:
+        def resolve_session_id(self, session_id):
+            return "s1"
+
+        def export_session(self, session_id):
+            return {"id": "s1", "title": "Collision", "messages": []}
+
+        def get_session_delete_targets(self, session_id):
+            return ["s1"]
+
+        def delete_session(self, *args, **kwargs):
+            captured["deleted"] = True
+            return True
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda: FakeDB())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermes", "sessions", "export", "--format", "md", "--session-id", "s1",
+            "--delete-after-verified", "--yes", str(tmp_path),
+        ],
+    )
+
+    main_mod.main()
+
+    assert existing.read_text(encoding="utf-8") == "keep this archive"
+    assert captured["deleted"] is False
+    assert "Export already exists" in capsys.readouterr().out
+
+
+def test_sessions_export_md_delegate_disappearance_aborts_delete(monkeypatch, tmp_path, capsys):
+    import hermes_cli.main as main_mod
+    import hermes_state
+
+    captured = {"deleted": False}
+
+    class FakeDB:
+        def resolve_session_id(self, session_id):
+            return "parent"
+
+        def export_session(self, session_id):
+            if session_id == "delegate":
+                return None
+            return {"id": session_id, "title": session_id, "messages": []}
+
+        def get_session_delete_targets(self, session_id):
+            return ["parent", "delegate"]
+
+        def delete_session(self, *args, **kwargs):
+            captured["deleted"] = True
+            return True
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda: FakeDB())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermes", "sessions", "export", "--format", "md", "--session-id", "parent",
+            "--delete-after-verified", "--yes", str(tmp_path),
+        ],
+    )
+
+    main_mod.main()
+
+    assert captured["deleted"] is False
+    assert "nothing was deleted" in capsys.readouterr().out
+
+
 def _trace_fake_db(captured):
     class FakeDB:
         def resolve_session_id(self, session_id):

@@ -42,6 +42,7 @@ class BuildOptions:
     ledger_limit: int = 80
     max_record_chars: int = DEFAULT_MAX_TEXT_CHARS
     include_tools: bool = False
+    legacy_session_fallback: bool = False
     timezone_name: str = DEFAULT_TZ
 
 
@@ -205,6 +206,177 @@ def collect_cron_records(home: Path, *, limit: int) -> list[SourceRecord]:
     return out
 
 
+def _parse_archive_frontmatter(lines: list[str]) -> tuple[dict[str, Any], int]:
+    if not lines or lines[0].strip() != "---":
+        return {}, 0
+    end = next((idx for idx in range(1, len(lines)) if lines[idx].strip() == "---"), -1)
+    if end < 0:
+        return {}, 0
+    values: dict[str, Any] = {}
+    for line in lines[1:end]:
+        if ":" not in line:
+            continue
+        key, raw = line.split(":", 1)
+        raw = raw.strip()
+        try:
+            values[key.strip()] = json.loads(raw)
+        except json.JSONDecodeError:
+            values[key.strip()] = raw.strip("\\\"'")
+    return values, end + 1
+
+
+def _bounded_archive_text(text: str, limit: int) -> str:
+    text = text.strip()
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    marker = "\n\n...[truncated]"
+    return text[: max(0, limit - len(marker))].rstrip() + marker
+
+
+def _archive_message_text(lines: list[str], start: int, *, max_chars: int) -> str:
+    """Keep only user/assistant prose from an exported Markdown session."""
+    parts: list[str] = []
+    role: str | None = None
+    message_lines: list[str] = []
+
+    def flush() -> None:
+        if role and message_lines:
+            visible_lines = message_lines
+            if role == "user":
+                scaffold_prefixes = (
+                    "[IMPORTANT: You are running as a scheduled cron job.",
+                    "[DISCORD FORMAT: This cron output is delivered to Discord.",
+                )
+                visible_lines = [
+                    line
+                    for line in message_lines
+                    if not line.startswith(scaffold_prefixes)
+                ]
+            content = "\n".join(visible_lines).strip()
+            if content:
+                parts.append(f"{role.capitalize()}: {content}")
+
+    for line in lines[start:]:
+        if line.startswith("## Export verification"):
+            break
+        if line.startswith("### "):
+            flush()
+            label = line[4:].split(" — ", 1)[0].strip().lower()
+            role = label if label in {"user", "assistant"} else None
+            message_lines = []
+            continue
+        if line.startswith("## "):
+            flush()
+            role = None
+            message_lines = []
+            continue
+        if role:
+            message_lines.append(line)
+    flush()
+    conversation = "\n\n".join(parts)
+    if conversation:
+        conversation = "Conversation excerpt\n\n" + conversation
+    return _bounded_archive_text(conversation, max_chars)
+
+
+def _archive_path(manifest: Path, raw_path: Any) -> Path | None:
+    """Resolve a manifest path only when it stays inside the export root."""
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    try:
+        root = manifest.parent.resolve()
+        path = Path(raw_path).expanduser()
+        candidate = path.resolve() if path.is_absolute() else (root / path).resolve()
+        candidate.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def collect_verified_archive_records(
+    home: Path,
+    *,
+    limit: int = 40,
+    max_record_chars: int = DEFAULT_MAX_TEXT_CHARS,
+) -> list[SourceRecord]:
+    """Collect one bounded record per SHA-verified Markdown archive session."""
+    manifest = home / "session-exports" / "manifest.jsonl"
+    if limit <= 0:
+        return []
+    try:
+        lines = manifest.read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return []
+
+    entries: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        session_id = str(entry.get("session_id") or "").strip()
+        if not session_id or session_id in seen_ids:
+            continue
+        seen_ids.add(session_id)
+        entries.append(entry)
+
+    records: list[SourceRecord] = []
+    for entry in entries:
+        archive_format = str(entry.get("format") or "").lower()
+        if archive_format not in {"md", "qmd"}:
+            continue
+        archive = _archive_path(manifest, entry.get("path"))
+        if archive is None or archive.suffix.lower() != f".{archive_format}":
+            continue
+        expected_sha = str(entry.get("sha256") or "").lower()
+        if len(expected_sha) != 64:
+            continue
+        try:
+            archive_bytes = archive.read_bytes()
+            if hashlib.sha256(archive_bytes).hexdigest() != expected_sha:
+                continue
+            archive_lines = archive_bytes.decode("utf-8").splitlines()
+        except (FileNotFoundError, OSError, UnicodeError):
+            continue
+        frontmatter, body_start = _parse_archive_frontmatter(archive_lines)
+        session_id = str(entry.get("session_id") or frontmatter.get("session_id") or "")
+        title = str(frontmatter.get("title") or session_id)
+        text = _archive_message_text(archive_lines, body_start, max_chars=max_record_chars)
+        timestamp = entry.get("exported_at")
+        if not isinstance(timestamp, (int, float)):
+            timestamp = None
+        records.append(
+            SourceRecord(
+                source_type="session-archive",
+                source_id=session_id,
+                title=title,
+                timestamp=timestamp,
+                text=text,
+                metadata={
+                    "archive_path": str(archive),
+                    "manifest": str(manifest),
+                    "sha256": expected_sha,
+                    "verified": "true",
+                    "format": str(entry.get("format") or "md"),
+                    "source": str(frontmatter.get("source") or ""),
+                    "created_at": str(frontmatter.get("created_at") or ""),
+                    "lineage_session_ids": json.dumps(
+                        entry.get("lineage_session_ids") or [session_id],
+                        ensure_ascii=False,
+                    ),
+                },
+            )
+        )
+        if len(records) >= limit:
+            break
+    return records
+
+
 def build_memory_tree_packs(options: BuildOptions | None = None) -> dict[str, Any]:
     """Build Memory Tree Lite packs and return the mutable state payload."""
 
@@ -212,16 +384,22 @@ def build_memory_tree_packs(options: BuildOptions | None = None) -> dict[str, An
     home = _home(options)
     data_dir = home / "data" / "memory-tree-lite"
     state_path = data_dir / "state.json"
-    session_records = collect_session_records(
-        home / "sessions",
-        limit_files=options.session_limit,
-        include_tools=options.include_tools,
-        max_record_chars=options.max_record_chars,
+    session_records = collect_verified_archive_records(
+        home, limit=options.session_limit, max_record_chars=options.max_record_chars
     )
+    legacy_session_records: list[SourceRecord] = []
+    if options.legacy_session_fallback and not session_records:
+        legacy_session_records = collect_session_records(
+            home / "sessions",
+            limit_files=options.session_limit,
+            include_tools=options.include_tools,
+            max_record_chars=options.max_record_chars,
+        )
     active_records = collect_active_work_records(home, limit=options.ledger_limit)
     cron_records = collect_cron_records(home, limit=options.cron_limit)
     records = [
         *(_redact_record(record, max_chars=options.max_record_chars) for record in session_records),
+        *(_redact_record(record, max_chars=options.max_record_chars) for record in legacy_session_records),
         *(_redact_record(record, max_chars=options.max_record_chars) for record in active_records),
         *(_redact_record(record, max_chars=options.max_record_chars) for record in cron_records),
     ]
@@ -257,6 +435,8 @@ def build_memory_tree_packs(options: BuildOptions | None = None) -> dict[str, An
     counts = {
         "records_total": len(records),
         "sessions": len(session_records),
+        "session_archives": len(session_records),
+        "legacy_sessions": len(legacy_session_records),
         "active_work": len(active_records),
         "cron_outputs": len(cron_records),
     }
@@ -266,6 +446,8 @@ def build_memory_tree_packs(options: BuildOptions | None = None) -> dict[str, An
             "",
             f"records_total: {len(records)}",
             f"sessions: {len(session_records)}",
+            f"session_archives: {len(session_records)}",
+            f"legacy_sessions: {len(legacy_session_records)}",
             f"active_work: {len(active_records)}",
             f"cron_outputs: {len(cron_records)}",
             "",
@@ -302,7 +484,8 @@ def format_build_report(state: dict[str, Any]) -> str:
         "Memory Tree Lite build complete\n"
         f"changed: {changed}\n"
         f"records: {counts.get('records_total', 0)} "
-        f"(sessions {counts.get('sessions', 0)}, active-work {counts.get('active_work', 0)}, "
+        f"(session archives {counts.get('session_archives', counts.get('sessions', 0))}, "
+        f"legacy sessions {counts.get('legacy_sessions', 0)}, active-work {counts.get('active_work', 0)}, "
         f"cron {counts.get('cron_outputs', 0)})\n"
         f"recent: {outputs.get('recent', '')}\n"
         f"index: {outputs.get('index', '')}"
@@ -314,6 +497,7 @@ __all__ = [
     "build_memory_tree_packs",
     "collect_active_work_records",
     "collect_cron_records",
+    "collect_verified_archive_records",
     "compact_text",
     "format_build_report",
     "redact_secrets",

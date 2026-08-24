@@ -54,7 +54,24 @@ def test_memory_tree_status_json_reports_manual_context_gate(tmp_path, monkeypat
     assert payload["context"]["enabled"] is False
     assert payload["context"]["mode"] == "manual"
     assert payload["build"]["records_total"] == 1
+    assert payload["build"]["session_archives"] == 0
     assert payload["packs"][0]["exists"] is True
+
+
+def test_memory_tree_status_treats_pre_archive_session_count_as_legacy(tmp_path):
+    data_dir = tmp_path / "data" / "memory-tree-lite"
+    data_dir.mkdir(parents=True)
+    (data_dir / "state.json").write_text(
+        json.dumps({"schema": "memory-tree-lite-state-v1", "counts": {"records_total": 7, "sessions": 7, "active_work": 0, "cron_outputs": 0}, "outputs": {}}),
+        encoding="utf-8",
+    )
+    from hermes_cli.memory_tree import memory_tree_status
+    payload = json.loads(memory_tree_status(json_mode=True, home=tmp_path))
+    text = memory_tree_status(home=tmp_path)
+    assert payload["build"]["session_archives"] == 0
+    assert payload["build"]["legacy_sessions"] == 7
+    assert "session_archives=0" in text
+    assert "legacy_sessions=7" in text
 
 
 def test_memory_tree_search_formats_provenance_matches(tmp_path, monkeypatch):
@@ -89,3 +106,17 @@ def test_default_toolsets_expose_memory_tree_on_call():
 
     assert "memory_tree" in _HERMES_CORE_TOOLS
     assert "memory_tree" in TOOLSETS["memory_tree"]["tools"]
+
+
+def test_memory_tree_cli_parser_registers_archive_build_command():
+    from hermes_cli._parser import build_top_level_parser
+    from hermes_cli.memory_tree import add_memory_tree_parser
+
+    parser, subparsers, _chat = build_top_level_parser()
+    add_memory_tree_parser(subparsers)
+
+    args = parser.parse_args(["memory-tree", "build", "--legacy-session-fallback"])
+
+    assert args.command == "memory-tree"
+    assert args.memory_tree_command == "build"
+    assert args.legacy_session_fallback is True
