@@ -2589,36 +2589,26 @@ def _markdown_tables_to_bullets(markdown_text: str) -> str:
     return "\n".join(output)
 
 
-def _format_cron_delivery_content(job: dict, content: str, *, platform: str = "") -> str:
-    """Wrap cron output for the destination medium."""
+def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool) -> str:
+    """Apply the cron wrapper, using Discord-native Markdown when relevant."""
     task_name = job.get("name", job["id"])
     job_id = job.get("id", "")
-    dest = str(platform or "").lower()
-    if dest == "discord":
-        body = _markdown_tables_to_bullets(content)
+    body = _markdown_tables_to_bullets(content) if for_discord else content
+    if for_discord:
         return (
-            f"# {task_name}\n\n"
+            f"# Cron Alert: {task_name}\n\n"
             f"**Job ID:** `{job_id}`\n\n"
             f"## Report\n\n"
-            f"{body}\n"
-        )
-    if dest == "email":
-        return (
-            f"## {task_name}\n\n"
-            f"**Job ID:** `{job_id}`\n\n"
-            f"{content}\n"
-        )
-    if dest == "telegram":
-        body = _markdown_tables_to_bullets(content)
-        return (
-            f"**{task_name}**\n\n"
-            f"Job ID:\n```\n{job_id}\n```\n\n"
-            f"{body}\n"
+            f"{body}\n\n"
+            f"## Manage\n\n"
+            f"To stop or manage this job, send me a new message, e.g. `stop reminder {task_name}`."
         )
     return (
-        f"**{task_name}**\n\n"
-        f"Job ID: `{job_id}`\n\n"
-        f"{content}\n"
+        f"Cronjob Response: {task_name}\n"
+        f"(job_id: {job_id})\n"
+        f"-------------\n\n"
+        f"{body}\n\n"
+        f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
     )
 
 
@@ -2910,6 +2900,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
 
+        for_discord = str(platform_name).lower() == "discord"
         email_subject = (
             _format_cron_email_subject(job)
             if str(platform_name).lower() == "email"
@@ -2919,7 +2910,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_content = _format_cron_delivery_content(
                 job,
                 content,
-                platform=platform_name,
+                for_discord=for_discord,
             )
         else:
             delivery_content = content

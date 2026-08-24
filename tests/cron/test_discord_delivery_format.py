@@ -13,40 +13,13 @@ def test_discord_cron_delivery_uses_headings_and_converts_tables():
     rendered = scheduler._format_cron_delivery_content(
         job,
         content,
-        platform="discord",
+        for_discord=True,
     )
 
-    assert rendered.startswith("# Weekly report")
+    assert rendered.startswith("# Cron Alert: Weekly report")
     assert "## Report" in rendered
     assert "- **Item:** Backup; **Status:** Healthy" in rendered
     assert "- **Item:** Queue; **Status:** Empty" in rendered
-    assert "| Item | Status |" not in rendered
-
-
-def test_email_cron_delivery_uses_markdown_heading_not_plaintext_wrapper():
-    job = {"id": "217e74bd5079", "name": "morning-evening-brief"}
-    content = "## Needs reply\n\n**Anna** [source](https://example.com)\n\n```\nHERMES-ACT:MMB-T2E0\n```"
-
-    rendered = scheduler._format_cron_delivery_content(
-        job,
-        content,
-        platform="email",
-    )
-
-    assert rendered.startswith("## morning-evening-brief")
-    assert "Cronjob Response:" not in rendered
-    assert "HERMES-ACT:MMB-T2E0" in rendered
-
-
-def test_telegram_cron_delivery_has_visible_heading():
-    job = {"id": "weekly-report", "name": "Weekly report"}
-    rendered = scheduler._format_cron_delivery_content(
-        job,
-        "| Item | Status |\n| --- | --- |\n| Backup | Healthy |",
-        platform="telegram",
-    )
-    assert rendered.startswith("**Weekly report**")
-    assert "```\nweekly-report\n```" in rendered
     assert "| Item | Status |" not in rendered
 
 
@@ -57,10 +30,10 @@ def test_non_discord_cron_delivery_preserves_existing_wrapper_and_table():
     rendered = scheduler._format_cron_delivery_content(
         job,
         content,
-        platform="sms",
+        for_discord=False,
     )
 
-    assert rendered.startswith("**Weekly report**")
+    assert rendered.startswith("Cronjob Response: Weekly report")
     assert "| Item | Status |" in rendered
 
 
@@ -151,10 +124,10 @@ def test_mixed_target_fanout_formats_each_platform_independently():
         call.args[0].value: call.args[3]
         for call in send_mock.await_args_list
     }
-    assert sent_by_platform["discord"].startswith("# Weekly report")
+    assert sent_by_platform["discord"].startswith("# Cron Alert: Weekly report")
     assert "| Item | Status |" not in sent_by_platform["discord"]
-    assert sent_by_platform["email"].startswith("## Weekly report")
-    assert "Cronjob Response:" not in sent_by_platform["email"]
+    assert sent_by_platform["email"].startswith("Cronjob Response: Weekly report")
+    assert "| Item | Status |" in sent_by_platform["email"]
 
 
 def test_mixed_target_prompt_has_no_discord_only_generation_guidance():

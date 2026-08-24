@@ -404,80 +404,11 @@ def _standalone_html_to_plain_text(body: str) -> str:
 
 
 def _standalone_plain_text_to_html(body: str) -> str:
-    """Turn Markdown-ish notification text into a compact HTML alternative."""
+    """Escape plain text into a compact HTML alternative."""
     from html import escape
 
-    text = body or ""
-    placeholders: list[str] = []
-
-    def protect(fragment: str) -> str:
-        placeholders.append(fragment)
-        return f"\x00PH{len(placeholders) - 1}\x00"
-
-    def restore(value: str) -> str:
-        def repl(match: re.Match[str]) -> str:
-            return placeholders[int(match.group(1))]
-
-        return re.sub(r"\x00PH(\d+)\x00", repl, value)
-
-    def fence(match: re.Match[str]) -> str:
-        code = escape(match.group(1))
-        return protect(f"<pre><code>{code}</code></pre>")
-
-    html = re.sub(r"```(?:\w*)\n(.*?)```", fence, text, flags=re.DOTALL)
-    html = re.sub(
-        r"`([^`\n]+)`",
-        lambda m: protect(f"<code>{escape(m.group(1))}</code>"),
-        html,
-    )
-    html = re.sub(
-        r"\[([^\]]+)\]\((https?://[^)\s]+)\)",
-        lambda m: protect(
-            f'<a href="{escape(m.group(2), quote=True)}">{escape(m.group(1))}</a>'
-        ),
-        html,
-    )
-    html = escape(html)
-    html = restore(html)
-    html = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", html)
-    html = re.sub(
-        r"<pre><code>.*?</code></pre>",
-        lambda m: protect(m.group(0)),
-        html,
-        flags=re.DOTALL,
-    )
-    lines = html.split("\n")
-    out: list[str] = []
-    in_list = False
-    for raw in lines:
-        line = raw.rstrip()
-        heading = re.match(r"^(#{1,3})\s+(.+)$", line)
-        bullet = re.match(r"^[-*]\s+(.+)$", line)
-        if heading:
-            if in_list:
-                out.append("</ul>")
-                in_list = False
-            level = min(len(heading.group(1)) + 1, 4)
-            out.append(f"<h{level}>{heading.group(2)}</h{level}>")
-            continue
-        if bullet:
-            if not in_list:
-                out.append("<ul>")
-                in_list = True
-            out.append(f"<li>{bullet.group(1)}</li>")
-            continue
-        if in_list:
-            out.append("</ul>")
-            in_list = False
-        if not line.strip():
-            continue
-        if re.fullmatch(r"\x00PH\d+\x00", line.strip()):
-            out.append(line.strip())
-            continue
-        out.append(f"<p>{line}</p>")
-    if in_list:
-        out.append("</ul>")
-    return "<html><body>" + restore("".join(out)) + "</body></html>"
+    escaped = escape(body or "").replace("\n", "<br>\n")
+    return f"<html><body><p>{escaped}</p></body></html>"
 
 
 def _render_email_bodies(body: str) -> Tuple[str, str]:
