@@ -8,9 +8,13 @@ This file is the retained/retired **authority**, not a commit-count souvenir.
 Score overlays as `KEEP` / `UPSTREAM-NOW` / `DROP` against current official
 `origin/main`. Do not replay `DROP` or `UPSTREAM-NOW` behavior on refresh.
 
-Frozen upstream cutoff: `fc9cbc872d8050c22f1192b16bc5ff4aed471e10`
-(2026-08-21, latest origin/main at composition time). Exact-SHA CI and review
-evidence must name this object.
+Frozen upstream cutoff: `fcbd1076a93841fa88855acce810e342a5b78101`
+(`v2026.8.19` / Hermes 0.20.5). Exact-SHA CI and review evidence must name
+this object.
+
+Cron memory: take official `skip_memory=False` from this tag. Do not replay
+`fc9cbc87` (skip MEMORY.md in scheduled jobs). Per-job toolset denylist still
+wins.
 
 Live topology fact: Default / Dad / Wife are **separate systemd gateways**,
 not `gateway.multiplex_profiles`. Shared-process multiplexing stays retired.
