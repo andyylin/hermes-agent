@@ -10,7 +10,7 @@ from agent.memory_tree_build import (
     collect_verified_archive_records,
     iter_recent_cron_outputs,
 )
-from agent.memory_tree_lite import search_memory_packs
+from agent.memory_tree_lite import SourceRecord, _query_terms, build_markdown_pack, search_memory_packs
 
 
 def test_iter_recent_cron_outputs_skips_file_removed_during_scan(tmp_path, monkeypatch):
@@ -272,3 +272,39 @@ def test_build_memory_tree_uses_legacy_jsonl_only_when_requested(tmp_path):
     assert "explicit legacy fallback" in (tmp_path / "data" / "memory-tree-lite" / "recent.md").read_text(
         encoding="utf-8"
     )
+
+
+def test_query_terms_keep_ascii_and_emit_cjk_runs():
+    assert _query_terms("LRG2608220276") == ["lrg2608220276"]
+    terms = _query_terms("智匯桃園 蔡雅蕙 NTUT")
+    assert "ntut" in terms
+    assert "智匯桃園" in terms
+    assert "蔡雅蕙" in terms
+
+
+def test_memory_tree_search_matches_cjk_and_mixed_queries(tmp_path):
+    pack = tmp_path / "recent.md"
+    pack.write_text(
+        build_markdown_pack(
+            [
+                SourceRecord(
+                    source_type="grok-bot-work-log",
+                    source_id="fyi-0824",
+                    title="Joi Watch FYI",
+                    timestamp=1.0,
+                    text="NTUT 蔡雅蕙 invited via Prodesign to 智匯桃園 AI領航 成果發表會.",
+                    metadata={"work_log": "data/grok-bot/work-log.md"},
+                )
+            ],
+            title="Hermes Memory Tree Lite - Recent",
+        ),
+        encoding="utf-8",
+    )
+    cjk = search_memory_packs([pack], "智匯桃園", limit=3, max_snippet_chars=200)
+    assert cjk
+    assert "智匯桃園" in cjk[0].snippet
+    mixed = search_memory_packs([pack], "NTUT 蔡雅蕙", limit=3, max_snippet_chars=200)
+    assert mixed
+    assert mixed[0].source_id == "fyi-0824"
+    ascii_only = search_memory_packs([pack], "NTUT", limit=1)
+    assert ascii_only and ascii_only[0].source_id == "fyi-0824"
