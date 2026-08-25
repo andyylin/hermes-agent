@@ -53,16 +53,23 @@ def normalize_text(text: str, max_chars: int = 4000) -> str:
     return f"{normalized[:max_chars].rstrip()}\n\n[truncated {omitted} chars]"
 
 
-_TOKEN_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:-]*")
+_ASCII_TOKEN_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:-]*")
+_CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3100-\u312f\u31a0-\u31bf]+")
 
 
 def _query_terms(query: str) -> list[str]:
     seen: set[str] = set()
     terms: list[str] = []
-    for token in _TOKEN_RE.findall(query.lower()):
-        if token not in seen:
+
+    def add(token: str) -> None:
+        if token and token not in seen:
             seen.add(token)
             terms.append(token)
+
+    for token in _ASCII_TOKEN_RE.findall(query.lower()):
+        add(token)
+    for run in _CJK_RUN_RE.findall(query):
+        add(run)
     return terms
 
 
