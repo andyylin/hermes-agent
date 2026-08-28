@@ -5,6 +5,7 @@ import os
 from gateway.config import PlatformConfig
 from plugins.platforms.discord import adapter as discord_adapter
 from plugins.platforms.discord.adapter import (
+    DiscordAdapter,
     _apply_yaml_config,
     _build_allowed_mentions,
     _discord_profile_bool,
@@ -38,6 +39,33 @@ def test_single_profile_env_keeps_precedence_over_yaml(monkeypatch):
     )
 
     assert mentions.everyone is True
+
+
+def test_single_profile_yaml_bridges_allow_bots(monkeypatch):
+    monkeypatch.delenv("DISCORD_ALLOW_BOTS", raising=False)
+    monkeypatch.setattr(discord_adapter, "_profile_scoped_config_load", lambda: False)
+
+    try:
+        seeded = _apply_yaml_config({}, {"allow_bots": "mentions"})
+
+        assert seeded is not None
+        assert seeded["allow_bots"] == "mentions"
+        assert os.environ["DISCORD_ALLOW_BOTS"] == "mentions"
+    finally:
+        os.environ.pop("DISCORD_ALLOW_BOTS", None)
+
+
+def test_profile_scoped_yaml_supplies_allow_bots_without_env_write(monkeypatch):
+    monkeypatch.delenv("DISCORD_ALLOW_BOTS", raising=False)
+    monkeypatch.setattr(discord_adapter, "_profile_scoped_config_load", lambda: True)
+
+    seeded = _apply_yaml_config({}, {"allow_bots": "mentions"})
+
+    assert seeded is not None
+    assert os.environ.get("DISCORD_ALLOW_BOTS") is None
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, extra=seeded))
+    adapter._gate_env_snapshot = {"DISCORD_ALLOW_BOTS": ""}
+    assert adapter._get_allow_bots() == "mentions"
 
 
 def test_profile_scoped_mentions_ignore_poisoned_env(monkeypatch):

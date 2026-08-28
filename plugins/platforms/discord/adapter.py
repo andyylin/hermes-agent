@@ -6790,7 +6790,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _get_allow_bots(self) -> str:
         """Per-profile DISCORD_ALLOW_BOTS mode (none|mentions|all)."""
-        return self._gate_env("DISCORD_ALLOW_BOTS", "none").lower().strip() or "none"
+        raw = self._gate_raw("allow_bots", "DISCORD_ALLOW_BOTS")
+        return str(raw or "none").lower().strip() or "none"
 
     def _discord_free_response_channels(self) -> set:
         """Return Discord channel IDs/names where no bot mention is required.
@@ -10509,6 +10510,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         ("require_mention", "DISCORD_REQUIRE_MENTION"),
         ("thread_require_mention", "DISCORD_THREAD_REQUIRE_MENTION"),
         ("bots_require_inline_mention", "DISCORD_BOTS_REQUIRE_INLINE_MENTION"),
+        ("allow_bots", "DISCORD_ALLOW_BOTS"),
         ("approval_mentions", "DISCORD_APPROVAL_MENTIONS"),
         ("auto_thread", "DISCORD_AUTO_THREAD"),
         ("history_backfill", "DISCORD_HISTORY_BACKFILL"),
