@@ -8,8 +8,8 @@ This file is the retained/retired **authority**, not a commit-count souvenir.
 Score overlays as `KEEP` / `UPSTREAM-NOW` / `DROP` against current official
 `origin/main`. Do not replay `DROP` or `UPSTREAM-NOW` behavior on refresh.
 
-Frozen upstream cutoff: `fcbd1076a93841fa88855acce810e342a5b78101`
-(`v2026.8.19` / Hermes 0.20.5). Exact-SHA CI and review evidence must name
+Frozen upstream cutoff: `5fc308a70719a83cccdbba4c0e39c23f5a8239d5`
+(`v2026.8.27` / Hermes 0.20.6). Exact-SHA CI and review evidence must name
 this object.
 
 Cron memory: take official `skip_memory=False` from this tag. Do not replay
