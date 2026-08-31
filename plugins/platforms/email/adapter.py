@@ -17,6 +17,7 @@ Environment variables:
 
 import asyncio
 import email as email_lib
+import hashlib
 import imaplib
 import logging
 import os
@@ -30,6 +31,7 @@ from agent.secret_scope import get_secret as _scoped_get_secret
 import ssl
 import uuid
 from email.header import decode_header
+from functools import partial
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -293,6 +295,131 @@ def _decode_header_value(raw: str) -> str:
     return " ".join(decoded)
 
 
+def _standalone_looks_like_html(body: str) -> bool:
+    """Detect an HTML document or fragment in delivery content."""
+    return bool(
+        re.search(
+            r"<(?:!doctype\b|/?[A-Za-z][A-Za-z0-9:-]*\b)[^>]*>",
+            body or "",
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _sanitize_email_html(body: str) -> str:
+    """Return a small allowlisted HTML fragment suitable for email clients."""
+    from html import escape
+    from html.parser import HTMLParser
+    from urllib.parse import urlparse
+
+    allowed_tags = {
+        "a", "b", "blockquote", "body", "br", "code", "div", "em",
+        "h1", "h2", "h3", "h4", "h5", "h6", "hr", "html", "i",
+        "li", "ol", "p", "pre", "span", "strong", "table", "tbody",
+        "td", "tfoot", "th", "thead", "tr", "u", "ul",
+    }
+    blocked_tags = {
+        "embed", "form", "iframe", "link", "meta", "object", "script", "style",
+    }
+    void_tags = {"br", "hr"}
+
+    class _Sanitizer(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=False)
+            self.output: List[str] = []
+            self.blocked_depth = 0
+
+        def handle_starttag(self, tag: str, attrs) -> None:
+            tag = tag.lower()
+            if tag in blocked_tags:
+                self.blocked_depth += 1
+                return
+            if self.blocked_depth or tag not in allowed_tags:
+                return
+            safe_attrs = []
+            for name, value in attrs:
+                name = name.lower()
+                value = value or ""
+                if tag == "a" and name == "href":
+                    scheme = urlparse(value.strip()).scheme.lower()
+                    if scheme in {"", "http", "https", "mailto"}:
+                        safe_attrs.append((name, value.strip()))
+                elif tag == "a" and name == "title":
+                    safe_attrs.append((name, value))
+                elif (
+                    tag in {"td", "th"}
+                    and name in {"colspan", "rowspan"}
+                    and value.isdigit()
+                ):
+                    safe_attrs.append((name, value))
+            rendered_attrs = "".join(
+                f' {name}="{escape(value, quote=True)}"' for name, value in safe_attrs
+            )
+            self.output.append(f"<{tag}{rendered_attrs}>")
+
+        def handle_startendtag(self, tag: str, attrs) -> None:
+            self.handle_starttag(tag, attrs)
+
+        def handle_endtag(self, tag: str) -> None:
+            tag = tag.lower()
+            if tag in blocked_tags:
+                if self.blocked_depth:
+                    self.blocked_depth -= 1
+                return
+            if not self.blocked_depth and tag in allowed_tags and tag not in void_tags:
+                self.output.append(f"</{tag}>")
+
+        def handle_data(self, data: str) -> None:
+            if not self.blocked_depth:
+                self.output.append(escape(data))
+
+        def handle_entityref(self, name: str) -> None:
+            if not self.blocked_depth:
+                self.output.append(f"&{name};")
+
+        def handle_charref(self, name: str) -> None:
+            if not self.blocked_depth:
+                self.output.append(f"&#{name};")
+
+    sanitizer = _Sanitizer()
+    sanitizer.feed(body or "")
+    sanitizer.close()
+    return "".join(sanitizer.output)
+
+
+def _standalone_html_to_plain_text(body: str) -> str:
+    """Build a readable plain-text fallback without external dependencies."""
+    from html import unescape
+
+    text = re.sub(r"<\s*br\s*/?\s*>", "\n", body or "", flags=re.IGNORECASE)
+    text = re.sub(
+        r"</\s*(?:p|div|h[1-6]|li|tr)\s*>",
+        "\n",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"<[^>]+>", "", text)
+    lines = [line.strip() for line in unescape(text).splitlines()]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def _standalone_plain_text_to_html(body: str) -> str:
+    """Escape plain text into a compact HTML alternative."""
+    from html import escape
+
+    escaped = escape(body or "").replace("\n", "<br>\n")
+    return f"<html><body><p>{escaped}</p></body></html>"
+
+
+def _render_email_bodies(body: str) -> Tuple[str, str]:
+    """Produce a readable plain body and sanitized HTML alternative."""
+    if _standalone_looks_like_html(body or ""):
+        html_body = _sanitize_email_html(body or "")
+        return _standalone_html_to_plain_text(html_body), html_body
+    plain_body = body or ""
+    return plain_body, _standalone_plain_text_to_html(plain_body)
+
+
 def _extract_text_body(msg: email_lib.message.Message) -> str:
     """Extract the plain-text body from a potentially multipart email."""
     if msg.is_multipart():
@@ -526,6 +653,65 @@ def _extract_attachments(
     return attachments
 
 
+def _stable_thread_message_id(key: str, domain: str) -> Optional[str]:
+    """Build a deterministic Message-ID-like anchor for recurring mail."""
+    raw_key = str(key or "").strip()
+    normalized_key = re.sub(
+        r"[^a-z0-9._-]+", "-", raw_key.lower()
+    ).strip(".-_")
+    safe_key = normalized_key[:80]
+    if safe_key and (normalized_key != raw_key.lower() or len(normalized_key) > 80):
+        digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:12]
+        safe_key = f"{normalized_key[:67].rstrip('.-_')}-{digest}"
+    safe_domain = re.sub(
+        r"[^a-z0-9.-]+", "", str(domain or "").strip().lower()
+    ).strip(".")
+    if not safe_key or not safe_domain:
+        return None
+    return f"<hermes-thread-{safe_key}@{safe_domain}>"
+
+
+_MESSAGE_ID_RE = re.compile(r"<[^<>\s]+>")
+_HERMES_EMAIL_THREAD_RE = re.compile(
+    r"^<hermes-(email-[0-9a-f]{24})-[0-9a-f]+@", re.IGNORECASE
+)
+
+
+def _message_ids(value: str) -> List[str]:
+    """Extract RFC Message-ID tokens from a header value in wire order."""
+    return _MESSAGE_ID_RE.findall(str(value or ""))
+
+
+def _email_thread_id(
+    message_id: str,
+    in_reply_to: str = "",
+    references: str = "",
+    fallback: str = "",
+) -> str:
+    """Return a stable, opaque session lane for one RFC email thread.
+
+    The first References entry is the conversation root when available. A
+    minimal client may send only In-Reply-To; Hermes outbound Message-IDs embed
+    the opaque lane so those replies remain recoverable after a gateway restart.
+    """
+    reference_ids = _message_ids(references)
+    if reference_ids:
+        anchor = reference_ids[0]
+    else:
+        parent_ids = _message_ids(in_reply_to)
+        if parent_ids:
+            hermes_parent = _HERMES_EMAIL_THREAD_RE.match(parent_ids[0])
+            if hermes_parent:
+                return hermes_parent.group(1).lower()
+            anchor = parent_ids[0]
+        else:
+            own_ids = _message_ids(message_id)
+            anchor = own_ids[0] if own_ids else str(message_id or fallback)
+
+    digest = hashlib.sha256(anchor.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return f"email-{digest}"
+
+
 class EmailAdapter(BasePlatformAdapter):
     """Email gateway adapter using IMAP (receive) and SMTP (send)."""
 
@@ -602,8 +788,10 @@ class EmailAdapter(BasePlatformAdapter):
         self._last_fetch_failed: bool = False
         self._last_fetch_error: str = ""
 
-        # Map chat_id (sender email) -> last subject + message-id for threading
+        # Map sender+email-thread -> subject + message-id for reply threading.
+        # Legacy sender-only entries remain readable for notifications/tests.
         self._thread_context: Dict[str, Dict[str, str]] = {}
+        self._thread_context_max: int = 2000
 
         logger.info("[Email] Adapter initialized for %s", self._address)
 
@@ -951,6 +1139,7 @@ class EmailAdapter(BasePlatformAdapter):
         subject = _decode_header_value(msg.get("Subject", "(no subject)"))
         message_id = msg.get("Message-ID", "")
         in_reply_to = msg.get("In-Reply-To", "")
+        references = msg.get("References", "")
         # Skip automated/noreply senders before any processing
         msg_headers = dict(msg.items())
         if _is_automated_sender(sender_addr, msg_headers):
@@ -977,6 +1166,7 @@ class EmailAdapter(BasePlatformAdapter):
             "subject": subject,
             "message_id": message_id,
             "in_reply_to": in_reply_to,
+            "references": references,
             "body": body,
             "attachments": attachments,
             "date": msg.get("Date", ""),
@@ -1078,6 +1268,12 @@ class EmailAdapter(BasePlatformAdapter):
         subject = msg_data["subject"]
         body = msg_data["body"].strip()
         attachments = msg_data["attachments"]
+        thread_id = _email_thread_id(
+            msg_data.get("message_id", ""),
+            msg_data.get("in_reply_to", ""),
+            msg_data.get("references", ""),
+            fallback=str(msg_data.get("uid", "")),
+        )
 
         # Build message text: include subject as context
         text = body
@@ -1103,10 +1299,14 @@ class EmailAdapter(BasePlatformAdapter):
                 msg_type = MessageType.DOCUMENT
 
         # Store thread context for reply threading
-        self._thread_context[sender_addr] = {
+        self._thread_context[f"{sender_addr}\x00{thread_id}"] = {
             "subject": subject,
             "message_id": msg_data["message_id"],
         }
+        if len(self._thread_context) > self._thread_context_max:
+            trim = self._thread_context_max // 2
+            for old_key in list(self._thread_context)[:trim]:
+                self._thread_context.pop(old_key, None)
 
         source = self.build_source(
             chat_id=sender_addr,
@@ -1114,6 +1314,7 @@ class EmailAdapter(BasePlatformAdapter):
             chat_type="dm",
             user_id=sender_addr,
             user_name=msg_data["sender_name"] or sender_addr,
+            thread_id=thread_id,
         )
 
         event = MessageEvent(
@@ -1140,7 +1341,7 @@ class EmailAdapter(BasePlatformAdapter):
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, content, reply_to
+                None, self._send_email, chat_id, content, reply_to, metadata
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -1157,35 +1358,75 @@ class EmailAdapter(BasePlatformAdapter):
             return self._address.rsplit("@", 1)[-1] or "localhost"
         return "localhost"
 
+    def _apply_notification_headers(
+        self,
+        msg: MIMEMultipart,
+        to_addr: str,
+        *,
+        reply_to_msg_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Apply one subject/threading contract to text and attachment emails."""
+        metadata = metadata or {}
+        explicit_subject = metadata.get("subject")
+        suppress_threading = bool(metadata.get("suppress_threading"))
+        thread_anchor_key = metadata.get("thread_anchor_key")
+
+        thread_id = str(metadata.get("thread_id") or "")
+        ctx = self._thread_context.get(f"{to_addr}\x00{thread_id}", {})
+        if not ctx:
+            ctx = self._thread_context.get(to_addr, {})
+        if explicit_subject:
+            subject = str(explicit_subject)
+        else:
+            subject = ctx.get("subject", "Hermes Agent")
+            if not subject.startswith("Re:"):
+                subject = f"Re: {subject}"
+        msg["Subject"] = subject
+
+        anchor = _stable_thread_message_id(
+            str(thread_anchor_key or ""), self._message_id_domain()
+        )
+        original_msg_id = anchor or (
+            None if suppress_threading else (reply_to_msg_id or ctx.get("message_id"))
+        )
+        if original_msg_id:
+            msg["In-Reply-To"] = original_msg_id
+            msg["References"] = original_msg_id
+
     def _send_email(
         self,
         to_addr: str,
         body: str,
         reply_to_msg_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Send an email via SMTP. Runs in executor thread."""
-        msg = MIMEMultipart()
+        msg = MIMEMultipart("alternative")
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        # Thread context for reply
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
-        msg["Subject"] = subject
-
-        # Threading headers
-        original_msg_id = reply_to_msg_id or ctx.get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+        self._apply_notification_headers(
+            msg,
+            to_addr,
+            reply_to_msg_id=reply_to_msg_id,
+            metadata=metadata,
+        )
 
         msg["Date"] = formatdate(localtime=True)
-        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
+        thread_id = str((metadata or {}).get("thread_id") or "").lower()
+        if re.fullmatch(r"email-[0-9a-f]{24}", thread_id):
+            msg_id = (
+                f"<hermes-{thread_id}-{uuid.uuid4().hex[:12]}@"
+                f"{self._message_id_domain()}>"
+            )
+        else:
+            msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
         msg["Message-ID"] = msg_id
 
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+        plain_body, html_body = _render_email_bodies(body)
+        msg.attach(MIMEText(plain_body, "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
 
         smtp = self._connect_smtp()
         try:
@@ -1197,7 +1438,7 @@ class EmailAdapter(BasePlatformAdapter):
             except Exception:
                 smtp.close()
 
-        logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, subject)
+        logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, msg["Subject"])
         return msg_id
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
@@ -1213,12 +1454,12 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send an image URL as part of an email body.
 
-        ``metadata`` is accepted to honor the base-class contract; the
-        email body send doesn't use it.
+        Notification metadata is forwarded so URL-image emails use the same
+        subject/thread contract as text and attachment sends.
         """
         text = caption or ""
         text += f"\n\nImage: {image_url}"
-        return await self.send(chat_id, text.strip(), reply_to)
+        return await self.send(chat_id, text.strip(), reply_to, metadata)
 
     async def send_multiple_images(
         self,
@@ -1263,7 +1504,7 @@ class EmailAdapter(BasePlatformAdapter):
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 None,
-                self._send_email_with_attachments,
+                partial(self._send_email_with_attachments, metadata=metadata),
                 chat_id,
                 body,
                 local_paths,
@@ -1277,22 +1518,14 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         file_paths: List[str],
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Send an email with multiple file attachments via SMTP."""
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
-        msg["Subject"] = subject
-
-        original_msg_id = ctx.get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+        self._apply_notification_headers(msg, to_addr, metadata=metadata)
 
         msg["Date"] = formatdate(localtime=True)
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
@@ -1333,6 +1566,7 @@ class EmailAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
         """Send a file as an email attachment."""
@@ -1340,7 +1574,11 @@ class EmailAdapter(BasePlatformAdapter):
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
                 None,
-                self._send_email_with_attachment,
+                partial(
+                    self._send_email_with_attachment,
+                    reply_to_msg_id=reply_to,
+                    metadata=metadata,
+                ),
                 chat_id,
                 caption or "",
                 file_path,
@@ -1357,22 +1595,20 @@ class EmailAdapter(BasePlatformAdapter):
         body: str,
         file_path: str,
         file_name: Optional[str] = None,
+        reply_to_msg_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Send an email with a file attachment via SMTP."""
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
-        msg["Subject"] = subject
-
-        original_msg_id = ctx.get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+        self._apply_notification_headers(
+            msg,
+            to_addr,
+            reply_to_msg_id=reply_to_msg_id,
+            metadata=metadata,
+        )
 
         msg["Date"] = formatdate(localtime=True)
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
@@ -1434,13 +1670,13 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    subject=None,
 ):
     """Out-of-process Email delivery via SMTP (one-shot). Implements the
     standalone_sender_fn contract; replaces the legacy _send_email helper."""
     import smtplib
     import ssl as _ssl
-    from email.mime.text import MIMEText
-    from email.utils import formatdate
+    from gateway.platforms.base import BasePlatformAdapter
 
     extra = getattr(pconfig, "extra", {}) or {}
     address = extra.get("address") or _get_secret("EMAIL_ADDRESS", "")
@@ -1454,19 +1690,61 @@ async def _standalone_send(
     if not all([address, password, smtp_host]):
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
+    safe_media = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    if media_files and not safe_media:
+        return {"error": "Email media delivery rejected all attachment paths as unsafe"}
+
     try:
-        msg = MIMEText(message, "plain", "utf-8")
+        if safe_media:
+            msg = MIMEMultipart("mixed")
+            body_container = MIMEMultipart("alternative")
+        else:
+            msg = MIMEMultipart("alternative")
+            body_container = msg
         msg["From"] = address
         msg["To"] = chat_id
-        msg["Subject"] = "Hermes Agent"
+        thread_anchor_key = None
+        if isinstance(subject, dict):
+            thread_anchor_key = subject.get("thread_anchor_key")
+            subject = subject.get("subject")
+        msg["Subject"] = subject or "Hermes Agent"
         msg["Date"] = formatdate(localtime=True)
+        domain = address.split("@", 1)[1] if "@" in address else "localhost"
+        anchor = _stable_thread_message_id(str(thread_anchor_key or ""), domain)
+        if anchor:
+            msg["In-Reply-To"] = anchor
+            msg["References"] = anchor
+        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{domain}>"
+        msg["Message-ID"] = msg_id
+
+        plain_body, html_body = _render_email_bodies(message or "")
+        body_container.attach(MIMEText(plain_body, "plain", "utf-8"))
+        body_container.attach(MIMEText(html_body, "html", "utf-8"))
+        if safe_media:
+            msg.attach(body_container)
+            for file_path, _is_voice in safe_media:
+                with open(file_path, "rb") as file_handle:
+                    attachment = MIMEBase("application", "octet-stream")
+                    attachment.set_payload(file_handle.read())
+                encoders.encode_base64(attachment)
+                attachment.add_header(
+                    "Content-Disposition",
+                    "attachment",
+                    filename=os.path.basename(file_path),
+                )
+                msg.attach(attachment)
 
         server = smtplib.SMTP(smtp_host, smtp_port)
         server.starttls(context=_ssl.create_default_context())
         server.login(address, password)
         server.send_message(msg)
         server.quit()
-        return {"success": True, "platform": "email", "chat_id": chat_id}
+        return {
+            "success": True,
+            "platform": "email",
+            "chat_id": chat_id,
+            "message_id": msg_id,
+        }
     except Exception as e:
         try:
             from tools.send_message_tool import _error as _e

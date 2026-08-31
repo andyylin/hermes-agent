@@ -517,6 +517,64 @@ class TestDeliverResultWrapping:
         voice_call = adapter.send_voice.call_args
         assert voice_call[1]["audio_path"] == str(media_path)
 
+    def test_email_cron_metadata_reaches_media_attachment(self, tmp_path, monkeypatch):
+        """Cron email media must use the same subject/thread contract as its text."""
+        from concurrent.futures import Future
+        from datetime import datetime
+
+        from gateway.config import Platform
+
+        media_path = self._safe_media_path(tmp_path, monkeypatch, "daily-report.pdf")
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+        adapter.send_document.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.EMAIL: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            import asyncio as _asyncio
+
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
+
+        job = {
+            "id": "daily-media",
+            "name": "Daily media",
+            "deliver": "origin",
+            "origin": {"platform": "email", "chat_id": "andy@example.net"},
+            "email_subject_template": "{job_name} — {date}",
+            "email_thread_key": "daily-media",
+        }
+
+        with (
+            patch("gateway.config.load_gateway_config", return_value=mock_cfg),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch("cron.scheduler._hermes_now", return_value=datetime(2026, 8, 4, 9, 0)),
+            patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro),
+        ):
+            result = _deliver_result(
+                job,
+                f"Daily report\nMEDIA:{media_path}",
+                adapters={Platform.EMAIL: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        adapter.send_document.assert_awaited_once()
+        assert adapter.send_document.await_args.kwargs["metadata"] == {
+            "subject": "Daily media — 2026-08-04",
+            "thread_anchor_key": "daily-media",
+        }
+
 
 class TestDeliverResultErrorReturns:
     """Verify _deliver_result returns error strings on failure, None on success."""
@@ -1818,6 +1876,57 @@ class TestSendMediaViaAdapter:
         self._run_with_loop(adapter, "123", media_files, None, {"id": "j3"})
         adapter.send_voice.assert_called_once()
         adapter.send_image_file.assert_called_once()
+
+    def test_failed_media_result_preserves_retry_identity(self, tmp_path, monkeypatch):
+        from concurrent.futures import Future
+
+        adapter = MagicMock()
+        adapter.send_image_file = AsyncMock()
+        photo_path = self._safe_media_path(tmp_path, monkeypatch, "failed.jpg")
+        completed = Future()
+        completed.set_result(MagicMock(success=False, error="upload rejected"))
+
+        def fake_schedule(coro, _loop):
+            coro.close()
+            return completed
+
+        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule):
+            failures = _send_media_via_adapter(
+                adapter,
+                "123",
+                [(str(photo_path), False)],
+                None,
+                MagicMock(),
+                {"id": "media-failure"},
+            )
+
+        assert failures[0][:2] == (str(photo_path), False)
+        assert "upload rejected" in failures[0][2]
+
+    def test_in_flight_timeout_is_not_fallback_eligible(self, tmp_path, monkeypatch):
+        adapter = MagicMock()
+        adapter.send_image_file = AsyncMock()
+        photo_path = self._safe_media_path(tmp_path, monkeypatch, "in-flight.jpg")
+        in_flight = MagicMock()
+        in_flight.result.side_effect = TimeoutError("timed out")
+        in_flight.cancel.return_value = False
+
+        def fake_schedule(coro, _loop):
+            coro.close()
+            return in_flight
+
+        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule):
+            failures = _send_media_via_adapter(
+                adapter,
+                "123",
+                [(str(photo_path), False)],
+                None,
+                MagicMock(),
+                {"id": "media-in-flight"},
+            )
+
+        in_flight.cancel.assert_called_once_with()
+        assert failures == []
 
 
 class TestParallelTick:
