@@ -189,7 +189,9 @@ export const zhHant = defineLocale({
       turnErrorTitle: '本輪失敗',
       backgroundDoneTitle: '背景工作已完成',
       backgroundFailedTitle: '背景工作失敗',
-      creditsTitle: '額度'
+      creditsTitle: '額度',
+      sessionMessageTitle: '新訊息',
+      sessionMessageBody: '排程任務已將結果送入此對話。'
     }
   },
 
@@ -313,6 +315,10 @@ export const zhHant = defineLocale({
         plugin: {
           label: '外掛通知',
           description: 'Hermes 在背景時，桌面外掛傳送了通知。'
+        },
+        sessionMessage: {
+          label: '排程任務結果',
+          description: '排程任務已將結果送入建立它的對話中。'
         }
       },
       test: '傳送測試通知',

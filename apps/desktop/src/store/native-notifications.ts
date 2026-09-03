@@ -14,7 +14,14 @@ export type { HermesOpenTarget }
 // Native OS notifications (Electron `Notification`), separate from the in-app
 // toast feed in `notifications.ts`. Each kind toggles independently.
 export type NativeNotificationKind =
-  'approval' | 'backgroundDone' | 'credits' | 'input' | 'plugin' | 'turnDone' | 'turnError'
+  | 'approval'
+  | 'backgroundDone'
+  | 'credits'
+  | 'input'
+  | 'plugin'
+  | 'sessionMessage'
+  | 'turnDone'
+  | 'turnError'
 
 export const NATIVE_NOTIFICATION_KINDS: readonly NativeNotificationKind[] = [
   'approval',
@@ -23,11 +30,17 @@ export const NATIVE_NOTIFICATION_KINDS: readonly NativeNotificationKind[] = [
   'turnError',
   'backgroundDone',
   'credits',
-  'plugin'
+  'plugin',
+  'sessionMessage'
 ]
 
-// Blocking prompts — surface even while focused if they're for another session.
-const ATTENTION_KINDS = new Set<NativeNotificationKind>(['approval', 'input'])
+// Blocking prompts — surface even while focused if they're for another
+// session. `sessionMessage` (out-of-band appends, e.g. cron delivery into the
+// originating Desktop/TUI session) joins this set for the same reason: the
+// content lands in a session that is, by definition, not the one the user is
+// currently looking at, so it must break through regardless of foreground
+// focus — only the on-screen-session guard below should suppress it.
+const ATTENTION_KINDS = new Set<NativeNotificationKind>(['approval', 'input', 'sessionMessage'])
 
 export interface NativeNotificationPrefs {
   enabled: boolean
@@ -44,6 +57,7 @@ const DEFAULT_PREFS: NativeNotificationPrefs = {
     credits: true,
     input: true,
     plugin: true,
+    sessionMessage: true,
     turnDone: true,
     turnError: true
   }

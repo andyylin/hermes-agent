@@ -189,7 +189,9 @@ export const zh: Translations = {
       turnErrorTitle: '本轮失败',
       backgroundDoneTitle: '后台任务已完成',
       backgroundFailedTitle: '后台任务失败',
-      creditsTitle: '额度'
+      creditsTitle: '额度',
+      sessionMessageTitle: '新消息',
+      sessionMessageBody: '一个计划任务向此对话发送了结果。'
     }
   },
 
@@ -487,6 +489,10 @@ export const zh: Translations = {
         plugin: {
           label: '插件通知',
           description: 'Hermes 在后台时，桌面插件发送了通知。'
+        },
+        sessionMessage: {
+          label: '计划任务结果',
+          description: '计划任务将结果发送到了创建它的对话中。'
         }
       },
       test: '发送测试通知',

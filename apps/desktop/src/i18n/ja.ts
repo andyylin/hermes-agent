@@ -195,7 +195,9 @@ export const ja = defineLocale({
       turnErrorTitle: 'ターンが失敗しました',
       backgroundDoneTitle: 'バックグラウンドタスクが完了しました',
       backgroundFailedTitle: 'バックグラウンドタスクが失敗しました',
-      creditsTitle: 'クレジット'
+      creditsTitle: 'クレジット',
+      sessionMessageTitle: '新しいメッセージ',
+      sessionMessageBody: 'スケジュールされたタスクがこのチャットに結果を送信しました。'
     }
   },
 
@@ -321,6 +323,10 @@ export const ja = defineLocale({
         plugin: {
           label: 'プラグイン通知',
           description: 'Hermes がバックグラウンドの間に、デスクトッププラグインが通知を送信しました。'
+        },
+        sessionMessage: {
+          label: 'スケジュールタスクの結果',
+          description: 'スケジュールされたタスクが、それを作成したチャットに結果を送信しました。'
         }
       },
       test: 'テスト通知を送信',

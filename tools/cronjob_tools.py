@@ -363,21 +363,37 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
             # snapshots; None for platforms without scope.
             "scope_id": get_session_env("HERMES_SESSION_SCOPE_ID") or None,
         }
+
+    # No messaging platform/chat_id — this is a local/programmatic surface
+    # (TUI, Desktop, CLI, ...). Those have no gateway adapter to route
+    # through, but they DO have a durable stored SessionDB row: capture it as
+    # a session-kind origin so deliver=origin still lands somewhere instead
+    # of silently producing a local-only job (see
+    # cron/scheduler.py::_resolve_session_origin, the durable-target read
+    # side of this capture).
+    origin_session_id = get_session_env("HERMES_SESSION_ID") or None
+    if origin_session_id:
+        return {
+            "kind": "session",
+            "session_id": origin_session_id,
+            "source": get_session_env("HERMES_SESSION_SOURCE") or origin_platform or None,
+        }
     return None
 
 
 def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> Optional[str]:
     """Return an informational notice when a created job won't deliver anywhere.
 
-    TUI/CLI sessions cannot be captured as a cron ``origin`` (no
-    ``HERMES_SESSION_PLATFORM``/``CHAT_ID`` is set for them), so a
-    ``deliver="origin"`` request — or an omitted ``deliver`` that defaults to
-    origin-or-local — produces a job that runs and saves output to
-    ``last_output`` but is never delivered back into the session. This is by
-    design (there is no live-delivery channel for local sessions), but silently
-    dropping the user's "tell me when it runs" intent is the trap reported in
-    #51568. Surface it at create time so the agent can relay it instead of
-    promising a delivery that never happens.
+    TUI/Desktop/CLI sessions capture a session-kind ``origin`` (the durable
+    stored SessionDB row id — see ``_origin_from_env``) rather than a
+    ``{platform, chat_id}`` pair, so ``deliver="origin"`` now resolves to that
+    stored session (see ``cron/scheduler.py::_resolve_session_origin`` /
+    ``_deliver_to_stored_session``) instead of silently producing a
+    local-only job. This notice now only fires when there is genuinely no
+    origin AND no configured home channel to fall back to — surfacing the
+    "tell me when it runs" trap reported in #51568 for the cases that are
+    still local-only (e.g. jobs created via API/script with no session
+    context at all).
 
     Returns ``None`` when the user explicitly asked for ``local`` (no surprise),
     or when the job resolves to a real delivery target.

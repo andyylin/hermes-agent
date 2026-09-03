@@ -237,6 +237,8 @@ export interface Translations {
       backgroundDoneTitle: string
       backgroundFailedTitle: string
       creditsTitle: string
+      sessionMessageTitle: string
+      sessionMessageBody: string
     }
   }
 
@@ -414,7 +416,14 @@ export interface Translations {
       enableAllDesc: string
       focusedHint: string
       kinds: Record<
-        'approval' | 'backgroundDone' | 'credits' | 'input' | 'plugin' | 'turnDone' | 'turnError',
+        | 'approval'
+        | 'backgroundDone'
+        | 'credits'
+        | 'input'
+        | 'plugin'
+        | 'sessionMessage'
+        | 'turnDone'
+        | 'turnError',
         { label: string; description: string }
       >
       test: string

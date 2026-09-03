@@ -31,6 +31,10 @@ export interface GatewayEventDeps {
   ) => Promise<void>
   queryClient: QueryClient
   refreshHermesConfig: () => Promise<void>
+  /** Stored -> runtime session id, so out-of-band events addressed by stored
+   *  id (cron session delivery) can tell whether that session is the one
+   *  currently on screen. */
+  runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   scheduleSessionsRefresh: () => void
   sessionInterrupted: (sessionId: string) => boolean
   sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>>

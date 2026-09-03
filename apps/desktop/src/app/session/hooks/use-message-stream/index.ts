@@ -46,6 +46,11 @@ interface MessageStreamOptions {
   queryClient: QueryClient
   refreshHermesConfig: () => Promise<void>
   refreshSessions: () => Promise<void>
+  /** Stored -> runtime session id. Optional: tests/harnesses that don't
+   *  exercise cron-session-delivery notifications can omit it — an internal
+   *  empty map is used, under which every stored id resolves as "not open in
+   *  this window" (the correct default). */
+  runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
   sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>>
   updateSessionState: (
     sessionId: string,
@@ -74,9 +79,12 @@ export function useMessageStream({
   queryClient,
   refreshHermesConfig,
   refreshSessions,
+  runtimeIdByStoredSessionIdRef,
   sessionStateByRuntimeIdRef,
   updateSessionState
 }: MessageStreamOptions) {
+  const internalRuntimeIdByStoredSessionIdRef = useRef(new Map<string, string>())
+  const resolvedRuntimeIdByStoredSessionIdRef = runtimeIdByStoredSessionIdRef ?? internalRuntimeIdByStoredSessionIdRef
   const sessionInterrupted = useCallback(
     (sessionId: string) => sessionStateByRuntimeIdRef.current.get(sessionId)?.interrupted ?? false,
     [sessionStateByRuntimeIdRef]
@@ -873,6 +881,7 @@ export function useMessageStream({
     hydrateFromStoredSession,
     queryClient,
     refreshHermesConfig,
+    runtimeIdByStoredSessionIdRef: resolvedRuntimeIdByStoredSessionIdRef,
     scheduleSessionsRefresh,
     sessionInterrupted,
     sessionStateByRuntimeIdRef,

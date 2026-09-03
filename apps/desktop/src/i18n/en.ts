@@ -194,7 +194,9 @@ export const en: Translations = {
       turnErrorTitle: 'Turn failed',
       backgroundDoneTitle: 'Background task finished',
       backgroundFailedTitle: 'Background task failed',
-      creditsTitle: 'Credits'
+      creditsTitle: 'Credits',
+      sessionMessageTitle: 'New message',
+      sessionMessageBody: 'A scheduled task delivered output to this chat.'
     }
   },
 
@@ -500,6 +502,10 @@ export const en: Translations = {
         plugin: {
           label: 'Plugin notifications',
           description: 'A desktop plugin sent a notification while Hermes was in the background.'
+        },
+        sessionMessage: {
+          label: 'Scheduled task output',
+          description: 'A scheduled task delivered its output into the chat that created it.'
         }
       },
       test: 'Send test notification',

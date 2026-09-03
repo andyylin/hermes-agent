@@ -2574,6 +2574,50 @@ def _broadcast_global_event(event: str, payload: dict | None = None) -> None:
             logger.debug("global-event broadcast write failed type=%s", event, exc_info=True)
 
 
+def broadcast_stored_session_event(
+    event: str, stored_session_id: str, payload: dict | None = None
+) -> None:
+    """Fan an event scoped to a *stored* SessionDB id to every connected client.
+
+    Emitters outside a live turn (cron delivery, out-of-band appends) know
+    the durable stored session id, not any live runtime ``sid`` — those are
+    two different keyspaces (see ``apps/desktop/src/lib/session-ids.ts``).
+    When the stored session happens to be open in THIS process right now,
+    resolve its live ``sid`` and emit with that as the frame's top-level
+    ``session_id`` so the client's existing explicit-session-id routing
+    (``resolveGatewayEventSessionId``) picks it up with no special-casing.
+    Otherwise falls back to a session-less global broadcast — the payload
+    still carries ``session_id`` (the stored id) for callers that read it
+    directly rather than going through the live-session routing pipeline.
+    """
+    runtime_sid: str | None = None
+    with _sessions_lock:
+        for sid, session in _sessions.items():
+            if str(session.get("session_key") or "") == str(stored_session_id):
+                runtime_sid = sid
+                break
+
+    if runtime_sid is None:
+        _broadcast_global_event(event, payload)
+        return
+
+    with _live_transports_lock:
+        targets = list(_live_transports)
+
+    frame = _event_frame(event, runtime_sid, payload)
+    if not targets:
+        write_json(frame)
+        return
+    for transport in targets:
+        try:
+            transport.write(frame)
+        except Exception:
+            logger.debug(
+                "stored-session-scoped broadcast write failed type=%s",
+                event, exc_info=True,
+            )
+
+
 _compute_host_supervisor = None
 _compute_host_supervisor_lock = threading.Lock()
 

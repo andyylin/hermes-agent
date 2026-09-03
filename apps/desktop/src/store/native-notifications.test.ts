@@ -105,6 +105,20 @@ describe('dispatchNativeNotification focus gating', () => {
     expect(notify).not.toHaveBeenCalled()
   })
 
+  it('fires a sessionMessage notification for an off-screen session even when focused (cron delivery)', () => {
+    setWindowState({ focused: true, hidden: false })
+    setActiveSessionId('on-screen')
+    dispatchNativeNotification({ kind: 'sessionMessage', sessionId: 'stored-elsewhere', title: 'Reminder fired' })
+    expect(notify).toHaveBeenCalledTimes(1)
+  })
+
+  it('suppresses a sessionMessage notification for the on-screen session', () => {
+    setWindowState({ focused: true, hidden: false })
+    setActiveSessionId('on-screen')
+    dispatchNativeNotification({ kind: 'sessionMessage', sessionId: 'on-screen', title: 'Reminder fired' })
+    expect(notify).not.toHaveBeenCalled()
+  })
+
   it('fires a global completion notification while away with no active session (pet gen)', () => {
     setActiveSessionId(null)
     dispatchNativeNotification({ global: true, kind: 'backgroundDone', title: 'Your pet hatched' })

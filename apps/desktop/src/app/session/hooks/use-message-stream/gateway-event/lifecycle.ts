@@ -1,5 +1,6 @@
 import type { HermesSkin } from '@hermes/shared/skin'
 
+import { translateNow } from '@/i18n'
 import {
   notifyCronChanged,
   notifyPairingChanged,
@@ -9,6 +10,7 @@ import {
   type PetChangeMeta,
   setChangeEventsAvailable
 } from '@/store/live-sync'
+import { dispatchNativeNotification } from '@/store/native-notifications'
 import { dropSessionState, unbindTileRuntime } from '@/store/session-states'
 // Leaf import (not the `@/themes` barrel) to avoid pulling the ThemeProvider
 // module graph into the gateway event hot path.
@@ -65,6 +67,43 @@ export function handleLifecycleEvent(ctx: GatewayEventContext): boolean {
       } else {
         notifySessionsChanged()
       }
+    }
+
+    return true
+  }
+
+  if (event.type === 'session.message.created') {
+    // Out-of-band append into a STORED session (cron delivering
+    // `deliver=origin` output back into the Desktop/TUI/CLI conversation
+    // that created the job — see `cron/session_delivery.py`). The backend
+    // addresses this by stored id, a different keyspace from the runtime
+    // `sid` this event's own top-level `session_id` may or may not carry
+    // (see `tui_gateway.server.broadcast_stored_session_event`), so read the
+    // stored id straight out of the payload rather than trusting `ctx.sessionId`.
+    const messagePayload = payload as
+      | { job_name?: string; preview?: string; session_id?: string }
+      | undefined
+    const storedSessionId = String(messagePayload?.session_id ?? '')
+
+    // The row is already durably appended regardless of any of this — refresh
+    // the session list (unread indicator) and fire a native notification only
+    // when the target isn't the session already on screen.
+    notifySessionsChanged()
+
+    if (storedSessionId) {
+      const runtimeId = deps.runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
+      // Falls back to the stored id itself when this window never opened that
+      // session (no runtime mapping yet): comparing a stored id against the
+      // active RUNTIME session id can never accidentally match, which is the
+      // correct "off-screen" answer for a session this window isn't showing.
+      const notificationSessionId = runtimeId ?? storedSessionId
+
+      dispatchNativeNotification({
+        body: messagePayload?.preview || translateNow('notifications.native.sessionMessageBody'),
+        kind: 'sessionMessage',
+        sessionId: notificationSessionId,
+        title: messagePayload?.job_name || translateNow('notifications.native.sessionMessageTitle')
+      })
     }
 
     return true

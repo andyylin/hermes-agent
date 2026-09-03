@@ -112,7 +112,24 @@ function timelineDisplayContent(message: SessionMessage, content: string): strin
       : `${count} background agent${count === 1 ? '' : 's'} finished`
   }
 
+  if (message.display_kind === 'cron_delivery') {
+    // Out-of-band cron output landing in the session that created the job
+    // (`deliver=origin` for Desktop/TUI/CLI — see cron/session_delivery.py).
+    // Unlike the canned phrases above, the point of this row IS the content
+    // (the delivered reminder/report text), so it's kept verbatim — only
+    // prefixed with the job name for context when the backend sent one.
+    const jobName = timelineCronJobName(message.display_metadata)
+
+    return jobName ? `${jobName}\n${content}` : content
+  }
+
   return content
+}
+
+function timelineCronJobName(metadata: SessionMessage['display_metadata']): string | undefined {
+  const name = parseDisplayMetadata(metadata)?.job_name
+
+  return typeof name === 'string' && name.trim() ? name.trim() : undefined
 }
 
 export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
@@ -203,7 +220,8 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       message.display_kind === 'model_switch' ||
       message.display_kind === 'async_delegation_complete' ||
       message.display_kind === 'auto_continue' ||
-      message.display_kind === 'personality_switch'
+      message.display_kind === 'personality_switch' ||
+      message.display_kind === 'cron_delivery'
         ? 'system'
         : message.role
 

@@ -1660,6 +1660,52 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     return None
 
 
+# Pseudo-platform for delivering job output directly into the stored
+# session (SessionDB row) that CREATED the job — the durable target for
+# Desktop/TUI/CLI origins, which have no gateway platform/chat_id at all
+# (see tools/cronjob_tools.py::_origin_from_env). Kept in the same
+# platform/chat_id target shape as BOT_CHAT_PLATFORM so the existing
+# dedup/loop machinery in _resolve_delivery_targets / _deliver_result needs
+# no structural changes: "chat_id" here IS the stored session id.
+SESSION_DELIVERY_PLATFORM = "session"
+
+# Historical/legacy non-messaging surface tags that must never reach the
+# Platform() enum lookup below: a job whose origin.platform was stamped
+# with one of these (pre-fix jobs, hand-edited jobs.json, or a session-
+# context leak) would otherwise blow up every fire with "unknown platform
+# 'webui'" (the exact field incident this module fixes — PD Neo Nemo
+# handoff watches). Deliberately NOT the full
+# ``gateway.session_context.NON_MESSAGING_SESSION_SURFACES`` set: that set
+# also includes real ``Platform`` enum members (local, api_server, webhook,
+# msgraph_webhook) which resolve fine below and keep their existing
+# not-configured/enabled handling. This set is only the UI/programmatic
+# surface names that are NOT valid Platform members and have no messaging
+# adapter behind them at all; silently skipping is correct, not a failure.
+_LOCAL_UI_PLATFORM_NAMES = frozenset(
+    {"", "desktop", "tui", "webui", "cli", "codex", "gateway", "kanban", "tool"}
+)
+
+
+def _resolve_session_origin(job: dict) -> Optional[dict]:
+    """Extract a session-kind origin (Desktop/TUI/CLI creation) from a job.
+
+    Distinct from :func:`_resolve_origin`, which only recognizes the legacy
+    ``{platform, chat_id}`` shape used by messaging-gateway origins. A
+    session-kind origin instead carries the durable ``session_id`` of the
+    SessionDB row the job was created from — see
+    ``tools/cronjob_tools.py::_origin_from_env``.
+    """
+    origin = job.get("origin")
+    if not isinstance(origin, dict):
+        return None
+    if origin.get("kind") != "session":
+        return None
+    session_id = origin.get("session_id")
+    if not session_id:
+        return None
+    return origin
+
+
 def _cron_mirror_delivery_enabled(job: dict, cfg: Optional[dict] = None) -> bool:
     """Whether a cron delivery should also be mirrored into the target chat's
     gateway session transcript.
@@ -2494,6 +2540,7 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
     """Resolve one concrete auto-delivery target for a cron job."""
 
     origin = _resolve_origin(job)
+    session_origin = _resolve_session_origin(job)
 
     if deliver_value == "local":
         return None
@@ -2505,7 +2552,38 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
     if bot_chat_profile is not None:
         return _resolve_bot_chat_target(job, bot_chat_profile)
 
+    # Explicit session:<stored_id> target — first-class alternative to
+    # deliver=origin for a Desktop/TUI/CLI stored session (see TASK
+    # cron-session-delivery). Never falls back to anything: an explicit id
+    # that doesn't resolve at delivery time is a scoped failure, not a
+    # silent drop.
+    if deliver_value.lower().startswith(f"{SESSION_DELIVERY_PLATFORM}:"):
+        explicit_session_id = deliver_value.split(":", 1)[1].strip()
+        if not explicit_session_id:
+            return None
+        return {
+            "platform": SESSION_DELIVERY_PLATFORM,
+            "chat_id": explicit_session_id,
+            "thread_id": None,
+            "kind": "session",
+            "session_id": explicit_session_id,
+            "_resolved_from": "explicit",
+        }
+
     if deliver_value == "origin":
+        if session_origin:
+            # Local Desktop/TUI/CLI origin: deliver straight into the
+            # stored session that created the job. No platform/chat_id
+            # resolution, no Platform() enum lookup, no "unknown platform"
+            # failure mode for these surfaces.
+            return {
+                "platform": SESSION_DELIVERY_PLATFORM,
+                "chat_id": str(session_origin["session_id"]),
+                "thread_id": None,
+                "kind": "session",
+                "session_id": str(session_origin["session_id"]),
+                "_resolved_from": "origin",
+            }
         if origin:
             return {
                 "platform": origin["platform"],
@@ -2729,6 +2807,29 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
                 os.unlink(query_file)
             except OSError:
                 pass
+
+
+def _deliver_to_stored_session(
+    job: dict,
+    content: str,
+    session_id: str,
+    *,
+    execution_id: Optional[str] = None,
+) -> Optional[str]:
+    """Deliver job output into the stored SessionDB row that created the job.
+
+    Thin wrapper around ``cron.session_delivery.deliver_cron_output_to_session``
+    — kept as a scheduler-local seam (like ``_deliver_to_bot_chat``) so the
+    per-target loop in ``_deliver_result`` doesn't need to know the delivery
+    module's internals. No header/footer wrap (``_format_cron_delivery_content``
+    is a messaging-platform concern): the session already renders this as
+    distinctly-tagged scheduled output via ``display_kind``.
+    """
+    from cron.session_delivery import deliver_cron_output_to_session
+
+    return deliver_cron_output_to_session(
+        job, content, session_id, execution_id=execution_id,
+    )
 
 
 def _normalize_deliver_value(deliver) -> str:
@@ -3219,7 +3320,13 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    execution_id: Optional[str] = None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -3319,6 +3426,32 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             bot_chat_error = _deliver_to_bot_chat(job, content, chat_id)
             if bot_chat_error:
                 delivery_errors.append(bot_chat_error)
+            continue
+
+        # session targets (deliver=origin from a Desktop/TUI/CLI-created job,
+        # or an explicit deliver=session:<stored_id>) don't ride a gateway
+        # adapter either: the output lands directly in the stored SessionDB
+        # row via mirror_to_session, with unread + a session.message.created
+        # event for native notifications. Handled before the Platform enum
+        # lookup below, which knows nothing about this pseudo-platform.
+        if platform_name == SESSION_DELIVERY_PLATFORM:
+            session_id = str(target.get("session_id") or chat_id)
+            session_error = _deliver_to_stored_session(
+                job, content, session_id, execution_id=execution_id,
+            )
+            if session_error:
+                delivery_errors.append(session_error)
+            continue
+
+        # Legacy/hand-edited/leaked non-messaging platform tags (see
+        # _LOCAL_UI_PLATFORM_NAMES). These have no messaging adapter at all —
+        # skip as a no-op rather than raising "unknown platform 'webui'"
+        # (the exact incident this module fixes).
+        if str(platform_name).lower() in _LOCAL_UI_PLATFORM_NAMES:
+            logger.info(
+                "Job '%s': skipping non-messaging target platform=%s (no adapter)",
+                job["id"], platform_name,
+            )
             continue
 
         for_discord = str(platform_name).lower() == "discord"
@@ -7620,6 +7753,7 @@ def _run_one_job_body(
                             deliver_content,
                             adapters=adapters,
                             loop=loop,
+                            execution_id=execution_id,
                         )
                 except Exception as de:
                     if isinstance(de, _FireClaimLostDuringSideEffect):
@@ -7790,6 +7924,7 @@ def _run_one_job_body(
                         + _failure_streak_nudge(job),
                         adapters=adapters,
                         loop=loop,
+                        execution_id=execution_id,
                     )
                 except Exception as delivery_exc:
                     delivery_error = str(delivery_exc)

@@ -555,6 +555,10 @@ export type TimelineDisplayMetadata =
       duration_seconds?: number
     }
   | { reactions: MessageReaction[] }
+  // cron_delivery (cron/session_delivery.py): the originating-session cron
+  // delivery's `deliver=origin` append carries the source job's identity so
+  // the timeline can label the row without parsing the content text.
+  | { source: 'cron'; job_id?: string; job_name?: string; execution_id?: string }
 
 /** One emoji reaction on a message. One per author, iOS-Tapback style. */
 export interface MessageReaction {
@@ -581,7 +585,13 @@ export interface SessionMessage {
   reasoning_content?: null | string
   reasoning_details?: unknown
   display_kind?:
-    'async_delegation_complete' | 'auto_continue' | 'hidden' | 'model_switch' | 'personality_switch' | string
+    | 'async_delegation_complete'
+    | 'auto_continue'
+    | 'cron_delivery'
+    | 'hidden'
+    | 'model_switch'
+    | 'personality_switch'
+    | string
   /**
    * A backend older than this app can still serve this as unparsed JSON text,
    * so readers must narrow before indexing into it.

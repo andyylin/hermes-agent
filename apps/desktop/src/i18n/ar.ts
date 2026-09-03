@@ -197,7 +197,9 @@ export const ar = defineLocale({
       turnDoneBody: '',
       turnErrorTitle: 'فشلت الجولة',
       backgroundDoneTitle: 'انتهت المهمة في الخلفية',
-      backgroundFailedTitle: 'فشلت المهمة في الخلفية'
+      backgroundFailedTitle: 'فشلت المهمة في الخلفية',
+      sessionMessageTitle: 'رسالة جديدة',
+      sessionMessageBody: 'سلّمت مهمة مجدولة نتائجها إلى هذه المحادثة.'
     }
   },
   remoteDisplayBanner: {
@@ -392,6 +394,10 @@ export const ar = defineLocale({
         backgroundDone: {
           label: 'اكتملت مهمة الخلفية',
           description: 'اكتمل أمر طرفية يعمل في الخلفية.'
+        },
+        sessionMessage: {
+          label: 'نتائج المهمة المجدولة',
+          description: 'سلّمت مهمة مجدولة نتائجها إلى المحادثة التي أنشأتها.'
         }
       },
       test: 'إرسال إشعار تجريبي',

@@ -421,18 +421,82 @@ describe('toChatMessages', () => {
         content: "[System: The user has changed the assistant's personality…]",
         display_kind: 'personality_switch',
         timestamp: 7
+      },
+      {
+        role: 'user',
+        content: 'Your reminder fired.',
+        display_kind: 'cron_delivery',
+        timestamp: 8
       }
     ])
 
-    expect(messages.map(message => message.role)).toEqual(['user', 'assistant', 'system', 'system', 'system', 'system'])
+    expect(messages.map(message => message.role)).toEqual([
+      'user',
+      'assistant',
+      'system',
+      'system',
+      'system',
+      'system',
+      'system'
+    ])
     expect(messages.map(chatMessageText)).toEqual([
       'real user turn',
       'real assistant reply',
       'model changed',
       'background agent work finished',
       'resumed interrupted turn',
-      'personality changed'
+      'personality changed',
+      'Your reminder fired.'
     ])
+  })
+
+  // Originating-session cron delivery (cron/session_delivery.py): the
+  // appended row is role='user' in the DB (never assistant, to preserve
+  // strict alternation on replay) but must render as a `system` scaffold
+  // line, not a chat bubble impersonating the user — and unlike the canned
+  // phrases above, the delivered text itself is the point of the row.
+  describe('cron_delivery display', () => {
+    it('renders the delivered content verbatim, prefixed with the job name when present', () => {
+      const messages = toChatMessages([
+        {
+          role: 'user',
+          content: 'Your reminder fired.',
+          display_kind: 'cron_delivery',
+          display_metadata: { job_id: 'j1', job_name: 'Morning reminder', source: 'cron' },
+          timestamp: 1
+        }
+      ])
+
+      expect(messages[0].role).toBe('system')
+      expect(chatMessageText(messages[0])).toBe('Morning reminder\nYour reminder fired.')
+    })
+
+    it('renders the delivered content alone when no job name is present', () => {
+      const messages = toChatMessages([
+        {
+          role: 'user',
+          content: 'Your reminder fired.',
+          display_kind: 'cron_delivery',
+          timestamp: 1
+        }
+      ])
+
+      expect(chatMessageText(messages[0])).toBe('Your reminder fired.')
+    })
+
+    it('never appends a role=assistant row (would break strict alternation on replay)', () => {
+      const messages = toChatMessages([
+        { role: 'assistant', content: 'prior assistant turn', timestamp: 1 },
+        {
+          role: 'user',
+          content: 'Your reminder fired.',
+          display_kind: 'cron_delivery',
+          timestamp: 2
+        }
+      ])
+
+      expect(messages.map(m => m.role)).toEqual(['assistant', 'system'])
+    })
   })
 
   // A backend older than this app serves display_metadata as unparsed JSON
