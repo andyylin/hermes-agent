@@ -2,7 +2,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from agent.memory_tree_build import (
+from hermes_plugins.memory_tree.memory_tree_build import (
     BuildOptions,
     _archive_message_text,
     build_memory_tree_packs,
@@ -10,7 +10,7 @@ from agent.memory_tree_build import (
     collect_verified_archive_records,
     iter_recent_cron_outputs,
 )
-from agent.memory_tree_lite import SourceRecord, _query_terms, build_markdown_pack, search_memory_packs
+from hermes_plugins.memory_tree.memory_tree_lite import SourceRecord, _query_terms, build_markdown_pack, search_memory_packs
 
 
 def test_iter_recent_cron_outputs_skips_file_removed_during_scan(tmp_path, monkeypatch):
@@ -44,7 +44,9 @@ def test_collect_cron_records_skips_file_removed_after_discovery(tmp_path, monke
     vanished = output / "gone.md"
     vanished.write_text("gone", encoding="utf-8")
 
-    monkeypatch.setattr("agent.memory_tree_build.iter_recent_cron_outputs", lambda home, limit: [vanished])
+    import hermes_plugins.memory_tree.memory_tree_build as build_mod
+
+    monkeypatch.setattr(build_mod, "iter_recent_cron_outputs", lambda home, limit: [vanished])
     vanished.unlink()
 
     assert collect_cron_records(home, limit=10) == []

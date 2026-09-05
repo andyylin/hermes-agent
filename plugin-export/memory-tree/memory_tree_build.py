@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from hermes_constants import get_hermes_home
-from agent.memory_tree_lite import SourceRecord, build_markdown_pack, collect_session_records, write_pack
+from .memory_tree_lite import SourceRecord, build_markdown_pack, collect_session_records, write_pack
 
 try:  # pragma: no cover - zoneinfo exists on supported runtimes
     from zoneinfo import ZoneInfo

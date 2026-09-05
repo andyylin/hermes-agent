@@ -169,7 +169,7 @@ def _result_to_dict(result: Any) -> dict[str, Any]:
 
 
 def _search_results(query: str, *, packs: Iterable[str] | None = None, limit: int = 5, chars: int = 500) -> list[Any]:
-    from agent.memory_tree_lite import search_memory_packs
+    from .memory_tree_lite import search_memory_packs
 
     return search_memory_packs(resolve_pack_paths(packs), query, limit=limit, max_snippet_chars=chars)
 
@@ -251,7 +251,7 @@ def cmd_memory_tree(args: Any) -> int:
         print(memory_tree_status(json_mode=getattr(args, "json", False), verbose=getattr(args, "verbose", False)))
         return 0
     if action == "build":
-        from agent.memory_tree_build import BuildOptions, build_memory_tree_packs, format_build_report
+        from .memory_tree_build import BuildOptions, build_memory_tree_packs, format_build_report
 
         state = build_memory_tree_packs(
             BuildOptions(
@@ -291,19 +291,19 @@ def cmd_memory_tree(args: Any) -> int:
         )
         return 0
     if action == "attention":
-        from agent.memory_tree_attention import format_attention_json, format_attention_report, scan_attention
+        from .memory_tree_attention import format_attention_json, format_attention_report, scan_attention
 
         items = scan_attention(stale_days=getattr(args, "stale_days", 7), include_stale=getattr(args, "include_stale", False))
         print(format_attention_json(items, max_chars=getattr(args, "chars", 4000)) if getattr(args, "json", False) else format_attention_report(items, max_chars=getattr(args, "chars", 4000)))
         return 0
     if action == "reconcile":
-        from agent.memory_tree_reconcile import format_reconcile_json, format_reconcile_text, reconcile_active_work
+        from .memory_tree_reconcile import format_reconcile_json, format_reconcile_text, reconcile_active_work
 
         report = reconcile_active_work()
         print(format_reconcile_json(report, max_chars=getattr(args, "chars", 4000)) if getattr(args, "json", False) else format_reconcile_text(report, max_chars=getattr(args, "chars", 4000)))
         return 0
     if action == "privacy":
-        from agent.memory_tree_privacy import format_privacy_json, format_privacy_text, scan_memory_tree_privacy
+        from .memory_tree_privacy import format_privacy_json, format_privacy_text, scan_memory_tree_privacy
 
         report = scan_memory_tree_privacy(max_snippet_chars=getattr(args, "snippet_chars", 160))
         print(format_privacy_json(report, max_chars=getattr(args, "chars", 4000)) if getattr(args, "json", False) else format_privacy_text(report, max_chars=getattr(args, "chars", 4000)))
@@ -311,12 +311,8 @@ def cmd_memory_tree(args: Any) -> int:
     raise SystemExit(f"Unknown memory-tree command: {action}")
 
 
-def add_memory_tree_parser(subparsers: Any) -> Any:
-    parser = subparsers.add_parser(
-        "memory-tree",
-        help="Inspect/search generated Memory Tree Lite packs without auto-injection",
-        description="Build, inspect, search, and preview Memory Tree Lite context on demand.",
-    )
+def register_cli(parser: Any) -> None:
+    """Wire ``hermes memory-tree`` subcommands (plugin CLI registration)."""
     sub = parser.add_subparsers(dest="memory_tree_command")
 
     status = sub.add_parser("status", help="Show pack/build/config status")
@@ -366,5 +362,3 @@ def add_memory_tree_parser(subparsers: Any) -> Any:
     privacy.add_argument("--snippet-chars", type=int, default=160)
     privacy.add_argument("--json", action="store_true")
 
-    parser.set_defaults(func=cmd_memory_tree)
-    return parser

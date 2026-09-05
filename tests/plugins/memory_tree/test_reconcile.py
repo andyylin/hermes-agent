@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from agent.memory_tree_reconcile import format_reconcile_text, reconcile_active_work
+from hermes_plugins.memory_tree.memory_tree_reconcile import format_reconcile_text, reconcile_active_work
 
 
 def _write_json(path: Path, data: dict) -> None:

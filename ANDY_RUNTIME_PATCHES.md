@@ -47,11 +47,13 @@ not `gateway.multiplex_profiles`. Shared-process multiplexing stays retired.
 7. **Bitwarden plaintext-cache purge** — encrypted-cache mode removes obsolete
    plaintext cache data fail-closed before validation, read, or fetch. The
    encrypted AES-GCM network-failure-only fallback is already upstream-owned.
-8. **Memory Tree manual retrieval** — local subsystem (`memory_tree` tool,
-   CLI, build/privacy/attention/reconcile). Official `origin/main` has none of
-   these files. Keep while default config has `memory_tree.enabled: true`.
-   This is the fattest unique KEEP; retire only with an explicit replacement
-   (session_search + skills) decision.
+8. **Memory Tree manual retrieval** — peeled to the user plugin at
+   `plugin-export/memory-tree/` on branch `feat/memory-tree-user-plugin-20260905`.
+   Copy to `~/.hermes/plugins/memory-tree` and enable via `plugins.enabled`.
+   Core overlay files (`agent/memory_tree_*`, `hermes_cli/memory_tree.py`,
+   `tools/memory_tree_tool.py`) are removed from this tree; keep
+   `memory_tree.enabled: true` in config for Andy's runtime semantics once the
+   plugin is installed.
 9. **House runtime pin/refresh scripts** — `scripts/maintenance/refresh_andy_runtime.sh`
    and `scripts/maintenance/pin-shared-hermes-runtime.sh`. Ops, not product.
    They keep source SHA and the SQLite-safe interpreter separate.

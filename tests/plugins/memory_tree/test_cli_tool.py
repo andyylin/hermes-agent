@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from agent.memory_tree_lite import SourceRecord, build_markdown_pack
+from hermes_plugins.memory_tree.memory_tree_lite import SourceRecord, build_markdown_pack
 
 
 def _write_pack(home: Path) -> Path:
@@ -37,6 +37,13 @@ def _write_pack(home: Path) -> Path:
     return pack
 
 
+def _enable_memory_tree_config(home: Path) -> None:
+    (home / "config.yaml").write_text(
+        "memory_tree:\n  enabled: true\n  mode: manual\n  packs:\n    - recent\n",
+        encoding="utf-8",
+    )
+
+
 def test_memory_tree_status_json_reports_manual_context_gate(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _write_pack(tmp_path)
@@ -45,7 +52,7 @@ def test_memory_tree_status_json_reports_manual_context_gate(tmp_path, monkeypat
         encoding="utf-8",
     )
 
-    from hermes_cli.memory_tree import memory_tree_status
+    from hermes_plugins.memory_tree.cli import memory_tree_status
 
     status = memory_tree_status(json_mode=True)
     payload = json.loads(status)
@@ -65,7 +72,8 @@ def test_memory_tree_status_treats_pre_archive_session_count_as_legacy(tmp_path)
         json.dumps({"schema": "memory-tree-lite-state-v1", "counts": {"records_total": 7, "sessions": 7, "active_work": 0, "cron_outputs": 0}, "outputs": {}}),
         encoding="utf-8",
     )
-    from hermes_cli.memory_tree import memory_tree_status
+    from hermes_plugins.memory_tree.cli import memory_tree_status
+
     payload = json.loads(memory_tree_status(json_mode=True, home=tmp_path))
     text = memory_tree_status(home=tmp_path)
     assert payload["build"]["session_archives"] == 0
@@ -78,7 +86,7 @@ def test_memory_tree_search_formats_provenance_matches(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _write_pack(tmp_path)
 
-    from hermes_cli.memory_tree import memory_tree_search
+    from hermes_plugins.memory_tree.cli import memory_tree_search
 
     output = memory_tree_search("Mattermost", limit=2, chars=300)
 
@@ -90,8 +98,9 @@ def test_memory_tree_search_formats_provenance_matches(tmp_path, monkeypatch):
 def test_memory_tree_tool_context_preview_is_callable_without_auto_injection(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _write_pack(tmp_path)
+    _enable_memory_tree_config(tmp_path)
 
-    from tools.memory_tree_tool import memory_tree_tool
+    from hermes_plugins.memory_tree.tool import memory_tree_tool
 
     result = json.loads(memory_tree_tool({"action": "context-preview", "query": "Mattermost", "limit": 1, "chars": 500}))
 
@@ -104,9 +113,15 @@ def test_memory_tree_tool_context_preview_is_callable_without_auto_injection(tmp
 def test_memory_tree_registry_dispatch_returns_supported_string(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _write_pack(tmp_path)
+    _enable_memory_tree_config(tmp_path)
 
-    from tools.memory_tree_tool import memory_tree_tool  # noqa: F401 - registers tool
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from hermes_plugins.memory_tree import register
     from tools.registry import registry
+
+    mgr = PluginManager()
+    manifest = PluginManifest(name="memory-tree", key="memory-tree", path=str(tmp_path))
+    register(PluginContext(manifest, mgr))
 
     raw = registry.dispatch(
         "memory_tree",
@@ -119,19 +134,15 @@ def test_memory_tree_registry_dispatch_returns_supported_string(tmp_path, monkey
     assert result["result"]["results"][0]["source_id"] == "mattermost-brief"
 
 
-def test_default_toolsets_expose_memory_tree_on_call():
-    from toolsets import _HERMES_CORE_TOOLS, TOOLSETS
-
-    assert "memory_tree" in _HERMES_CORE_TOOLS
-    assert "memory_tree" in TOOLSETS["memory_tree"]["tools"]
-
-
 def test_memory_tree_cli_parser_registers_archive_build_command():
-    from hermes_cli._parser import build_top_level_parser
-    from hermes_cli.memory_tree import add_memory_tree_parser
+    import argparse
 
-    parser, subparsers, _chat = build_top_level_parser()
-    add_memory_tree_parser(subparsers)
+    from hermes_plugins.memory_tree.cli import register_cli
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    plugin_parser = subparsers.add_parser("memory-tree")
+    register_cli(plugin_parser)
 
     args = parser.parse_args(["memory-tree", "build", "--legacy-session-fallback"])
 

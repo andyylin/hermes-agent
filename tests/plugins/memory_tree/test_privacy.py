@@ -1,8 +1,8 @@
 import json
 from pathlib import Path
 
-from agent.memory_tree_build import redact_secrets
-from agent.memory_tree_privacy import scan_memory_tree_privacy
+from hermes_plugins.memory_tree.memory_tree_build import redact_secrets
+from hermes_plugins.memory_tree.memory_tree_privacy import scan_memory_tree_privacy
 
 
 def _state_with_pack(home: Path, text: str) -> Path:

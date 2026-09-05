@@ -1,16 +1,28 @@
-"""On-call Memory Tree Lite retrieval tool.
-
-This exposes generated Memory Tree packs to the agent only when explicitly
-called. It never auto-injects context into prompts.
-"""
+"""Memory Tree Lite model tool (on-call retrieval only)."""
 from __future__ import annotations
 
 import json
 from typing import Any
 
 
+def _memory_tree_config_enabled() -> bool:
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        data = load_config_readonly()
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    section = data.get("memory_tree")
+    if not isinstance(section, dict):
+        return False
+    return bool(section.get("enabled", False))
+
+
 def check_memory_tree_requirements() -> bool:
-    return True
+    """Expose the tool only when ``memory_tree.enabled`` is true in config."""
+    return _memory_tree_config_enabled()
 
 
 MEMORY_TREE_SCHEMA = {
@@ -56,6 +68,17 @@ MEMORY_TREE_SCHEMA = {
 
 
 def memory_tree_tool(args: dict[str, Any] | None = None, **_: Any) -> str:
+    if not _memory_tree_config_enabled():
+        return json.dumps(
+            {
+                "success": False,
+                "error": "memory_tree.enabled is false in config.yaml; enable it to use Memory Tree retrieval",
+                "auto_injected": False,
+            }
+        )
+
+    from .cli import memory_tree_context_preview, memory_tree_search, memory_tree_status
+
     args = args or {}
     action = str(args.get("action") or "search")
     query = str(args.get("query") or "").strip()
@@ -63,46 +86,56 @@ def memory_tree_tool(args: dict[str, Any] | None = None, **_: Any) -> str:
     chars = int(args.get("chars") or 800)
     packs = args.get("packs")
 
-    from hermes_cli.memory_tree import memory_tree_context_preview, memory_tree_search, memory_tree_status
-
     if action == "status":
-        return json.dumps({
-            "success": True,
-            "auto_injected": False,
-            "status": json.loads(memory_tree_status(json_mode=True)),
-        })
+        return json.dumps(
+            {
+                "success": True,
+                "auto_injected": False,
+                "status": json.loads(memory_tree_status(json_mode=True)),
+            }
+        )
     if action == "search":
         if not query:
-            return json.dumps({"success": False, "error": "query is required for memory_tree search", "auto_injected": False})
-        return json.dumps({
-            "success": True,
-            "auto_injected": False,
-            "result": json.loads(
-                memory_tree_search(query, packs=packs, limit=limit, chars=chars, json_mode=True)
-            ),
-        })
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "query is required for memory_tree search",
+                    "auto_injected": False,
+                }
+            )
+        return json.dumps(
+            {
+                "success": True,
+                "auto_injected": False,
+                "result": json.loads(
+                    memory_tree_search(query, packs=packs, limit=limit, chars=chars, json_mode=True)
+                ),
+            }
+        )
     if action == "context-preview":
         if not query:
-            return json.dumps({"success": False, "error": "query is required for memory_tree context-preview", "auto_injected": False})
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "query is required for memory_tree context-preview",
+                    "auto_injected": False,
+                }
+            )
         payload = json.loads(
             memory_tree_context_preview(query, packs=packs, limit=limit, chars=chars, json_mode=True)
         )
-        return json.dumps({
-            "success": True,
+        return json.dumps(
+            {
+                "success": True,
+                "auto_injected": False,
+                "context": payload["context"],
+                "result": payload,
+            }
+        )
+    return json.dumps(
+        {
+            "success": False,
+            "error": f"unknown memory_tree action: {action}",
             "auto_injected": False,
-            "context": payload["context"],
-            "result": payload,
-        })
-    return json.dumps({"success": False, "error": f"unknown memory_tree action: {action}", "auto_injected": False})
-
-
-from tools.registry import registry
-
-registry.register(
-    name="memory_tree",
-    toolset="memory_tree",
-    schema=MEMORY_TREE_SCHEMA,
-    handler=lambda args, **kw: memory_tree_tool(args, **kw),
-    check_fn=check_memory_tree_requirements,
-    emoji="🌳",
-)
+        }
+    )

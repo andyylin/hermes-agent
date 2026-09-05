@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agent.memory_tree_attention import _scan_ledger_records, format_attention_report
+from hermes_plugins.memory_tree.memory_tree_attention import _scan_ledger_records, format_attention_report
 
 
 def _items(records):
