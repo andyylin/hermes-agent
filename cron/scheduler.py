@@ -2986,140 +2986,15 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     return targets[0] if targets else None
 
 
-def _markdown_tables_to_bullets(markdown_text: str) -> str:
-    """Best-effort conversion of simple Markdown tables into bullet lists.
-
-    Discord's Markdown table rendering is inconsistent and hard to read in
-    alert channels. This keeps cron alerts Discord-friendly even when a
-    no-agent script or LLM slips a table into the body.
-    """
-    lines = markdown_text.splitlines()
-    output: list[str] = []
-    i = 0
-    fence_char: str | None = None
-    fence_width = 0
-
-    def _fence_marker(line: str) -> tuple[str, int, str] | None:
-        stripped = line.lstrip()
-        if not stripped or stripped[0] not in ("`", "~"):
-            return None
-        char = stripped[0]
-        width = len(stripped) - len(stripped.lstrip(char))
-        if width < 3:
-            return None
-        return char, width, stripped[width:]
-
-    def _table_cells(line: str) -> list[str]:
-        r"""Split a Markdown table row without treating ``\|`` as a boundary."""
-        stripped = line.strip()
-        if stripped.startswith("|"):
-            stripped = stripped[1:]
-        if stripped.endswith("|") and not stripped.endswith(r"\|"):
-            stripped = stripped[:-1]
-
-        cells: list[str] = []
-        current: list[str] = []
-        escaped = False
-        for char in stripped:
-            if escaped:
-                if char == "|":
-                    current.append("|")
-                else:
-                    current.extend(("\\", char))
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == "|":
-                cells.append("".join(current).strip())
-                current = []
-            else:
-                current.append(char)
-        if escaped:
-            current.append("\\")
-        cells.append("".join(current).strip())
-        return cells
-
-    def _is_separator(line: str) -> bool:
-        cells = _table_cells(line)
-        if not cells:
-            return False
-        return all(cell and set(cell.replace(":", "").replace("-", "")) == set() and "-" in cell for cell in cells)
-
-    while i < len(lines):
-        marker = _fence_marker(lines[i])
-        if fence_char is not None:
-            output.append(lines[i])
-            if (
-                marker is not None
-                and marker[0] == fence_char
-                and marker[1] >= fence_width
-                and not marker[2].strip()
-            ):
-                fence_char = None
-                fence_width = 0
-            i += 1
-            continue
-        if marker is not None:
-            fence_char, fence_width, _ = marker
-            output.append(lines[i])
-            i += 1
-            continue
-        if "|" in lines[i] and i + 1 < len(lines) and _is_separator(lines[i + 1]):
-            headers = _table_cells(lines[i])
-            separators = _table_cells(lines[i + 1])
-            if len(headers) != len(separators):
-                output.append(lines[i])
-                i += 1
-                continue
-            rows: list[list[str]] = []
-            i += 2
-            while i < len(lines) and "|" in lines[i] and lines[i].strip():
-                row = _table_cells(lines[i])
-                if len(row) != len(headers):
-                    break
-                rows.append(row)
-                i += 1
-            if not rows:
-                output.extend((lines[i - 2], lines[i - 1]))
-                continue
-            if output and output[-1].strip():
-                output.append("")
-            for row in rows:
-                pairs = []
-                for idx, value in enumerate(row):
-                    header = headers[idx] if idx < len(headers) and headers[idx] else f"Column {idx + 1}"
-                    if value:
-                        pairs.append(f"**{header}:** {value}")
-                if pairs:
-                    output.append(f"- {'; '.join(pairs)}")
-            if i < len(lines) and lines[i].strip():
-                output.append("")
-            continue
-        output.append(lines[i])
-        i += 1
-
-    return "\n".join(output)
-
-
-def _format_cron_delivery_content(job: dict, content: str, *, for_discord: bool) -> str:
-    """Apply the cron wrapper, using Discord-native Markdown when relevant."""
+def _format_cron_delivery_content(job: dict, content: str) -> str:
+    """Apply the cron delivery header/footer wrapper."""
     task_name = job.get("name", job["id"])
     job_id = job.get("id", "")
-    body = _markdown_tables_to_bullets(content) if for_discord else content
-    if for_discord:
-        return (
-            f"# Cron Alert: {task_name}\n\n"
-            f"**Job ID:** `{job_id}`\n\n"
-            f"## Report\n\n"
-            f"{body}\n\n"
-            f"## Manage\n\n"
-            f"To stop or manage this job, send me a new message, e.g. `stop reminder {task_name}`."
-        )
     return (
         f"Cronjob Response: {task_name}\n"
         f"(job_id: {job_id})\n"
         f"-------------\n\n"
-        f"{body}\n\n"
+        f"{content}\n\n"
         f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
     )
 
@@ -3374,13 +3249,12 @@ def _deliver_result(
         pass
 
     # Extracting and platform-specific formatting happen per target below.
-    # A fan-out may include Discord plus email/Telegram, and one shared payload
-    # would leak Discord's table-to-bullet rendering into every sibling target.
+    # A fan-out may include Discord plus email/Telegram; email subjects are
+    # resolved per target while the wrapper text is shared.
     from gateway.platforms.base import BasePlatformAdapter
 
     # Keep the current upstream media-policy bridge for standalone cron runs,
-    # but extract and filter media inside the target loop so Discord-specific
-    # formatting never leaks into email or other fan-out targets.
+    # but extract and filter media inside the target loop.
     from gateway.media_policy import apply_media_policy_env
 
     apply_media_policy_env(user_cfg)
@@ -3454,18 +3328,13 @@ def _deliver_result(
             )
             continue
 
-        for_discord = str(platform_name).lower() == "discord"
         email_subject = (
             _format_cron_email_subject(job)
             if str(platform_name).lower() == "email"
             else None
         )
         if wrap_response:
-            delivery_content = _format_cron_delivery_content(
-                job,
-                content,
-                for_discord=for_discord,
-            )
+            delivery_content = _format_cron_delivery_content(job, content)
         else:
             delivery_content = content
         media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)

@@ -1,4 +1,4 @@
-"""Discord-specific cron delivery formatting regression tests."""
+"""Cron delivery formatting regression tests."""
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -6,94 +6,29 @@ from cron import scheduler
 from gateway.config import Platform
 
 
-def test_discord_cron_delivery_uses_headings_and_converts_tables():
+def test_cron_delivery_uses_shared_wrapper_for_discord():
     job = {"id": "weekly-report", "name": "Weekly report"}
-    content = """Bottom line\n\n| Item | Status |\n| --- | --- |\n| Backup | Healthy |\n| Queue | Empty |"""
+    content = """Bottom line\n\n| Item | Status |\n| --- | --- |\n| Backup | Healthy |"""
 
-    rendered = scheduler._format_cron_delivery_content(
-        job,
-        content,
-        for_discord=True,
-    )
+    rendered = scheduler._format_cron_delivery_content(job, content)
 
-    assert rendered.startswith("# Cron Alert: Weekly report")
-    assert "## Report" in rendered
-    assert "- **Item:** Backup; **Status:** Healthy" in rendered
-    assert "- **Item:** Queue; **Status:** Empty" in rendered
-    assert "| Item | Status |" not in rendered
+    assert rendered.startswith("Cronjob Response: Weekly report")
+    assert "(job_id: weekly-report)" in rendered
+    assert "| Item | Status |" in rendered
+    assert "# Cron Alert:" not in rendered
 
 
-def test_non_discord_cron_delivery_preserves_existing_wrapper_and_table():
+def test_non_discord_cron_delivery_uses_same_wrapper():
     job = {"id": "weekly-report", "name": "Weekly report"}
     content = "| Item | Status |\n| --- | --- |\n| Backup | Healthy |"
 
-    rendered = scheduler._format_cron_delivery_content(
-        job,
-        content,
-        for_discord=False,
-    )
+    rendered = scheduler._format_cron_delivery_content(job, content)
 
     assert rendered.startswith("Cronjob Response: Weekly report")
     assert "| Item | Status |" in rendered
 
 
-def test_discord_table_conversion_preserves_empty_table_and_adjacent_pipe_prose():
-    content = """| Item | Status |
-| --- | --- |
-prose | with | extra pipes"""
-
-    rendered = scheduler._markdown_tables_to_bullets(content)
-
-    assert rendered == content
-
-
-def test_discord_table_conversion_preserves_adjacent_pipe_prose_after_rows():
-    content = """| Item | Status |
-| --- | --- |
-| Backup | Healthy |
-prose | with | extra pipes"""
-
-    rendered = scheduler._markdown_tables_to_bullets(content)
-
-    assert "- **Item:** Backup; **Status:** Healthy" in rendered
-    assert "prose | with | extra pipes" in rendered
-
-
-def test_discord_table_conversion_handles_escaped_pipes_in_cells():
-    content = r"""| Command | Status |
-| --- | --- |
-| `left \| right` | Healthy |"""
-
-    rendered = scheduler._markdown_tables_to_bullets(content)
-
-    assert "- **Command:** `left | right`; **Status:** Healthy" in rendered
-
-
-def test_discord_table_conversion_preserves_backtick_fenced_code():
-    content = """Before
-```text
-| Item | Status |
-| --- | --- |
-| Backup | Healthy |
-```
-After"""
-
-    assert scheduler._markdown_tables_to_bullets(content) == content
-
-
-def test_discord_table_conversion_preserves_tilde_fenced_code():
-    content = """Before
-~~~markdown
-| Item | Status |
-| --- | --- |
-| Backup | Healthy |
-~~~
-After"""
-
-    assert scheduler._markdown_tables_to_bullets(content) == content
-
-
-def test_mixed_target_fanout_formats_each_platform_independently():
+def test_mixed_target_fanout_uses_shared_wrapper_for_each_platform():
     job = {"id": "weekly-report", "name": "Weekly report", "deliver": "all"}
     content = "| Item | Status |\n| --- | --- |\n| Backup | Healthy |"
     targets = [
@@ -124,8 +59,8 @@ def test_mixed_target_fanout_formats_each_platform_independently():
         call.args[0].value: call.args[3]
         for call in send_mock.await_args_list
     }
-    assert sent_by_platform["discord"].startswith("# Cron Alert: Weekly report")
-    assert "| Item | Status |" not in sent_by_platform["discord"]
+    assert sent_by_platform["discord"].startswith("Cronjob Response: Weekly report")
+    assert "| Item | Status |" in sent_by_platform["discord"]
     assert sent_by_platform["email"].startswith("Cronjob Response: Weekly report")
     assert "| Item | Status |" in sent_by_platform["email"]
 

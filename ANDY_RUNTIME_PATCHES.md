@@ -25,36 +25,25 @@ not `gateway.multiplex_profiles`. Shared-process multiplexing stays retired.
    prefix-required groups. Read-only messages are archived before dispatch is
    stopped; archive groups can still dispatch; prefix-required groups strip an
    approved prefix before dispatch. Official LINE still has allowlists only.
-2. **Discord free-response auto-threading** — free-response controls mention
-   gating, not thread creation; `discord.no_thread_channels` remains the
-   explicit opt-out. Official still does
-   `skip_thread = no_thread OR is_free_channel`.
-3. **Discord thread retention** — Hermes-created threads default to one-week
-   auto-archive, configurable with `discord.thread_auto_archive_minutes`.
-   Official create-thread default is 1440 minutes.
-4. **Discord cron formatting** — wrapped Discord reports use readable headings
-   and table-to-bullet conversion **inside** the per-target loop. Mixed
-   email/Discord fan-out is rendered independently; unwrapped output stays
-   literal. Official has no `_markdown_tables_to_bullets` helper.
-5. **Email notifications** — standalone email sends multipart HTML plus plain
+2. **Email notifications** — standalone email sends multipart HTML plus plain
    fallback; cron jobs can use `email_subject_template` and `email_thread_key`
    for dated subjects and stable RFC threading. Inbound sessions isolate by
    RFC thread. `hermes send` exposes the same threading metadata. Official
    outbound is plain-text only.
-6. **Cron delivery integrity** — pre-agent exits close / defer the session
+3. **Cron delivery integrity** — pre-agent exits close / defer the session
    store; attachment fallback retries only confirmed failures; an already
    in-flight timeout is not retried because that could duplicate delivery.
-7. **Bitwarden plaintext-cache purge** — encrypted-cache mode removes obsolete
+4. **Bitwarden plaintext-cache purge** — encrypted-cache mode removes obsolete
    plaintext cache data fail-closed before validation, read, or fetch. The
    encrypted AES-GCM network-failure-only fallback is already upstream-owned.
-8. **Memory Tree manual retrieval** — peeled to the user plugin at
+5. **Memory Tree manual retrieval** — peeled to the user plugin at
    `plugin-export/memory-tree/` on branch `feat/memory-tree-user-plugin-20260905`.
    Copy to `~/.hermes/plugins/memory-tree` and enable via `plugins.enabled`.
    Core overlay files (`agent/memory_tree_*`, `hermes_cli/memory_tree.py`,
    `tools/memory_tree_tool.py`) are removed from this tree; keep
    `memory_tree.enabled: true` in config for Andy's runtime semantics once the
    plugin is installed.
-9. **House runtime pin/refresh scripts** — `scripts/maintenance/refresh_andy_runtime.sh`
+6. **House runtime pin/refresh scripts** — `scripts/maintenance/refresh_andy_runtime.sh`
    and `scripts/maintenance/pin-shared-hermes-runtime.sh`. Ops, not product.
    They keep source SHA and the SQLite-safe interpreter separate.
 
@@ -73,12 +62,18 @@ Official already owns the equivalent or stronger contract:
 
 Do not revive:
 
+- Discord free-response auto-threading overlay (Andy asked to drop 2026-09-07).
+  Official: `skip_thread = no_thread OR is_free_channel`.
+- Discord one-week thread retention / `discord.thread_auto_archive_minutes`
+  (Andy asked to drop 2026-09-07). Official hardcodes 1440 minutes.
+- Discord cron headings + `_markdown_tables_to_bullets` (Andy asked to drop
+  2026-09-07). Official uses the shared `Cronjob Response` wrapper only.
 - Shared-process profile multiplexing and the later isolate-policy stack
   (Discord mention/multiplex family, remaining gateway multiplex seams,
   LINE-as-multiplex-only scoping, cron `adapters_by_profile` fail-closed).
   Separate systemd units already isolate wife/dad/default.
 - `Format cron deliveries per medium` and its immediate revert. Net zero.
-  The earlier Discord table-to-bullet KEEP stays; do not replay this pair.
+  Do not replay this pair.
 - Discord copy-fence isolation.
 - Matrix additions.
 - Projects / session-DB authority overlays.

@@ -142,8 +142,7 @@ async def test_registers_native_thread_slash_command(adapter):
 
 
 @pytest.mark.asyncio
-async def test_thread_slash_uses_profile_retention_when_duration_omitted(adapter):
-    adapter.config.extra["thread_auto_archive_minutes"] = 1440
+async def test_thread_slash_uses_default_duration_when_omitted(adapter):
     adapter._handle_thread_create_slash = AsyncMock()
     adapter._register_slash_commands()
 

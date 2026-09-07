@@ -400,7 +400,7 @@ discord:
 
 If a thread's parent channel is in this list, the thread also becomes mention-free.
 
-Free-response channels remain eligible for auto-threading. Add a channel to [`discord.no_thread_channels`](#discordno_thread_channels) when it should stay mention-free **and** receive inline replies.
+Free-response channels bypass auto-threading and receive inline replies. Add a channel to [`discord.no_thread_channels`](#discordno_thread_channels) when it should stay mention-free **and** receive inline replies without being a free-response channel.
 
 #### `discord.auto_thread`
 
@@ -408,18 +408,7 @@ Free-response channels remain eligible for auto-threading. Add a channel to [`di
 
 When enabled, every `@mention` in a regular text channel automatically creates a new thread for the conversation. This keeps the main channel clean and gives each conversation its own isolated session history. Once a thread is created, subsequent messages in that thread don't require `@mention` — the bot knows it's already participating. Set [`thread_require_mention`](#discordthread_require_mention) to `true` to disable this in-thread shortcut for multi-bot setups.
 
-Messages sent in existing threads or DMs are unaffected by this setting. Channels listed in `discord.no_thread_channels` bypass auto-threading and get inline replies instead; `discord.free_response_channels` only changes mention gating.
-
-#### `discord.thread_auto_archive_minutes`
-
-**Type:** integer — **Default:** `10080`
-
-Controls auto-archive retention for Hermes-created threads, including automatic conversation threads, `/thread`, forum posts, and the Discord `create_thread` tool. Discord accepts `60`, `1440`, `4320`, or `10080` minutes.
-
-```yaml
-discord:
-  thread_auto_archive_minutes: 10080  # one week
-```
+Messages sent in existing threads or DMs are unaffected by this setting. Channels listed in `discord.free_response_channels` or `discord.no_thread_channels` also bypass auto-threading and get inline replies instead.
 
 #### `discord.reactions`
 
