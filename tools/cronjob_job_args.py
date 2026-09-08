@@ -63,6 +63,13 @@ def _origin_from_env(
     origin_platform = get_session_env("HERMES_SESSION_PLATFORM")
     origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
     if not (origin_platform and origin_chat_id):
+        origin_session_id = get_session_env("HERMES_SESSION_ID") or None
+        if origin_session_id:
+            return {
+                "kind": "session",
+                "session_id": origin_session_id,
+                "source": get_session_env("HERMES_SESSION_SOURCE") or origin_platform or None,
+            }
         return None
     # A non-push surface (api_server: request/response, ``send()`` is a stub) cannot receive a
     # fire-time report, so an origin stamp would make ``deliver=origin`` fail silently on every
