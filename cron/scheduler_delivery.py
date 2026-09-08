@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, List, Optional
 
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -89,6 +90,16 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     if isinstance(origin, dict) and origin.get("platform") and origin.get("chat_id"):
         return origin
     return None
+
+
+def _resolve_session_origin(job: dict) -> Optional[dict]:
+    """Desktop/TUI/CLI origin: durable SessionDB row id, not a messaging platform."""
+    origin = job.get("origin")
+    if not isinstance(origin, dict) or origin.get("kind") != "session":
+        return None
+    if not origin.get("session_id"):
+        return None
+    return origin
 
 
 def _cron_mirror_delivery_enabled(job: dict, cfg: Optional[dict] = None) -> bool:
@@ -569,6 +580,7 @@ def _resolve_single_delivery_target(
     provenance (fan-out is never continuable), while a user-written bare platform token is a
     deliberate home-channel address and gets the ``home`` tag."""
     origin = _resolve_origin(job)
+    session_origin = _resolve_session_origin(job)
     if deliver_value == "local":
         return None
     # Must precede the generic platform:chat_id split so the profile name isn't parsed as chat_id.
@@ -576,7 +588,29 @@ def _resolve_single_delivery_target(
     if bot_chat_profile is not None:
         return _resolve_bot_chat_target(job, bot_chat_profile)
 
+    if deliver_value.lower().startswith(f"{SESSION_DELIVERY_PLATFORM}:"):
+        explicit_session_id = deliver_value.split(":", 1)[1].strip()
+        if not explicit_session_id:
+            return None
+        return {
+            "platform": SESSION_DELIVERY_PLATFORM,
+            "chat_id": explicit_session_id,
+            "thread_id": None,
+            "kind": "session",
+            "session_id": explicit_session_id,
+            "_resolved_from": "explicit",
+        }
+
     if deliver_value == "origin":
+        if session_origin:
+            return {
+                "platform": SESSION_DELIVERY_PLATFORM,
+                "chat_id": str(session_origin["session_id"]),
+                "thread_id": None,
+                "kind": "session",
+                "session_id": str(session_origin["session_id"]),
+                "_resolved_from": "origin",
+            }
         if origin:
             return {
                 "platform": origin["platform"],
@@ -797,6 +831,45 @@ _ROUTING_TOKENS = frozenset({"all"})
 # Pseudo-platform: deliver output as a real inbound turn into a profile's "Bot Chat" (not a mirror).
 # ``bot-chat`` = own profile; ``bot-chat:<name>`` = named profile on THIS machine.
 BOT_CHAT_PLATFORM = "bot-chat"
+SESSION_DELIVERY_PLATFORM = "session"
+_LOCAL_UI_PLATFORM_NAMES = frozenset(
+    {"", "desktop", "tui", "webui", "cli", "codex", "gateway", "kanban", "tool"}
+)
+
+
+def _format_cron_email_subject(job: dict):
+    """Build an optional email subject and stable recurring-thread anchor."""
+    template = job.get("email_subject_template") or job.get("delivery_subject_template")
+    if not template:
+        return None
+    try:
+        from cron import scheduler as _sched_mod
+        now = _sched_mod._hermes_now()
+    except Exception:
+        now = datetime.now()
+    try:
+        subject = str(template).format(
+            date=now.strftime("%Y-%m-%d"),
+            date_compact=now.strftime("%Y%m%d"),
+            job_name=job.get("name", job.get("id", "")),
+            job_id=job.get("id", ""),
+        )
+    except (IndexError, KeyError, ValueError) as exc:
+        logger.warning(
+            "Job '%s': invalid email subject template %r: %s",
+            job.get("id", "?"), template, exc)
+        return None
+    thread_key = str(job.get("email_thread_key") or "").strip()
+    if thread_key:
+        return {"subject": subject, "thread_anchor_key": thread_key}
+    return {"subject": subject, "suppress_threading": True}
+
+
+def _deliver_to_stored_session(
+    job: dict, content: str, session_id: str, *, execution_id: Optional[str] = None,
+) -> Optional[str]:
+    from cron.session_delivery import deliver_cron_output_to_session
+    return deliver_cron_output_to_session(job, content, session_id, execution_id=execution_id)
 
 
 def parse_bot_chat_deliver_token(part: str) -> Optional[str]:
@@ -1223,6 +1296,12 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
         if thread_id:
             media_metadata["thread_id"] = thread_id
 
+    if str(t.platform_name).lower() == "email":
+        email_subject = _format_cron_email_subject(t.job)
+        if email_subject:
+            route_metadata.update(email_subject)
+            media_metadata.update(email_subject)
+
     # Relay egress needs metadata.scope_id (fail-closed tenant guard; scope cache is COLD after a
     # restart; router stamps HOME only). Origin targets only: a wrong fan-out scope is worse than
     # none.
@@ -1450,9 +1529,12 @@ def _standalone_send(
     shutdown_msg = f"delivery to {t.where} skipped — interpreter is shutting down"
 
     def _send():
-        return _send_to_platform(
-            t.platform, t.pconfig, t.chat_id, content, thread_id=t.thread_id,
-            media_files=media_files)
+        kwargs = dict(thread_id=t.thread_id, media_files=media_files)
+        if str(t.platform_name).lower() == "email":
+            email_subject = _format_cron_email_subject(job)
+            if email_subject:
+                kwargs["subject"] = email_subject
+        return _send_to_platform(t.platform, t.pconfig, t.chat_id, content, **kwargs)
 
     def _warned(msg: str) -> tuple[None, str]:
         logger.warning("Job '%s': %s", job["id"], msg)
@@ -1661,7 +1743,8 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
 
 
 def _deliver_result(
-    job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
+    job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False,
+    execution_id: Optional[str] = None,
 ) -> Optional[str]:
     """Deliver job output to the configured target(s). With ``adapters``/``loop`` (gateway
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
@@ -1763,6 +1846,19 @@ def _deliver_result(
                     delivery_errors.append(bot_chat_error)
                 if receipt and receipt["status"] == "ambiguous":
                     unverified_targets.append(bot_chat_error)
+            continue
+
+        if target["platform"] == SESSION_DELIVERY_PLATFORM:
+            session_id = str(target.get("session_id") or target.get("chat_id") or "")
+            session_error = _deliver_to_stored_session(job, content, session_id, execution_id=execution_id)
+            if session_error:
+                delivery_errors.append(session_error)
+            continue
+
+        if str(target.get("platform") or "").lower() in _LOCAL_UI_PLATFORM_NAMES:
+            logger.info(
+                "Job '%s': skipping non-messaging target platform=%s (no adapter)",
+                job["id"], target.get("platform"))
             continue
 
         t = _prepare_target_delivery(
