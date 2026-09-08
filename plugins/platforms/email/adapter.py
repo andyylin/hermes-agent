@@ -3,6 +3,7 @@ receives, SMTP sends. Configured via EMAIL_* env vars or ``platforms.email`` in 
 
 import asyncio
 import email as email_lib
+import hashlib
 from contextlib import contextmanager, suppress
 import imaplib
 import logging
@@ -323,6 +324,118 @@ def _attach_file(msg: MIMEMultipart, path: Path, filename: str) -> None:
         encoders.encode_base64(part)
         part.add_header("Content-Disposition", f"attachment; filename={filename}")
         msg.attach(part)
+
+
+def _standalone_looks_like_html(body: str) -> bool:
+    return bool(re.search(r"<(?:!doctype\b|/?[A-Za-z][A-Za-z0-9:-]*\b)[^>]*>", body or "", flags=re.IGNORECASE))
+
+
+def _sanitize_email_html(body: str) -> str:
+    """Return a small allowlisted HTML fragment suitable for email clients."""
+    from html import escape
+    from html.parser import HTMLParser
+    from urllib.parse import urlparse
+
+    allowed_tags = {
+        "a", "b", "blockquote", "body", "br", "code", "div", "em",
+        "h1", "h2", "h3", "h4", "h5", "h6", "hr", "html", "i",
+        "li", "ol", "p", "pre", "span", "strong", "table", "tbody",
+        "td", "tfoot", "th", "thead", "tr", "u", "ul",
+    }
+    blocked_tags = {"embed", "form", "iframe", "link", "meta", "object", "script", "style"}
+    void_tags = {"br", "hr"}
+
+    class _Sanitizer(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=False)
+            self.output: List[str] = []
+            self.blocked_depth = 0
+
+        def handle_starttag(self, tag: str, attrs) -> None:
+            tag = tag.lower()
+            if tag in blocked_tags:
+                self.blocked_depth += 1
+                return
+            if self.blocked_depth or tag not in allowed_tags:
+                return
+            safe_attrs = []
+            for name, value in attrs:
+                name = name.lower()
+                value = value or ""
+                if tag == "a" and name == "href":
+                    scheme = urlparse(value.strip()).scheme.lower()
+                    if scheme in {"", "http", "https", "mailto"}:
+                        safe_attrs.append((name, value.strip()))
+                elif tag == "a" and name == "title":
+                    safe_attrs.append((name, value))
+                elif tag in {"td", "th"} and name in {"colspan", "rowspan"} and value.isdigit():
+                    safe_attrs.append((name, value))
+            rendered_attrs = "".join(f' {name}="{escape(value, quote=True)}"' for name, value in safe_attrs)
+            self.output.append(f"<{tag}{rendered_attrs}>")
+
+        def handle_startendtag(self, tag: str, attrs) -> None:
+            self.handle_starttag(tag, attrs)
+
+        def handle_endtag(self, tag: str) -> None:
+            tag = tag.lower()
+            if tag in blocked_tags:
+                if self.blocked_depth:
+                    self.blocked_depth -= 1
+                return
+            if not self.blocked_depth and tag in allowed_tags and tag not in void_tags:
+                self.output.append(f"</{tag}>")
+
+        def handle_data(self, data: str) -> None:
+            if not self.blocked_depth:
+                self.output.append(escape(data))
+
+        def handle_entityref(self, name: str) -> None:
+            if not self.blocked_depth:
+                self.output.append(f"&{name};")
+
+        def handle_charref(self, name: str) -> None:
+            if not self.blocked_depth:
+                self.output.append(f"&#{name};")
+
+    sanitizer = _Sanitizer()
+    sanitizer.feed(body or "")
+    sanitizer.close()
+    return "".join(sanitizer.output)
+
+
+def _standalone_html_to_plain_text(body: str) -> str:
+    from html import unescape
+    text = re.sub(r"<\s*br\s*/?\s*>", "\n", body or "", flags=re.IGNORECASE)
+    text = re.sub(r"</\s*(?:p|div|h[1-6]|li|tr)\s*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    lines = [line.strip() for line in unescape(text).splitlines()]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def _standalone_plain_text_to_html(body: str) -> str:
+    from html import escape
+    escaped = escape(body or "").replace("\n", "<br>\n")
+    return f"<html><body><p>{escaped}</p></body></html>"
+
+
+def _render_email_bodies(body: str) -> Tuple[str, str]:
+    if _standalone_looks_like_html(body or ""):
+        html_body = _sanitize_email_html(body or "")
+        return _standalone_html_to_plain_text(html_body), html_body
+    return body or "", _standalone_plain_text_to_html(body or "")
+
+
+def _stable_thread_message_id(key: str, domain: str) -> Optional[str]:
+    raw_key = str(key or "").strip()
+    normalized_key = re.sub(r"[^a-z0-9._-]+", "-", raw_key.lower()).strip(".-_")
+    safe_key = normalized_key[:80]
+    if safe_key and (normalized_key != raw_key.lower() or len(normalized_key) > 80):
+        digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:12]
+        safe_key = f"{normalized_key[:67].rstrip('.-_')}-{digest}"
+    safe_domain = re.sub(r"[^a-z0-9.-]+", "", str(domain or "").strip().lower()).strip(".")
+    if not safe_key or not safe_domain:
+        return None
+    return f"<hermes-thread-{safe_key}@{safe_domain}>"
 
 
 class EmailAdapter(BasePlatformAdapter):
@@ -656,27 +769,38 @@ class EmailAdapter(BasePlatformAdapter):
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send an email reply to the given address."""
-        return await self._run_send(self._send_email, (chat_id, content, reply_to), "[Email] Send failed to %s: %s", chat_id)
+        return await self._run_send(self._send_email, (chat_id, content, reply_to, metadata), "[Email] Send failed to %s: %s", chat_id)
 
     def _message_id_domain(self) -> str:
         """Domain for generated Message-IDs; ``localhost`` when EMAIL_ADDRESS lacks ``@``."""
         return (self._address.rsplit("@", 1)[-1] if "@" in self._address else "") or "localhost"
 
     def _new_reply(self, to_addr: str, body: str, reply_to_msg_id: Optional[str] = None, *,
-                   attach_empty_body: bool = False) -> Tuple[MIMEMultipart, str, str]:
+                   attach_empty_body: bool = False, metadata: Optional[Dict[str, Any]] = None) -> Tuple[MIMEMultipart, str, str]:
         """Build a threaded reply skeleton. Returns ``(msg, msg_id, subject)``."""
-        msg, ctx = MIMEMultipart(), self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
-        original_msg_id = reply_to_msg_id or ctx.get("message_id")
+        metadata = metadata or {}
+        msg = MIMEMultipart("alternative")
+        ctx = self._thread_context.get(to_addr, {})
+        explicit_subject = metadata.get("subject")
+        if explicit_subject:
+            subject = str(explicit_subject)
+        else:
+            subject = ctx.get("subject", "Hermes Agent")
+            if not subject.startswith("Re:"):
+                subject = f"Re: {subject}"
+        thread_anchor_key = metadata.get("thread_anchor_key")
+        suppress_threading = bool(metadata.get("suppress_threading"))
+        anchor = _stable_thread_message_id(str(thread_anchor_key or ""), self._message_id_domain())
+        original_msg_id = anchor or (None if suppress_threading else (reply_to_msg_id or ctx.get("message_id")))
         threading = (("In-Reply-To", original_msg_id), ("References", original_msg_id)) if original_msg_id else ()
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
         for key, value in (("From", self._address), ("To", to_addr), ("Subject", subject), *threading,
                            ("Date", formatdate(localtime=True)), ("Message-ID", msg_id)):
             msg[key] = value
         if body or attach_empty_body:
-            msg.attach(MIMEText(body, "plain", "utf-8"))
+            plain_body, html_body = _render_email_bodies(body or "")
+            msg.attach(MIMEText(plain_body, "plain", "utf-8"))
+            msg.attach(MIMEText(html_body, "html", "utf-8"))
         return msg, msg_id, subject
 
     def _smtp_send(self, msg: MIMEMultipart) -> None:
@@ -691,16 +815,19 @@ class EmailAdapter(BasePlatformAdapter):
             except Exception:
                 smtp.close()
 
-    def _send_email(self, to_addr: str, body: str, reply_to_msg_id: Optional[str] = None) -> str:
+    def _send_email(self, to_addr: str, body: str, reply_to_msg_id: Optional[str] = None,
+                    metadata: Optional[Dict[str, Any]] = None) -> str:
         """Send an email via SMTP. Runs in executor thread."""
-        msg, msg_id, subject = self._new_reply(to_addr, body, reply_to_msg_id, attach_empty_body=True)
+        msg, msg_id, subject = self._new_reply(
+            to_addr, body, reply_to_msg_id, attach_empty_body=True, metadata=metadata)
         self._smtp_send(msg)
         logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, subject)
         return msg_id
 
-    def _send_with_files(self, to_addr: str, body: str, files: List[Tuple[Path, str]], *, lenient: bool) -> str:
+    def _send_with_files(self, to_addr: str, body: str, files: List[Tuple[Path, str]], *, lenient: bool,
+                         metadata: Optional[Dict[str, Any]] = None) -> str:
         """Send a reply with attachments; *lenient* logs-and-skips unattachable files instead of raising."""
-        msg, msg_id, _ = self._new_reply(to_addr, body)
+        msg, msg_id, _ = self._new_reply(to_addr, body, metadata=metadata)
         for path, name in files:
             try:
                 _attach_file(msg, path, name)
@@ -714,7 +841,7 @@ class EmailAdapter(BasePlatformAdapter):
     async def send_image(self, chat_id: str, image_url: str, caption: Optional[str] = None,
                          reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send an image URL as part of an email body (``metadata`` unused)."""
-        return await self.send(chat_id, f"{caption or ''}\n\nImage: {image_url}".strip(), reply_to)
+        return await self.send(chat_id, f"{caption or ''}\n\nImage: {image_url}".strip(), reply_to, metadata)
 
     async def send_multiple_images(self, chat_id: str, images: List[Tuple[str, str]],
                                    metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0) -> None:
@@ -735,25 +862,34 @@ class EmailAdapter(BasePlatformAdapter):
         if not local_paths and not body_parts:
             return
         try:
-            await asyncio.get_running_loop().run_in_executor(None, self._send_email_with_attachments, chat_id, "\n\n".join(body_parts), local_paths)
+            await asyncio.get_running_loop().run_in_executor(
+                None, self._send_email_with_attachments, chat_id, "\n\n".join(body_parts), local_paths, metadata)
         except Exception as e:
             logger.error("[Email] Multi-image send failed, falling back: %s", e, exc_info=True)
             await super().send_multiple_images(chat_id, images, metadata, human_delay)
 
-    def _send_email_with_attachments(self, to_addr: str, body: str, file_paths: List[str]) -> str:
+    def _send_email_with_attachments(self, to_addr: str, body: str, file_paths: List[str],
+                                     metadata: Optional[Dict[str, Any]] = None) -> str:
         """Send an email with multiple file attachments via SMTP (unattachable files are skipped)."""
-        msg_id = self._send_with_files(to_addr, body, [(Path(f), Path(f).name) for f in file_paths], lenient=True)
+        msg_id = self._send_with_files(
+            to_addr, body, [(Path(f), Path(f).name) for f in file_paths], lenient=True, metadata=metadata)
         logger.info("[Email] Sent multi-attachment email to %s (%d files)", to_addr, len(file_paths))
         return msg_id
 
     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None,
                             file_name: Optional[str] = None, reply_to: Optional[str] = None, **kwargs) -> SendResult:
         """Send a file as an email attachment."""
-        return await self._run_send(self._send_email_with_attachment, (chat_id, caption or "", file_path, file_name), "[Email] Send document failed: %s")
+        return await self._run_send(
+            self._send_email_with_attachment,
+            (chat_id, caption or "", file_path, file_name, kwargs.get("metadata")),
+            "[Email] Send document failed: %s")
 
-    def _send_email_with_attachment(self, to_addr: str, body: str, file_path: str, file_name: Optional[str] = None) -> str:
+    def _send_email_with_attachment(self, to_addr: str, body: str, file_path: str, file_name: Optional[str] = None,
+                                    metadata: Optional[Dict[str, Any]] = None) -> str:
         """Send an email with a single file attachment via SMTP (raises if unattachable)."""
-        return self._send_with_files(to_addr, body, [(Path(file_path), file_name or Path(file_path).name)], lenient=False)
+        return self._send_with_files(
+            to_addr, body, [(Path(file_path), file_name or Path(file_path).name)],
+            lenient=False, metadata=metadata)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return basic info about the email chat."""
@@ -761,7 +897,8 @@ class EmailAdapter(BasePlatformAdapter):
 
 
 # Plugin glue: register() exposes the platform via the registry; EMAIL_* env → PlatformConfig seeding stays in core.
-async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False):
+async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None,
+                           force_document=False, subject=None, **_kwargs):
     """Out-of-process Email delivery via SMTP (one-shot); standalone_sender_fn contract."""
     extra = getattr(pconfig, "extra", {}) or {}
     address, password = extra.get("address") or _get_secret("EMAIL_ADDRESS", ""), _get_secret("EMAIL_PASSWORD", "")
@@ -771,14 +908,42 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
     if not all([address, password, smtp_host]):
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
     try:
-        msg = MIMEText(message, "plain", "utf-8")
-        for key, value in (("From", address), ("To", chat_id), ("Subject", "Hermes Agent"), ("Date", formatdate(localtime=True))):
-            msg[key] = value
+        domain = (address.rsplit("@", 1)[-1] if "@" in address else "") or "localhost"
+        meta = subject if isinstance(subject, dict) else {}
+        header_subject = str(meta.get("subject") or "Hermes Agent")
+        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{domain}>"
+        headers = (("From", address), ("To", chat_id), ("Subject", header_subject),
+                   ("Date", formatdate(localtime=True)), ("Message-ID", msg_id))
+        body_root = MIMEMultipart("alternative")
+        for key, value in headers:
+            body_root[key] = value
+        anchor = _stable_thread_message_id(str(meta.get("thread_anchor_key") or ""), domain)
+        if anchor:
+            body_root["In-Reply-To"] = anchor
+            body_root["References"] = anchor
+        plain_body, html_body = _render_email_bodies(message or "")
+        body_root.attach(MIMEText(plain_body, "plain", "utf-8"))
+        body_root.attach(MIMEText(html_body, "html", "utf-8"))
+        attachments = []
+        for item in media_files or []:
+            raw_path = item[0] if isinstance(item, (tuple, list)) else item
+            path = Path(str(raw_path))
+            if path.exists():
+                attachments.append(path)
+        if attachments:
+            msg = MIMEMultipart("mixed")
+            for key, value in body_root.items():
+                msg[key] = value
+            msg.attach(body_root)
+            for path in attachments:
+                _attach_file(msg, path, path.name)
+        else:
+            msg = body_root
         server = _open_smtp(smtp_host, smtp_port, smtp_security, _tls_context(smtp_tls_verify, smtp_host), smtplib.SMTP, smtplib.SMTP_SSL)
         server.login(address, password)
         server.send_message(msg)
         server.quit()
-        return {"success": True, "platform": "email", "chat_id": chat_id}
+        return {"success": True, "platform": "email", "chat_id": chat_id, "message_id": msg_id}
     except Exception as e:
         try:
             from tools.send_message_tool import _error as _e

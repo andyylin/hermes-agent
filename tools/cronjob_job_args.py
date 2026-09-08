@@ -15,6 +15,13 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
     origin_platform = get_session_env("HERMES_SESSION_PLATFORM")
     origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
     if not (origin_platform and origin_chat_id):
+        origin_session_id = get_session_env("HERMES_SESSION_ID") or None
+        if origin_session_id:
+            return {
+                "kind": "session",
+                "session_id": origin_session_id,
+                "source": get_session_env("HERMES_SESSION_SOURCE") or origin_platform or None,
+            }
         return None
     thread_id = get_session_env("HERMES_SESSION_THREAD_ID") or None
     # Slack stamps every TOP-LEVEL message's own id as the session thread (a per-message
