@@ -1,0 +1,10 @@
+name: memory-tree
+version: 1.0.0
+description: "On-call retrieval from generated Memory Tree Lite packs (build, search, attention, privacy, reconcile)"
+author: "Andy Lin / Hermes Agent"
+kind: standalone
+provides_tools:
+  - memory_tree
+tags:
+  - memory
+  - context
