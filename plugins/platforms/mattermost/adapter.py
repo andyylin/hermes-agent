@@ -124,6 +124,8 @@ class MattermostAdapter(BasePlatformAdapter):
         self._dedup = MessageDeduplicator()
         # Inbound human user_id per (channel_id, thread_key) for ephemeral progress posts.
         self._inbound_users: Dict[Tuple[str, str], str] = {}
+        # Suppress repeated ephemeral→persistent fallback warnings within one CRT thread turn.
+        self._logged_ephemeral_fallback_key: Optional[str] = None
 
     # --- HTTP helpers ---
 
@@ -178,6 +180,37 @@ class MattermostAdapter(BasePlatformAdapter):
             return False
         return (any(marker in body for marker in ("root_id", "rootid", "root id", "thread", "post"))
                 and any(marker in body for marker in ("invalid", "not found", "does not exist", "missing")))
+
+    def _last_post_is_permission_denied(self) -> bool:
+        """Return True when the last POST was rejected for missing token permissions."""
+        if self._last_post_status == 403:
+            return True
+        body = (self._last_post_error or "").lower()
+        return "permissions" in body and "app_error" in body
+
+    @staticmethod
+    def _ephemeral_fallback_log_key(
+        chat_id: str, metadata: _Metadata, reply_to: Optional[str],
+    ) -> str:
+        thread_key = ""
+        if isinstance(metadata, dict):
+            for field in ("thread_id", "root_id"):
+                if metadata.get(field):
+                    thread_key = str(metadata[field])
+                    break
+        if not thread_key and reply_to:
+            thread_key = str(reply_to)
+        return f"{chat_id}:{thread_key}"
+
+    def _typing_parent_id_from_metadata(self, metadata: _Metadata) -> Optional[str]:
+        """CRT typing needs parent_id (thread root); channel-only typing is invisible in threads."""
+        if not isinstance(metadata, dict):
+            return None
+        for field in ("thread_id", "root_id", "reply_to"):
+            value = metadata.get(field)
+            if value:
+                return str(value)
+        return None
 
     async def _post_preserving_thread(
         self, chat_id: str, payload: Dict[str, Any], metadata: _Metadata) -> Dict[str, Any]:
@@ -364,12 +397,28 @@ class MattermostAdapter(BasePlatformAdapter):
             user_id = self._resolve_inbound_user_id(chat_id, metadata, reply_to)
             if user_id:
                 result = SendResult(success=True)
+                ephemeral_forbidden = False
                 for chunk in self.truncate_message(self.format_message(content), MAX_POST_LENGTH):
                     result = await self._post_ephemeral_message(chat_id, chunk, user_id, reply_to, metadata)
                     if not result.success:
+                        ephemeral_forbidden = self._last_post_is_permission_denied()
                         break
                 if result.success:
                     return result
+                if ephemeral_forbidden:
+                    fallback_key = self._ephemeral_fallback_log_key(chat_id, metadata, reply_to)
+                    if self._logged_ephemeral_fallback_key != fallback_key:
+                        logger.warning(
+                            "Mattermost: ephemeral progress forbidden in %s; using persistent threaded "
+                            "posts (not tracked for cleanup)",
+                            chat_id,
+                        )
+                        self._logged_ephemeral_fallback_key = fallback_key
+                    for chunk in self.truncate_message(self.format_message(content), MAX_POST_LENGTH):
+                        data = await self._post_message(chat_id, chunk, reply_to, metadata)
+                        if not data or "id" not in data:
+                            return SendResult(success=False, error="Failed to create post")
+                    return SendResult(success=True, message_id=None)
                 logger.warning(
                     "Mattermost: ephemeral progress failed in %s (%s); posting persistently",
                     chat_id, result.error,
@@ -395,7 +444,11 @@ class MattermostAdapter(BasePlatformAdapter):
     # --- Optional overrides ---
 
     async def send_typing(self, chat_id: str, metadata: _Metadata = None) -> None:
-        await self._api_post(f"users/{self._bot_user_id}/typing", {"channel_id": chat_id})
+        payload: Dict[str, Any] = {"channel_id": chat_id}
+        parent_id = self._typing_parent_id_from_metadata(metadata)
+        if parent_id:
+            payload["parent_id"] = parent_id
+        await self._api_post("users/me/typing", payload)
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
         payload = _with_mentions_disabled({"message": self.format_message(content)})
