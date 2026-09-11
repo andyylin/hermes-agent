@@ -331,6 +331,7 @@ class TestMattermostEphemeralProgress:
     @pytest.mark.asyncio
     async def test_missing_inbound_user_id_skips_ephemeral_send(self):
         self.adapter._api_post = AsyncMock(return_value={"id": "should_not_happen"})
+        self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
 
         result = await self.adapter.send(
             "channel_1",
@@ -338,8 +339,9 @@ class TestMattermostEphemeralProgress:
             metadata={"_interim_send": True, "thread_id": "root_post"},
         )
 
-        assert result.success is False
-        self.adapter._api_post.assert_not_called()
+        assert result.success is True
+        assert result.message_id == "should_not_happen"
+        assert self.adapter._api_post.call_args[0][0] == "posts"
 
     @pytest.mark.asyncio
     async def test_inbound_user_stash_used_when_metadata_lacks_user_id(self):
