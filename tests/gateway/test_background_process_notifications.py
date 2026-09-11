@@ -801,3 +801,31 @@ async def test_raw_output_modes_are_human_facing(monkeypatch, tmp_path):
         assert "proc_deadbeef" not in text and "[Background process" not in text and "~" not in text
         assert "\x1b[" not in text
         assert "make -j8 all" in text
+
+
+@pytest.mark.asyncio
+async def test_inject_watch_notification_mattermost_channel_thread_from_event(monkeypatch, tmp_path):
+    """Mattermost channel threads are not in _parse_session_key; event fields must wake the thread."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = SimpleNamespace(
+        send=AsyncMock(), handle_message=AdmittingHandler(), supports_async_delivery=True,
+    )
+    runner.adapters[Platform.MATTERMOST] = adapter
+    evt = {
+        "type": "async_delegation",
+        "session_key": "agent:main:mattermost:channel:chan123:root456",
+        "platform": "mattermost",
+        "chat_type": "channel",
+        "chat_id": "chan123",
+        "thread_id": "root456",
+        "user_id": "andy",
+    }
+    result = await runner._inject_watch_notification("[SYSTEM: subagent finished]", evt)
+    assert result is True
+    adapter.handle_message.assert_awaited_once()
+    synth_event = adapter.handle_message.await_args.args[0]
+    assert synth_event.internal is True
+    assert synth_event.source.platform == Platform.MATTERMOST
+    assert synth_event.source.chat_id == "chan123"
+    assert synth_event.source.chat_type == "channel"
+    assert synth_event.source.thread_id == "root456"
