@@ -2849,6 +2849,11 @@ class GatewayTurnMixin:
             _status_thread_metadata = self._thread_metadata_for_progress(
                 source, event_message_id, _progress_thread_id, _relay_prospective_thread_id,
             )
+        if source.platform == Platform.MATTERMOST and source.user_id:
+            _progress_metadata = dict(_progress_metadata or {})
+            _progress_metadata.setdefault("inbound_user_id", source.user_id)
+            _status_thread_metadata = dict(_status_thread_metadata or {})
+            _status_thread_metadata.setdefault("inbound_user_id", source.user_id)
         return _progress_metadata, _progress_reply_to, _status_thread_metadata
 
     async def _run_agent_write_tool_log(self, log_queue: Any) -> None:
