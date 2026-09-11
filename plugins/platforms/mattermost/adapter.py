@@ -299,6 +299,94 @@ class MattermostAdapter(BasePlatformAdapter):
         payload = _with_mentions_disabled({"message": self.format_message(content)})
         return _post_result(await self._api("PUT", f"posts/{message_id}/patch", payload), "Failed to edit post")
 
+    async def _api_delete(self, path: str) -> bool:
+        """DELETE /api/v4/{path}.
+
+        Normal gateway traffic uses the long-lived Mattermost aiohttp session.
+        Progress-bubble cleanup can run very late in a turn, including while a
+        gateway replacement is closing that session.  If the primary connector
+        is already closed, retry with a short-lived session so cleanup is not
+        silently lost after the final response lands.
+        """
+        import aiohttp
+        if ".." in path:
+            logger.error("MM API path traversal blocked: %s", path)
+            return False
+        url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
+
+        last_delete_error: list[BaseException | None] = [None]
+
+        async def _delete_with_session(session: Any, *, request_kwargs: Optional[Dict[str, Any]] = None) -> bool:
+            try:
+                last_delete_error[0] = None
+                async with session.delete(
+                    url,
+                    headers=self._headers(),
+                    timeout=aiohttp.ClientTimeout(total=30),
+                    **(request_kwargs or {}),
+                ) as resp:
+                    if resp.status >= 400:
+                        body = await resp.text()
+                        logger.error("MM API DELETE %s → %s: %s", path, resp.status, body[:200])
+                        return False
+                    return True
+            except (aiohttp.ClientError, RuntimeError) as exc:
+                # RuntimeError covers aiohttp's "Session is closed" path; live
+                # logs also showed "Connector is closed" as ClientError.
+                last_delete_error[0] = exc
+                logger.error("MM API DELETE %s network error: %s", path, exc)
+                return False
+
+        session = self._session
+        session_closed = session is None or getattr(session, "closed", False) is True
+        if not session_closed:
+            ok = await _delete_with_session(session)
+            if ok:
+                return True
+            session_closed = getattr(session, "closed", False) is True
+            closed_error = "closed" in str(last_delete_error[0] or "").lower()
+            if not session_closed and not closed_error:
+                return False
+            session_closed = True
+
+        if not self._base_url or not self._token:
+            logger.error("MM API DELETE %s unavailable: Mattermost URL/token not configured", path)
+            return False
+
+        try:
+            from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+
+            proxy = resolve_proxy_url(platform_env_var="MATTERMOST_PROXY")
+            session_kwargs, request_kwargs = proxy_kwargs_for_aiohttp(proxy)
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30),
+                **session_kwargs,
+            ) as transient_session:
+                logger.debug(
+                    "MM API DELETE %s using transient session after primary session closed=%s",
+                    path,
+                    session_closed,
+                )
+                return await _delete_with_session(
+                    transient_session,
+                    request_kwargs=request_kwargs,
+                )
+        except (aiohttp.ClientError, RuntimeError) as exc:
+            logger.error("MM API DELETE %s transient session error: %s", path, exc)
+            return False
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a previously sent Mattermost post.
+
+        Mattermost post IDs are globally unique, so the channel ID is not
+        needed by the REST endpoint.  The gateway only tracks IDs returned from
+        sends it performed itself; Mattermost enforces token permissions server
+        side if a caller ever passes an invalid/unauthorized post ID.
+        """
+        if not message_id:
+            return False
+        return await self._api_delete(f"posts/{message_id}")
+
     async def send_image(self, chat_id: str, image_url: str, caption: Optional[str] = None,
                          reply_to: Optional[str] = None, metadata: _Metadata = None) -> SendResult:
         return await self._send_url_as_file(chat_id, image_url, caption, reply_to, "image", metadata)
