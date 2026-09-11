@@ -263,6 +263,127 @@ class TestMattermostSend:
 
 
 # ---------------------------------------------------------------------------
+# Ephemeral interim progress — CRT-safe tool/thinking/heartbeat bubbles
+# ---------------------------------------------------------------------------
+
+class TestMattermostEphemeralProgress:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._reply_mode = "thread"
+
+    @pytest.mark.asyncio
+    async def test_interim_send_uses_ephemeral_api_with_inbound_user(self):
+        self.adapter._api_post = AsyncMock(return_value={"id": "eph_post"})
+        self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
+
+        result = await self.adapter.send(
+            "channel_1",
+            "⚙️ terminal...",
+            reply_to="root_post",
+            metadata={"_interim_send": True, "inbound_user_id": "user_andy", "thread_id": "root_post"},
+        )
+
+        assert result.success is True
+        assert result.message_id is None
+        self.adapter._api_post.assert_called_once()
+        path, payload = self.adapter._api_post.call_args[0]
+        assert path == "posts/ephemeral"
+        assert payload["user_id"] == "user_andy"
+        assert payload["post"]["channel_id"] == "channel_1"
+        assert payload["post"]["message"] == "⚙️ terminal..."
+        assert payload["post"]["root_id"] == "root_post"
+        assert payload["post"]["props"]["disable_mentions"] is True
+
+    @pytest.mark.asyncio
+    async def test_final_send_still_uses_persistent_posts(self):
+        self.adapter._api_post = AsyncMock(return_value={"id": "final_post"})
+        self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
+
+        result = await self.adapter.send(
+            "channel_1",
+            "Final answer body",
+            reply_to="root_post",
+            metadata={"notify": True},
+        )
+
+        assert result.success is True
+        assert result.message_id == "final_post"
+        path, payload = self.adapter._api_post.call_args[0]
+        assert path == "posts"
+        assert "user_id" not in payload
+
+    @pytest.mark.asyncio
+    async def test_approval_prompt_stays_persistent_even_with_interim_marker(self):
+        self.adapter._api_post = AsyncMock(return_value={"id": "approval_post"})
+        self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
+
+        result = await self.adapter.send(
+            "channel_1",
+            "Approve this command?",
+            reply_to="root_post",
+            metadata={"_interim_send": True, "is_approval_prompt": True, "inbound_user_id": "user_andy"},
+        )
+
+        assert result.success is True
+        assert result.message_id == "approval_post"
+        assert self.adapter._api_post.call_args[0][0] == "posts"
+
+    @pytest.mark.asyncio
+    async def test_missing_inbound_user_id_skips_ephemeral_send(self):
+        self.adapter._api_post = AsyncMock(return_value={"id": "should_not_happen"})
+
+        result = await self.adapter.send(
+            "channel_1",
+            "⚙️ terminal...",
+            metadata={"_interim_send": True, "thread_id": "root_post"},
+        )
+
+        assert result.success is False
+        self.adapter._api_post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_inbound_user_stash_used_when_metadata_lacks_user_id(self):
+        self.adapter._inbound_users[("channel_1", "root_post")] = "user_from_stash"
+        self.adapter._api_post = AsyncMock(return_value={"id": "eph_post"})
+        self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
+
+        result = await self.adapter.send(
+            "channel_1",
+            "⏳ Working",
+            reply_to="root_post",
+            metadata={"_interim_send": True, "thread_id": "root_post"},
+        )
+
+        assert result.success is True
+        assert self.adapter._api_post.call_args[0][1]["user_id"] == "user_from_stash"
+
+    @pytest.mark.asyncio
+    async def test_ws_event_stashes_inbound_user_for_thread(self):
+        self.adapter._bot_user_id = "bot_user_id"
+        self.adapter.handle_message = AsyncMock()
+        post_data = {
+            "id": "top_post_123",
+            "user_id": "user_123",
+            "channel_id": "chan_456",
+            "message": "@hermes-bot start work",
+            "root_id": "",
+        }
+        event = {
+            "event": "posted",
+            "data": {
+                "post": json.dumps(post_data),
+                "channel_type": "O",
+                "sender_name": "@alice",
+            },
+        }
+
+        await self.adapter._handle_ws_event(event)
+
+        assert self.adapter._inbound_users[("chan_456", "top_post_123")] == "user_123"
+        assert self.adapter._inbound_users[("chan_456", "")] == "user_123"
+
+
+# ---------------------------------------------------------------------------
 # delete_message — required by display.platforms.mattermost.cleanup_progress
 # ---------------------------------------------------------------------------
 
