@@ -47,6 +47,10 @@ not `gateway.multiplex_profiles`. Shared-process multiplexing stays retired.
 6. **House runtime pin/refresh scripts** — `scripts/maintenance/refresh_andy_runtime.sh`
    and `scripts/maintenance/pin-shared-hermes-runtime.sh`. Ops, not product.
    They keep source SHA and the SQLite-safe interpreter separate.
+7. **Mattermost `delete_message`** — official `cleanup_progress` only honors
+   adapters that override `delete_message` (Telegram/Discord). Joi Mattermost
+   posts thinking/tool bubbles, then deletes them after a successful final
+   reply. Nemo PD One already has this; keep the DELETE + closed-session retry.
 
 ## UPSTREAM-NOW — do not keep as a fork reason
 
