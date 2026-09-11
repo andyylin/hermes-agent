@@ -263,6 +263,55 @@ class TestMattermostSend:
 
 
 # ---------------------------------------------------------------------------
+# delete_message — required by display.platforms.mattermost.cleanup_progress
+# ---------------------------------------------------------------------------
+
+class TestMattermostDeleteMessage:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._session = MagicMock()
+        self.adapter._session.closed = False
+
+    def _delete_resp(self, status=200, body=""):
+        mock_resp = AsyncMock()
+        mock_resp.status = status
+        mock_resp.text = AsyncMock(return_value=body)
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+        return mock_resp
+
+    @pytest.mark.asyncio
+    async def test_empty_id_does_not_call_api(self):
+        assert await self.adapter.delete_message("channel_1", "") is False
+        self.adapter._session.delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_success(self):
+        self.adapter._session.delete = MagicMock(return_value=self._delete_resp(200))
+        assert await self.adapter.delete_message("channel_1", "post123") is True
+        url = self.adapter._session.delete.call_args[0][0]
+        assert url.endswith("/api/v4/posts/post123")
+
+    @pytest.mark.asyncio
+    async def test_delete_http_error(self):
+        self.adapter._session.delete = MagicMock(return_value=self._delete_resp(403, "forbidden"))
+        assert await self.adapter.delete_message("channel_1", "post123") is False
+
+    @pytest.mark.asyncio
+    async def test_closed_session_retries_transient(self):
+        self.adapter._session.closed = True
+        transient = MagicMock()
+        transient.delete = MagicMock(return_value=self._delete_resp(200))
+        transient_cm = AsyncMock()
+        transient_cm.__aenter__ = AsyncMock(return_value=transient)
+        transient_cm.__aexit__ = AsyncMock(return_value=False)
+        with patch("aiohttp.ClientSession", return_value=transient_cm):
+            assert await self.adapter.delete_message("channel_1", "post123") is True
+        transient.delete.assert_called_once()
+        self.adapter._session.delete.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # WebSocket event parsing
 # ---------------------------------------------------------------------------
 
