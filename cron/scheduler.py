@@ -48,6 +48,11 @@ from agent.delegation_context import (
 
 logger = logging.getLogger(__name__)
 
+# systemd-run + BWS inject can take >5s to spawn python -m cron.scheduler.
+# A too-short ack window marks healthy jobs failed (Sep 11 morning/evening
+# brief, resin email, token-efficiency) even when the script never started.
+EXTERNAL_CRON_WORKER_ACK_SECONDS = 20.0
+
 
 def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
     """Done-callback: close a SessionDB whose constructor finished after run_job's init timeout
@@ -3215,7 +3220,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
     with _running_lock:
         _restart_safe_waiter_job_ids.add(job_id)
 
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + EXTERNAL_CRON_WORKER_ACK_SECONDS
     while time.monotonic() < deadline:
         if ack_path.exists():
             try:
@@ -3277,9 +3282,10 @@ def _launch_external_cron_worker(job: dict) -> bool:
     # handoff: that could duplicate side effects.  The execution owner/dead-owner
     # recovery ledger remains the authority.
     logger.warning(
-        "Cron external worker for job '%s' did not acknowledge within 5s; "
+        "Cron external worker for job '%s' did not acknowledge within %.0fs; "
         "leaving the durable execution claim untouched",
         job_id,
+        EXTERNAL_CRON_WORKER_ACK_SECONDS,
     )
     return _wait_for_external_cron_worker(
         process,
