@@ -360,6 +360,41 @@ class TestMattermostEphemeralProgress:
         assert self.adapter._api_post.call_args[0][1]["user_id"] == "user_from_stash"
 
     @pytest.mark.asyncio
+    async def test_ephemeral_403_falls_back_to_persistent_without_delete_id(self):
+        """system_user bots cannot POST /posts/ephemeral; progress must still land in-thread."""
+        self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
+        self.adapter._last_post_status = 403
+        self.adapter._last_post_error = "api.context.permissions.app_error"
+
+        async def _post_side_effect(path, payload):
+            if path == "posts/ephemeral":
+                self.adapter._last_post_status = 403
+                self.adapter._last_post_error = "api.context.permissions.app_error"
+                return {}
+            if path == "posts":
+                self.adapter._last_post_status = 200
+                self.adapter._last_post_error = ""
+                return {"id": "persistent_progress"}
+            return {}
+
+        self.adapter._api_post = AsyncMock(side_effect=_post_side_effect)
+
+        result = await self.adapter.send(
+            "channel_1",
+            "⚙️ terminal...",
+            reply_to="root_post",
+            metadata={"_interim_send": True, "inbound_user_id": "user_andy", "thread_id": "root_post"},
+        )
+
+        assert result.success is True
+        assert result.message_id is None
+        assert self.adapter._api_post.call_count == 2
+        ephemeral_call, persistent_call = self.adapter._api_post.call_args_list
+        assert ephemeral_call[0][0] == "posts/ephemeral"
+        assert persistent_call[0][0] == "posts"
+        assert persistent_call[0][1]["root_id"] == "root_post"
+
+    @pytest.mark.asyncio
     async def test_ws_event_stashes_inbound_user_for_thread(self):
         self.adapter._bot_user_id = "bot_user_id"
         self.adapter.handle_message = AsyncMock()
@@ -383,6 +418,40 @@ class TestMattermostEphemeralProgress:
 
         assert self.adapter._inbound_users[("chan_456", "top_post_123")] == "user_123"
         assert self.adapter._inbound_users[("chan_456", "")] == "user_123"
+
+
+# ---------------------------------------------------------------------------
+# Typing — CRT threads need parent_id on users/me/typing
+# ---------------------------------------------------------------------------
+
+class TestMattermostTyping:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+
+    @pytest.mark.asyncio
+    async def test_send_typing_includes_parent_id_for_crt_thread(self):
+        self.adapter._api_post = AsyncMock(return_value={})
+
+        await self.adapter.send_typing(
+            "channel_1",
+            metadata={"thread_id": "root_post", "inbound_user_id": "user_andy"},
+        )
+
+        self.adapter._api_post.assert_called_once_with(
+            "users/me/typing",
+            {"channel_id": "channel_1", "parent_id": "root_post"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_typing_channel_only_without_thread_metadata(self):
+        self.adapter._api_post = AsyncMock(return_value={})
+
+        await self.adapter.send_typing("channel_1")
+
+        self.adapter._api_post.assert_called_once_with(
+            "users/me/typing",
+            {"channel_id": "channel_1"},
+        )
 
 
 # ---------------------------------------------------------------------------
