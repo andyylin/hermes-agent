@@ -198,11 +198,25 @@ class MattermostAdapter(BasePlatformAdapter):
             base["file_ids"] = file_ids
         payload = _with_mentions_disabled(base)
         if self._reply_mode == "thread":
-            # root_id from reply_to, else metadata["thread_id"]/["root_id"], resolved to the true thread root.
-            candidate = reply_to or (
-                isinstance(metadata, dict) and (metadata.get("thread_id") or metadata.get("root_id")))
-            if candidate:
-                payload["root_id"] = await self._resolve_root_id(str(candidate))
+            # Prefer a still-live root. Progress-bubble cleanup can delete reply_to;
+            # posting that id 400s ("Invalid RootId") and never lands in the thread.
+            candidates: list[str] = []
+            if reply_to:
+                candidates.append(str(reply_to))
+            if isinstance(metadata, dict):
+                for key in ("thread_id", "root_id"):
+                    value = metadata.get(key)
+                    if value:
+                        candidates.append(str(value))
+            seen: set[str] = set()
+            for candidate in candidates:
+                if not candidate or candidate in seen:
+                    continue
+                seen.add(candidate)
+                root_id = await self._resolve_root_id(candidate)
+                if root_id:
+                    payload["root_id"] = root_id
+                    break
         return await self._post_preserving_thread(chat_id, payload, metadata)
 
     async def _post_with_file(self, chat_id: str, file_id: str, caption: Optional[str], reply_to: Optional[str],
@@ -265,11 +279,17 @@ class MattermostAdapter(BasePlatformAdapter):
         logger.info("Mattermost: disconnected")
 
     async def _resolve_root_id(self, post_id: str) -> str:
-        """Resolve a post_id to its thread root_id (a reply's own ID causes "Invalid RootId parameter")."""
+        """Resolve a post_id to its thread root_id (a reply's own ID causes "Invalid RootId parameter").
+
+        A missing/deleted post must not be reused as root_id — that 400s forever.
+        """
         if not post_id:
             return post_id
         data = await self._api_get(f"posts/{post_id}")
-        return data["root_id"] if data and data.get("root_id") else post_id
+        if not data:
+            logger.warning("Mattermost: thread root %s is gone; skipping it", post_id)
+            return ""
+        return data["root_id"] if data.get("root_id") else post_id
 
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: _Metadata = None) -> SendResult:

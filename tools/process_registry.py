@@ -333,6 +333,7 @@ class ProcessSession:
     # (#70716)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
+    watcher_chat_type: str = ""
     watcher_user_id: str = ""
     watcher_user_name: str = ""
     watcher_thread_id: str = ""
@@ -374,7 +375,7 @@ class ProcessSession:
 
 
 # Watcher routing fields, in event-dict key order (``watcher_<key>`` on the session).
-_WATCHER_ROUTE_KEYS = ("platform", "chat_id", "user_id", "user_name", "thread_id", "message_id")
+_WATCHER_ROUTE_KEYS = ("platform", "chat_id", "chat_type", "user_id", "user_name", "thread_id", "message_id")
 # Session fields persisted verbatim in the crash-recovery checkpoint (plus
 # ``session_id``; ``command`` is redacted and ``owner_task_id`` defaulted on write).
 _CHECKPOINT_FIELDS = (
