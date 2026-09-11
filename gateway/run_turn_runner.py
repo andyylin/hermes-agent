@@ -467,9 +467,13 @@ class TurnRunner:
         return groups + ([current] if current else [])
 
     async def _send_progress_text(self, st, text: str):
+        from gateway.run import _interim_metadata
         ctx = self._ctx
         result = await st.adapter.send(
-            chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
+            chat_id=ctx.source.chat_id,
+            content=text,
+            reply_to=ctx._progress_reply_to,
+            metadata=_interim_metadata(ctx._progress_metadata),
         )
         self._track_progress_result(result)
         return result
