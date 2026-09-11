@@ -68,8 +68,14 @@ _monitor_stop = threading.Event()
 _LIVE_STATES = {"running", "stalling", "finalizing"}
 _ACTIVE_STATES = ("running", "stalling")
 # Routing origin persisted at dispatch so a restart-recovered completion can
-# reconstruct a full SessionSource (scope_id drives relay tenant egress).
-_ROUTING_KEYS = ("scope_id", "user_id", "user_name")
+# reconstruct a full SessionSource. Mattermost channel threads are
+# ``chat_type=channel`` plus a 6th session-key part; ``_parse_session_key``
+# omits that part (it may be a group user_id), so platform/chat/thread must
+# ride the event or the wake is dropped and Andy has to ping.
+_ROUTING_KEYS = (
+    "scope_id", "user_id", "user_name",
+    "platform", "chat_type", "chat_id", "thread_id", "message_id",
+)
 # Structured stall metadata — additive, present only on stall finalizations.
 _STALL_META_KEYS = ("stalled_after_quiet_seconds", "stall_threshold_seconds", "stall_phase", "stall_grace_seconds")
 # Private stall bookkeeping on the record -> public field in list_async_delegations().
