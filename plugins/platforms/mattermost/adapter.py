@@ -362,17 +362,22 @@ class MattermostAdapter(BasePlatformAdapter):
             return SendResult(success=True)
         if self._should_use_ephemeral_post(metadata):
             user_id = self._resolve_inbound_user_id(chat_id, metadata, reply_to)
-            if not user_id:
+            if user_id:
+                result = SendResult(success=True)
+                for chunk in self.truncate_message(self.format_message(content), MAX_POST_LENGTH):
+                    result = await self._post_ephemeral_message(chat_id, chunk, user_id, reply_to, metadata)
+                    if not result.success:
+                        break
+                if result.success:
+                    return result
                 logger.warning(
-                    "Mattermost: skipping ephemeral progress post in %s — no inbound user_id", chat_id,
+                    "Mattermost: ephemeral progress failed in %s (%s); posting persistently",
+                    chat_id, result.error,
                 )
-                return SendResult(success=False, error="no inbound user_id for ephemeral post")
-            result = SendResult(success=True)
-            for chunk in self.truncate_message(self.format_message(content), MAX_POST_LENGTH):
-                result = await self._post_ephemeral_message(chat_id, chunk, user_id, reply_to, metadata)
-                if not result.success:
-                    break
-            return result
+            else:
+                logger.warning(
+                    "Mattermost: no inbound user_id for ephemeral in %s; posting persistently", chat_id,
+                )
         result = SendResult(success=True)
         for chunk in self.truncate_message(self.format_message(content), MAX_POST_LENGTH):
             result = _post_result(await self._post_message(chat_id, chunk, reply_to, metadata), "Failed to create post")
