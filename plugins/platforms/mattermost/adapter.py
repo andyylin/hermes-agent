@@ -122,10 +122,6 @@ class MattermostAdapter(BasePlatformAdapter):
         self._last_post_status: Optional[int] = None  # POST-only, read by the broken-thread-root fallback
         self._last_post_error: str = ""
         self._dedup = MessageDeduplicator()
-        # Inbound human user_id per (channel_id, thread_key) for ephemeral progress posts.
-        self._inbound_users: Dict[Tuple[str, str], str] = {}
-        # Suppress repeated ephemeral→persistent fallback warnings within one CRT thread turn.
-        self._logged_ephemeral_fallback_key: Optional[str] = None
 
     # --- HTTP helpers ---
 
@@ -181,27 +177,6 @@ class MattermostAdapter(BasePlatformAdapter):
         return (any(marker in body for marker in ("root_id", "rootid", "root id", "thread", "post"))
                 and any(marker in body for marker in ("invalid", "not found", "does not exist", "missing")))
 
-    def _last_post_is_permission_denied(self) -> bool:
-        """Return True when the last POST was rejected for missing token permissions."""
-        if self._last_post_status == 403:
-            return True
-        body = (self._last_post_error or "").lower()
-        return "permissions" in body and "app_error" in body
-
-    @staticmethod
-    def _ephemeral_fallback_log_key(
-        chat_id: str, metadata: _Metadata, reply_to: Optional[str],
-    ) -> str:
-        thread_key = ""
-        if isinstance(metadata, dict):
-            for field in ("thread_id", "root_id"):
-                if metadata.get(field):
-                    thread_key = str(metadata[field])
-                    break
-        if not thread_key and reply_to:
-            thread_key = str(reply_to)
-        return f"{chat_id}:{thread_key}"
-
     def _typing_parent_id_from_metadata(self, metadata: _Metadata) -> Optional[str]:
         """CRT typing needs parent_id (thread root); channel-only typing is invisible in threads."""
         if not isinstance(metadata, dict):
@@ -224,47 +199,6 @@ class MattermostAdapter(BasePlatformAdapter):
                                    + str(flat_payload.get("message") or "")).strip()
         logger.warning("Mattermost: falling back to flat channel delivery for notify-worthy post in %s", chat_id)
         return await self._api_post("posts", flat_payload)
-
-    def _stash_inbound_user(self, channel_id: str, post: Dict[str, Any], sender_id: str) -> None:
-        """Remember who triggered the turn so interim progress can target ephemeral posts."""
-        if not channel_id or not sender_id:
-            return
-        keys = [""]
-        post_id, root_id = str(post.get("id") or ""), str(post.get("root_id") or "")
-        if post_id:
-            keys.append(post_id)
-        if root_id:
-            keys.append(root_id)
-        for key in keys:
-            self._inbound_users[(channel_id, key)] = sender_id
-
-    def _resolve_inbound_user_id(
-        self, chat_id: str, metadata: _Metadata, reply_to: Optional[str],
-    ) -> Optional[str]:
-        if isinstance(metadata, dict):
-            for field in ("inbound_user_id", "recipient_user_id"):
-                if metadata.get(field):
-                    return str(metadata[field])
-        thread_keys: List[str] = []
-        if isinstance(metadata, dict):
-            for field in ("thread_id", "root_id"):
-                if metadata.get(field):
-                    thread_keys.append(str(metadata[field]))
-        if reply_to:
-            thread_keys.append(str(reply_to))
-        thread_keys.append("")
-        for key in thread_keys:
-            uid = self._inbound_users.get((chat_id, key))
-            if uid:
-                return uid
-        return None
-
-    @staticmethod
-    def _should_use_ephemeral_post(metadata: _Metadata) -> bool:
-        """Interim progress/status only — finals, approvals, and notify-worthy sends stay persistent."""
-        if not isinstance(metadata, dict) or not metadata.get("_interim_send"):
-            return False
-        return not (metadata.get("notify") or metadata.get("is_approval_prompt"))
 
     async def _build_threaded_post_payload(
         self, chat_id: str, message: str, reply_to: Optional[str], metadata: _Metadata,
@@ -295,18 +229,6 @@ class MattermostAdapter(BasePlatformAdapter):
                     payload["root_id"] = root_id
                     break
         return payload
-
-    async def _post_ephemeral_message(
-        self, chat_id: str, message: str, user_id: str, reply_to: Optional[str], metadata: _Metadata,
-    ) -> SendResult:
-        """Deliver interim progress to one user without creating a persistent thread reply."""
-        payload_post = await self._build_threaded_post_payload(chat_id, message, reply_to, metadata)
-        data = await self._api_post("posts/ephemeral", {"user_id": user_id, "post": payload_post})
-        if not data:
-            return SendResult(success=False, error="Failed to create ephemeral post")
-        # No message_id: ephemerals must not enter cleanup_progress deletion (DELETE would
-        # rewrite thread state for other CRT followers).
-        return SendResult(success=True, message_id=None)
 
     async def _post_message(self, chat_id: str, message: str, reply_to: Optional[str], metadata: _Metadata,
                             file_ids: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -393,40 +315,6 @@ class MattermostAdapter(BasePlatformAdapter):
         """Send a message (or multiple chunks) to a channel; reply_to / metadata["thread_id"] is the root post."""
         if not content:
             return SendResult(success=True)
-        if self._should_use_ephemeral_post(metadata):
-            user_id = self._resolve_inbound_user_id(chat_id, metadata, reply_to)
-            if user_id:
-                result = SendResult(success=True)
-                ephemeral_forbidden = False
-                for chunk in self.truncate_message(self.format_message(content), MAX_POST_LENGTH):
-                    result = await self._post_ephemeral_message(chat_id, chunk, user_id, reply_to, metadata)
-                    if not result.success:
-                        ephemeral_forbidden = self._last_post_is_permission_denied()
-                        break
-                if result.success:
-                    return result
-                if ephemeral_forbidden:
-                    fallback_key = self._ephemeral_fallback_log_key(chat_id, metadata, reply_to)
-                    if self._logged_ephemeral_fallback_key != fallback_key:
-                        logger.warning(
-                            "Mattermost: ephemeral progress forbidden in %s; using persistent threaded "
-                            "posts (not tracked for cleanup)",
-                            chat_id,
-                        )
-                        self._logged_ephemeral_fallback_key = fallback_key
-                    for chunk in self.truncate_message(self.format_message(content), MAX_POST_LENGTH):
-                        data = await self._post_message(chat_id, chunk, reply_to, metadata)
-                        if not data or "id" not in data:
-                            return SendResult(success=False, error="Failed to create post")
-                    return SendResult(success=True, message_id=None)
-                logger.warning(
-                    "Mattermost: ephemeral progress failed in %s (%s); posting persistently",
-                    chat_id, result.error,
-                )
-            else:
-                logger.warning(
-                    "Mattermost: no inbound user_id for ephemeral in %s; posting persistently", chat_id,
-                )
         result = SendResult(success=True)
         for chunk in self.truncate_message(self.format_message(content), MAX_POST_LENGTH):
             result = _post_result(await self._post_message(chat_id, chunk, reply_to, metadata), "Failed to create post")
@@ -810,7 +698,6 @@ class MattermostAdapter(BasePlatformAdapter):
         if sender_id == self._bot_user_id or post.get("type") or self._dedup.is_duplicate(post_id):
             return
         channel_id, is_dm = post.get("channel_id", ""), data.get("channel_type", "O") == "D"
-        self._stash_inbound_user(channel_id, post, sender_id)
         message_text = post.get("message", "")
         if not is_dm:  # DMs need no gating; channels are mention-gated.
             message_text = self._apply_channel_gating(channel_id, message_text)
