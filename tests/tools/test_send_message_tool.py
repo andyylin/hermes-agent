@@ -1741,6 +1741,67 @@ class TestSendViaAdapterStandaloneFallback:
 
         assert result == {"error": "Plugin standalone send failed: boom!"}
 
+    @pytest.mark.asyncio
+    async def test_standalone_sender_without_subject_kwarg_still_sends(self, monkeypatch):
+        """Mattermost-shaped senders reject subject=; extra-send must not TypeError."""
+        from tools.send_message_tool import _send_via_adapter
+        from gateway.platform_registry import platform_registry
+
+        seen = {}
+
+        async def mm_shaped(pconfig, chat_id, message, *, thread_id=None, media_files=None,
+                            force_document=False):
+            seen["chat_id"] = chat_id
+            seen["message"] = message
+            seen["thread_id"] = thread_id
+            return {"success": True, "message_id": "mm-1"}
+
+        platform_registry.register(self._make_entry(mm_shaped))
+        try:
+            monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+            result = await _send_via_adapter(
+                _FakePlatform("fakeplatform"),
+                SimpleNamespace(extra={}),
+                "chat-1",
+                "hi",
+                thread_id="root-1",
+                subject={"subject": "nope"},
+            )
+        finally:
+            platform_registry.unregister("fakeplatform")
+
+        assert result == {"success": True, "message_id": "mm-1"}
+        assert seen == {"chat_id": "chat-1", "message": "hi", "thread_id": "root-1"}
+
+    @pytest.mark.asyncio
+    async def test_standalone_sender_with_var_keyword_still_gets_subject(self, monkeypatch):
+        """Email-shaped senders with **kwargs must still receive subject."""
+        from tools.send_message_tool import _send_via_adapter
+        from gateway.platform_registry import platform_registry
+
+        seen = {}
+
+        async def email_shaped(pconfig, chat_id, message, *, thread_id=None, media_files=None,
+                               force_document=False, subject=None, **_kwargs):
+            seen["subject"] = subject
+            return {"success": True, "message_id": "em-1"}
+
+        platform_registry.register(self._make_entry(email_shaped))
+        try:
+            monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+            result = await _send_via_adapter(
+                _FakePlatform("fakeplatform"),
+                SimpleNamespace(extra={}),
+                "chat-1",
+                "hi",
+                subject={"subject": "Estate recap"},
+            )
+        finally:
+            platform_registry.unregister("fakeplatform")
+
+        assert result == {"success": True, "message_id": "em-1"}
+        assert seen["subject"] == {"subject": "Estate recap"}
+
 class TestSendTelegramThreadNotFoundRetry:
     """Tests for thread-not-found retry behaviour in _send_telegram (#27012)."""
 

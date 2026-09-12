@@ -2,6 +2,7 @@
 react); works in both CLI and gateway contexts."""
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -444,6 +445,22 @@ async def _dispatch_on_gateway_loop(runner, make_coro, log_message):
     return await asyncio.shield(asyncio.wrap_future(fut))
 
 
+def _filter_standalone_kwargs(sender, kwargs):
+    """Keep only kwargs the plugin standalone sender actually accepts.
+
+    Email takes ``subject``; Mattermost/Discord/Telegram do not. Passing
+    ``subject=`` unconditionally TypeErrors and out-of-process extra-send
+    (specialist finish wake) never lands on those platforms.
+    """
+    try:
+        sig = inspect.signature(sender)
+    except (TypeError, ValueError):
+        return kwargs
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in sig.parameters}
+
+
 async def _send_via_adapter(platform, pconfig, chat_id, chunk, *, thread_id=None, media_files=None,
                             force_document=False, subject=None):
     """Live in-process gateway adapter first, else the plugin's ``standalone_sender_fn`` (cron),
@@ -484,8 +501,13 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk, *, thread_id=None
                           f"connected? For out-of-process delivery (e.g. cron in a separate process), the platform "
                           f"plugin must register a standalone_sender_fn on its PlatformEntry.")}
     try:
-        result = await sender(pconfig, chat_id, chunk, thread_id=thread_id, media_files=media_files,
-                              force_document=force_document, subject=subject)
+        call_kw = _filter_standalone_kwargs(sender, {
+            "thread_id": thread_id,
+            "media_files": media_files,
+            "force_document": force_document,
+            "subject": subject,
+        })
+        result = await sender(pconfig, chat_id, chunk, **call_kw)
     except asyncio.CancelledError:
         raise
     except Exception as e:
