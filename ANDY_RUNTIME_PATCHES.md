@@ -8,10 +8,10 @@ This file is the retained/retired **authority**, not a commit-count souvenir.
 Score overlays as `KEEP` / `UPSTREAM-NOW` / `DROP` against current official
 `origin/main`. Do not replay `DROP` or `UPSTREAM-NOW` behavior on refresh.
 
-Frozen upstream cutoff: `2237be355906fbe6065ce1815711eee52b2d646e`
-(`v2026.9.7` / Hermes 0.21.1). Exact-SHA CI and review evidence must name
-this object. The previous cutoff was `29112bef099274229cadff79cdff7bf7b99c4b77`
-(`v2026.8.31` / 0.21.0).
+Frozen upstream cutoff: `345cd2b057a452236de401d3534b8502a7465e8d`
+(`v2026.9.14` / Hermes 0.21.3). Exact-SHA CI and review evidence must name
+this object. The previous cutoff was `939e45c91d751fadd94dcd1b873ac3cb44846213`
+(`v2026.9.11` / 0.21.2).
 
 Cron memory: take official `skip_memory=False` from this tag. Do not replay
 `fc9cbc87` (skip MEMORY.md in scheduled jobs). Per-job toolset denylist still
@@ -62,6 +62,9 @@ Official already owns the equivalent or stronger contract:
   (issue #72348).
 - Telegram `_scoped_gate_env` and Signal scoped allowlist reads.
 - Discord native thread rename via `edit(name=...)`.
+- Restart-safe cron worker ack window. Official
+  `HANDOFF_ADOPTION_GRACE_SECONDS` is 30s on this tag (issue #109243).
+  Do not replay the 20s overlay.
 
 ## DROP — retired, reverted, or not load-bearing here
 
