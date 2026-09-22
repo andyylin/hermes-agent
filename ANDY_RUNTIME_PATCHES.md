@@ -52,6 +52,9 @@ not `gateway.multiplex_profiles`. Shared-process multiplexing stays retired.
    posts thinking/tool bubbles, then deletes them after a successful final
    reply. Nemo PD One already has this; keep the DELETE + closed-session retry.
 
+
+6. **Mattermost DM top-level → fresh session (2026-09-19)** — when `reply_mode`/`MATTERMOST_REPLY_MODE` is `thread`, top-level DM posts set `thread_id = post_id` the same as channels (drop the `not is_dm` gate). Replies with `root_id` stay in that thread session. UI threading unchanged. Fixes unbounded shared DM session (~394k). Upstream PR pending via Cursor cloud agent.
+
 ## UPSTREAM-NOW — do not keep as a fork reason
 
 Official already owns the equivalent or stronger contract:
