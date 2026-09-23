@@ -26,6 +26,9 @@ not `gateway.multiplex_profiles`. Shared-process multiplexing stays retired.
    prefix-required groups. Read-only messages are archived before dispatch is
    stopped; archive groups can still dispatch; prefix-required groups strip an
    approved prefix before dispatch. Official LINE still has allowlists only.
+   Compose / Cursor Cloud rebase must run
+   `python -m pytest tests/gateway/test_line_plugin.py -q` on the candidate and
+   fail closed if red.
 2. **Email notifications** — standalone email sends multipart HTML plus plain
    fallback; cron jobs can use `email_subject_template` and `email_thread_key`
    for dated subjects and stable RFC threading. Inbound sessions isolate by

@@ -45,6 +45,7 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.helpers import MessageDeduplicator, cancel_task
 from gateway.platforms.event import MessageEvent, MessageType
+from plugins.platforms.line.digest_media import remap_media_urls_for_archive
 from gateway.config import Platform
 
 logger = logging.getLogger(__name__)
@@ -570,6 +571,11 @@ class LineAdapter(BasePlatformAdapter):
         archive_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(archive_dir, 0o700)
         safe_chat_id = re.sub(r"[^A-Za-z0-9_.-]", "_", chat_id or "unknown")
+        message_id = (event.get("message") or {}).get("id", "")
+        # Persist digest-scoped copy (72h TTL store) so vision survives cache/images 24h wipe.
+        if media_urls:
+            media_urls = remap_media_urls_for_archive(
+                hermes_home, chat_id or safe_chat_id, message_id, media_urls, msg_type=msg_type)
         record = {
             "received_at": time.time(),
             "event_timestamp": event.get("timestamp"),
@@ -577,7 +583,7 @@ class LineAdapter(BasePlatformAdapter):
             "chat_id": chat_id,
             "chat_type": chat_type,
             "user_id": source.get("userId", ""),
-            "message_id": (event.get("message") or {}).get("id", ""),
+            "message_id": message_id,
             "message_type": msg_type,
             "text": text,
             "media_urls": media_urls,
