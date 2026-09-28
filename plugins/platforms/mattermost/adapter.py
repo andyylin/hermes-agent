@@ -527,7 +527,8 @@ class MattermostAdapter(BasePlatformAdapter):
         return file_data, _url_filename(image_url, f"image_{index}.png"), ct
 
     async def send_multiple_images(self, chat_id: str, images: List[Tuple[str, str]],
-                                   metadata: _Metadata = None, human_delay: float = 0.0) -> SendResult:
+                                   metadata: _Metadata = None, human_delay: float = 0.0,
+                                   reply_to: Optional[str] = None) -> SendResult:
         """Send a batch of images as one post; chunked at Mattermost's 5-``file_ids`` cap, each chunk
         falling back to the base per-image loop on failure."""
         if not images:
@@ -549,17 +550,20 @@ class MattermostAdapter(BasePlatformAdapter):
                     continue
                 logger.info("Mattermost: sending %d image(s) as single post (chunk %d/%d)",
                             len(file_ids), chunk_idx + 1, len(chunks))
-                data = await self._post_message(chat_id, "\n".join(caption_parts), None, metadata, file_ids)
+                data = await self._post_message(
+                    chat_id, "\n".join(caption_parts), reply_to, metadata, file_ids)
                 if data and "id" in data:
                     delivered = True
                 else:
                     logger.warning("Mattermost: multi-image post failed, falling back")
-                    fallback = await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                    fallback = await super().send_multiple_images(
+                        chat_id, chunk, metadata, human_delay=human_delay, reply_to=reply_to)
                     delivered = delivered or fallback.success
             except Exception as e:
                 logger.warning("Mattermost: multi-image send failed (chunk %d/%d), falling back: %s",
                                chunk_idx + 1, len(chunks), e, exc_info=True)
-                fallback = await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                fallback = await super().send_multiple_images(
+                    chat_id, chunk, metadata, human_delay=human_delay, reply_to=reply_to)
                 delivered = delivered or fallback.success
         return SendResult(success=delivered, error=None if delivered else "all images failed to send")
 
@@ -696,9 +700,9 @@ class MattermostAdapter(BasePlatformAdapter):
             message_text = self._apply_channel_gating(channel_id, message_text)
             if message_text is None:
                 return
-        # Thread support: replies use root_id; in thread mode a top-level channel post is itself a valid root.
+        # Thread support: replies use root_id; in thread mode a top-level post (channel or DM) is its own root.
         thread_id = post.get("root_id") or None
-        if not thread_id and self._reply_mode == "thread" and not is_dm and post_id:
+        if not thread_id and self._reply_mode == "thread" and post_id:
             thread_id = post_id
         if message_text[:1].isspace() and message_text.lstrip().startswith("/"):
             message_text = message_text.lstrip()

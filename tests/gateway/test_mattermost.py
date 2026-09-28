@@ -713,6 +713,88 @@ class TestMattermostMediaTypes:
         assert msg.media_types[0].startswith("image/")
 
 
+class TestMattermostDmThreadInbound:
+    """CRT thread roots for DMs must match channels when reply_mode is thread."""
+
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._bot_user_id = "bot_user_id"
+        self.adapter.handle_message = AsyncMock()
+
+    def _dm_event(self, post_id, root_id="", reply_mode="thread"):
+        self.adapter._reply_mode = reply_mode
+        post_data = {
+            "id": post_id,
+            "user_id": "user_123",
+            "channel_id": "chan_dm",
+            "message": "hello",
+            "root_id": root_id,
+        }
+        return {
+            "event": "posted",
+            "data": {
+                "post": json.dumps(post_data),
+                "channel_type": "D",
+                "sender_name": "@andy",
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_dm_top_level_post_is_thread_root_in_thread_mode(self):
+        await self.adapter._handle_ws_event(self._dm_event("dm_root_post"))
+        msg_event = self.adapter.handle_message.call_args[0][0]
+        assert msg_event.source.thread_id == "dm_root_post"
+
+    @pytest.mark.asyncio
+    async def test_dm_reply_uses_existing_root_id(self):
+        await self.adapter._handle_ws_event(self._dm_event("dm_reply", root_id="dm_root_post"))
+        msg_event = self.adapter.handle_message.call_args[0][0]
+        assert msg_event.source.thread_id == "dm_root_post"
+
+    @pytest.mark.asyncio
+    async def test_dm_top_level_post_has_no_thread_when_not_thread_mode(self):
+        await self.adapter._handle_ws_event(self._dm_event("dm_flat", reply_mode="off"))
+        msg_event = self.adapter.handle_message.call_args[0][0]
+        assert msg_event.source.thread_id is None
+
+
+class TestMattermostDocumentThreading:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._reply_mode = "thread"
+        self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
+        self.adapter._api_post = AsyncMock(return_value={"id": "file_post"})
+
+    @pytest.mark.asyncio
+    async def test_send_document_with_reply_to_sets_root_id(self, tmp_path):
+        doc = tmp_path / "bed-flange-floor-cover-v1.zip"
+        doc.write_bytes(b"PK")
+        self.adapter._upload_file = AsyncMock(return_value="file_abc")
+
+        result = await self.adapter.send_document(
+            "chan_dm", str(doc), reply_to="root_post", metadata={"thread_id": "root_post"},
+        )
+
+        assert result.success is True
+        payload = self.adapter._api_post.await_args.args[1]
+        assert payload["root_id"] == "root_post"
+        assert payload["file_ids"] == ["file_abc"]
+
+    @pytest.mark.asyncio
+    async def test_send_document_with_metadata_thread_id_sets_root_id(self, tmp_path):
+        doc = tmp_path / "chart.webp"
+        doc.write_bytes(b"RIFF")
+        self.adapter._upload_file = AsyncMock(return_value="file_webp")
+
+        result = await self.adapter.send_document(
+            "chan_dm", str(doc), metadata={"thread_id": "dm_root_post"},
+        )
+
+        assert result.success is True
+        payload = self.adapter._api_post.await_args.args[1]
+        assert payload["root_id"] == "dm_root_post"
+
+
 @pytest.mark.asyncio
 async def test_mattermost_top_level_channel_post_is_thread_root():
     adapter = _make_adapter()
