@@ -4373,7 +4373,7 @@ class BasePlatformAdapter(ABC):
         try:
             if reply_to is None:
                 reply_to = _reply_anchor_for_event(event)
-            batch_kwargs: Dict[str, Any] = dict(
+            batch_kwargs: dict[str, Any] = dict(
                 chat_id=event.source.chat_id, images=images, metadata=metadata, human_delay=human_delay)
             if reply_to and self._accepts_kwarg(
                     self.send_multiple_images, "reply_to", var_kw=True, unknown=False):
