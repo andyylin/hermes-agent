@@ -713,6 +713,87 @@ class TestMattermostMediaTypes:
         assert msg.media_types[0].startswith("image/")
 
 
+class TestMattermostMediaThreading:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._reply_mode = "thread"
+        self.adapter._api_get = AsyncMock(return_value={"id": "trigger_post", "root_id": "crt_root"})
+        self.adapter._api_post = AsyncMock(return_value={"id": "img_post"})
+        self.adapter._upload_file = AsyncMock(return_value="file_1")
+
+    @pytest.mark.asyncio
+    async def test_send_multiple_images_threads_via_reply_to(self, tmp_path):
+        img = tmp_path / "tray.png"
+        img.write_bytes(b"\x89PNG" + b"\x00" * 8)
+        result = await self.adapter.send_multiple_images(
+            "dm_chan",
+            [(f"file://{img}", "caption")],
+            metadata={"thread_id": "crt_root"},
+            reply_to="trigger_post",
+        )
+        assert result.success
+        payload = self.adapter._api_post.await_args.args[1]
+        assert payload["root_id"] == "crt_root"
+        assert payload["file_ids"] == ["file_1"]
+
+    @pytest.mark.asyncio
+    async def test_send_multiple_images_empty_caption_still_threads(self, tmp_path):
+        img = tmp_path / "views.png"
+        img.write_bytes(b"\x89PNG" + b"\x00" * 8)
+        await self.adapter.send_multiple_images(
+            "dm_chan",
+            [(f"file://{img}", "")],
+            metadata={"thread_id": "crt_root"},
+            reply_to="trigger_post",
+        )
+        payload = self.adapter._api_post.await_args.args[1]
+        assert payload["root_id"] == "crt_root"
+        assert payload["message"] == ""
+        assert payload["file_ids"] == ["file_1"]
+
+    @pytest.mark.asyncio
+    async def test_send_multiple_images_flat_when_reply_mode_off(self, tmp_path):
+        self.adapter._reply_mode = "off"
+        img = tmp_path / "flat.png"
+        img.write_bytes(b"\x89PNG" + b"\x00" * 8)
+        await self.adapter.send_multiple_images(
+            "dm_chan",
+            [(f"file://{img}", "")],
+            metadata={"thread_id": "crt_root"},
+            reply_to="trigger_post",
+        )
+        payload = self.adapter._api_post.await_args.args[1]
+        assert "root_id" not in payload
+
+
+@pytest.mark.asyncio
+async def test_mattermost_top_level_dm_post_is_thread_root():
+    adapter = _make_adapter()
+    adapter._reply_mode = "thread"
+    adapter._bot_user_id = "bot_user_id"
+    adapter.handle_message = AsyncMock()
+    post_data = {
+        "id": "dm_top_123",
+        "user_id": "user_123",
+        "channel_id": "dm_chan",
+        "message": "draw a tray",
+        "root_id": "",
+    }
+    event = {
+        "event": "posted",
+        "data": {
+            "post": json.dumps(post_data),
+            "channel_type": "D",
+            "sender_name": "@andy",
+        },
+    }
+
+    await adapter._handle_ws_event(event)
+
+    msg_event = adapter.handle_message.call_args[0][0]
+    assert msg_event.source.thread_id == "dm_top_123"
+
+
 @pytest.mark.asyncio
 async def test_mattermost_top_level_channel_post_is_thread_root():
     adapter = _make_adapter()
