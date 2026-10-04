@@ -2916,7 +2916,8 @@ class BasePlatformAdapter(ABC):
 
     async def send_multiple_images(
         self, chat_id: str, images: List[Tuple[str, str]],
-        metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0) -> SendResult:
+        metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0,
+        reply_to: Optional[str] = None) -> SendResult:
         """Send ``(url, alt)`` images (``http(s)://`` or ``file://``) one by one (GIFs via
         ``send_animation``, local files via ``send_image_file``); override to bundle natively
         (Signal). Returns success when at least one image was delivered — the outcome
@@ -2937,7 +2938,8 @@ class BasePlatformAdapter(ABC):
                 else:
                     sender, url_kw = self.send_image, {"image_url": image_url}
                 img_result = await sender(
-                    chat_id=chat_id, **url_kw, caption=alt_text or None, metadata=metadata)
+                    chat_id=chat_id, **url_kw, caption=alt_text or None, reply_to=reply_to,
+                    metadata=metadata)
                 if not img_result.success:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
                 else:
@@ -4197,10 +4199,11 @@ class BasePlatformAdapter(ABC):
             return Path(path).suffix.lower() in _IMAGE_EXTS and not force_document_attachments
         _image_paths = [p for p, is_voice in media_files if not is_voice and _as_image(p)]
         _image_paths += [p for p in local_files if _as_image(p)]
+        reply_anchor = _reply_anchor_for_event(event)
         if _image_paths:
             await self._send_image_batch(
                 event, [(f"file://{_quote(p)}", "") for p in _image_paths], metadata, human_delay,
-                record_delivery)
+                record_delivery, reply_to=reply_anchor)
         chat_id = event.source.chat_id
 
         async def _send_one(path: str, *, is_voice: bool, media_tag: bool) -> SendResult:
@@ -4208,13 +4211,17 @@ class BasePlatformAdapter(ABC):
             do."""
             ext = Path(path).suffix.lower()
             if media_tag and should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-                result = await self.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata, is_voice=is_voice)
+                result = await self.send_voice(
+                    chat_id=chat_id, audio_path=path, reply_to=reply_anchor, metadata=metadata,
+                    is_voice=is_voice)
             elif ext in _VIDEO_EXTS:
                 if media_tag:
                     logger.info("[%s] Sending video attachment (%s) to %s", self.name, ext, chat_id)
-                result = await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
+                result = await self.send_video(
+                    chat_id=chat_id, video_path=path, reply_to=reply_anchor, metadata=metadata)
             else:
-                result = await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+                result = await self.send_document(
+                    chat_id=chat_id, file_path=path, reply_to=reply_anchor, metadata=metadata)
             if not result.success:
                 logger.warning("[%s] Failed to send %s (%s): %s", self.name,
                                "media" if media_tag else "local file", ext, result.error)
@@ -4238,13 +4245,19 @@ class BasePlatformAdapter(ABC):
 
     async def _send_image_batch(
         self, event: MessageEvent, images: list, metadata: Dict[str, Any], human_delay: float,
-        record_delivery: Callable) -> None:
+        record_delivery: Callable, *, reply_to: Optional[str] = None) -> None:
         """Batch-send images; a failure is logged (never raised) so other attachments still go.
         The batch result feeds ``record_delivery`` so media-only turns report their real
         outcome instead of FAILURE."""
         try:
-            result = await self.send_multiple_images(
+            if reply_to is None:
+                reply_to = _reply_anchor_for_event(event)
+            batch_kwargs: Dict[str, Any] = dict(
                 chat_id=event.source.chat_id, images=images, metadata=metadata, human_delay=human_delay)
+            if reply_to and self._accepts_kwarg(
+                    self.send_multiple_images, "reply_to", var_kw=True, unknown=False):
+                batch_kwargs["reply_to"] = reply_to
+            result = await self.send_multiple_images(**batch_kwargs)
         except Exception as batch_err:
             logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
             record_delivery(SendResult(success=False, error=str(batch_err)))
