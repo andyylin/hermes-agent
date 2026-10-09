@@ -1,17 +1,34 @@
 # Andy Runtime Patch Queue
 
 `andy-runtime` / live `runtime-deploy` is a deliberately small, linear patch
-queue rebased on current `upstream/main`. It is the only supported custom
+queue rebased on a frozen official tag. It is the only supported custom
 runtime branch.
 
 This file is the retained/retired **authority**, not a commit-count souvenir.
-Score overlays as `KEEP` / `UPSTREAM-NOW` / `DROP` against current official
-`origin/main`. Do not replay `DROP` or `UPSTREAM-NOW` behavior on refresh.
+Score overlays as `KEEP` / `UPSTREAM-NOW` / `DROP` against the frozen tag
+below. Do not score against newer untagged `main` or `rc.` / `abandoned-rc.`
+tags. Do not replay `DROP` or `UPSTREAM-NOW` behavior on refresh.
 
-Frozen upstream cutoff: `f97608f178d1ffeca59860195ab7da295f7c8e5f`
-(`v2026.9.24` / Hermes 0.21.5). Exact-SHA CI and review evidence must name
-this object. The previous cutoff was `939e45c91d751fadd94dcd1b873ac3cb44846213`
-(`v2026.9.11` / 0.21.2).
+Frozen upstream cutoff: `818c13be1dc4fd28987e1e881a9408224afd4535`
+(`v0.21.6`). Exact-SHA CI and review evidence must name this object. The
+previous cutoff was `f97608f178d1ffeca59860195ab7da295f7c8e5f`
+(`v2026.9.24` / Hermes 0.21.5).
+
+This tag declares Python 3.14 as the only supported runtime (`pyproject.toml`
+marks every core dependency `python_version >= '3.14'`; `uv.lock` resolves
+only for `>=3.14`). `hermes_bootstrap` calls
+`hermes_cli.venv_sync.prepare_launch`. A stampless `.git` checkout at
+`$HERMES_HOME/hermes-agent` is adopted by
+`hermes_cli.post_update.step_adopt_blessed_checkout` with
+`updateMechanism=self`, and the next launch can build a PM environment and
+`execv` into the store Python. No KEEP file edits `hermes_bootstrap.py`,
+`venv_sync.py`, or `post_update.py`. KEEP 6's pin script still
+`ExecStart`s the shared venv via `python -m hermes_cli.main`, and that entry
+imports `hermes_bootstrap`. `HERMES_DISABLE_LAZY_INSTALLS=1` makes
+`prepare_launch` return before adoption and before `execv`. With no PM
+install state, `pm.environments.activate_dependencies` then keeps a real venv
+(`sys.prefix != sys.base_prefix`). The variable does not undo a stamp or a
+committed PM generation written by an earlier unguarded launch.
 
 Cron memory: take official `skip_memory=False` from this tag. Do not replay
 `fc9cbc87` (skip MEMORY.md in scheduled jobs). Per-job toolset denylist still
@@ -35,8 +52,12 @@ not `gateway.multiplex_profiles`. Shared-process multiplexing stays retired.
    store; attachment fallback retries only confirmed failures; an already
    in-flight timeout is not retried because that could duplicate delivery.
 4. **Bitwarden plaintext-cache purge** — encrypted-cache mode removes obsolete
-   plaintext cache data fail-closed before validation, read, or fetch. The
+   plaintext cache data fail-closed before validation, read, or fetch
+   (`_purge_plaintext_disk_cache` from `fetch_bitwarden_secrets`,
+   `BitwardenSource.fetch`, and `_write_encrypted_disk_cache`). The
    encrypted AES-GCM network-failure-only fallback is already upstream-owned.
+   v0.21.6 removed the pre-decomposition `apply_bitwarden_secrets`
+   PLUGIN-COMPAT shim; do not put that shim back.
 5. **Memory Tree manual retrieval** — peeled to the user plugin at
    `plugin-export/memory-tree/` on branch `feat/memory-tree-user-plugin-20260905`.
    Copy to `~/.hermes/plugins/memory-tree` and enable via `plugins.enabled`.
@@ -51,6 +72,13 @@ not `gateway.multiplex_profiles`. Shared-process multiplexing stays retired.
    adapters that override `delete_message` (Telegram/Discord). Joi Mattermost
    posts thinking/tool bubbles, then deletes them after a successful final
    reply. Nemo PD One already has this; keep the DELETE + closed-session retry.
+   Follow-ons still missing upstream, carried with this item:
+   CRT typing sends `parent_id` (`_typing_parent_id_from_metadata`); a child
+   agent or background process wakes the channel thread (`_ROUTING_KEYS` and
+   `watcher_chat_type`); MEDIA images, voice, video, and documents stay in
+   the CRT thread (`reply_to` on `_deliver_media_attachments` /
+   `send_multiple_images`). Ephemeral progress was tried and then removed on
+   this queue; interim progress stays persistent and returns post ids.
 
 ## UPSTREAM-NOW — do not keep as a fork reason
 
@@ -62,6 +90,17 @@ Official already owns the equivalent or stronger contract:
   (issue #72348).
 - Telegram `_scoped_gate_env` and Signal scoped allowlist reads.
 - Discord native thread rename via `edit(name=...)`.
+- Dashboard password login behind `X-Forwarded-Prefix` (old fork commit
+  `1dd23c9958`, never on GitHub). `hermes_cli/dashboard_auth/login_page.py`
+  `render_login_html` / `_apply_proxy_prefix` sets `<main data-prefix>`, and
+  `_PASSWORD_FORM_SCRIPT` posts to `prefix + '/auth/password-login'`.
+  `hermes_cli/dashboard_auth/routes.py` `_prefix()` reads
+  `prefix_from_request`, and `login_page` passes `prefix=_prefix(request)`
+  into `render_login_html`. Do not re-add the fork patch.
+- Mattermost DM top-level thread roots. Already in this tag via
+  `5a0e0d35b9` (`fix(mattermost): preserve thread-local delivery hygiene`):
+  `MattermostAdapter._last_post_failure_is_broken_thread_root`. Not a
+  separate overlay.
 
 ## DROP — retired, reverted, or not load-bearing here
 
