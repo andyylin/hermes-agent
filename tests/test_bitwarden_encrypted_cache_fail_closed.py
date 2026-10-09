@@ -23,9 +23,10 @@ def test_encrypted_mode_removes_plaintext_before_failed_fetch(monkeypatch, tmp_p
     bw._reset_cache_for_tests(home)
     plaintext_path = _write_plaintext_cache(home)
 
+    # v0.21.6 runs bws through run_cli, not subprocess.run.
     monkeypatch.setattr(
-        bw.subprocess,
-        "run",
+        bw,
+        "run_cli",
         lambda *args, **kwargs: mock.Mock(
             returncode=1,
             stdout="",
