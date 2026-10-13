@@ -425,7 +425,7 @@ class TestRunJobScript:
         """
         stale = tmp_path / "repo-venv" / "bin" / "python"
         stale.parent.mkdir(parents=True)
-        stale.write_text("#!/bin/sh\nprintf 'stale\\n'", encoding="utf-8")
+        stale.write_text("#!/bin/sh\nprintf '%s\\n' stale 'LAZY=1'\n", encoding="utf-8")
         stale.chmod(0o755)
 
         monkeypatch.setattr(
@@ -442,7 +442,7 @@ class TestRunJobScript:
         script.write_text(
             "import os, sys\n"
             "print(sys.executable)\n"
-            "print(os.environ.get('HERMES_DISABLE_LAZY_INSTALLS', ''))\n",
+            "print('LAZY=' + (os.environ.get('HERMES_DISABLE_LAZY_INSTALLS') or ''))\n",
             encoding="utf-8",
         )
 
@@ -452,7 +452,7 @@ class TestRunJobScript:
         assert success is True, output
         executable, lazy = output.splitlines()
         assert Path(executable).resolve() == Path(sys.executable).resolve()
-        assert lazy == ""
+        assert lazy == "LAZY="
 
     def test_emoji_stdout_round_trips_through_script_capture(self, cron_env):
         """Emoji in script stdout must reach the caller intact (#42384).
