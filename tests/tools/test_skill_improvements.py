@@ -18,7 +18,7 @@ from tools.skill_manager_tool import (
 SKILL_CONTENT = """\
 ---
 name: test-skill
-description: A test skill for unit testing.
+description: A test skill for unit testing. Not for X.
 ---
 
 # Test Skill
@@ -55,7 +55,7 @@ class TestFuzzyPatchSkill:
         skill = """\
 ---
 name: ws-skill
-description: Whitespace test
+description: Whitespace test. Not for X.
 ---
 
 # Commands
@@ -76,7 +76,7 @@ description: Whitespace test
         skill = """\
 ---
 name: dup-skill
-description: Duplicate test
+description: Duplicate test. Not for X.
 ---
 
 # Steps

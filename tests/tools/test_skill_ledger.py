@@ -19,7 +19,7 @@ import pytest
 
 VALID_SKILL_CONTENT = """---
 name: my-skill
-description: test skill
+description: test skill. Not for X.
 ---
 
 # My Skill

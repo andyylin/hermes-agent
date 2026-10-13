@@ -145,8 +145,9 @@ def _validate_category(category: Optional[str]) -> Optional[str]:
 
 def _validate_frontmatter(content: str, *, new_skill: bool = False) -> Optional[str]:
     """Validate frontmatter (name + description) and a non-empty body. ``new_skill`` (create
-    only) also enforces SKILL_PROMPT_DESC_LIMIT so new skills never lose routing signal to
-    index truncation; edit/patch skip it so existing over-limit skills stay maintainable."""
+    only) also enforces SKILL_PROMPT_DESC_LIMIT and a word-boundary Not exclusion inside that
+    index window, so new skills never lose the exclusion to truncation; edit/patch skip both
+    so existing over-limit skills stay maintainable."""
     if not content.strip():
         return "Content cannot be empty."
     content = content.lstrip("\ufeff")  # tolerate a Windows UTF-8 BOM
@@ -167,6 +168,14 @@ def _validate_frontmatter(content: str, *, new_skill: bool = False) -> Optional[
     desc = str(parsed["description"])
     if len(desc) > MAX_DESCRIPTION_LENGTH:
         return f"Description exceeds {MAX_DESCRIPTION_LENGTH} characters."
+    # The skill index shows this prefix only (extract_skill_description). An
+    # exclusion past it never reaches the model; "When to Use" is not indexed.
+    index_window = desc.strip().strip("'\"")[:SKILL_PROMPT_DESC_LIMIT]
+    if new_skill and not re.search(r"\bnot\b", index_window, re.I):
+        return (
+            f"Description must include a Not exclusion inside the "
+            f"{SKILL_PROMPT_DESC_LIMIT}-character index window. "
+            "When to Use does not stop a false load.")
     if new_skill and len(desc.strip().strip("'\"")) > SKILL_PROMPT_DESC_LIMIT:
         return (
             f"Description is {len(desc.strip())} chars — new skills must fit the "

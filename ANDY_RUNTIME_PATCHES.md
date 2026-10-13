@@ -79,6 +79,16 @@ not `gateway.multiplex_profiles`. Shared-process multiplexing stays retired.
    the CRT thread (`reply_to` on `_deliver_media_attachments` /
    `send_multiple_images`). Ephemeral progress was tried and then removed on
    this queue; interim progress stays persistent and returns post ids.
+8. **New-skill description Not exclusion** — a newly created skill's
+   description must contain a word-boundary `not` (any case) inside the
+   skill-index window. The window is `SKILL_PROMPT_DESC_LIMIT` (60) in
+   `agent/skill_utils.py`. `extract_skill_description` shows the full
+   normalized description when it is at most that long, and only the first
+   57 characters plus `...` when it is longer. New skills are already
+   rejected past 60, so `_validate_frontmatter` (`new_skill=True` only)
+   checks `normalized[:SKILL_PROMPT_DESC_LIMIT]`. `notes` and `knot` do not
+   count. Edits and patches of existing skills are not checked. Official
+   has no exclusion requirement.
 
 ## UPSTREAM-NOW — do not keep as a fork reason
 

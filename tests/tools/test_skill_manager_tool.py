@@ -27,6 +27,7 @@ from tools.skill_manager_tool import (
     skill_manage,
 )
 from agent.skill_utils import (
+    SKILL_PROMPT_DESC_LIMIT,
     extract_skill_description,
     parse_frontmatter,
 )
@@ -44,7 +45,7 @@ def _skill_dir(tmp_path):
 VALID_SKILL_CONTENT = """\
 ---
 name: test-skill
-description: A test skill for unit testing.
+description: A test skill for unit testing. Not for X.
 ---
 
 # Test Skill
@@ -80,7 +81,7 @@ Step 1.
 MISMATCHED_NAME_CONTENT = """\
 ---
 name: keeta-eng-conduct
-description: Frontmatter name differs from the directory name.
+description: Frontmatter name differs from the directory name. Not X.
 ---
 
 # Mismatched Name Skill
@@ -119,6 +120,13 @@ class TestValidateCategory:
 # ---------------------------------------------------------------------------
 
 
+def _skill_md(description: str, name: str = "sample-skill") -> str:
+    return (
+        f"---\nname: {name}\ndescription: {description}\n---\n\n"
+        "# Sample\n\nDo the thing.\n"
+    )
+
+
 class TestValidateFrontmatter:
     def test_no_frontmatter(self):
         err = _validate_frontmatter("# Just a heading\nSome content.\n")
@@ -127,6 +135,54 @@ class TestValidateFrontmatter:
     def test_invalid_yaml(self):
         content = "---\n: invalid: yaml: {{{\n---\n\nBody.\n"
         assert _validate_frontmatter(content) is not None
+
+
+class TestNewSkillNotExclusion:
+    """New skills must carry a word-boundary Not exclusion in the index window."""
+
+    def test_new_without_not_rejected(self):
+        err = _validate_frontmatter(_skill_md("Route host logs."), new_skill=True)
+        assert err is not None
+        assert "index window" in err
+        assert str(SKILL_PROMPT_DESC_LIMIT) in err
+
+    def test_not_for_x_passes(self):
+        assert _validate_frontmatter(_skill_md("Not for X."), new_skill=True) is None
+
+    def test_edit_existing_skill_without_not_passes(self, tmp_path):
+        with _skill_dir(tmp_path):
+            created = _create_skill("my-skill", _skill_md("Not for X.", name="my-skill"))
+            assert created["success"] is True, created
+            edited = _edit_skill("my-skill", _skill_md("Updated description.", name="my-skill"))
+        assert edited["success"] is True, edited
+        assert _validate_frontmatter(_skill_md("Updated description.")) is None
+
+    def test_notes_and_knot_do_not_count(self):
+        err = _validate_frontmatter(_skill_md("Take notes on a knot."), new_skill=True)
+        assert err is not None
+        assert "index window" in err
+
+    def test_not_must_fall_inside_index_window(self):
+        # A description that fills the limit is shown in full. Truncation to
+        # limit-3 applies only past the limit, so Not in the last three
+        # characters is still inside the index window.
+        tail = " not"
+        inside = ("x" * (SKILL_PROMPT_DESC_LIMIT - len(tail))) + tail
+        assert len(inside) == SKILL_PROMPT_DESC_LIMIT
+        assert _validate_frontmatter(_skill_md(inside), new_skill=True) is None
+
+        # The same word past the window does not count, even though the
+        # description contains it.
+        outside = ("y" * SKILL_PROMPT_DESC_LIMIT) + " not"
+        err = _validate_frontmatter(_skill_md(outside), new_skill=True)
+        assert err is not None
+        assert "index window" in err
+
+        # Not inside the window does not waive the prompt-budget cap.
+        over_budget = "Not for X. " + ("z" * SKILL_PROMPT_DESC_LIMIT)
+        budget_err = _validate_frontmatter(_skill_md(over_budget), new_skill=True)
+        assert budget_err is not None
+        assert "system-prompt budget" in budget_err
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +485,7 @@ class TestPatchSkill:
         content = """\
 ---
 name: test-skill
-description: A test skill.
+description: A test skill. Not for X.
 ---
 
 # Test
@@ -747,7 +803,7 @@ class TestPatchRecoveryLoop:
     CONTENT = """\
 ---
 name: test-skill
-description: A test skill.
+description: A test skill. Not for X.
 ---
 
 # Test Skill
@@ -1220,7 +1276,7 @@ def _skill_content(name: str) -> str:
     return (
         "---\n"
         f"name: {name}\n"
-        "description: A test skill for unit testing.\n"
+        "description: A test skill for unit testing. Not for X.\n"
         "---\n\n"
         f"# {name}\n\n"
         "Step 1: Do the thing.\n"

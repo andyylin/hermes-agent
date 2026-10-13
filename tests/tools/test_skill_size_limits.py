@@ -32,7 +32,7 @@ def _make_skill_content(body_chars: int) -> str:
     frontmatter = (
         "---\n"
         "name: test-skill\n"
-        "description: A test skill\n"
+        "description: A test skill. Not for X.\n"
         "---\n"
     )
     body = "# Test Skill\n\n" + ("x" * max(0, body_chars - 15))
@@ -62,7 +62,7 @@ class TestCreateSkillSizeLimit:
 
     def test_create_at_limit(self, isolate_skills):
         # Content at exactly the limit should succeed
-        frontmatter = "---\nname: edge-skill\ndescription: Edge case\n---\n# Edge\n\n"
+        frontmatter = "---\nname: edge-skill\ndescription: Edge case. Not for X.\n---\n# Edge\n\n"
         body_budget = MAX_SKILL_CONTENT_CHARS - len(frontmatter)
         content = frontmatter + ("x" * body_budget)
         assert len(content) == MAX_SKILL_CONTENT_CHARS
