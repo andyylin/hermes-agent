@@ -158,7 +158,7 @@ Interpreter choice is by file extension:
 | Extension | Interpreter |
 |-----------|-------------|
 | `.sh`, `.bash` | `bash` from `PATH` (fallback `/bin/bash`) |
-| anything else | `sys.executable` (current Python), or a [configured interpreter](#using-your-own-python-environment) |
+| anything else | gateway `sys.executable`, or the committed PM environment's Python; a [configured interpreter](#using-your-own-python-environment) wins |
 
 We intentionally do NOT honour `#!/...` shebangs — keeping the interpreter set explicit and small reduces the surface the scheduler trusts.
 

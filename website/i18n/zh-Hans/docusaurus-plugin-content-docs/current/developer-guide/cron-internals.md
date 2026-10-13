@@ -141,6 +141,8 @@ import requests, json
 # 将摘要打印到 stdout——agent 进行分析并报告
 ```
 
+在 POSIX 上，`.py` 脚本使用网关解释器（`sys.executable`），除非 PM 已为该安装提交依赖环境（`committed_venv`）。此时使用该环境自己的解释器，并把当前检出放在其工作区快照之前，且不设置 `PYTHONPATH`。残留的树内 `venv` 不是一次选择。Windows 仍只叠加已提交的代，否则保持交给它的解释器。每个任务的 `interpreter` 在所有平台上优先。
+
 脚本超时默认为 120 秒。`_get_script_timeout()` 通过三层链路解析限制：
 
 1. **模块级覆盖** — `_SCRIPT_TIMEOUT`（用于测试/monkeypatching）。仅在与默认值不同时使用。

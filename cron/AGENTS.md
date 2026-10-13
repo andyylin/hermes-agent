@@ -12,7 +12,9 @@ schedule via the `cronjob` tool; users via `hermes cron list|add|edit|pause|resu
 `skills`, `model`/`provider` overrides, `script` (pre-run data-collection script whose stdout is
 injected into the prompt; `no_agent=True` makes the script the whole job), `context_from` (chain job
 A's last output into job B's prompt), `workdir` (run with that directory's `AGENTS.md`/`CLAUDE.md`
-loaded), multi-platform delivery.
+loaded), multi-platform delivery. On POSIX a `script` runs with the gateway interpreter
+(`sys.executable`) unless PM has committed a dependency environment (`committed_venv`); the
+leftover `<repo>/venv` is not a fallback. Windows still overlays only a committed generation.
 
 Hardening invariants — each guards a real failure; don't weaken without answering for it:
 - **Inactivity watchdog** on cron agent sessions (`_cron_inactivity_seconds()`): default 600s idle,

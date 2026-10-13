@@ -299,6 +299,8 @@ import requests, json
 # Print summary to stdout — agent analyzes and reports
 ```
 
+On POSIX a `.py` script runs with the gateway interpreter (`sys.executable`) unless PM has committed a dependency environment for the install (`committed_venv`). That environment's own interpreter is used, with the live checkout ahead of its workspace snapshot and without `PYTHONPATH`. The leftover in-tree `venv` is not a selection. Windows still overlays only a committed generation and otherwise keeps the interpreter it was handed. A per-job `interpreter` wins on every platform.
+
 The script timeout defaults to 3600 seconds (1 hour). `_get_script_timeout()` resolves the limit through a three-layer chain:
 
 1. **Module-level override** — `_SCRIPT_TIMEOUT` (for tests/monkeypatching). Only used when it differs from the default.

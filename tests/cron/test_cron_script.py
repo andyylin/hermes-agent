@@ -362,7 +362,7 @@ class TestRunJobScript:
         monkeypatch.setattr(
             "hermes_cli._launchers.resolve_store_python", lambda repo: Path(sys.executable)
         )
-        monkeypatch.setattr("pm.environments.selected_venv", lambda repo: venv)
+        monkeypatch.setattr("pm.environments.committed_venv", lambda repo: venv)
         monkeypatch.delenv("PYTHONPATH", raising=False)
 
         script = cron_env / "scripts" / "probe.py"
@@ -404,7 +404,7 @@ class TestRunJobScript:
             "hermes_cli._launchers.resolve_store_python", lambda repo: Path(sys.executable)
         )
         monkeypatch.setattr(
-            "pm.environments.selected_venv",
+            "pm.environments.committed_venv",
             _broken if broken == "selection_raises" else (lambda repo: tmp_path / "gone-venv"),
         )
         (cron_env / "scripts" / "probe.py").write_text('print("ok")\n', encoding="utf-8")
@@ -412,6 +412,47 @@ class TestRunJobScript:
         success, output = _run_job_script("probe.py")
         assert success is False
         assert "dependency environment" in output
+
+    @pytest.mark.platforms("posix")
+    def test_posix_uncommitted_store_uses_gateway_interpreter_not_repo_venv(
+        self, cron_env, tmp_path, monkeypatch
+    ):
+        """No committed PM environment: the script runs on the gateway interpreter.
+
+        ``selected_venv`` would answer the leftover ``<repo>/venv`` — a pre-PM tree,
+        often a different Python than the process running the gateway. That path is
+        not a selection, even when a store Python is recorded.
+        """
+        stale = tmp_path / "repo-venv" / "bin" / "python"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("#!/bin/sh\nprintf '%s\\n' stale 'LAZY=1'\n", encoding="utf-8")
+        stale.chmod(0o755)
+
+        monkeypatch.setattr(
+            "hermes_cli._launchers.resolve_store_python",
+            lambda repo: Path("/store/bin/python3"),
+        )
+        monkeypatch.setattr("pm.environments.committed_venv", lambda repo: None)
+        # What project_python/selected_venv would hand the child. Production must not call them.
+        monkeypatch.setattr("pm.environments.project_python", lambda repo: stale)
+        monkeypatch.setattr("pm.environments.selected_venv", lambda repo: stale.parent.parent)
+        monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+
+        script = cron_env / "scripts" / "probe.py"
+        script.write_text(
+            "import os, sys\n"
+            "print(sys.executable)\n"
+            "print('LAZY=' + (os.environ.get('HERMES_DISABLE_LAZY_INSTALLS') or ''))\n",
+            encoding="utf-8",
+        )
+
+        from cron.scheduler_script import _run_job_script
+
+        success, output = _run_job_script("probe.py")
+        assert success is True, output
+        executable, lazy = output.splitlines()
+        assert Path(executable).resolve() == Path(sys.executable).resolve()
+        assert lazy == "LAZY="
 
     def test_emoji_stdout_round_trips_through_script_capture(self, cron_env):
         """Emoji in script stdout must reach the caller intact (#42384).
