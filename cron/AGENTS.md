@@ -28,6 +28,12 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   finds the stamp with a dead owner restores the instant ONCE (`cron/occurrences.py`), the
   executions ledger's `scheduled_instant` blocks a second fire, `cron.catch_up_missed: false`
   skips past-grace misses with a logged reason. Never drop a slot silently (#107485).
+- **`executions.db` writes stay short and retry `SQLITE_BUSY`.** Several restart-safe workers
+  adopt in the same minute. The connection asks for WAL and a busy timeout (`cron/executions.py`);
+  on a WAL-reset-vulnerable SQLite the file stays DELETE, and that journal holds its write lock
+  until commit. Liveness and config reads stay outside the transaction, writes are `BEGIN
+  IMMEDIATE`, and adopt retries a lock error — a worker that dies on the lock exits before its
+  ownership ack. Do not move `_owner_is_live` back inside the write.
 - Per-home tick lock `<home>/cron/.tick.lock` prevents duplicate ticks across processes for
   that profile's store; never a `~/.hermes/...` literal.
 - **The ticker binds each served profile's scope for the whole tick, including pre-loop code.**
