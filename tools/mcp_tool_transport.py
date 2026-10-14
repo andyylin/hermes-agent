@@ -294,19 +294,15 @@ class MCPServerTransportMixin:
     def _track_spawned_children(self, new_pids: set[int]) -> None:
         """Ledger the freshly spawned stdio children (pids, pgids, machine spawn ledger). pgids are
         captured while alive (getpgid fails after exit; the sweep needs them for reparented descendants)."""
+        from tools.mcp_tool_stdio_shutdown import adopt_stdio_pgroup
         new_pgids: dict[int, int] = {}
         new_starts: dict[int, int] = {}
         for pid in new_pids:
-            try:
-                new_pgids[pid] = os.getpgid(pid)
-            except ProcessLookupError:
-                # Raced and already exited. The SDK spawns with start_new_session=True, so the
-                # child was its own group leader (pgid == pid): keep that group covered — any
-                # descendant it left behind still has to be reaped; the prune forgets the group
-                # once nothing in it is alive.
-                new_pgids[pid] = pid
-            except (AttributeError, OSError):  # Windows (os.getpgid is POSIX-only)
-                pass
+            # Own process group so killpg reaches npx → node grandchildren without
+            # signalling the gateway. None on platforms without process groups.
+            pgid = adopt_stdio_pgroup(pid)
+            if pgid is not None:
+                new_pgids[pid] = pgid
             # Record the leader's start time so a later sweep can detect PID/PGID
             # recycling before signalling (see _stdio_starttimes, #43044).
             start = _leader_start_time(pid)

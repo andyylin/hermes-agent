@@ -1574,6 +1574,12 @@ platform_toolsets:
 #     entry falls back to the normal eager connect. The banner and the TUI show
 #     such a server as "lazy" with its cached tool count until it is first used.
 #
+# Runtime knobs (not server definitions) live under mcp: in config.yaml.
+#   mcp.stdio_shutdown_grace_seconds — seconds after SIGTERM before SIGKILL of a
+#   stdio MCP process group on gateway shutdown (default 4; 0 = SIGKILL immediately).
+#   A child that ignores SIGTERM (npx → node, n8n) is killed when this elapses
+#   instead of holding systemctl restart until TimeoutStopSec.
+#
 # mcp_servers:
 #   time:
 #     command: uvx
