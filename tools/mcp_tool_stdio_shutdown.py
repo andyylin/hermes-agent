@@ -39,6 +39,9 @@ def stdio_shutdown_grace_seconds() -> float:
         raw = (load_config().get("mcp") or {}).get(
             "stdio_shutdown_grace_seconds", DEFAULT_STDIO_SHUTDOWN_GRACE_S)
     except Exception:
+        logger.debug(
+            "mcp.stdio_shutdown_grace_seconds unreadable; using %.1f",
+            DEFAULT_STDIO_SHUTDOWN_GRACE_S, exc_info=True)
         return DEFAULT_STDIO_SHUTDOWN_GRACE_S
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         logger.warning(

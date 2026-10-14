@@ -189,7 +189,7 @@ async def _close_selected_mcp_servers(servers, *, wildcard: bool, selected, sele
         server._skip_stdio_reap = True
     results = await asyncio.gather(*(server.shutdown() for server in servers), return_exceptions=True)
     for server, result in zip(servers, results):
-        if isinstance(result, Exception):
+        if isinstance(result, BaseException):
             logger.debug("Error closing MCP server '%s': %s", server.name, result)
     with _core._lock:
         for key in selected:
@@ -209,8 +209,8 @@ def _await_scheduled_shutdown(future, timeout: float, *, reap_stdio: bool, reap_
         if reap_stdio and not reap_done.is_set():
             from tools.mcp_tool_stdio_shutdown import stdio_shutdown_grace_seconds
             reap_done.wait(stdio_shutdown_grace_seconds() + 1.0)
-    except BaseException as exc:
-        logger.debug("Error during MCP shutdown: %s", exc)
+    except BaseException:
+        logger.debug("Error during MCP shutdown", exc_info=True)
 
 
 async def _nudge_stdio_close(servers, head: float) -> None:
