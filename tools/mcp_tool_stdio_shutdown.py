@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import time
 from typing import Optional
 
@@ -100,7 +101,7 @@ def adopt_stdio_pgroup(pid: int) -> Optional[int]:
     except OSError as exc:
         logger.warning(
             "MCP stdio pid %d shares the gateway process group and setpgid failed (%s); "
-            "shutdown will signal only that pid, so grandchildren may survive",
+            "shutdown will signal that pid and its descendants, not the group",
             pid, exc)
         return pgid
     return pid
@@ -245,9 +246,8 @@ def escalate_taken_groups(pids, pgids, starts, *, grace: float, posix: Optional[
         return
     if posix is None:
         posix = os.name == "posix"
-    import signal as _signal
     my_pgid = _my_pgid() if posix else None
-    sigkill = getattr(_signal, "SIGKILL", _signal.SIGTERM)
+    sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
     # Leaders that share our group: killpg would include us. Snapshot their
     # descendants now so a leader that exits on SIGTERM cannot hide them.
     shared = _shared_group_descendants(pids, pgids, my_pgid) if posix else []
@@ -257,14 +257,14 @@ def escalate_taken_groups(pids, pgids, starts, *, grace: float, posix: Optional[
             return True
         return any(_leader_alive(pid) for pid in shared)
 
-    def _signal(sig: int) -> None:
+    def _deliver(sig: int) -> None:
         _signal_members(pids, pgids, starts, sig, posix=posix, my_pgid=my_pgid)
         _signal_pid_list(shared, sig)
 
-    _signal(_signal.SIGTERM)
+    _deliver(signal.SIGTERM)
     _wait_until_quiet(grace, _busy)
     if _busy():
-        _signal(sigkill)
+        _deliver(sigkill)
         for pid, owner in pids.items():
             if _leader_alive(pid):
                 logger.warning(
