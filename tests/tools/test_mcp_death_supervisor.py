@@ -627,7 +627,7 @@ def test_connecting_a_stdio_server_registers_its_real_process_group():
     child = subprocess.Popen(_VICTIM, start_new_session=True)
     try:
         with _stdio_connection(child.pid, fake) as server:
-            asyncio.run(server.start({"command": "echo", "args": ["hi"]}))
+            asyncio.run(server.start({"command": "/bin/echo", "args": ["hi"]}))
 
         assert f"register {os.getpgid(child.pid)}" in fake.lines(), (
             "connecting a stdio server did not hand its process group to the "
@@ -647,7 +647,7 @@ def test_a_server_that_exited_is_released_on_teardown():
         with _stdio_connection(child.pid, fake) as server:
 
             async def _connect_then_lose_the_child():
-                await server.start({"command": "echo", "args": ["hi"]})
+                await server.start({"command": "/bin/echo", "args": ["hi"]})
                 nonlocal pgid
                 pgid = os.getpgid(child.pid)
                 # The server exits while connected. Reap it here so the
@@ -678,7 +678,7 @@ def test_shutdown_kills_a_stdio_child_and_releases_its_group():
         with _stdio_connection(child.pid, fake) as server:
 
             async def _connect_then_shutdown():
-                await server.start({"command": "echo", "args": ["hi"]})
+                await server.start({"command": "/bin/echo", "args": ["hi"]})
                 await server.shutdown()
 
             asyncio.run(_connect_then_shutdown())
@@ -709,7 +709,7 @@ def test_a_server_that_survived_teardown_stays_registered(monkeypatch):
         with _stdio_connection(child.pid, fake) as server:
 
             async def _connect_then_shutdown():
-                await server.start({"command": "echo", "args": ["hi"]})
+                await server.start({"command": "/bin/echo", "args": ["hi"]})
                 await server.shutdown()
 
             asyncio.run(_connect_then_shutdown())

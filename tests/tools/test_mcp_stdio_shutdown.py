@@ -58,25 +58,6 @@ while True:
     time.sleep(3600)
 """
 
-_ADOPT_CHILD = """\
-import os, sys, time
-pid_path, gc_path = sys.argv[1], sys.argv[2]
-with open(pid_path, "w") as handle:
-    handle.write(str(os.getpid()))
-line = sys.stdin.readline()
-if not line.startswith("spawn"):
-    os._exit(1)
-child = os.fork()
-if child == 0:
-    with open(gc_path, "w") as handle:
-        handle.write("%s %s" % (os.getpid(), os.getpgid(0)))
-    while True:
-        time.sleep(3600)
-while True:
-    time.sleep(3600)
-"""
-
-
 def _dead(pid: int) -> bool:
     import psutil
     try:
@@ -87,10 +68,27 @@ def _dead(pid: int) -> bool:
 
 
 def _kill_group(pgid: int) -> None:
+    """SIGKILL ``pgid`` unless it is this process's group.
+
+    A failed ``setpgid`` leaves the child in our group. Killing that group
+    kills the test runner.
+    """
     if not hasattr(os, "killpg"):
         return
     try:
+        if pgid == os.getpgrp():
+            return
+    except OSError:
+        return
+    try:
         os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _kill_pid(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGKILL)
     except OSError:
         pass
 
@@ -271,34 +269,92 @@ def test_every_group_shares_one_grace(tmp_path, clean_ledger):
 
 @pytest.mark.platforms("posix")
 @pytest.mark.live_system_guard_bypass
-def test_adopt_moves_child_off_our_group_before_grandchildren(tmp_path, clean_ledger):
-    """A child that still shares our group is adopted; a grandchild spawned after joins it."""
+def test_adopt_moves_an_unexeced_child_before_it_forks(tmp_path, clean_ledger):
+    """``setpgid`` works only before exec. A forked child becomes its own leader;
+    the grandchild it then forks inherits that group, and reap kills both."""
     pytest.importorskip("psutil")
     from tools.mcp_tool_stdio_shutdown import adopt_stdio_pgroup, reap_stdio_servers
 
-    pid_path = tmp_path / "pid"
     gc_path = tmp_path / "gc"
-    proc = _spawn(
-        _ADOPT_CHILD, [str(pid_path), str(gc_path)], new_session=False, stdin=subprocess.PIPE)
+    go_read, go_write = os.pipe()
+    park_read, park_write = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        # Never return into pytest. A forked interpreter that keeps running
+        # the test body would reap the parent and itself.
+        try:
+            os.close(go_write)
+            os.close(park_write)
+            os.read(go_read, 1)
+            grandchild = os.fork()
+            if grandchild == 0:
+                with open(gc_path, "w") as handle:
+                    handle.write(f"{os.getpid()} {os.getpgid(0)}\n")
+                os.read(park_read, 1)
+            else:
+                os.read(park_read, 1)
+        finally:
+            os._exit(0)
+
+    os.close(go_read)
+    os.close(park_read)
     adopted = None
     try:
-        _await_file(pid_path)
-        assert os.getpgid(proc.pid) == os.getpgrp()
-        adopted = adopt_stdio_pgroup(proc.pid)
+        adopted = adopt_stdio_pgroup(pid)
         assert adopted is not None and adopted != os.getpgrp()
-        assert os.getpgid(proc.pid) == adopted
-        proc.stdin.write(b"spawn\n")
-        proc.stdin.flush()
+        assert os.getpgid(pid) == adopted
+        os.write(go_write, b"x")
         _await_file(gc_path)
         grandchild_pid, grandchild_pgid = (int(part) for part in gc_path.read_text().split())
         assert grandchild_pgid == adopted
-        _register(proc.pid, "n8n", adopted)
+        _register(pid, "n8n", adopted)
+        started = time.monotonic()
         reap_stdio_servers({"n8n"}, grace=0.4)
-        wait_until(
-            lambda: _dead(proc.pid) and _dead(grandchild_pid), timeout=5, what="adopted tree exited")
+        elapsed = time.monotonic() - started
+        wait_until(lambda: _dead(pid) and _dead(grandchild_pid), timeout=5, what="adopted tree exited")
+        assert elapsed < 2.4
     finally:
+        os.close(go_write)
+        os.close(park_write)
         if adopted is not None:
             _kill_group(adopted)
+        _kill_pid(pid)
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.live_system_guard_bypass
+def test_shared_group_after_exec_kills_the_tree_not_us(tmp_path, clean_ledger):
+    """After exec, ``setpgid`` is refused. Reap still kills the grandchild, and not us."""
+    pytest.importorskip("psutil")
+    from tools.mcp_tool_stdio_shutdown import adopt_stdio_pgroup, reap_stdio_servers
+
+    gc_path = tmp_path / "gc"
+    ready = tmp_path / "ready"
+    proc = _spawn(_IGNORING_TREE, [str(gc_path), str(ready)], new_session=False)
+    grandchild = None
+    try:
+        _await_file(ready)
+        _await_file(gc_path)
+        grandchild = int(gc_path.read_text().strip())
+        assert os.getpgid(proc.pid) == os.getpgrp()
+        assert os.getpgid(grandchild) == os.getpgrp()
+        adopted = adopt_stdio_pgroup(proc.pid)
+        assert adopted == os.getpgrp()
+        _register(proc.pid, "n8n", adopted)
+        started = time.monotonic()
+        reap_stdio_servers({"n8n"}, grace=0.4)
+        elapsed = time.monotonic() - started
+        wait_until(
+            lambda: _dead(proc.pid) and _dead(grandchild), timeout=5, what="shared-group tree exited")
+        assert elapsed < 2.4
+    finally:
+        _kill_pid(proc.pid)
+        if grandchild is not None:
+            _kill_pid(grandchild)
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:

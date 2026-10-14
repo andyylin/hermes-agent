@@ -387,15 +387,16 @@ def _signal_mcp_process(pid: int, sig: int, server_name: str, pgid: Optional[int
     killpg = getattr(os, "killpg", None)
     if pgid is not None and killpg is not None:
         if my_pgid is not None and pgid == my_pgid:
-            # Child shares the gateway's pgroup: killpg would kill the gateway too, so use
-            # per-pid kill. Warn because per-pid kill can't reach grandchildren in this group.
-            logger.warning("MCP server '%s' pgid %d matches gateway pgid; skipping "
-                           # Fall through to the per-pid kill() path instead. Warn because per-pid kill
-                           # cannot reach grandchildren in this shared group — if the direct child has
-                           # already exited, they may leak (inherent: group-killing them would also kill the
-                           # gateway). See #47134.
-                           "killpg to avoid self-kill and using per-pid kill — any "
-                           "grandchildren in this group may not be reaped", server_name, pgid)
+            # Child shares the gateway's pgroup. killpg would kill the gateway.
+            # POSIX also refuses setpgid() after the child has exec'd, so the
+            # child cannot be moved now. Signal descendants individually
+            # (npx → node) before the leader: once the leader exits they
+            # reparent and a tree walk can no longer find them. See #47134.
+            logger.warning(
+                "MCP server '%s' pgid %d matches gateway pgid; skipping killpg "
+                "to avoid self-kill and signalling descendants individually",
+                server_name, pgid)
+            _signal_descendant_tree(pid, sig)
         else:
             try:
                 killpg(pgid, sig)
@@ -410,6 +411,27 @@ def _signal_mcp_process(pid: int, sig: int, server_name: str, pgid: Optional[int
         pass
     if os.name == "nt":  # Windows has no pgid reaching reparented grandchildren — kill the tree
         _kill_windows_process_tree(pid, sig)
+
+
+def _signal_descendant_tree(pid: int, sig: int) -> None:
+    """Signal each live descendant of ``pid`` without signalling its process group.
+
+    Used when the child shares the gateway group (``killpg`` would include the
+    gateway, and ``setpgid`` after exec is refused). Best-effort; never raises.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return
+    try:
+        descendants = psutil.Process(pid).children(recursive=True)
+    except (psutil.Error, OSError):
+        return
+    for child in descendants:
+        try:
+            os.kill(child.pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
 
 
 def _kill_windows_process_tree(pid: int, sig: int) -> None:

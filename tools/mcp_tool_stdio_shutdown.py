@@ -70,10 +70,10 @@ def adopt_stdio_pgroup(pid: int) -> Optional[int]:
     """Return the child's process group, moving it off the gateway's group if needed.
 
     The MCP SDK spawns with ``start_new_session`` (the child is already its own
-    leader, so grandchildren inherit that group). When a child is still in the
-    gateway's group, ``killpg`` would signal the gateway too, and a per-pid
-    kill misses ``npx`` → ``node`` grandchildren. ``setpgid`` makes this child
-    the leader of a new group; processes it spawns afterwards join that group.
+    leader, so grandchildren inherit that group). ``setpgid`` can move a child
+    that has not exec'd yet; POSIX refuses it after exec (EACCES). A child that
+    is still in the gateway's group stays there — ``killpg`` would signal the
+    gateway — and shutdown signals its descendants individually instead.
     ``None`` on platforms without process groups.
     """
     getpgid = getattr(os, "getpgid", None)
@@ -135,6 +135,41 @@ def _group_still_running(posix: bool, pgid: Optional[int], my_pgid: Optional[int
         return False
     from tools.mcp_tool_lifecycle import _group_alive
     return _group_alive(pgid, my_pgid)
+
+
+def _descendant_pids(pid: int) -> list[int]:
+    """Children of ``pid``, snapshotted while it is still alive.
+
+    A leader that exits on SIGTERM reparents ``npx``'s ``node`` grandchild onto
+    init. The pid list captured here is what the SIGKILL pass still signals
+    when the leader's process group is the gateway's and ``killpg`` is unsafe.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return []
+    try:
+        return [child.pid for child in psutil.Process(pid).children(recursive=True)]
+    except (psutil.Error, OSError):
+        return []
+
+
+def _shared_group_descendants(pids, pgids, my_pgid: Optional[int]) -> list[int]:
+    if my_pgid is None:
+        return []
+    descendants = []
+    for pid in pids:
+        if pgids.get(pid) == my_pgid:
+            descendants.extend(_descendant_pids(pid))
+    return descendants
+
+
+def _signal_pid_list(pids, sig: int) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
 
 
 def _signal_members(pids, pgids, starts, sig: int, *, posix: bool, my_pgid: Optional[int]) -> None:
@@ -213,19 +248,30 @@ def escalate_taken_groups(pids, pgids, starts, *, grace: float, posix: Optional[
     import signal as _signal
     my_pgid = _my_pgid() if posix else None
     sigkill = getattr(_signal, "SIGKILL", _signal.SIGTERM)
+    # Leaders that share our group: killpg would include us. Snapshot their
+    # descendants now so a leader that exits on SIGTERM cannot hide them.
+    shared = _shared_group_descendants(pids, pgids, my_pgid) if posix else []
 
     def _busy() -> bool:
-        return _needs_signal(pids, pgids, posix=posix, my_pgid=my_pgid)
+        if _needs_signal(pids, pgids, posix=posix, my_pgid=my_pgid):
+            return True
+        return any(_leader_alive(pid) for pid in shared)
 
-    _signal_members(pids, pgids, starts, _signal.SIGTERM, posix=posix, my_pgid=my_pgid)
+    def _signal(sig: int) -> None:
+        _signal_members(pids, pgids, starts, sig, posix=posix, my_pgid=my_pgid)
+        _signal_pid_list(shared, sig)
+
+    _signal(_signal.SIGTERM)
     _wait_until_quiet(grace, _busy)
     if _busy():
-        _signal_members(pids, pgids, starts, sigkill, posix=posix, my_pgid=my_pgid)
+        _signal(sigkill)
         for pid, owner in pids.items():
             if _leader_alive(pid):
                 logger.warning(
                     "Force-killed MCP process %d (%s) after %.1fs SIGTERM grace", pid, owner, grace)
-        _wait_until_quiet(_SIGKILL_SETTLE_S, lambda: any(_leader_alive(pid) for pid in pids))
+        _wait_until_quiet(
+            _SIGKILL_SETTLE_S,
+            lambda: any(_leader_alive(pid) for pid in pids) or any(_leader_alive(pid) for pid in shared))
 
     survivors = []
     released = []
