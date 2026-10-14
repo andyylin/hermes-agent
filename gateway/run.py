@@ -4850,58 +4850,52 @@ async def _await_thread_exit(
     return not thread.is_alive()
 
 
-async def _shutdown_mcp_servers_nonblocking(timeout: float = 5.0, config: Any = None) -> bool:
-    """Close MCP servers off-loop with a bounded wait; True when done within ``timeout``.
-    ``shutdown_mcp_servers()`` can block ~15s; on the loop thread short-grace supervisors (s6 3s)
-    SIGKILL us before ``mark_exited()`` runs, so every later boot reports a phantom unclean death.
-    On timeout shutdown proceeds and the daemon thread is left to finish or die.
+async def _shutdown_mcp_servers_nonblocking(timeout: Optional[float] = None, config: Any = None) -> bool:
+    """Close MCP servers off-loop; True when the worker finishes within the join budget.
 
-    Teardown is per served profile, under that profile's runtime scope — the mirror of startup
-    discovery (``_discover_mcp_tools_for_profiles``) and of the periodic reconcile chore. A
-    server's close path reads its own config/credentials at call time, so an unscoped shutdown on
-    a bare thread resolved every served profile's teardown against the LAUNCH home. The trailing
-    wildcard call (under the launch profile's own scope) stops the shared loop and reaps anything
-    the per-profile passes did not own.
-
-    ``timeout`` is a TOTAL budget: each pass gets ``timeout / (N + 1)``, because the default 15s
-    per-pass wait inside ``shutdown_mcp_servers`` let N profiles consume the whole caller budget and
-    the trailing wildcard pass — the only one that stops the shared loop — never ran.
-
-    The worker runs in a FRESH context, not ``copy_context()``: the caller may sit inside a served
-    profile's scope, and the trailing wildcard pass must run under the launch profile's own scope
-    (``launch_profile_scope_if_multiplexed`` binds the launch home) — inheriting the caller's made it
-    resolve the live home to that profile.
+    Per-profile passes only close sessions (``reap_stdio=False``). The trailing wildcard
+    pass, under the launch profile's own scope, SIGTERMs every stdio process group, waits
+    one grace, then SIGKILL — N profiles must not pay N graces, and a child that ignores
+    SIGTERM (npx → node) must not hold stop until systemd TimeoutStopSec. When ``timeout``
+    is omitted the join covers that grace. An explicit ``timeout`` is still split evenly
+    so a caller budget cannot be consumed before the wildcard pass. The worker runs in a
+    fresh context so a caller inside a served profile does not poison the launch-home pass.
+    s6-style supervisors that SIGKILL around 3s should lower ``mcp.stdio_shutdown_grace_seconds``.
 
     See #82874.
     """
-    from tui_gateway.launch_profile_policy import launch_profile_scope_if_multiplexed
+    from tools.mcp_tool_stdio_shutdown import gateway_mcp_shutdown_budget
 
     profile_homes = (
         _multiplex_profile_homes(config) if getattr(config, "multiplex_profiles", False) else [])
-    pass_timeout = max(1.0, timeout / (len(profile_homes) + 1))
+    join_timeout, profile_timeout, wildcard_timeout = gateway_mcp_shutdown_budget(
+        timeout, len(profile_homes))
 
     def _do() -> None:
         from tools.mcp_tool_common import _core
         from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+        from tui_gateway.launch_profile_policy import launch_profile_scope_if_multiplexed
         for profile_name, profile_home in profile_homes:
             try:
                 with _profile_runtime_scope(Path(profile_home), hydrate_secrets=False):
-                    shutdown_mcp_servers(scope=_core._mcp_registry_scope(), timeout=pass_timeout)
+                    shutdown_mcp_servers(
+                        scope=_core._mcp_registry_scope(), timeout=profile_timeout,
+                        reap_stdio=False)
             except Exception:
                 logger.debug("MCP shutdown raised for profile '%s'", profile_name, exc_info=True)
         try:
             with launch_profile_scope_if_multiplexed():
-                shutdown_mcp_servers(timeout=pass_timeout)
+                shutdown_mcp_servers(timeout=wildcard_timeout, reap_stdio=True)
         except Exception:
             logger.debug("MCP shutdown raised", exc_info=True)
 
     thread = threading.Thread(target=Context().run, args=(_do,), name="mcp-shutdown", daemon=True)
     thread.start()
-    done = await _await_thread_exit(thread, timeout=timeout)
+    done = await _await_thread_exit(thread, timeout=join_timeout)
     if not done:
         logger.warning(
             "MCP shutdown did not finish within %.1fs; continuing gateway "
-            "teardown (background thread will be reaped at process exit)", timeout)
+            "teardown (background thread will be reaped at process exit)", join_timeout)
     return done
 
 

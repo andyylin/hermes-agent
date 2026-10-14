@@ -757,10 +757,19 @@ simultaneous provider calls. Tune it in `config.yaml`:
 ```yaml
 mcp:
   discovery_concurrency: 4   # max simultaneous server connects; 0 = unlimited
+  stdio_shutdown_grace_seconds: 4.0  # SIGTERM→SIGKILL wait on stop; 0 = SIGKILL immediately
 ```
 
 A pass with more servers than the cap runs in waves; each wave keeps the usual 120 s budget (whole
 pass capped at 300 s), so a slow fleet finishes later rather than timing out.
+
+On gateway stop, Hermes closes each stdio session (stdin) and then signals that server's
+process group: SIGTERM, one shared wait of `mcp.stdio_shutdown_grace_seconds`, then SIGKILL.
+Every server is signalled together — the grace is not paid once per server. A child that
+ignores SIGTERM (`npx` launching `node`, including n8n) is force-killed when the grace
+elapses instead of holding `systemctl restart` until systemd's `TimeoutStopSec`. Set the
+grace to `0` to SIGKILL immediately after SIGTERM. Supervisors that stop the gateway in
+about 3 seconds (s6) should set it below that window.
 
 ### Lazy start
 

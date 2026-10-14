@@ -538,14 +538,20 @@ class MCPServerRunMixin:
             raise self._error
 
     async def shutdown(self):
-        """Signal the Task to exit and wait for clean resource teardown."""
+        """Signal the Task to exit and wait for clean resource teardown.
+
+        The wait is short on purpose: a stdio child that ignores SIGTERM must not
+        hold this join. Batch shutdown reaps every group once and sets
+        ``_skip_stdio_reap`` so this method does not pay a second grace.
+        """
+        from tools.mcp_tool_stdio_shutdown import SESSION_CLOSE_TIMEOUT_S
         self._shutdown_event.set()
         # Also set reconnect: closes any race where _wait_for_lifecycle_event misses the
         # shutdown flag after returning "reconnect".
         self._reconnect_event.set()
         if self._task and not self._task.done():
             try:
-                await asyncio.wait_for(self._task, timeout=10)
+                await asyncio.wait_for(self._task, timeout=SESSION_CLOSE_TIMEOUT_S)
             except TimeoutError:
                 logger.warning("MCP server '%s' shutdown timed out, cancelling task", self.name)
                 self._task.cancel()
@@ -560,6 +566,9 @@ class MCPServerRunMixin:
             self._pending_refresh_tasks.clear()
         self._deregister_tools()
         self.session = None
+        if not getattr(self, "_skip_stdio_reap", False):
+            from tools.mcp_tool_stdio_shutdown import reap_stdio_servers
+            await asyncio.to_thread(reap_stdio_servers, {self.name})
 
     def _deregister_tools(self) -> None:
         """Drop this server's tools from the registry (idempotent); on shutdown AND budget
