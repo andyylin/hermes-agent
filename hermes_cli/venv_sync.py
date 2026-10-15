@@ -617,6 +617,10 @@ def relaunch_command(
     to that interpreter, and do not depend on its obsolete editable finder.
     The ``-c`` snippet activates the committed environment before ``runpy``
     so the guest imports that generation, not the bare store interpreter.
+    A script file also gets its own directory at the front of ``sys.path``,
+    which ``python script.py`` does and ``-I`` plus ``runpy.run_path`` do not.
+    ``-m`` targets are left alone: their search path is the checkout, not a
+    script folder.
     """
     # Preserve interpreter options, not application flags with the same names.
     options: list[str] = []
@@ -644,7 +648,13 @@ def relaunch_command(
     else:
         # distlib .exe launchers are executable zip files with __main__, not
         # importable modules named '__main__'. run_path handles both shapes.
-        body = f"runpy.run_path({str(Path(argv[0]).absolute())!r}, run_name='__main__')"
+        # Insert after activation: that call rewrites sys.path and would bury
+        # the script directory behind the checkout.
+        script = Path(argv[0]).absolute()
+        body = (
+            f"sys.path.insert(0, {str(script.parent)!r}); "
+            f"runpy.run_path({str(script)!r}, run_name='__main__')"
+        )
     return [str(python), *options, "-I", "-c", prefix + body]
 
 
