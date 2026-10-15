@@ -397,6 +397,47 @@ def test_relaunch_activates_managed_env_before_the_guest_imports(tmp_path):
     assert json.loads(result.stdout) == {"fastapi": "managed"}
 
 
+def test_relaunch_str_root_reaches_real_activate_dependencies(tmp_path, monkeypatch):
+    """The ``-c`` snippet passes a str. ``activate_dependencies`` must accept it.
+
+    A stub that ignores its argument hides ``project_root.resolve()`` raising
+    ``AttributeError: 'str' object has no attribute 'resolve'``.
+    """
+    from pm import environments as runtime_paths
+
+    repo = Path(__file__).resolve().parents[2]
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    state = runtime_paths.install_state_dir(repo)
+    selected = state / "environments" / "new" / "venv"
+    site = selected / (
+        "Lib/site-packages" if os.name == "nt"
+        else f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+    )
+    site.mkdir(parents=True)
+    (selected / "pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
+    (site / "webui_probe.py").write_text("origin = 'managed'\n", encoding="utf-8")
+    (state / "facts.json").write_text(json.dumps({
+        "schema": 1,
+        "packages": {"venv": {"environment": str(selected)}},
+    }), encoding="utf-8")
+    script = tmp_path / "hermex-webui-start.sh"
+    script.write_text(
+        "import json, webui_probe\n"
+        "print(json.dumps({'origin': webui_probe.origin}))\n",
+        encoding="utf-8",
+    )
+    command = venv_sync.relaunch_command(
+        Path(sys.executable), repo, [str(script)], [sys.executable, str(script)], None,
+    )
+    source = command[command.index("-c") + 1]
+    assert f"activate_dependencies({str(repo)!r})" in source
+    result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+    assert result.returncode == 0, result.stderr
+    assert "AttributeError" not in result.stderr
+    assert json.loads(result.stdout) == {"origin": "managed"}
+
+
 def test_relaunch_runs_zip_launchers_and_preserves_interpreter_options(tmp_path):
     import zipfile
     launcher = tmp_path / "hermes.exe"

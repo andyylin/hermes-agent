@@ -1109,14 +1109,23 @@ def system_gateway_install_command(
     )
 
 
-def chown_root_owned_command(home: Path, uid: int, gid: int) -> tuple[str, ...]:
-    """Give back only the files the system install created as root."""
+def chown_root_owned_command(
+    home: Path, uid: int, gid: int, since: Path
+) -> tuple[str, ...]:
+    """Chown root-owned paths whose status changed after ``since``.
+
+    ``since`` is a file touched immediately before ``gateway install``.
+    GNU find ``-cnewer`` compares ctime to that file's mtime, so pre-existing
+    root-owned files the install did not create or touch stay root-owned.
+    """
     return (
         "sudo",
         "find",
         str(home),
         "-user",
         "root",
+        "-cnewer",
+        str(since),
         "-exec",
         "chown",
         f"{uid}:{gid}",
@@ -1727,7 +1736,9 @@ def _cmd_system_install(args: argparse.Namespace) -> int:
 
 def _cmd_chown_root(args: argparse.Namespace) -> int:
     return _print_argv(
-        chown_root_owned_command(Path(args.home), args.uid, args.gid)
+        chown_root_owned_command(
+            Path(args.home), args.uid, args.gid, Path(args.since)
+        )
     )
 
 
@@ -1797,6 +1808,7 @@ def _build_parser() -> argparse.ArgumentParser:
     chown_root.add_argument("--home", required=True)
     chown_root.add_argument("--uid", type=int, required=True)
     chown_root.add_argument("--gid", type=int, required=True)
+    chown_root.add_argument("--since", required=True)
     chown_root.set_defaults(func=_cmd_chown_root)
 
     orphans = sub.add_parser("orphans")

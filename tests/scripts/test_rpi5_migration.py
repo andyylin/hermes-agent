@@ -431,12 +431,15 @@ def test_system_gateway_install_keeps_home_and_chowns_only_root_files():
         "--run-as-user",
         "pi",
     )
-    assert mig.chown_root_owned_command(home, 1000, 1000) == (
+    stamp = Path("/home/pi/rpi5-install-stamp")
+    assert mig.chown_root_owned_command(home, 1000, 1000, stamp) == (
         "sudo",
         "find",
         "/home/pi/.hermes",
         "-user",
         "root",
+        "-cnewer",
+        str(stamp),
         "-exec",
         "chown",
         "1000:1000",

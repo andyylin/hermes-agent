@@ -645,17 +645,23 @@ not make the already-running default process re-read config.
    That runs:
 
    ```bash
+   stamp=$(mktemp)
+   touch "$stamp"
    sudo env HERMES_HOME=/home/pi/.hermes \
      /home/pi/.hermes/hermes-agent/.hermes/bin/hermes \
      gateway install --system --run-as-user pi
-   sudo find /home/pi/.hermes -user root -exec chown "$(id -u):$(id -g)" {} +
+   sudo find /home/pi/.hermes -user root -cnewer "$stamp" \
+     -exec chown "$(id -u):$(id -g)" {} +
+   rm -f "$stamp"
    ```
 
    The script uses `$HOME/.hermes` and `id -un`, which are `/home/pi/.hermes`
    and `pi` when the operator is `pi`. It does not also build the environment.
-   The install runs as root and can leave root-owned files under the user's
-   Hermes home. The `find` chowns only those files. It does not chown the
-   whole tree, and it does not chown the system unit drop-ins.
+   The install runs as root and can leave new root-owned files under the
+   user's Hermes home. The `find` chowns root-owned paths whose status changed
+   during that install (`-cnewer` is ctime against the stamp's mtime).
+   Root-owned files the install did not create or touch stay as they are.
+   It does not chown the system unit drop-ins.
 
    This rewrites `hermes-gateway.service` and enables it. It does not restart a
    running process, and it does not remove `zz-multiplex-memory.conf` or

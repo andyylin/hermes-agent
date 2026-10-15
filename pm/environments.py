@@ -446,14 +446,20 @@ def _require_own_dependencies(project_root: Path) -> None:
         raise RuntimeError("no dependency environment is committed for this install")
 
 
-def activate_dependencies(project_root: Path) -> None:
+def activate_dependencies(project_root: Path | str) -> None:
     """Select the committed tree at process boot, before third-party imports.
+
+    ``project_root`` may be a string. The store-interpreter relaunch passes one:
+    its ``-c`` snippet has no ``Path`` binding, and ``project_root.resolve()``
+    on that string raises ``AttributeError``. Callers that already hold a Path
+    are unchanged.
 
     A process with no extension selection keeps its original launch contract.
     Already-running processes are never switched after a dependency install.
     """
     import sys
 
+    project_root = Path(project_root)
     state = install_state_dir(project_root)
     if state.is_dir():
         from hermes_cli.runtime_state import runtime_lock, recover_publication, lease_generation
