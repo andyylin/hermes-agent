@@ -32,11 +32,11 @@ def test_activates_for_a_real_second_profile(two_profile_host):
     assert secret_scope.is_multiplex_active()
 
 
-def test_the_retired_opt_out_no_longer_disarms_the_credential_guard(two_profile_host, monkeypatch):
-    """``gateway.multiplex_profiles: false`` is retired as a topology opt-out, so it must not
-    disarm this guard: a multi-home host that skipped activation because of a stale ``false``
-    would serve the second profile with the LAUNCH profile's credentials -- the exact fail-open
-    the guard exists to prevent. The host is multi-profile; that is the whole question."""
+def test_config_false_does_not_disarm_the_credential_guard(two_profile_host, monkeypatch):
+    """The messaging gateway honors ``false``; this guard must not.
+
+    A multi-home host that skipped activation because of ``false`` would serve the second profile
+    with the LAUNCH profile's credentials. The host is multi-profile; that is the whole question."""
     (two_profile_host / "config.yaml").write_text("{}\n", encoding="utf-8")
     from hermes_cli import config as cfg_mod
 
