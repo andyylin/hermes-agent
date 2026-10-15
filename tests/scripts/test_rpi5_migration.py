@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -126,6 +127,9 @@ def test_webui_without_python_pin_is_left_alone():
     assert len(lines) == 1
     assert "Interpreter drop-in: leave" in lines[0]
     assert "hermes dashboard" in lines[0]
+    assert "activates the managed environment" in lines[0]
+    assert "Do not set HERMES_DISABLE_LAZY_INSTALLS." in lines[0]
+    assert "fastapi" in lines[0]
 
 
 def test_scan_roots_groups_dropins_with_the_owning_unit(tmp_path: Path):
@@ -319,6 +323,144 @@ def test_sideline_and_rollback_round_trip(tmp_path: Path):
     assert not (dropins / mig.RUNTIME_DROPIN).exists()
 
 
+def _write_pinning(dropins: Path) -> None:
+    for name in (*mig.PINNING_DROPINS, mig.MEMORY_DROPIN):
+        body = MEMORY_BODY if name == mig.MEMORY_DROPIN else PIN_BODY
+        (dropins / name).write_text(body, encoding="utf-8")
+
+
+def test_sideline_moves_set_property_memory_overrides(tmp_path: Path):
+    dropins = tmp_path / "hermes-gateway.service.d"
+    backup = tmp_path / "backup"
+    control = tmp_path / "system.control" / "hermes-gateway.service.d"
+    dropins.mkdir()
+    control.mkdir(parents=True)
+    _write_pinning(dropins)
+    (control / "50-MemoryHigh.conf").write_text(
+        "[Service]\nMemoryHigh=2G\n", encoding="utf-8"
+    )
+    (control / "50-MemoryMax.conf").write_text(MEMORY_BODY, encoding="utf-8")
+    (control / "50-CPUQuota.conf").write_text("[Service]\nCPUQuota=50%\n", encoding="utf-8")
+
+    moved = mig.sideline_dropins(dropins, backup, control)
+    assert "50-MemoryHigh.conf" in moved
+    assert "50-MemoryMax.conf" in moved
+    assert "50-CPUQuota.conf" not in moved
+    assert not (control / "50-MemoryMax.conf").exists()
+    assert (control / "50-CPUQuota.conf").is_file()
+    assert (backup / "50-MemoryMax.conf").read_text(encoding="utf-8") == MEMORY_BODY
+
+    again = mig.sideline_dropins(dropins, backup, control)
+    assert again == ()
+
+    actions = mig.rollback_dropins(dropins, backup, control)
+    assert "restored 50-MemoryHigh.conf" in actions
+    assert "restored 50-MemoryMax.conf" in actions
+    assert (control / "50-MemoryMax.conf").read_text(encoding="utf-8") == MEMORY_BODY
+    assert not (backup / "50-MemoryHigh.conf").exists()
+
+
+def test_rollback_does_not_require_set_property_files(tmp_path: Path):
+    dropins = tmp_path / "hermes-gateway.service.d"
+    backup = tmp_path / "backup"
+    control = tmp_path / "system.control" / "hermes-gateway.service.d"
+    dropins.mkdir()
+    _write_pinning(dropins)
+    mig.sideline_dropins(dropins, backup, control)
+    assert mig.control_memory_files(control) == []
+    actions = mig.rollback_dropins(dropins, backup, control)
+    assert not any("50-Memory" in action for action in actions)
+    assert (dropins / mig.MEMORY_DROPIN).is_file()
+    assert not control.exists()
+
+
+def test_sideline_privilege_follows_write_access(tmp_path: Path):
+    if os.geteuid() == 0:
+        pytest.skip("root can write a mode 0555 directory")
+    dropins = tmp_path / "hermes-gateway.service.d"
+    dropins.mkdir()
+    control = tmp_path / "system.control" / "hermes-gateway.service.d"
+    assert mig.sideline_privilege(dropins, control) == "user"
+    dropins.chmod(0o555)
+    try:
+        assert mig.sideline_privilege(dropins, control) == "root"
+    finally:
+        dropins.chmod(0o755)
+    control.mkdir(parents=True)
+    (control / "50-MemoryMax.conf").write_text(MEMORY_BODY, encoding="utf-8")
+    control.chmod(0o555)
+    try:
+        assert mig.sideline_privilege(dropins, control) == "root"
+    finally:
+        control.chmod(0o755)
+
+
+def test_rollback_privilege_is_root_when_control_parent_is_not_writable(tmp_path: Path):
+    if os.geteuid() == 0:
+        pytest.skip("root can write a mode 0555 directory")
+    dropins = tmp_path / "hermes-gateway.service.d"
+    dropins.mkdir()
+    parent = tmp_path / "locked"
+    parent.mkdir()
+    control = parent / "hermes-gateway.service.d"
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    (backup / "50-MemoryMax.conf").write_text(MEMORY_BODY, encoding="utf-8")
+    parent.chmod(0o555)
+    try:
+        assert mig.sideline_privilege(dropins, control, backup) == "root"
+    finally:
+        parent.chmod(0o755)
+
+
+def test_compiler_env_selects_gcc():
+    assert mig.compiler_assignments() == ("CC=gcc", "CXX=g++")
+
+
+def test_system_gateway_install_keeps_home_and_chowns_only_root_files():
+    home = Path("/home/pi/.hermes")
+    launcher = Path("/home/pi/.hermes/hermes-agent/.hermes/bin/hermes")
+    assert mig.system_gateway_install_command(home, "pi", launcher) == (
+        "sudo",
+        "env",
+        "HERMES_HOME=/home/pi/.hermes",
+        str(launcher),
+        "gateway",
+        "install",
+        "--system",
+        "--run-as-user",
+        "pi",
+    )
+    assert mig.chown_root_owned_command(home, 1000, 1000) == (
+        "sudo",
+        "find",
+        "/home/pi/.hermes",
+        "-user",
+        "root",
+        "-exec",
+        "chown",
+        "1000:1000",
+        "{}",
+        "+",
+    )
+
+
+def test_preflight_ignores_a_bak_copy_of_the_webui_unit(tmp_path: Path):
+    root = tmp_path / "systemd"
+    root.mkdir()
+    (root / "hermes-webui.service").write_text(WEBUI_UNIT, encoding="utf-8")
+    (root / "hermes-webui.service.bak").write_text(
+        WEBUI_UNIT + "Environment=VIRTUAL_ENV=/home/pi/.hermes/venvs/hermes-py314-v0.21.7\n",
+        encoding="utf-8",
+    )
+    units = mig.scan_roots([root])
+    assert [unit.name for unit in units] == ["hermes-webui.service"]
+    text = mig.format_inventory(units)
+    assert "Interpreter drop-in: leave" in text
+    assert "Interpreter drop-in: retarget" not in text
+    assert "hermes-webui.service.bak" not in text
+
+
 def test_rollback_refuses_a_partial_backup_before_any_rename(tmp_path: Path):
     dropins = tmp_path / "hermes-gateway.service.d"
     backup = tmp_path / "backup"
@@ -334,15 +476,34 @@ def test_rollback_refuses_a_partial_backup_before_any_rename(tmp_path: Path):
     assert (backup / mig.PINNING_DROPINS[0]).is_file()
 
 
-def test_locate_dropins_refuses_zero_or_two(tmp_path: Path):
-    user = tmp_path / "user"
-    system = tmp_path / "system"
-    (user / "hermes-gateway.service.d").mkdir(parents=True)
-    (system / "hermes-gateway.service.d").mkdir(parents=True)
-    assert mig.locate_dropin_dirs([user]) == [user / "hermes-gateway.service.d"]
-    found = mig.locate_dropin_dirs([user, system])
-    assert len(found) == 2
+def test_locate_ignores_empty_dirs_and_system_control(tmp_path: Path):
+    live = tmp_path / "etc" / "systemd" / "system" / "hermes-gateway.service.d"
+    live.mkdir(parents=True)
+    (live / "memory-limits.conf").write_text(MEMORY_BODY, encoding="utf-8")
+    empty = tmp_path / "run" / "systemd" / "system" / "hermes-gateway.service.d"
+    empty.mkdir(parents=True)
+    control = (
+        tmp_path / "etc" / "systemd" / "system.control" / "hermes-gateway.service.d"
+    )
+    control.mkdir(parents=True)
+    (control / "50-MemoryMax.conf").write_text(MEMORY_BODY, encoding="utf-8")
+    found = mig.locate_dropin_dirs(
+        [tmp_path / "etc" / "systemd", tmp_path / "run" / "systemd" / "system"]
+    )
+    assert found == [live]
     assert mig.locate_dropin_dirs([tmp_path / "missing"]) == []
+    assert mig.locate_dropin_dirs([empty.parent]) == []
+
+
+def test_locate_dropins_refuses_two_nonempty_scopes(tmp_path: Path):
+    user = tmp_path / "user" / "hermes-gateway.service.d"
+    system = tmp_path / "system" / "hermes-gateway.service.d"
+    user.mkdir(parents=True)
+    system.mkdir(parents=True)
+    (user / "a.conf").write_text(PIN_BODY, encoding="utf-8")
+    (system / "b.conf").write_text(PIN_BODY, encoding="utf-8")
+    found = mig.locate_dropin_dirs([tmp_path])
+    assert len(found) == 2
 
 
 def test_rollback_checklist_covers_the_host_without_gc_or_migrate_apply():

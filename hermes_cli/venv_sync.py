@@ -587,6 +587,27 @@ def _sync_source_dependencies(root: Path, *, arm: bool, borrowed_from: Path | No
         (root / name).unlink(missing_ok=True)
 
 
+def _activate_before_guest(root: Path) -> str:
+    """Select the committed environment before the guest script imports.
+
+    ``-I`` drops the caller's venv. The re-exec runs the guest from the top,
+    and ``run_agent`` only activates after that script's own imports. A process
+    that imports third-party modules first (hermes-webui imports fastapi, then
+    ``run_agent``) would otherwise see the bare store interpreter. A root that
+    is not a Hermes checkout has no ``pm.environments`` and skips this.
+    """
+    root_lit = repr(str(root))
+    # find_spec('pm.environments') imports the parent and raises when this root
+    # is not a Hermes checkout. A missing top-level pm is a skipped activation.
+    return (
+        "import importlib.util; "
+        "_spec = importlib.util.find_spec('pm.environments') "
+        "if importlib.util.find_spec('pm') else None; "
+        "(_spec and __import__('pm.environments', fromlist=['activate_dependencies'])"
+        f".activate_dependencies({root_lit})); "
+    )
+
+
 def relaunch_command(
     python: Path, root: Path, argv: list[str], original: list[str], module: str | None,
 ) -> list[str]:
@@ -594,6 +615,8 @@ def relaunch_command(
 
     An old venv may use a different Python ABI. Do not add the new generation
     to that interpreter, and do not depend on its obsolete editable finder.
+    The ``-c`` snippet activates the committed environment before ``runpy``
+    so the guest imports that generation, not the bare store interpreter.
     """
     # Preserve interpreter options, not application flags with the same names.
     options: list[str] = []
@@ -607,7 +630,13 @@ def relaunch_command(
         if option in ("-W", "-X") and index < len(original):
             options.append(original[index])
             index += 1
-    prefix = f"import sys, runpy; sys.path.insert(0, {str(root)!r}); sys.argv = {argv!r}; "
+    root_lit = repr(str(root))
+    prefix = (
+        "import sys, runpy; "
+        f"sys.path.insert(0, {root_lit}); "
+        f"sys.argv = {argv!r}; "
+        f"{_activate_before_guest(root)}"
+    )
     if argv[0] == "-c":
         body = f"exec({original[index + 1]!r})"
     elif module and module != "__main__":

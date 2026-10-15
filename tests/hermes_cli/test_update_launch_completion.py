@@ -369,6 +369,34 @@ def test_blessed_legacy_install_is_adopted_before_sync(tmp_path, monkeypatch, co
     assert calls == [(["all"],)]
 
 
+def test_relaunch_activates_managed_env_before_the_guest_imports(tmp_path):
+    root = tmp_path / "checkout"
+    (root / "pm").mkdir(parents=True)
+    (root / "pm" / "__init__.py").write_text("")
+    (root / "pm" / "environments.py").write_text(
+        "def activate_dependencies(project_root):\n"
+        "    import sys\n"
+        "    module = type(sys)('fastapi')\n"
+        "    module.__file__ = 'managed'\n"
+        "    sys.modules['fastapi'] = module\n"
+    )
+    script = root / "hermex-webui-start.sh"
+    script.write_text(
+        "import json, fastapi\n"
+        "print(json.dumps({'fastapi': fastapi.__file__}))\n"
+    )
+    argv = [str(script)]
+    command = venv_sync.relaunch_command(
+        Path(sys.executable), root, argv, [sys.executable, *argv], None
+    )
+    source = command[command.index("-c") + 1]
+    assert source.index("activate_dependencies") < source.index("runpy.run_path")
+    assert "HERMES_DISABLE_LAZY_INSTALLS" not in source
+    result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"fastapi": "managed"}
+
+
 def test_relaunch_runs_zip_launchers_and_preserves_interpreter_options(tmp_path):
     import zipfile
     launcher = tmp_path / "hermes.exe"

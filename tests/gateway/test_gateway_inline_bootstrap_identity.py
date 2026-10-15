@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from gateway.status import looks_like_gateway_command_line
+from gateway.status_inline_source import inline_bootstrap_argv
 from hermes_cli import _launchers, venv_sync
 from hermes_cli.update_cmd_windows import _hermes_holder_subcommand
 
@@ -48,6 +49,20 @@ def test_bootstrap_launched_gateway_is_a_gateway(form: str, join: str) -> None:
     command_line = _JOINS[join]([str(t) for t in _forms(["gateway", "run", "--replace"])[form]])
     assert looks_like_gateway_command_line(command_line)
     assert _hermes_holder_subcommand(command_line) == "gateway"
+
+
+def test_webui_relaunch_activates_before_run_path_and_keeps_identity() -> None:
+    script = ROOT / "hermex-webui-start.sh"
+    command = [
+        str(part)
+        for part in venv_sync.relaunch_command(
+            Path(PY), ROOT, [str(script)], [PY, str(script)], None
+        )
+    ]
+    source = command[command.index("-c") + 1]
+    assert source.index("activate_dependencies") < source.index("runpy.run_path")
+    assert inline_bootstrap_argv(command) == [PY, str(script)]
+    assert inline_bootstrap_argv(" ".join(command).split()) == [PY, str(script)]
 
 
 @pytest.mark.parametrize("join", _JOINS)

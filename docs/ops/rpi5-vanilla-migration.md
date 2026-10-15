@@ -227,7 +227,7 @@ Extras the profiles need, and how this tree packages them (`pyproject.toml`,
 | mattermost, line | `aiohttp` only (no extra of their own). `all` and `matrix` both pin `aiohttp` |
 | email | stdlib `imaplib` / `smtplib` |
 | sms | extra `sms` is inside `all` (`aiohttp`). The adapter uses aiohttp REST, not the Twilio SDK |
-| WebUI / API | extra `web` (`fastapi`) is inside `all` |
+| WebUI / API | extra `web` (`fastapi`, `uvicorn`) is inside `all`. The store-interpreter re-exec activates that environment before `hermex-webui-start.sh` runs. Do not set `HERMES_DISABLE_LAZY_INSTALLS` |
 | MCP Python client | extra `mcp` is inside `all` |
 | langfuse | not an extra. Catalog plugin, installed only when a profile selects it |
 | gbrain and other bun/stdio MCP servers | stay outside the venv. Do not pip-install them |
@@ -273,7 +273,11 @@ The script refuses a checkout that still has PR 46 or PR 47, and it refuses an
 install key other than `5935b2ebc06c58fa`. It unsets `VIRTUAL_ENV` and
 `PYTHONHOME` and drops `~/.hermes/venvs/*/bin` from `PATH`. It drives
 `python -m pm.build_env` with PM's pinned toolchain (`--python` is not passed).
-The throwaway lives under `mktemp` and is deleted before `hermes pm install`,
+This Pi has `gcc` and `g++` and does not have `clang++`. Native extras
+(`python-olm`) probe `clang++` unless `CC` and `CXX` are set, so the script
+exports `CC=gcc` and `CXX=g++` for both that throwaway build and
+`hermes pm install`. The throwaway lives under `mktemp` and is deleted before
+`hermes pm install`,
 whether the import gate passes or fails. A failed gate leaves `facts.json`
 absent. Exit 4 means the driver interpreter or
 `~/.hermes/hermes-agent/.hermes/bin/hermes` is missing. Do not substitute the
@@ -568,9 +572,27 @@ not make the already-running default process re-read config.
    counts against the cap. If it is its own unit, the gateway still has
    headroom. Do not put the 2G file back while five profiles share this cgroup.
 
-   The command refuses when it finds more than one `hermes-gateway.service.d`,
-   and when any of the four names is missing from both the live directory and
-   the backup. A second run is a no-op once the backup holds the files.
+   The command refuses when it finds more than one non-empty
+   `hermes-gateway.service.d`, and when any of the four names is missing from
+   both the live directory and the backup. An empty
+   `/run/systemd/system/hermes-gateway.service.d` does not count: systemd
+   creates that directory with no files, and it is not a second unit scope.
+   A second run is a no-op once the backup holds the files.
+
+   `systemctl set-property` writes
+   `/etc/systemd/system.control/hermes-gateway.service.d/50-Memory*.conf`.
+   That directory is a sibling of `/etc/systemd/system`, so a scan of the unit
+   directory does not see it, and those files outrank unit drop-ins. The same
+   command moves every `50-Memory*.conf` there into
+   `~/rpi5-unit-backup/gateway-dropins/`. A host that has none is unchanged.
+   Rollback puts them back when the backup has them, and does not require them.
+
+   When the live directory is not writable, the script re-runs the helper
+   under `sudo`. `$HOME` is expanded before `sudo`, so the backup is
+   `~/rpi5-unit-backup/gateway-dropins` and not a path under `/root`. After
+   the move it `chown`s that backup back to the invoking user. The new
+   `zz-multiplex-memory.conf` stays root-owned. That is what a system unit
+   drop-in is.
 
 7. Leave `hermes-webui` alone. On this host it is the separate hermes-webui
    application. `ExecStart` is `hermex-webui-start.sh`. It is not
@@ -584,8 +606,19 @@ not make the already-running default process re-read config.
    (`~/.hermes/installs/5935b2ebc06c58fa/environments/<32-hex>/venv/bin/python`).
    `--preflight` prints `Interpreter drop-in: retarget` or `leave`. When it
    says `leave`, the start script is not using Hermes's env; do not edit the
-   drop-in. Do not restart the webui until the gateway restart below has
+   drop-in. Preflight ignores unit backup copies (`*.bak`, `*.old`,
+   `*.dpkg-old`, `*.dpkg-dist`, `*.rpmnew`, `*.rpmsave`, and names ending in
+   `~`). A `hermes-webui.service.bak` that still pins `VIRTUAL_ENV` is not a
+   live unit. Do not restart the webui until the gateway restart below has
    succeeded.
+
+   `hermex-webui-start.sh` imports `run_agent`. Once `install-stamp.json` says
+   `updateMechanism: self`, that import re-execs into the store interpreter
+   with `-I`, which drops the WebUI venv. The re-exec activates the managed
+   environment before the WebUI script runs, so `fastapi` and `uvicorn` come
+   from the committed environment. extra `web` is inside `all`, which this
+   migration installs. Do not set `HERMES_DISABLE_LAZY_INSTALLS`. That variable
+   is an internal PM switch; it is not how the WebUI finds its dependencies.
 
 8. On the default profile, set the flag explicitly so the next boot does not
    depend on the retired false value:
@@ -601,9 +634,28 @@ not make the already-running default process re-read config.
    the memory drop-in in step 6 is in place. Do not add
    `zz-profile-runtime-env.conf`. The renderer is retired:
 
+   On this host the gateway unit is a system unit. `sudo` clears the
+   environment, so `HERMES_HOME` has to be on the command, and the launcher
+   has to be the absolute `.hermes/bin/hermes` from this checkout:
+
    ```bash
-   hermes gateway install
+   docs/ops/rpi5-vanilla-migration.sh --install-system-unit
    ```
+
+   That runs:
+
+   ```bash
+   sudo env HERMES_HOME=/home/pi/.hermes \
+     /home/pi/.hermes/hermes-agent/.hermes/bin/hermes \
+     gateway install --system --run-as-user pi
+   sudo find /home/pi/.hermes -user root -exec chown "$(id -u):$(id -g)" {} +
+   ```
+
+   The script uses `$HOME/.hermes` and `id -un`, which are `/home/pi/.hermes`
+   and `pi` when the operator is `pi`. It does not also build the environment.
+   The install runs as root and can leave root-owned files under the user's
+   Hermes home. The `find` chowns only those files. It does not chown the
+   whole tree, and it does not chown the system unit drop-ins.
 
    This rewrites `hermes-gateway.service` and enables it. It does not restart a
    running process, and it does not remove `zz-multiplex-memory.conf` or
@@ -611,9 +663,8 @@ not make the already-running default process re-read config.
    `-p wife` (or dad, katie, alice). That writes or enables the profile unit
    this migration just disabled.
 
-   Then `systemctl --user daemon-reload` (or `sudo systemctl daemon-reload`
-   for a system unit). `gateway install` already reloads after a unit rewrite;
-   reload again if the only edits were drop-ins.
+   Then `sudo systemctl daemon-reload`. `gateway install` already reloads
+   after a unit rewrite; reload again if the only edits were drop-ins.
 
 10. Restart the default gateway, then the webui unit you already had (the one
    whose `ExecStart` contains `hermex-webui-start.sh`):
@@ -853,7 +904,11 @@ you do this.
    That restores `zzz-main-v0217.conf`, `zz-py314-runtime.conf`,
    `92-canonical-runtime.conf`, and `memory-limits.conf` from
    `~/rpi5-unit-backup/gateway-dropins/`, and removes
-   `zz-multiplex-memory.conf` and `zz-profile-runtime-env.conf`. It then
+   `zz-multiplex-memory.conf` and `zz-profile-runtime-env.conf`. When the
+   backup also has `50-Memory*.conf`, it restores those into
+   `/etc/systemd/system.control/hermes-gateway.service.d`. A host that never
+   had them is unchanged; rollback does not require them. When the live
+   directory is not writable, the restore runs under `sudo`. It then
    restores `install-stamp.json` from
    `install-stamp.json.external-backup` when that backup exists, and removes
    the `.hermes/bin/hermes` launcher the claim created. A missing stamp
