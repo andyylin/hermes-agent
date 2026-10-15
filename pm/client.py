@@ -206,11 +206,16 @@ def ensure(name, *, base_env=None, explicit=False, verify=True, progress=None, p
 
 
 def sync_venv(extras=None, *, explicit=False, plugins: PluginInput | None = None, repair=False,
-              project_root: Path | None = None, evict_incompatible_plugins: bool = False) -> None:
+              project_root: Path | None = None, evict_incompatible_plugins: bool = False,
+              commit_environment: bool = False) -> None:
+    from pm.deployment_guard import externally_managed_runtime
     from pm.environments import running_from_selected_environment
 
-    if extras and not explicit and not repair and not running_from_selected_environment(
-            paths.repo_root() if project_root is None else Path(project_root)):
+    root = paths.repo_root() if project_root is None else Path(project_root)
+    # The worker is a PM runtime. Record the caller's interpreter here, before
+    # the request crosses that boundary, or an external venv looks managed.
+    caller_external = externally_managed_runtime(root)
+    if extras and not explicit and not repair and not running_from_selected_environment(root):
         # A lazy extra may only extend the environment this process runs from. From any other
         # interpreter (a build_environment test venv, a developer venv, a Nix Python) the sync would
         # commit a selection this process never activates while every process booted afterwards
@@ -229,10 +234,14 @@ def sync_venv(extras=None, *, explicit=False, plugins: PluginInput | None = None
     if is_runtime() and not foreign:
         from pm.install import sync_venv as direct
         return direct(extras, explicit=explicit, plugins=plugins, repair=repair,
-                      evict_incompatible_plugins=evict_incompatible_plugins)
+                      evict_incompatible_plugins=evict_incompatible_plugins,
+                      commit_environment=commit_environment,
+                      externally_managed=caller_external)
     _request("sync_venv", {"extras": extras, "explicit": explicit, "repair": repair,
                           "plugins": plugin_inputs.encode(plugins),
-                          "evict_incompatible_plugins": evict_incompatible_plugins}, project_root=project_root)
+                          "evict_incompatible_plugins": evict_incompatible_plugins,
+                          "commit_environment": commit_environment,
+                          "externally_managed": caller_external}, project_root=project_root)
 
 
 def ensure_tools_for_sync() -> None:

@@ -46,6 +46,13 @@ def build_plugins_parser(subparsers, *, cmd_plugins: Callable) -> None:
         "--no-enable", action="store_true",
         help="Install disabled (skip confirmation prompt); enable later with `hermes plugins enable <name>`",
     )
+    plugins_install.add_argument(
+        "--commit-environment", action="store_true",
+        help="Create the install's dependency environment when Hermes is running from an "
+             "interpreter the package manager did not build and nothing is committed yet. "
+             "The default leaves that interpreter in place. "
+             "plugins.commit_dependency_environment: true opts in for every plugin command.",
+    )
 
     plugins_search = plugins_subparsers.add_parser(
         "search", help="Search the curated Hermes plugin catalog")
@@ -136,10 +143,24 @@ def build_plugins_parser(subparsers, *, cmd_plugins: Callable) -> None:
     _enable_override_group.add_argument(
         "--no-allow-tool-override", action="store_true",
         help="Enable without granting built-in tool override (skip prompt).")
+    plugins_enable.add_argument(
+        "--commit-environment", action="store_true",
+        help="Create the install's dependency environment when Hermes is running from an "
+             "interpreter the package manager did not build and nothing is committed yet. "
+             "The default leaves that interpreter in place. "
+             "plugins.commit_dependency_environment: true opts in for every plugin command.",
+    )
 
     plugins_disable = plugins_subparsers.add_parser(
         "disable", help="Disable a plugin without removing it")
     plugins_disable.add_argument("name", help="Plugin name to disable")
+    plugins_disable.add_argument(
+        "--commit-environment", action="store_true",
+        help="Create the install's dependency environment when Hermes is running from an "
+             "interpreter the package manager did not build and nothing is committed yet. "
+             "The default leaves that interpreter in place. "
+             "plugins.commit_dependency_environment: true opts in for every plugin command.",
+    )
 
     plugins_capabilities = plugins_subparsers.add_parser(
         "capabilities", help="Show declared vs granted capabilities per plugin",

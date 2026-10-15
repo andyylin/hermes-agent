@@ -1724,14 +1724,13 @@ DEFAULT_CONFIG = {
         # explicit: `hermes plugins update <name>`, or auto_apply below (git-class plugins only,
         # scan-gated by that same pipeline).
         "auto_update_check_hours": 24,
-        # Opt-in unattended apply for the cadence check. Git-row plugins ONLY; every apply runs the
-        # same security scan / consent pipeline as the manual update command.
+        # Opt-in unattended apply for the cadence check (git-row plugins; same scan as a manual update).
         "auto_apply": False,
-        # Where third-party Python plugins run. in_process: imported into Hermes (default).
-        # host: one plugin-host process per profile runs them and they reach Hermes only through
-        # ctx (a crashing or hanging plugin takes down its host, which restarts; Hermes keeps
-        # running). Bundled plugins stay in-process; `hermes plugins validate` says whether a
-        # plugin can run in the host.
+        # External interpreter, no facts.json yet: create one only when this is true.
+        "commit_dependency_environment": False,
+        # Where third-party Python plugins run. in_process (default) imports them into Hermes.
+        # host: one plugin-host process per profile; a crash restarts the host, not Hermes.
+        # Bundled plugins stay in-process; `hermes plugins validate` says whether a plugin can.
         "isolation": "in_process",
         "host": {
             # argv prefix the plugin host runs under, e.g. a sandbox runner. [] = plain subprocess.
