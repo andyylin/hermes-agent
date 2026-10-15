@@ -1690,7 +1690,9 @@ def start_server(
     # launch profile's credentials, and that snapshot is the only source for launch keys with no
     # ``.env`` to rebuild from (systemd ``Environment=``, ``op run``, Compose): anything injected or
     # rotated by a later boot step would otherwise be invisible for the process lifetime. No-op on a
-    # single-profile host; `gateway.multiplex_profiles: false` is retired and no longer skips it.
+    # single-profile host. This guard does not read gateway.multiplex_profiles: the messaging
+    # gateway honors an explicit false, but skipping activation here would serve a second profile
+    # with the launch profile's credentials.
     try:
         from tui_gateway.launch_profile_policy import activate_multi_profile_hosting_eagerly
 

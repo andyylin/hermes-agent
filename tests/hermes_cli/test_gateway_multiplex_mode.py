@@ -123,7 +123,7 @@ def test_standalone_launcher_never_multiplexes_other_profiles(fleet, flag):
             assert decision.enabled is True
 
 
-def test_explicit_true_is_never_second_guessed_and_explicit_false_is_retired(fleet, monkeypatch):
+def test_explicit_true_is_never_second_guessed(fleet):
     root, _services, pids = fleet
     pids["coder"] = 4101
     (root / "config.yaml").write_text("gateway:\n  multiplex_profiles: true\n", encoding="utf-8")
@@ -131,23 +131,105 @@ def test_explicit_true_is_never_second_guessed_and_explicit_false_is_retired(fle
     assert mode.resolve_multiplex_mode(cfg) == mode.MultiplexDecision(True, "config")
     assert cfg.multiplex_profiles is True
     assert mode.explicit_multiplex_flag(root) is True
+    assert mode.default_gateway_multiplexes(root) is True
 
-    # RETIRED opt-out: `false` still parses, but it can no longer pin a second gateway onto this
-    # host — with nothing blocking, the process multiplexes and says the key was ignored.
+
+def test_config_false_stays_standalone_with_no_other_gateway_running(fleet, caplog):
+    """An explicit false is the reason this process stays on its own profile.
+
+    No other gateway is up, so the old path treated false as unset, multiplexed, and rewrote the
+    file. The boot log must name the config setting.
+    """
+    import logging
+
+    root, _services, pids = fleet
+    assert not pids
+    (root / "config.yaml").write_text(
+        "model:\n  default: x\ngateway:\n  multiplex_profiles: false\n", encoding="utf-8")
+    cfg = load_gateway_config()
+    with caplog.at_level(logging.WARNING, logger=mode.logger.name):
+        decision = mode.resolve_multiplex_mode(cfg)
+        mode.log_multiplex_decision(decision)
+    assert decision == mode.MultiplexDecision(False, "config", mode.CONFIG_OPT_OUT_REASON)
+    assert cfg.multiplex_profiles is False
+    assert mode.explicit_multiplex_flag(root) is False
+    assert mode.default_gateway_multiplexes(root) is False
+    assert "multiplex_profiles: false" in (root / "config.yaml").read_text(encoding="utf-8")
+    assert not (root / mode.REWRITTEN_MARKER_NAME).exists()
+    assert mode.CONFIG_OPT_OUT_REASON in caplog.text
+    assert "still run their own gateway" not in caplog.text
+    assert "serves only the launching profile" in caplog.text
+    # The startup entry point is the same verdict: no scoped multiplex reload, file left false.
+    from gateway.run import load_gateway_config_for_runner
+    assert load_gateway_config_for_runner().multiplex_profiles is False
+    assert "multiplex_profiles: false" in (root / "config.yaml").read_text(encoding="utf-8")
+
+
+def test_config_false_log_names_the_setting_even_when_a_secondary_gateway_is_up(fleet, caplog):
+    """A live secondary used to be the only sentence in the log, so the config looked irrelevant."""
+    import logging
+
+    root, _services, pids = fleet
+    pids["coder"] = 4101
+    (root / "config.yaml").write_text("gateway:\n  multiplex_profiles: false\n", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger=mode.logger.name):
+        decision = mode.resolve_multiplex_mode(load_gateway_config())
+        mode.log_multiplex_decision(decision)
+    assert decision.enabled is False and decision.source == "config"
+    assert decision.reason == mode.CONFIG_OPT_OUT_REASON
+    assert "coder" not in decision.reason
+    assert "still run their own gateway" not in caplog.text
+    assert mode.CONFIG_OPT_OUT_REASON in caplog.text
+
+
+def test_unset_flag_still_names_a_live_secondary_gateway(fleet, caplog):
+    """None is unchanged: the preflight, not the config file, is why the process stays standalone."""
+    import logging
+
+    root, _services, pids = fleet
+    pids["coder"] = 4101
+    with caplog.at_level(logging.WARNING, logger=mode.logger.name):
+        decision = mode.resolve_multiplex_mode(load_gateway_config())
+        mode.log_multiplex_decision(decision)
+    assert decision.enabled is False and decision.source == "guard"
+    assert "'coder'" in decision.reason and "still run their own gateway" in decision.reason
+    assert "still run their own gateway" in caplog.text
+    assert mode.CONFIG_OPT_OUT_REASON not in caplog.text
+    assert "multiplex_profiles" not in (root / "config.yaml").read_text(encoding="utf-8")
+
+
+def test_env_override_precedence_over_config(fleet, monkeypatch, caplog):
+    """GATEWAY_MULTIPLEX_PROFILES wins over config.yaml, both directions, and the log names it."""
+    import logging
+
+    root, _services, _pids = fleet
+    (root / "config.yaml").write_text("gateway:\n  multiplex_profiles: true\n", encoding="utf-8")
     monkeypatch.setenv("GATEWAY_MULTIPLEX_PROFILES", "false")
-    pids.clear()
+    cfg = load_gateway_config()
+    assert cfg.multiplex_profiles is False
+    with caplog.at_level(logging.WARNING, logger=mode.logger.name):
+        decision = mode.resolve_multiplex_mode(cfg)
+        mode.log_multiplex_decision(decision)
+    assert decision == mode.MultiplexDecision(False, "config", mode.ENV_OPT_OUT_REASON)
+    assert cfg.multiplex_profiles is False
+    assert mode.explicit_multiplex_flag(root) is False
+    assert mode.default_gateway_multiplexes(root) is False
+    assert "multiplex_profiles: true" in (root / "config.yaml").read_text(encoding="utf-8")
+    assert mode.ENV_OPT_OUT_REASON in caplog.text
+    assert "still run their own gateway" not in caplog.text
+
+    monkeypatch.setenv("GATEWAY_MULTIPLEX_PROFILES", "true")
+    (root / "config.yaml").write_text("gateway:\n  multiplex_profiles: false\n", encoding="utf-8")
     cfg = load_gateway_config()
     decision = mode.resolve_multiplex_mode(cfg)
-    assert decision.enabled is True and decision.source == "retired-opt-out"
+    assert decision == mode.MultiplexDecision(True, "config")
     assert cfg.multiplex_profiles is True
-    assert mode.explicit_multiplex_flag(root) is False
+    assert mode.explicit_multiplex_flag(root) is True
 
-    # ...and it still cannot force a fold that would double-bind: a secondary that owns a live
-    # gateway keeps this process standalone, with the blocker named (never a silent second bind).
-    pids["coder"] = 4101
+    monkeypatch.setenv("GATEWAY_MULTIPLEX_PROFILES", "")
     cfg = load_gateway_config()
-    guarded = mode.resolve_multiplex_mode(cfg)
-    assert guarded.enabled is False and guarded.source == "guard" and "coder" in guarded.reason
+    assert cfg.multiplex_profiles is False
+    assert mode.resolve_multiplex_mode(cfg).reason == mode.CONFIG_OPT_OUT_REASON
 
 
 def test_migration_plan_treats_the_unset_default_as_not_yet_multiplexed(fleet):

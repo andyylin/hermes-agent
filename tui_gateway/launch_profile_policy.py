@@ -80,10 +80,10 @@ def activate_multi_profile_hosting_eagerly() -> bool:
     boot step: the frozen snapshot is the only source for launch keys with no ``.env`` to rebuild
     from, so every credential the boot still injects must already be in ``os.environ``.
 
-    ``gateway.multiplex_profiles: false`` is deliberately NOT consulted: it is retired as a
-    topology opt-out, and a multi-home host that skipped activation because of a stale ``false``
-    would serve a second profile with the LAUNCH profile's credentials — the exact fail-open this
-    guard exists to prevent.
+    ``gateway.multiplex_profiles: false`` is deliberately NOT consulted here. The messaging
+    gateway honors that opt-out at startup; this guard is the credential fail-closed for a
+    process that can still be asked for a second home. Skipping activation because of ``false``
+    would serve that home with the LAUNCH profile's credentials.
 
     A genuinely single-profile host still never activates (byte-identical behaviour, ``os.environ``
     precedence preserved). An unreadable profiles directory fails CLOSED: we cannot prove the host

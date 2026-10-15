@@ -116,20 +116,22 @@ update` summary and `hermes gateway status`; a banner in the dashboard
 (`/api/status` carries `multiplex_standalone_reason`). A single-profile install
 is not warned — there is nothing to serve. Nothing is written on a refusal.
 
-An **explicit** `true` bypasses migration preflight, except for a launching
-profile that opts out with `gateway.standalone: true`:
+An **explicit** value bypasses the "other gateways are up" guess, except for a
+launching profile that opts out with `gateway.standalone: true`:
 
 - `gateway.multiplex_profiles: true` (what the migration writes) multiplexes
   regardless of the preflight — you, or the migration, made the call.
-- `gateway.multiplex_profiles` has **one valid value right now: `true`**, and
-  it is written for you. An unset key resolves on and is made explicit in the
-  default profile's `config.yaml`. `false` is **retired**: the gateway rewrites
-  it to `true` in place and prints a one-time boxed notice at that start and in
-  the next `hermes update` summary — never a silent flip. A per-profile gateway
-  is `gateway.standalone: true` in that profile's own config (a temporary shim,
-  not a supported topology) or `--force` for the boundary cases below.
-- `GATEWAY_MULTIPLEX_PROFILES` in the process environment overrides the
-  unset-key decision the same way an explicit `true` does.
+- `gateway.multiplex_profiles: false` keeps the default gateway on its own
+  profile, including when no other profile gateway is running. The boot log
+  names that setting. The file is not rewritten. An unset key still resolves on
+  when the preflight is clear and is then written as `true`. A per-profile
+  gateway is `gateway.standalone: true` in that profile's own config (a
+  temporary shim, not a supported topology) or `--force` for the boundary
+  cases below.
+- `GATEWAY_MULTIPLEX_PROFILES` in the process environment overrides config.yaml.
+  A recognized `false` (`false`, `0`, `off`, `no`) keeps the gateway standalone;
+  a recognized `true` forces multiplexing. A blank or unrecognized value is not
+  an override.
 - `gateway.standalone: true` in a **named** profile's own `config.yaml`
   (`profiles/<name>/config.yaml`) is a **temporary compatibility shim** (see
   [below](#temporary-gatewaystandalone-true)): the host gateway does not serve
@@ -165,7 +167,8 @@ profile keeps `--force` as its path.
 With the flag unset, the default gateway decides at each boot (above). To pin
 it, set it on the profile whose gateway runs as the host process (usually the
 **default profile**) and restart its gateway — `true` forces multiplexing even
-where the boot preflight would have held back (`false` is retired and ignored):
+where the boot preflight would have held back, and `false` keeps that gateway
+standalone even when every other profile gateway is down:
 
 ```bash
 hermes config set gateway.multiplex_profiles true
