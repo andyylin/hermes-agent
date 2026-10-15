@@ -4,7 +4,9 @@
 # The default mode commits the PM environment only. It does not edit
 # config.yaml, systemd units, or profile homes. --sideline-dropins moves
 # gateway drop-in files and nothing else. --rollback restores those drop-ins
-# and, when a claim backup exists, the external install stamp. No mode prints
+# and, when a claim backup exists, the external install stamp.
+# --install-system-unit refreshes the system hermes-gateway unit and chowns
+# root-owned files in the user's Hermes home back. No mode prints
 # credential values.
 #
 # Idempotent. A missing runtime facts.json is gated by a throwaway
@@ -29,6 +31,7 @@
 #   docs/ops/rpi5-vanilla-migration.sh --alice-mcp-env          # print paths, do not write
 #   docs/ops/rpi5-vanilla-migration.sh --alice-mcp-env --write  # write alice config.yaml
 #   docs/ops/rpi5-vanilla-migration.sh --sideline-dropins
+#   docs/ops/rpi5-vanilla-migration.sh --install-system-unit
 #   docs/ops/rpi5-vanilla-migration.sh --orphans
 #   docs/ops/rpi5-vanilla-migration.sh --gc            # refused before 2026-10-16 12:41 Taipei
 #   docs/ops/rpi5-vanilla-migration.sh --rollback      # restore sideline'd drop-ins and the external stamp; print the rest
@@ -59,6 +62,7 @@ case "${1:-}" in
   --preflight) MODE="preflight" ;;
   --preflight-fold) MODE="preflight-fold" ;;
   --sideline-dropins) MODE="sideline-dropins" ;;
+  --install-system-unit) MODE="install-system-unit" ;;
   --orphans) MODE="orphans" ;;
   --gc) MODE="gc" ;;
   --rollback) MODE="rollback" ;;
@@ -68,7 +72,7 @@ case "${1:-}" in
   --alice-mcp-env) MODE="alice-mcp-env" ;;
   "") MODE="apply" ;;
   *)
-    echo "usage: $0 [--check | --preflight | --preflight-fold | --config-edits | --renderer-keys PATH | --matrix-probe PROFILE | --alice-mcp-env [--write] | --sideline-dropins | --orphans | --gc | --rollback]" >&2
+    echo "usage: $0 [--check | --preflight | --preflight-fold | --config-edits | --renderer-keys PATH | --matrix-probe PROFILE | --alice-mcp-env [--write] | --sideline-dropins | --install-system-unit | --orphans | --gc | --rollback]" >&2
     exit 4
     ;;
 esac
@@ -138,6 +142,8 @@ fi
 
 HELPER="${CHECKOUT}/docs/ops/rpi5_migration.py"
 BACKUP_DROPINS="${HOME}/rpi5-unit-backup/gateway-dropins"
+# set-property overrides. Sibling of /etc/systemd/system, not inside it.
+CONTROL_DROPINS="/etc/systemd/system.control/hermes-gateway.service.d"
 FACTS="${HOME}/.hermes/installs/${EXPECTED_KEY}/facts.json"
 ENVIRONMENTS="${HOME}/.hermes/installs/${EXPECTED_KEY}/environments"
 
@@ -157,6 +163,18 @@ unit_roots() {
 
 helper() {
   "$DRIVER" "$HELPER" "$@"
+}
+
+# Live drop-ins under /etc are not writable by the operator. sudo expands
+# $HOME before it runs, so the backup path passed in is already absolute.
+run_helper() {
+  local privilege="$1"
+  shift
+  if [[ "$privilege" == "root" ]]; then
+    sudo "$DRIVER" "$HELPER" "$@"
+  else
+    "$DRIVER" "$HELPER" "$@"
+  fi
 }
 
 # publish_launchers leaves updateMechanism external alone, so `pm install python`
@@ -267,7 +285,32 @@ fi
 
 if [[ "$MODE" == "sideline-dropins" ]]; then
   dropin_dir="$(locate_gateway_dropins)" || exit $?
-  helper sideline-dropins --dropin-dir "$dropin_dir" --backup "$BACKUP_DROPINS"
+  privilege="$(helper sideline-privilege --dropin-dir "$dropin_dir" --control-dir "$CONTROL_DROPINS" --backup "$BACKUP_DROPINS")" || exit $?
+  run_helper "$privilege" sideline-dropins --dropin-dir "$dropin_dir" --backup "$BACKUP_DROPINS" --control-dir "$CONTROL_DROPINS"
+  if [[ "$privilege" == "root" ]]; then
+    # The new system drop-in stays root-owned. The backup is the operator's.
+    sudo chown -R "$(id -u):$(id -g)" "$BACKUP_DROPINS"
+  fi
+  exit 0
+fi
+
+if [[ "$MODE" == "install-system-unit" ]]; then
+  ensure_official_launcher
+  LAUNCHER="${CHECKOUT}/.hermes/bin/hermes"
+  if [[ ! -x "$LAUNCHER" ]]; then
+    echo "official launcher missing: ${LAUNCHER}" >&2
+    exit 4
+  fi
+  install_argv="$(helper system-gateway-install --home "${HOME}/.hermes" --user "$(id -un)" --launcher "$LAUNCHER")" || exit $?
+  mapfile -t install_cmd <<< "$install_argv"
+  if [[ ${#install_cmd[@]} -eq 0 ]]; then
+    echo "system unit install command was empty" >&2
+    exit 4
+  fi
+  "${install_cmd[@]}"
+  chown_argv="$(helper chown-root-owned --home "${HOME}/.hermes" --uid "$(id -u)" --gid "$(id -g)")" || exit $?
+  mapfile -t chown_cmd <<< "$chown_argv"
+  "${chown_cmd[@]}"
   exit $?
 fi
 
@@ -291,8 +334,9 @@ fi
 
 if [[ "$MODE" == "rollback" ]]; then
   dropin_dir="$(locate_gateway_dropins)" || exit $?
+  privilege="$(helper sideline-privilege --dropin-dir "$dropin_dir" --control-dir "$CONTROL_DROPINS" --backup "$BACKUP_DROPINS")" || exit $?
   set +e
-  helper rollback-dropins --dropin-dir "$dropin_dir" --backup "$BACKUP_DROPINS"
+  run_helper "$privilege" rollback-dropins --dropin-dir "$dropin_dir" --backup "$BACKUP_DROPINS" --control-dir "$CONTROL_DROPINS"
   dropin_rc=$?
   helper restore-external-stamp --checkout "$CHECKOUT"
   stamp_rc=$?
@@ -393,6 +437,14 @@ fi
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+
+# python-olm probes clang++, which this Pi does not have.
+compiler_env="$(helper compiler-env)" || exit $?
+while IFS= read -r assignment; do
+  if [[ -n "$assignment" ]]; then
+    export "$assignment"
+  fi
+done <<< "$compiler_env"
 
 # No --record-selection: that flag writes the tool-store facts, not the runtime
 # selection, and this throwaway must not commit anything.

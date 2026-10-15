@@ -43,6 +43,25 @@ MEMORY_DROPIN = "memory-limits.conf"
 NEW_MEMORY_DROPIN = "zz-multiplex-memory.conf"
 RUNTIME_DROPIN = "zz-profile-runtime-env.conf"
 GATEWAY_UNIT = "hermes-gateway.service"
+# systemd set-property writes these under system.control (or user.control).
+# They outrank unit drop-ins, so a 2G MemoryMax there survives the sideline.
+_CONTROL_DIR_NAMES = frozenset({"system.control", "user.control"})
+_UNIT_BACKUP_SUFFIXES = (
+    ".bak",
+    ".old",
+    ".dpkg-old",
+    ".dpkg-dist",
+    ".rpmnew",
+    ".rpmsave",
+)
+# python-olm probes clang++. This Pi has gcc/g++ and no clang++.
+COMPILER_ENV = (("CC", "gcc"), ("CXX", "g++"))
+WEBUI_MANAGED_ENV = (
+    "hermes-webui imports run_agent. A self-managed stamp re-execs that process "
+    "into the store interpreter. The re-exec activates the managed environment "
+    "before the WebUI script runs. extra web (fastapi, uvicorn) is inside all, "
+    "which this migration installs. Do not set HERMES_DISABLE_LAZY_INSTALLS."
+)
 FOLD_PROFILES = ("wife", "dad", "katie", "alice")
 # Live host: only the kids opt out. Wife and dad are already in the multiplex plan.
 STANDALONE_PROFILES = ("katie", "alice")
@@ -366,7 +385,7 @@ def iter_unit_files(roots: list[Path]) -> list[Path]:
             print(f"skip unreadable root: {root}", file=sys.stderr)
             continue
         for path in paths:
-            if not path.is_file():
+            if not path.is_file() or _is_unit_backup(path):
                 continue
             blob = f"{path.parent.name}/{path.name}"
             if "hermes" in blob or "hermex" in blob:
@@ -601,7 +620,8 @@ def webui_lines(units: list[UnitFacts]) -> tuple[str, ...]:
             pin = "retarget" if unit.interpreter_pin else "leave"
             lines.append(
                 "hermes-webui stays on hermex-webui-start.sh. "
-                f"Interpreter drop-in: {pin}. Do not replace ExecStart with hermes dashboard."
+                f"Interpreter drop-in: {pin}. Do not replace ExecStart with hermes dashboard. "
+                f"{WEBUI_MANAGED_ENV}"
             )
         elif unit.interpreter_pin:
             lines.append(
@@ -968,6 +988,32 @@ CONFIG_EDITS = (
 )
 
 
+def _is_unit_backup(path: Path) -> bool:
+    """Editor and package-manager copies are not live units."""
+    name = path.name
+    return name.endswith(_UNIT_BACKUP_SUFFIXES) or name.endswith("~")
+
+
+def _is_control_memory(name: str) -> bool:
+    return name.startswith("50-Memory") and name.endswith(".conf")
+
+
+def _dropin_dir_counts(path: Path) -> bool:
+    """A live unit drop-in directory.
+
+    An empty ``/run/systemd/system/hermes-gateway.service.d`` is not a second
+    scope. ``system.control`` / ``user.control`` hold ``set-property`` overrides
+    and are sidelined separately, not as another unit directory.
+    """
+    if _CONTROL_DIR_NAMES.intersection(path.parts):
+        return False
+    try:
+        entries = list(path.iterdir())
+    except OSError:
+        return True
+    return bool(entries)
+
+
 def locate_dropin_dirs(roots: list[Path], unit: str = GATEWAY_UNIT) -> list[Path]:
     name = f"{unit}.d"
     found: list[Path] = []
@@ -975,12 +1021,108 @@ def locate_dropin_dirs(roots: list[Path], unit: str = GATEWAY_UNIT) -> list[Path
         try:
             if not root.is_dir():
                 continue
-            matches = [path for path in root.rglob(name) if path.is_dir()]
+            matches = [
+                path
+                for path in root.rglob(name)
+                if path.is_dir() and _dropin_dir_counts(path)
+            ]
         except OSError:
             print(f"skip unreadable root: {root}", file=sys.stderr)
             continue
         found.extend(matches)
     return sorted(found)
+
+
+def control_memory_files(control_dir: Path) -> list[Path]:
+    if not control_dir.is_dir():
+        return []
+    return sorted(
+        path
+        for path in control_dir.iterdir()
+        if path.is_file() and _is_control_memory(path.name)
+    )
+
+
+def _backup_has_control_memory(backup_dir: Path | None) -> bool:
+    if backup_dir is None or not backup_dir.is_dir():
+        return False
+    return any(
+        path.is_file() and _is_control_memory(path.name) for path in backup_dir.iterdir()
+    )
+
+
+def _can_write_dir(path: Path) -> bool:
+    if path.exists():
+        return os.access(path, os.W_OK)
+    parent = path.parent
+    return parent.exists() and os.access(parent, os.W_OK)
+
+
+def _control_has_memory(control_dir: Path) -> bool:
+    try:
+        return bool(control_memory_files(control_dir))
+    except OSError:
+        return True
+
+
+def sideline_privilege(
+    dropin_dir: Path,
+    control_dir: Path | None = None,
+    backup_dir: Path | None = None,
+) -> str:
+    """``root`` when sideline or rollback has to rewrite a directory this user cannot.
+
+    An empty ``system.control`` directory does not force root. ``50-Memory*.conf``
+    in that directory, or the same names sitting in the backup, does.
+    """
+    if dropin_dir.exists() and not os.access(dropin_dir, os.W_OK):
+        return "root"
+    if control_dir is None:
+        return "user"
+    restoring = _backup_has_control_memory(backup_dir) and not _can_write_dir(control_dir)
+    moving = control_dir.is_dir() and _control_has_memory(control_dir) and not os.access(
+        control_dir, os.W_OK
+    )
+    if restoring or moving:
+        return "root"
+    return "user"
+
+
+def compiler_assignments() -> tuple[str, ...]:
+    return tuple(f"{key}={value}" for key, value in COMPILER_ENV)
+
+
+def system_gateway_install_command(
+    home: Path, user: str, launcher: Path
+) -> tuple[str, ...]:
+    """``sudo`` clears the environment, so HERMES_HOME is on the env prefix."""
+    return (
+        "sudo",
+        "env",
+        f"HERMES_HOME={home}",
+        str(launcher),
+        "gateway",
+        "install",
+        "--system",
+        "--run-as-user",
+        user,
+    )
+
+
+def chown_root_owned_command(home: Path, uid: int, gid: int) -> tuple[str, ...]:
+    """Give back only the files the system install created as root."""
+    return (
+        "sudo",
+        "find",
+        str(home),
+        "-user",
+        "root",
+        "-exec",
+        "chown",
+        f"{uid}:{gid}",
+        "{}",
+        "+",
+    )
 
 
 def _require_dropin(dropin_dir: Path, backup_dir: Path, name: str) -> str | None:
@@ -997,12 +1139,29 @@ def _require_dropin(dropin_dir: Path, backup_dir: Path, name: str) -> str | None
     raise FileNotFoundError(f"{name} is not in {dropin_dir} or {backup_dir}")
 
 
-def sideline_dropins(dropin_dir: Path, backup_dir: Path) -> tuple[str, ...]:
+def _sideline_control_memory(
+    control_dir: Path | None, backup_dir: Path
+) -> list[str]:
+    if control_dir is None:
+        return []
+    moved: list[str] = []
+    for path in control_memory_files(control_dir):
+        relocated = _require_dropin(control_dir, backup_dir, path.name)
+        if relocated:
+            moved.append(relocated)
+    return moved
+
+
+def sideline_dropins(
+    dropin_dir: Path, backup_dir: Path, control_dir: Path | None = None
+) -> tuple[str, ...]:
     """Move the Python-pinning drop-ins and the 2G memory cap aside, then write the new cap.
 
     Missing pinning files are an error: ``gateway install`` will not remove them,
     and a restart would keep the external venv. A second run is a no-op when the
-    backup already holds the files and the new cap is in place.
+    backup already holds the files and the new cap is in place. ``50-Memory*.conf``
+    under ``control_dir`` is moved into the same backup when that directory exists.
+    A host with no set-property overrides is unchanged.
     """
     backup_dir.mkdir(parents=True, exist_ok=True)
     dropin_dir.mkdir(parents=True, exist_ok=True)
@@ -1011,15 +1170,42 @@ def sideline_dropins(dropin_dir: Path, backup_dir: Path) -> tuple[str, ...]:
         relocated = _require_dropin(dropin_dir, backup_dir, name)
         if relocated:
             moved.append(relocated)
+    moved.extend(_sideline_control_memory(control_dir, backup_dir))
     (dropin_dir / NEW_MEMORY_DROPIN).write_text(memory_dropin_text(), encoding="utf-8")
     return tuple(moved)
 
 
-def rollback_dropins(dropin_dir: Path, backup_dir: Path) -> tuple[str, ...]:
+def _restore_control_memory(
+    control_dir: Path | None, backup_dir: Path
+) -> list[str]:
+    """Put ``50-Memory*.conf`` back. Absence is success: not every host has them."""
+    if control_dir is None or not _backup_has_control_memory(backup_dir):
+        return []
+    names = sorted(
+        path.name
+        for path in backup_dir.iterdir()
+        if path.is_file() and _is_control_memory(path.name)
+    )
+    control_dir.mkdir(parents=True, exist_ok=True)
+    actions: list[str] = []
+    for name in names:
+        dest = control_dir / name
+        if dest.exists():
+            dest.unlink()
+        shutil.move(str(backup_dir / name), str(dest))
+        actions.append(f"restored {name}")
+    return actions
+
+
+def rollback_dropins(
+    dropin_dir: Path, backup_dir: Path, control_dir: Path | None = None
+) -> tuple[str, ...]:
     """Put the sideline backup back and remove drop-ins this migration added.
 
-    Refuses before any rename when the backup is missing a sideline'd file, so
-    a partial backup cannot leave the live directory half-restored.
+    Refuses before any rename when the backup is missing a sideline'd pinning
+    or ``memory-limits.conf`` file, so a partial backup cannot leave the live
+    directory half-restored. ``50-Memory*.conf`` is restored when present and
+    is not required.
     """
     if not backup_dir.is_dir():
         raise FileNotFoundError(f"drop-in backup missing: {backup_dir}")
@@ -1043,6 +1229,7 @@ def rollback_dropins(dropin_dir: Path, backup_dir: Path) -> tuple[str, ...]:
             dest.unlink()
         shutil.move(str(backup_dir / name), str(dest))
         actions.append(f"restored {name}")
+    actions.extend(_restore_control_memory(control_dir, backup_dir))
     return tuple(actions)
 
 
@@ -1317,7 +1504,9 @@ ROLLBACK_CHECKLIST = (
     "This command restores zzz-main-v0217.conf, zz-py314-runtime.conf, "
     "92-canonical-runtime.conf, and memory-limits.conf from "
     "~/rpi5-unit-backup/gateway-dropins, and removes zz-multiplex-memory.conf "
-    "and zz-profile-runtime-env.conf.",
+    "and zz-profile-runtime-env.conf. It also restores 50-Memory*.conf into "
+    "/etc/systemd/system.control/hermes-gateway.service.d when the backup has "
+    "them. A host that never had those files is unchanged.",
     "Restore install-stamp.json from install-stamp.json.external-backup when "
     "that file exists, and remove the .hermes/bin/hermes launcher this claim "
     "created. A missing backup leaves the stamp unchanged.",
@@ -1376,9 +1565,19 @@ def _cmd_locate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _optional_path(value: str | None) -> Path | None:
+    if not value:
+        return None
+    return Path(value)
+
+
 def _cmd_sideline(args: argparse.Namespace) -> int:
     try:
-        moved = sideline_dropins(Path(args.dropin_dir), Path(args.backup))
+        moved = sideline_dropins(
+            Path(args.dropin_dir),
+            Path(args.backup),
+            _optional_path(args.control_dir),
+        )
     except (FileNotFoundError, FileExistsError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -1390,7 +1589,11 @@ def _cmd_sideline(args: argparse.Namespace) -> int:
 
 def _cmd_rollback(args: argparse.Namespace) -> int:
     try:
-        actions = rollback_dropins(Path(args.dropin_dir), Path(args.backup))
+        actions = rollback_dropins(
+            Path(args.dropin_dir),
+            Path(args.backup),
+            _optional_path(args.control_dir),
+        )
     except FileNotFoundError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -1491,6 +1694,43 @@ def _cmd_gc_gate(_args: argparse.Namespace) -> int:
     return 1
 
 
+def _cmd_privilege(args: argparse.Namespace) -> int:
+    print(
+        sideline_privilege(
+            Path(args.dropin_dir),
+            _optional_path(args.control_dir),
+            _optional_path(args.backup),
+        )
+    )
+    return 0
+
+
+def _print_argv(argv: tuple[str, ...]) -> int:
+    for token in argv:
+        print(token)
+    return 0
+
+
+def _cmd_compiler(_args: argparse.Namespace) -> int:
+    for line in compiler_assignments():
+        print(line)
+    return 0
+
+
+def _cmd_system_install(args: argparse.Namespace) -> int:
+    return _print_argv(
+        system_gateway_install_command(
+            Path(args.home), args.user, Path(args.launcher)
+        )
+    )
+
+
+def _cmd_chown_root(args: argparse.Namespace) -> int:
+    return _print_argv(
+        chown_root_owned_command(Path(args.home), args.uid, args.gid)
+    )
+
+
 def _cmd_claim(args: argparse.Namespace) -> int:
     try:
         print(claim_external_checkout(Path(args.checkout)))
@@ -1529,12 +1769,35 @@ def _build_parser() -> argparse.ArgumentParser:
     sideline = sub.add_parser("sideline-dropins")
     sideline.add_argument("--dropin-dir", required=True)
     sideline.add_argument("--backup", required=True)
+    sideline.add_argument("--control-dir", default=None)
     sideline.set_defaults(func=_cmd_sideline)
 
     rollback = sub.add_parser("rollback-dropins")
     rollback.add_argument("--dropin-dir", required=True)
     rollback.add_argument("--backup", required=True)
+    rollback.add_argument("--control-dir", default=None)
     rollback.set_defaults(func=_cmd_rollback)
+
+    privilege = sub.add_parser("sideline-privilege")
+    privilege.add_argument("--dropin-dir", required=True)
+    privilege.add_argument("--control-dir", default=None)
+    privilege.add_argument("--backup", default=None)
+    privilege.set_defaults(func=_cmd_privilege)
+
+    compiler = sub.add_parser("compiler-env")
+    compiler.set_defaults(func=_cmd_compiler)
+
+    system_install = sub.add_parser("system-gateway-install")
+    system_install.add_argument("--home", required=True)
+    system_install.add_argument("--user", required=True)
+    system_install.add_argument("--launcher", required=True)
+    system_install.set_defaults(func=_cmd_system_install)
+
+    chown_root = sub.add_parser("chown-root-owned")
+    chown_root.add_argument("--home", required=True)
+    chown_root.add_argument("--uid", type=int, required=True)
+    chown_root.add_argument("--gid", type=int, required=True)
+    chown_root.set_defaults(func=_cmd_chown_root)
 
     orphans = sub.add_parser("orphans")
     orphans.add_argument("--facts", required=True)
