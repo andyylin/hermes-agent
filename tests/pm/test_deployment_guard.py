@@ -161,7 +161,7 @@ def test_member_enable_builds_when_commit_environment_is_set(tmp_path, monkeypat
 
 def test_config_opt_in_allows_member_enable_to_build(tmp_path, monkeypatch):
     _as_user_venv(monkeypatch, tmp_path)
-    core, home = _layout(tmp_path, monkeypatch, opt_in=True)
+    _core, home = _layout(tmp_path, monkeypatch, opt_in=True)
     _plugin(home, "needs-sync", pyproject=True)
     calls = _watch_apply(monkeypatch)
     from pm.install import sync_venv
@@ -191,7 +191,7 @@ def test_disabling_a_member_on_external_runtime_publishes_config_only(tmp_path, 
 
 
 def test_enabled_platforms_join_the_committed_selection(tmp_path, monkeypatch):
-    core, home = _layout(
+    core, _home = _layout(
         tmp_path, monkeypatch,
         extras=("telegram", "discord", "matrix", "slack"),
         platforms={
