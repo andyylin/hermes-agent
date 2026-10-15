@@ -41,7 +41,7 @@ from pm.plugin_inputs import Members
 
 def _write_enabled(home: Path, enabled: list, provider: str | None = None) -> None:
     home.mkdir(parents=True, exist_ok=True)
-    cfg: dict = {"plugins": {"enabled": enabled, "commit_dependency_environment": True}}
+    cfg: dict = {"plugins": {"enabled": enabled}}
     if provider:
         cfg["memory"] = {"provider": provider}
     with (home / "config.yaml").open("w", encoding="utf-8") as f:

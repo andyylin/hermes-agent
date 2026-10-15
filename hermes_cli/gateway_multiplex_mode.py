@@ -1,4 +1,4 @@
-"""Boot-time verdict for ``gateway.multiplex_profiles`` (the default is on; an explicit false opts out).
+"""Boot-time verdict for ``gateway.multiplex_profiles`` (the default is on, and there is no opt-out).
 
 ``GatewayConfig.from_dict`` leaves the flag ``None`` when neither config.yaml nor
 ``GATEWAY_MULTIPLEX_PROFILES`` set it. Turning the default on must not make a default gateway
@@ -7,13 +7,13 @@ fights), so the implicit default is a *request*: the gateway runs the same prefl
 ``hermes gateway migrate --multiplex`` runs and multiplexes only when the fold would have been
 safe. An explicit ``true`` is never second-guessed.
 
-An explicit ``false`` is a real opt-out. It stays standalone even when every other profile's
-gateway is down — naming those processes as the reason made the setting look irrelevant, and
-the process then took the whole fleet the moment they stopped. The log names the setting that
-won (config.yaml, or ``GATEWAY_MULTIPLEX_PROFILES`` when the env override is false).
+An explicit ``false`` is RETIRED (multiplex-only ruling): it parses, it is logged, and it is then
+resolved exactly like an unset key. The key itself survives because it is still the RUNTIME
+mode flag every scoped code path reads (``config.multiplex_profiles``) — what it can no longer do
+is pin a second gateway process onto this host.
 
-An unset flag that the preflight refuses is logged, never fatal: the gateway comes up standalone
-and the log names the blocker plus ``hermes gateway migrate --multiplex``.
+The refusal is logged, never fatal: the gateway comes up standalone exactly as before the
+default flipped, and the log names the blocker plus ``hermes gateway migrate --multiplex``.
 """
 
 from __future__ import annotations
@@ -38,13 +38,15 @@ STANDALONE_DEPRECATION_NOTICE = (
     "it will be removed once they are — plan to fold this profile with `hermes gateway migrate --multiplex`."
 )
 
-#: ``gateway.multiplex_profiles: false`` pins this process to its own profile. The boot log uses
-#: one of these two sentences so the reason is the setting that won, not a live secondary gateway.
-CONFIG_OPT_OUT_REASON = "gateway.multiplex_profiles is false in config.yaml"
-ENV_OPT_OUT_REASON = "GATEWAY_MULTIPLEX_PROFILES is false and overrides config.yaml"
+#: ``gateway.multiplex_profiles: false`` is no longer an opt-out from the one-gateway-per-host
+#: topology; it parses, it is reported, and it is ignored.
+RETIRED_OPT_OUT_REASON = (
+    "gateway.multiplex_profiles: false is retired and was rewritten to true; one gateway per host "
+    "serves every profile. A per-profile gateway is `gateway.standalone: true` in that profile's "
+    "config (temporary shim) or `--force`.")
 
-#: Marker an older build left after rewriting ``false`` to ``true``. ``hermes update`` still prints
-#: that notice once when the marker is already on disk; a boot that honors ``false`` does not write it.
+#: One-time marker the gateway leaves after rewriting a retired ``false``; ``hermes update``'s summary
+#: prints the notice from it and clears it, so the flip is never silent on either surface.
 REWRITTEN_MARKER_NAME = ".multiplex_opt_out_rewritten"
 
 
@@ -80,8 +82,9 @@ def default_gateway_multiplexes(default_home: Optional[Path] = None) -> bool:
     the explicit flag, else False — an unset flag is decided by the gateway at boot, never guessed
     here.
 
-    An explicit ``false`` reports standalone. Answering True from it made every CLI surface
-    contradict a gateway that stays on its own profile (see :func:`resolve_multiplex_mode`).
+    The one thing that can no longer report "standalone" is an explicit ``false``: it is RETIRED
+    (warned about and ignored at boot, see :func:`resolve_multiplex_mode`), so answering False from
+    it made every CLI surface contradict the gateway that was about to multiplex anyway.
     """
     from hermes_constants import get_default_hermes_root
     from hermes_cli.gateway_multiplex_served import recorded_served_profiles
@@ -89,14 +92,14 @@ def default_gateway_multiplexes(default_home: Optional[Path] = None) -> bool:
     recorded = recorded_served_profiles(root)
     if recorded is not None:
         return bool(recorded)
-    return explicit_multiplex_flag(root) is True
+    flag = explicit_multiplex_flag(root)
+    return False if flag is None else True
 
 
 @dataclass(frozen=True)
 class MultiplexDecision:
     enabled: bool
-    # "config" (config.yaml / env override — explicit true, or explicit false with ``reason``),
-    # "default" (implicit default applied),
+    # "config" (config.yaml / env override — explicit), "default" (implicit default applied),
     # "guard" (implicit default refused; ``reason`` names the blocker).
     source: str
     reason: str = ""
@@ -127,9 +130,9 @@ def implicit_multiplex_blocker() -> Optional[str]:
     blocker (duplicate bot credential, port binder without a ``/p/<profile>/`` ingress) keeps this
     gateway standalone.
 
-    These blockers apply only to an UNSET flag. An explicit ``false`` never reaches here: it is
-    not a transient condition, and treating it as one made the boot log name a live secondary
-    gateway instead of the setting (see :func:`resolve_multiplex_mode`).
+    Every blocker here is a TRANSIENT, fixable condition, which is why this function is now also
+    the whole answer for an explicit ``gateway.multiplex_profiles: false`` (see
+    :func:`resolve_multiplex_mode`): the host converges the moment the blocker is gone.
 
     The launching profile's IDENTITY is deliberately not a blocker: multiplex-only means "the one
     host process", whichever profile started it. Gating on ``active == 'default'`` made a host
@@ -166,11 +169,11 @@ def _default_profile_home() -> Path:
 
 
 def persist_resolved_default(decision: MultiplexDecision, default_home: Optional[Path] = None) -> bool:
-    """Write ``gateway.multiplex_profiles: true`` into the DEFAULT profile's config.yaml so an UNSET
-    key that resolved on reads as the gateway behaves ("left unset" was read as "off"). An explicit
-    ``false`` never reaches here: the runtime stayed standalone and the file must keep saying false.
-    Comment-preserving writer, once, and NEVER on a guard refusal (the file must not say true while
-    the runtime is standalone). Returns True on a write."""
+    """Write ``gateway.multiplex_profiles: true`` into the DEFAULT profile's config.yaml so the file
+    reads as the gateway behaves. The key has ONE valid value right now (Teknium ruling): an unset key
+    is made explicit ("left unset" was read as "off"), a retired ``false`` is rewritten in place and
+    leaves a one-time marker for the boxed notice. Comment-preserving writer, once, and NEVER on a guard
+    refusal (the file must not say true while the runtime is standalone). Returns True on a write."""
     if not decision.enabled or decision.source == "guard":
         return False
     default_home = Path(default_home) if default_home is not None else _default_profile_home()
@@ -184,6 +187,8 @@ def persist_resolved_default(decision: MultiplexDecision, default_home: Optional
             return False
         from hermes_cli.gateway_migrate import _write_multiplex_flag
         _write_multiplex_flag(default_home, True)
+        if decision.source == "retired-opt-out":
+            (default_home / REWRITTEN_MARKER_NAME).write_text(RETIRED_OPT_OUT_REASON + "\n", encoding="utf-8")
     except Exception:
         logger.debug("could not persist gateway.multiplex_profiles: true", exc_info=True)
         return False
@@ -220,40 +225,24 @@ def _box(body: list[str]) -> list[str]:
             "└" + "─" * width + "┘"]
 
 
-def _explicit_opt_out_reason() -> str:
-    """The setting that pinned ``false``: the env override when it won, else config.yaml.
-
-    ``GatewayConfig.multiplex_profiles`` is already the merged bool. Re-read the env here so the
-    boot log can name which one the operator set, including when a live secondary gateway would
-    otherwise have been the only sentence in the log.
-    """
-    from gateway.config import _env_multiplex_profiles_override
-    if _env_multiplex_profiles_override() is False:
-        return ENV_OPT_OUT_REASON
-    return CONFIG_OPT_OUT_REASON
-
-
 def resolve_multiplex_mode(config) -> MultiplexDecision:
     """Settle ``config.multiplex_profiles`` for one gateway boot; the config is updated in place.
 
-    An explicit ``false`` (config.yaml, or ``GATEWAY_MULTIPLEX_PROFILES`` when that override won)
-    stays standalone before any preflight. The "another profile still runs its own gateway" guard
-    is only for an UNSET flag: it is transient, and using it as the reason for an explicit false
-    made the process take every profile the moment those gateways were down.
-
-    An unset flag still refuses to multiplex while a real blocker holds (an s6 container, a
-    secondary that still owns a gateway, a duplicate bot credential). An explicit ``true`` skips
-    the preflight.
+    ``gateway.multiplex_profiles: false`` is RETIRED as a topology opt-out (multiplex-only ruling).
+    The key still parses and still drives the runtime mode this function writes back, but an
+    explicit ``false`` no longer pins a per-profile fleet: it is warned about and resolved exactly
+    like an unset key. That is safe because the unset path is not optimistic — it refuses to
+    multiplex while any real blocker holds (an s6 container, a secondary that still owns a gateway,
+    a duplicate bot credential), so a host that genuinely cannot fold still comes up standalone and
+    says why, and it converges by itself once ``hermes gateway migrate --multiplex`` has run.
     """
     current = getattr(config, "multiplex_profiles", None)
     standalone = standalone_launcher_decision(config)
     if standalone is not None:
         return standalone
-    if current is False:
-        config.multiplex_profiles = False
-        return MultiplexDecision(False, "config", _explicit_opt_out_reason())
     if current:
         return MultiplexDecision(True, "config")
+    retired_opt_out = current is False
     try:
         blocker = implicit_multiplex_blocker()
     except Exception as exc:  # a broken preflight must not take the gateway down with it
@@ -261,6 +250,8 @@ def resolve_multiplex_mode(config) -> MultiplexDecision:
         blocker = f"preflight failed ({exc})"
     if blocker:
         decision = MultiplexDecision(False, "guard", blocker)
+    elif retired_opt_out:
+        decision = MultiplexDecision(True, "retired-opt-out", RETIRED_OPT_OUT_REASON)
     else:
         decision = MultiplexDecision(True, "default", "gateway.multiplex_profiles unset; default applies")
     config.multiplex_profiles = decision.enabled
@@ -279,10 +270,11 @@ def record_multiplex_decision(decision: MultiplexDecision) -> None:
 
 def log_multiplex_decision(decision: MultiplexDecision) -> None:
     record_multiplex_decision(decision)
-    if decision.source == "config" and not decision.enabled:
-        logger.warning(
-            "This gateway stays standalone: %s. It serves only the launching profile.",
-            decision.reason)
+    if decision.source == "retired-opt-out":
+        logger.warning("%s", RETIRED_OPT_OUT_REASON)
+        persist_resolved_default(decision)
+        for line in retired_opt_out_notice_lines():
+            print(line)
     elif decision.source == "guard" and decision.reason == SINGLE_PROFILE_REASON:
         logger.info("Single-profile install: gateway.multiplex_profiles unset, serving the default profile only.")
     elif decision.source == "guard":

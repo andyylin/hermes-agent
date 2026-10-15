@@ -611,12 +611,13 @@ def cleanup_on_exit(role: str) -> None:
 
 
 def _multiplex_profiles_enabled() -> bool:
-    """Roster for the host record this process publishes when the caller does not pass ``multiplex``.
-
-    The messaging gateway settles ``gateway.multiplex_profiles`` in
-    ``resolve_multiplex_mode`` (an explicit ``false`` stays standalone) and republishes its own
-    served set from that verdict. This helper is the dashboard/serve roster: reading ``false``
-    here would advertise only the launch profile while ``?profile=`` still serves the others.
+    """Will THIS process multiplex? An explicit ``true`` and an unset key both say yes, and an
+    explicit ``false`` is RETIRED (``hermes_cli.gateway_multiplex_mode``) — it is warned about and
+    ignored at boot, so it must not make the claim-time record advertise a narrower roster than
+    the process actually serves. Reading it here was the last place the retired flag still decided
+    topology, and it made CLI/dashboard report "standalone, serving default" while the runtime
+    multiplexed. The RUNTIME verdict (a boot-time guard refusal) narrows the record afterwards, in
+    ``gateway.run._refresh_host_gateway_record``, which republishes the SETTLED set.
     """
     return True
 

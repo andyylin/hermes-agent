@@ -37,11 +37,8 @@ is documented as a known limitation at the end of this document.
   keeps an unset flag as `None` (readers test truthiness, so it reads as off);
   `load_gateway_config_for_runner` then calls `resolve_multiplex_mode`, which
   writes the boot verdict — `True` on a quiet multi-profile default install,
-  `False` with a logged reason otherwise. An explicit `true` passes through.
-  An explicit `false` stays standalone and the log names config.yaml or
-  `GATEWAY_MULTIPLEX_PROFILES` (whichever won); it does not name a live
-  secondary gateway and it does not rewrite the file. A config injected into
-  `GatewayRunner(config=...)` is not resolved.
+  `False` with a logged reason otherwise. Explicit values pass through
+  verbatim; a config injected into `GatewayRunner(config=...)` is not resolved.
 - Other processes read the LIVE gateway's `served_profiles` record first and
   the explicit flag second (`gateway_multiplex_mode.default_gateway_multiplexes`
   / `explicit_multiplex_flag`), never the merged default: `named_profile_served_
@@ -69,10 +66,9 @@ is documented as a known limitation at the end of this document.
   only source for launch keys with no `.env` to rebuild from (systemd
   `Environment=`, `op run`, Compose) — a key injected or rotated after the
   freeze is invisible for the process lifetime. A genuinely single-profile
-  host never activates. This credential guard does not read
-  `gateway.multiplex_profiles` (the messaging gateway honors an explicit
-  `false`; skipping activation here would serve a second profile with the
-  launch profile's credentials); an unreadable `profiles/` directory
+  host never activates; `gateway.multiplex_profiles: false` is retired and
+  deliberately NOT consulted here (honouring it would serve a second profile
+  with the launch profile's credentials); an unreadable `profiles/` directory
   fails closed (it activates) and logs a WARNING.
 - With the guard armed the **launch profile is a tenant too**: a body with no
   routed profile binds `launch_profile_scope_if_multiplexed()` rather than

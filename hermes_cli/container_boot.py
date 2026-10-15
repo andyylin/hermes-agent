@@ -106,10 +106,8 @@ def reconcile_profile_gateways(
     # step, instead of N processes fighting over the same profiles.
     #
     # It used to be gated on `gateway.multiplex_profiles`, which made the UNSET default (on) boot
-    # the slots anyway — the container shipped a per-profile fleet by accident. Container boot
-    # still does not read the key: one root gateway per container, plus a `gateway.standalone`
-    # profile's own slot. The messaging gateway's startup decision honors an explicit false
-    # separately (hermes_cli/gateway_multiplex_mode.py).
+    # the slots anyway — the container shipped the opt-out topology by accident. The key is retired
+    # as a topology switch (hermes_cli/gateway_multiplex_mode.py), so there is nothing to read.
     named = [(name, entry, _read_desired_state(entry)) for name, entry in _named_profile_dirs(hermes_home)]
     # The exception is a `gateway.standalone` profile: the root multiplexer never serves it
     # (profiles_to_serve excludes it), so it boots its own slot from its own intent, beside the root.

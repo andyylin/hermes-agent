@@ -181,12 +181,6 @@ plugins:
   # stuck thread is abandoned. Default 10; set 0 to disable; values above 600
   # are clamped.
   load_timeout_seconds: 10
-  # Opt in to letting plugin install/enable/disable create the package manager's
-  # dependency environment (installs/<id>/facts.json) when Hermes is running from
-  # an interpreter the package manager did not build and nothing is committed yet.
-  # Default false: those commands leave the current interpreter in place.
-  # `hermes plugins install|enable|disable --commit-environment` opts in once.
-  commit_dependency_environment: false
 ```
 
 Three ways to flip state:

@@ -732,8 +732,8 @@ def _publication(plugins: PluginInput | None):
     return None
 
 
-def _publish_inactive(change, *, reason: str = "inactive plugin") -> None:
-    """Publish plugin code or config without touching the dependency environment."""
+def _publish_inactive(change) -> None:
+    """A disabled plugin's code changes without touching the dependency environment."""
     from pm import receipt
     from hermes_cli.runtime_state import finish_publication, recover_publication
 
@@ -743,7 +743,7 @@ def _publish_inactive(change, *, reason: str = "inactive plugin") -> None:
     except BaseException:
         recover_publication(paths.repo_root())
         raise
-    receipt.record_venv_rebuild(False, reason)
+    receipt.record_venv_rebuild(False, "inactive plugin")
 
 
 def _target_selection(package, fact: dict, *, extras, inputs: dict, repair: bool, shipped, frozen):
@@ -758,16 +758,7 @@ def _target_selection(package, fact: dict, *, extras, inputs: dict, repair: bool
         return enabled, stamp, {"repair": True}
     # The first writable generation replaces, rather than layers on,
     # the payload. Retain its extras until a recorded selection owns them.
-    recorded = fact.get("extras", [])
-    if not isinstance(recorded, list):
-        recorded = []
     enabled = sorted(set(_still_declared(package, fact.get("extras", shipped or []))) | set(extras or []))
-    from pm.deployment_guard import union_platform_extras
-
-    enabled = union_platform_extras(
-        enabled, project=package.project_root(), frozen=frozen,
-        recorded=_still_declared(package, recorded),
-    )
     return enabled, package.expected_stamp(enabled, **inputs), inputs
 
 
@@ -782,11 +773,6 @@ def _commit_selection(package, facts: Facts, change, *, enabled: list[str], stam
                                                    skip_invalid_secondary=skip_invalid_secondary, **inputs) or {})
         if not repair and package.expected_stamp(enabled, **inputs) != stamp:
             raise ValueError("Dependency inputs changed while preparing publication; retry.")
-        if not current and not repair and result.get("environment") is not None:
-            from pm.deployment_guard import assert_committed_platform_dependencies
-
-            assert_committed_platform_dependencies(
-                Path(result["environment"]), package.project_root(), enabled)
         if change is not None:
             change.publish(paths.repo_root())
         if not current:
@@ -802,40 +788,9 @@ def _commit_selection(package, facts: Facts, change, *, enabled: list[str], stam
         raise
 
 
-def _sync_or_publish(package, change, plugins, *, extras, repair: bool, explicit: bool,
-                     shipped, frozen, commit_environment: bool,
-                     externally_managed: bool | None) -> None:
-    """Publish a dep-free or external selection, or build the dependency environment."""
-    from pm import receipt
-    from pm.deployment_guard import EXTERNAL_COMMIT_CAUSE, EXTERNAL_COMMIT_REMEDY, plugin_sync_action
-
-    action = plugin_sync_action(
-        change, project_root=paths.repo_root(), commit_environment=commit_environment,
-        externally_managed=externally_managed)
-    if action == "publish":
-        _publish_inactive(change, reason="plugin selection published without a dependency sync")
-        return
-    if action == "refuse":
-        raise InstallError("venv", EXTERNAL_COMMIT_CAUSE, EXTERNAL_COMMIT_REMEDY)
-    inputs = {"plugin_dirs": change.members} if change is not None else _member_inputs(plugins)
-    facts = Facts(paths.runtime_facts_path(), strict=repair)
-    fact = facts.get("venv") or _facts().get("venv") or {}
-    enabled, stamp, inputs = _target_selection(
-        package, fact, extras=extras, inputs=inputs, repair=repair, shipped=shipped, frozen=frozen)
-    current = not repair and _runtime_state_matches(fact, stamp)
-    if not current and not repair and not explicit and not lazy_installs_allowed():
-        raise _refuse_lazy("venv", str(extras) if extras else "venv out of sync")
-    receipt.record_feature_list(enabled)
-    _commit_selection(
-        package, facts, change, enabled=enabled, stamp=stamp, inputs=inputs,
-        current=current, repair=repair, explicit=explicit)
-
-
 def sync_venv(extras: Optional[list[str]] = None, *, explicit: bool = False,
               plugins: PluginInput | None = None, repair: bool = False,
-              evict_incompatible_plugins: bool = False,
-              commit_environment: bool = False,
-              externally_managed: bool | None = None) -> None:
+              evict_incompatible_plugins: bool = False) -> None:
     """Make the venv match uv.lock + the enabled extras. Extras union into
     the installed state (one ledger); no-op when the stamp already matches.
     ``repair`` restores the recorded dependency graph into a fresh generation,
@@ -846,11 +801,7 @@ def sync_venv(extras: Optional[list[str]] = None, *, explicit: bool = False,
     source of plugin members (see pm.plugin_inputs); None discovers them from config.
     ``evict_incompatible_plugins`` is the update's contract: a discovered plugin that
     keeps the environment from building is disabled instead of failing the sync
-    (see pm.plugin_eviction). ``commit_environment`` opts this plugin publication
-    into creating ``facts.json`` on an interpreter PM did not build.
-    ``externally_managed`` is that interpreter's classification as seen by the
-    caller. None asks this process. The PM worker passes the client's value:
-    its own prefix is a PM runtime and must not decide the question.
+    (see pm.plugin_eviction).
 
     Lazy installs OFF = the frozen feature set: when
     security.allow_lazy_installs is false AND the bundle's
@@ -889,10 +840,17 @@ def sync_venv(extras: Optional[list[str]] = None, *, explicit: bool = False,
                 fact = facts.get("venv") or _facts().get("venv") or {}
                 sync_evicting(package, facts, fact, extras=extras, shipped=shipped, frozen=frozen, explicit=explicit)
             else:
-                _sync_or_publish(
-                    package, change, plugins, extras=extras, repair=repair, explicit=explicit,
-                    shipped=shipped, frozen=frozen, commit_environment=commit_environment,
-                    externally_managed=externally_managed)
+                inputs = {"plugin_dirs": change.members} if change is not None else _member_inputs(plugins)
+                facts = Facts(paths.runtime_facts_path(), strict=repair)
+                fact = facts.get("venv") or _facts().get("venv") or {}
+                enabled, stamp, inputs = _target_selection(package, fact, extras=extras, inputs=inputs,
+                                                           repair=repair, shipped=shipped, frozen=frozen)
+                current = not repair and _runtime_state_matches(fact, stamp)
+                if not current and not repair and not explicit and not lazy_installs_allowed():
+                    raise _refuse_lazy("venv", str(extras) if extras else "venv out of sync")
+                receipt.record_feature_list(enabled)
+                _commit_selection(package, facts, change, enabled=enabled, stamp=stamp, inputs=inputs,
+                                  current=current, repair=repair, explicit=explicit)
         outcome = "ok"
     except BaseException as exc:
         receipt.record_step("dependency-sync", False, f"{type(exc).__name__}: {exc}")
