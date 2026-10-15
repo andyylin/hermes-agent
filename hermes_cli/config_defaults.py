@@ -1727,6 +1727,11 @@ DEFAULT_CONFIG = {
         # Opt-in unattended apply for the cadence check. Git-row plugins ONLY; every apply runs the
         # same security scan / consent pipeline as the manual update command.
         "auto_apply": False,
+        # Let plugin install/enable/disable create installs/<id>/facts.json when this process
+        # is not running an interpreter the package manager built and nothing is committed yet.
+        # False keeps the current interpreter. `hermes plugins install|enable|disable
+        # --commit-environment` opts in for one command.
+        "commit_dependency_environment": False,
         # Where third-party Python plugins run. in_process: imported into Hermes (default).
         # host: one plugin-host process per profile runs them and they reach Hermes only through
         # ctx (a crashing or hanging plugin takes down its host, which restarts; Hermes keeps

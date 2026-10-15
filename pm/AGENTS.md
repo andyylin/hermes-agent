@@ -16,6 +16,14 @@ for declared runtime extras, `hermes pm install` for setup/sync, and `hermes pm 
 for damaged dependencies. Do not mutate Hermes environments with raw pip or uv.
 Use `pm.build_environment` for fresh build outputs and `pm.ensure_environment` for
 isolated tool environments. Callers receive an interpreter or tool path, not uv.
+
+Plugin install, enable, and disable publish through `sync_venv`, but a plugin
+with no Python declaration does not build an environment. On an interpreter PM
+did not build, with no `facts.json` yet, that publication does not create one
+unless `plugins.commit_dependency_environment` is true or the command passes
+`--commit-environment` (`pm/deployment_guard.py`). A generation that is committed
+keeps the extras for every platform enabled in config and is not recorded when
+it would drop one of those dependencies.
 Nix's declarative uv2nix builds and unrelated user projects remain independently owned.
 
 The `[tool.uv] exclude-newer = "3 days"` release-age check covers **Hermes's own dependencies

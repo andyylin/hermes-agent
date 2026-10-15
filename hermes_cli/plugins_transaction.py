@@ -15,7 +15,7 @@ def recover_plugin_publication(project: Path, row: dict, journal: Path) -> None:
 
 def publish_plugin(staged: Path, target: Path, old_metadata: dict, new_metadata: dict,
                    *, target_digest: str | None = None, require_consent: bool = False,
-                   assume_consent: bool = False) -> None:
+                   assume_consent: bool = False, commit_environment: bool = False) -> None:
     """Publish *staged* into *target*. *assume_consent* is consent the caller
     already holds (``--yes-deps``, or a memory-provider migration under
     ``security.allow_lazy_installs``): the active-replacement consent veto is
@@ -41,7 +41,7 @@ def publish_plugin(staged: Path, target: Path, old_metadata: dict, new_metadata:
                 raise plugins_cmd.PluginOperationError(
                     outcome.format(reason), failure_class=tagged_failure_class(reason) or "other")
 
-    sync_venv(explicit=True, plugins=StagedUpdate({
+    sync_venv(explicit=True, commit_environment=commit_environment, plugins=StagedUpdate({
         "staged": str(staged.resolve()), "target": str(target.absolute()),
         "old_metadata": old_metadata, "new_metadata": new_metadata,
         "target_digest": target_digest if target_digest is not None else (tree_digest(target) if target.exists() else None),

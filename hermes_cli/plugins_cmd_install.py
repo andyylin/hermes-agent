@@ -340,6 +340,7 @@ def _install_plugin_core(
     catalog: Optional[dict] = None,
     allow_removed: bool = False,
     before_swap=None,
+    commit_environment: bool = False,
 ) -> tuple[Path, dict, str]:
     """Clone a Git plugin and atomically record its source and exact revision.
 
@@ -479,7 +480,7 @@ def _install_plugin_core(
                 f"copies are under {backup} (re-apply by hand).[/yellow]")
         try:
             publish_plugin(tmp_target, target, old_metadata, new_metadata, require_consent=True,
-                           assume_consent=assume_deps_consent)
+                           assume_consent=assume_deps_consent, commit_environment=commit_environment)
         except Exception as exc:
             raise _pc().PluginOperationError(f"Plugin '{plugin_name}' was not published: {exc}",
                                              failure_class=_publish_failure_class(exc)) from exc
@@ -537,6 +538,7 @@ def cmd_install(
     allow_removed: bool = False,
     no_deps: bool = False,
     yes_deps: bool = False,
+    commit_environment: bool = False,
 ) -> None:
     """Install a plugin from the curated catalog (bare name), a Git URL, or owner/repo shorthand.
 
@@ -590,10 +592,11 @@ def cmd_install(
         if entry is not None:
             return catalog.install_catalog_entry(
                 entry, force=force, ref=ref, allow_removed=allow_removed, scan_decision_cb=_interactive_scan_decision,
-                python_deps=not no_deps, assume_deps_consent=yes_deps)
+                python_deps=not no_deps, assume_deps_consent=yes_deps, commit_environment=commit_environment)
         return _pc()._install_plugin_core(
             identifier, force=force, ref=ref, scan_decision_cb=_interactive_scan_decision,
-            python_deps=not no_deps, allow_removed=allow_removed, assume_deps_consent=yes_deps)
+            python_deps=not no_deps, allow_removed=allow_removed, assume_deps_consent=yes_deps,
+            commit_environment=commit_environment)
 
     try:
         target, installed_manifest, installed_name = recorded_install(
@@ -657,7 +660,8 @@ def cmd_install(
         from hermes_cli.plugins_admission import AdmissionRefused
 
         try:
-            _pc()._set_plugin_enabled(installed_name, enable=True, console=console)
+            _pc()._set_plugin_enabled(installed_name, enable=True, console=console,
+                                     commit_environment=commit_environment)
         except AdmissionRefused:
             console.print(
                 "[dim]The plugin stays installed but disabled; re-enable "

@@ -55,6 +55,7 @@ def admit_plugin_set_change(
     extra_dirs: Iterable[Path] = (),
     expected_config: str | None = None,
     plugin: Optional[str] = None,
+    commit_environment: bool = False,
 ) -> None:
     """PM discovers and validates the proposed union under its install lock.
 
@@ -67,7 +68,7 @@ def admit_plugin_set_change(
 
     home = Path(active_plugins_dir).parent if active_plugins_dir is not None else get_hermes_home()
     try:
-        sync_venv(explicit=True, plugins=Selection({
+        sync_venv(explicit=True, commit_environment=commit_environment, plugins=Selection({
             "home": str(home.resolve()), "enabled": sorted(candidate_enabled),
             "disabled": sorted(candidate_disabled), "extra_dirs": [str(Path(d).resolve()) for d in extra_dirs],
             **({"expected_config": expected_config} if expected_config is not None else {}),

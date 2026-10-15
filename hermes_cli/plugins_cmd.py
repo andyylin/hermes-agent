@@ -490,7 +490,7 @@ def _plugin_selection_version() -> str:
 
 def _admit_and_save_plugin_sets(
     enabled: set, disabled: set, *, extra_dirs=(), console=None, action: str = "enable", expected_config=None,
-    plugin: Optional[str] = None,
+    plugin: Optional[str] = None, commit_environment: bool = False,
 ) -> None:
     """ONE admission authority for proposed enabled/disabled sets (C13):
     the candidate union is resolved against the ACTIVE environment and
@@ -506,7 +506,7 @@ def _admit_and_save_plugin_sets(
     try:
         admit_plugin_set_change(
             enabled, disabled, active_plugins_dir=_plugins_dir(), extra_dirs=extra_dirs, expected_config=expected_config,
-            plugin=plugin,
+            plugin=plugin, commit_environment=commit_environment,
         )
     except DependencyConflict as exc:
         # `hermes pm install` cannot fix a conflict, so the retry hint below would mislead here.
@@ -561,7 +561,7 @@ def _plugin_aliases(key: str, entries: Optional[list] = None) -> set:
     return names
 
 
-def _activate_key(key: str, *, enable: bool, console=None) -> bool:
+def _activate_key(key: str, *, enable: bool, console=None, commit_environment: bool = False) -> bool:
     """Transactionally persist canonical *key*, purging aliases from the opposing list.
 
     False when the lists already say so (nothing written). PM owns the selection and dependency
@@ -572,7 +572,8 @@ def _activate_key(key: str, *, enable: bool, console=None) -> bool:
     target, other = (enabled, disabled) if enable else (disabled, enabled)
     if key in target and not (aliases & other):
         return False
-    _set_plugin_enabled(key, enable=enable, aliases=aliases, console=console)
+    _set_plugin_enabled(key, enable=enable, aliases=aliases, console=console,
+                       commit_environment=commit_environment)
     return True
 
 
@@ -620,7 +621,8 @@ def _selection_lock() -> threading.Lock:
         return _SELECTION_LOCKS.setdefault(hermes_home_key(), threading.Lock())
 
 
-def _set_plugin_enabled(name: str, *, enable: bool, aliases=(), console=None) -> None:
+def _set_plugin_enabled(name: str, *, enable: bool, aliases=(), console=None,
+                        commit_environment: bool = False) -> None:
     """Submit the command's delta with the version of the selection it read."""
     from pm.plugins_state import read_home_selection
 
@@ -633,7 +635,8 @@ def _set_plugin_enabled(name: str, *, enable: bool, aliases=(), console=None) ->
         _apply_activation(enabled, disabled, name, aliases, enable=enable)
         _admit_and_save_plugin_sets(enabled, disabled, console=console,
                                    action=f"{'Enable' if enable else 'Disable'} '{name}'",
-                                   expected_config=expected_config, plugin=name if enable else None)
+                                   expected_config=expected_config, plugin=name if enable else None,
+                                   commit_environment=commit_environment)
 
 
 def _apply_activation(enabled: set, disabled: set, key: str, aliases, *, enable: bool) -> None:
@@ -692,7 +695,8 @@ def _resolve_plugin_key_and_source(name: str) -> Optional[tuple]:
     return (entry[5], entry[3]) if entry else None
 
 
-def cmd_enable(name: str, allow_tool_override: Optional[bool] = None) -> None:
+def cmd_enable(name: str, allow_tool_override: Optional[bool] = None, *,
+               commit_environment: bool = False) -> None:
     """Add a plugin to the enabled allow-list (and remove it from disabled).
 
     Non-bundled plugins request consent for declared capabilities. The legacy
@@ -723,7 +727,7 @@ def cmd_enable(name: str, allow_tool_override: Optional[bool] = None) -> None:
         except PluginOperationError as exc:
             _fail(console, f"[red]Error:[/red] {exc}")
 
-    changed = _activate_key(key, enable=True, console=console)
+    changed = _activate_key(key, enable=True, console=console, commit_environment=commit_environment)
     if changed:
         from hermes_cli.plugins_activation import activate_plugin_now, activation_hint
         console.print(f"[green]✓[/green] Plugin [bold]{key}[/bold] enabled. Takes effect on next session.")
@@ -750,14 +754,14 @@ def _enable_consent(console, key: str, allow_tool_override: Optional[bool]) -> N
         _resolve_tool_override_grant(console, key, allow_tool_override)
 
 
-def cmd_disable(name: str) -> None:
+def cmd_disable(name: str, *, commit_environment: bool = False) -> None:
     """Remove a plugin from the enabled allow-list (and add to disabled)."""
     console = _console()
     key = _resolve_plugin_key(name)
     if key is None:
         _fail(console, _unknown_plugin_message(name))
     toolset_key = _saved_list_toolset_key(key)  # resolve while the plugin still loads
-    if not _activate_key(key, enable=False, console=console):
+    if not _activate_key(key, enable=False, console=console, commit_environment=commit_environment):
         console.print(f"[dim]Plugin '{key}' is already disabled.[/dim]")
         return
     _toggle_plugin_toolset(key, enable=False, toolset_key=toolset_key)
@@ -1076,7 +1080,8 @@ _PLUGIN_ACTIONS = {
         ref=getattr(args, "ref", None),
         allow_removed=getattr(args, "allow_removed", False),
         no_deps=getattr(args, "no_deps", False),
-        yes_deps=getattr(args, "yes_deps", False)),
+        yes_deps=getattr(args, "yes_deps", False),
+        commit_environment=getattr(args, "commit_environment", False)),
     "search": lambda args: _catalog().cmd_search(
         getattr(args, "term", "") or "", json_output=getattr(args, "json", False)),
     "browse": lambda args: _catalog().cmd_search(""),
@@ -1092,8 +1097,10 @@ _PLUGIN_ACTIONS = {
     "uninstall": lambda args: cmd_remove(args.name),
     "enable": lambda args: cmd_enable(
         args.name,
-        allow_tool_override=_tri_state_flag(args, "allow_tool_override", "no_allow_tool_override")),
-    "disable": lambda args: cmd_disable(args.name),
+        allow_tool_override=_tri_state_flag(args, "allow_tool_override", "no_allow_tool_override"),
+        commit_environment=getattr(args, "commit_environment", False)),
+    "disable": lambda args: cmd_disable(
+        args.name, commit_environment=getattr(args, "commit_environment", False)),
     "capabilities": lambda args: cmd_capabilities(getattr(args, "name", None)),
     "list": lambda args: cmd_list(args),
     "ls": lambda args: cmd_list(args),

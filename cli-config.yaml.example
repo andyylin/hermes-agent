@@ -65,6 +65,11 @@ plugins:
   # seconds. Subdirectory installs download only that folder.
   # Raise this for large repositories or slow connections. Maximum: 3600.
   clone_timeout_seconds: 300
+  # Let plugin install/enable/disable create the package manager's dependency
+  # environment when Hermes is running an interpreter PM did not build and
+  # nothing is committed yet. Default false leaves that interpreter in place.
+  # `hermes plugins install|enable|disable --commit-environment` opts in once.
+  commit_dependency_environment: false
 
 # =============================================================================
 # Model Configuration

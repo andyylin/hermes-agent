@@ -252,7 +252,8 @@ def _refuse_unsupported_catalog_platform(entry: PluginCatalogEntry) -> None:
 
 def install_catalog_entry(entry: PluginCatalogEntry, *, force: bool, ref: Optional[str] = None,
                           allow_removed: bool = False, scan_decision_cb=None, python_deps: bool = True,
-                          assume_deps_consent: bool = False, before_swap=None) -> tuple:
+                          assume_deps_consent: bool = False, before_swap=None,
+                          commit_environment: bool = False) -> tuple:
     """``_install_plugin_core`` at the catalog pin (an explicit *ref* wins) + provenance recorded on the
     install-metadata record at the sha ACTUALLY checked out (a ``--ref`` install is not at the reviewed
     pin, so ``update_available`` must say so). Returns the core's ``(target, manifest, installed_name)``."""
@@ -263,7 +264,7 @@ def install_catalog_entry(entry: PluginCatalogEntry, *, force: bool, ref: Option
     target, manifest, installed_name = _install_plugin_core(
         entry.install_identifier, force=force, ref=ref or entry.sha, scan_decision_cb=scan_decision_cb,
         reviewed_pin=entry.sha, python_deps=python_deps, assume_deps_consent=assume_deps_consent,
-        allow_removed=allow_removed, before_swap=before_swap,
+        allow_removed=allow_removed, before_swap=before_swap, commit_environment=commit_environment,
         catalog={"name": entry.name, "repo": entry.repo, "tier": entry.tier, "pin": entry.sha})
     return target, manifest, installed_name
 
