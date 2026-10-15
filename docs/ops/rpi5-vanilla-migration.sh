@@ -6,7 +6,7 @@
 # gateway drop-in files and nothing else. --rollback restores those drop-ins
 # and, when a claim backup exists, the external install stamp.
 # --install-system-unit refreshes the system hermes-gateway unit and chowns
-# root-owned files in the user's Hermes home back. No mode prints
+# root-owned paths the install created or touched. No mode prints
 # credential values.
 #
 # Idempotent. A missing runtime facts.json is gated by a throwaway
@@ -307,8 +307,12 @@ if [[ "$MODE" == "install-system-unit" ]]; then
     echo "system unit install command was empty" >&2
     exit 4
   fi
+  # Touched before install. -cnewer keeps root-owned files the install did not change.
+  chown_since="$(mktemp)"
+  touch "$chown_since"
+  trap 'rm -f "$chown_since"' EXIT
   "${install_cmd[@]}"
-  chown_argv="$(helper chown-root-owned --home "${HOME}/.hermes" --uid "$(id -u)" --gid "$(id -g)")" || exit $?
+  chown_argv="$(helper chown-root-owned --home "${HOME}/.hermes" --uid "$(id -u)" --gid "$(id -g)" --since "$chown_since")" || exit $?
   mapfile -t chown_cmd <<< "$chown_argv"
   "${chown_cmd[@]}"
   exit $?
