@@ -364,6 +364,8 @@ def test_rollback_checklist_covers_the_host_without_gc_or_migrate_apply():
         "hermes-gateway-wife",
         "Do not run `hermes gateway migrate --multiplex`",
         "Do not run `hermes pm gc`",
+        "install-stamp.json.external-backup",
+        ".hermes/bin/hermes",
     ):
         assert phrase in text
 

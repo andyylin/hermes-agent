@@ -277,9 +277,26 @@ The throwaway lives under `mktemp` and is deleted before `hermes pm install`,
 whether the import gate passes or fails. A failed gate leaves `facts.json`
 absent. Exit 4 means the driver interpreter or
 `~/.hermes/hermes-agent/.hermes/bin/hermes` is missing. Do not substitute the
-external venv's `hermes` on `PATH`. Publish the store interpreter with the
-driver (`PYTHONPATH` pointed at the checkout, `python -m hermes_cli.main pm
-install python`) and re-run the script.
+external venv's `hermes` on `PATH`.
+
+Install the store interpreter when it is absent:
+
+```bash
+PYTHONPATH="$HOME/.hermes/hermes-agent" python -m hermes_cli.main pm install python
+```
+
+`pm install python` calls `publish_launchers`. That function leaves a tree
+whose `install-stamp.json` says `updateMechanism: external` alone, which is
+how the old external venv left this checkout. The command can succeed while
+`.hermes/bin/hermes` is still missing. Apply and `--gc` then run
+`claim-managed` on that checkout. The claim runs only when the stamp says
+`external`, the tree is a git checkout with `pyproject.toml`, and PM's store
+interpreter is already installed. It copies the stamp to
+`install-stamp.json.external-backup`, rewrites it with `write_source_stamp`
+(the stamp a fresh self-managed checkout publishes: `updateMechanism: self`,
+`source: git`), calls `publish_launchers` with `create=False`, and requires
+`.hermes/bin/hermes` to be executable. A failed publish puts the backup back.
+`--rollback` restores that backup and removes a launcher the claim created.
 
 Then the official launcher (`~/.hermes/hermes-agent/.hermes/bin/hermes`) runs:
 
@@ -837,10 +854,15 @@ you do this.
    `92-canonical-runtime.conf`, and `memory-limits.conf` from
    `~/rpi5-unit-backup/gateway-dropins/`, and removes
    `zz-multiplex-memory.conf` and `zz-profile-runtime-env.conf`. It then
-   prints the rest of this list. It does not start or stop units. If the
-   backup is missing one of the four files, it exits non-zero before it
-   renames anything. Keep the `~/rpi5-unit-backup/` copy from pre-flight
-   step 4 so you can put a missing file back by hand without printing it.
+   restores `install-stamp.json` from
+   `install-stamp.json.external-backup` when that backup exists, and removes
+   the `.hermes/bin/hermes` launcher the claim created. A missing stamp
+   backup leaves the stamp unchanged. It then prints the rest of this list.
+   It does not start or stop units. If the drop-in backup is missing one of
+   the four files, it exits non-zero before it renames any drop-in, and it
+   still restores the stamp backup when one exists. Keep the
+   `~/rpi5-unit-backup/` copy from pre-flight step 4 so you can put a missing
+   file back by hand without printing it.
 
 6. If `98-py314-v0217.conf` was retargeted, restore it from the unit backup.
    Do not point hermes-webui at `hermes dashboard`. If the preflight said

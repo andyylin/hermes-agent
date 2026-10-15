@@ -2,8 +2,9 @@
 # Commit the rpi5 dependency environment with official Hermes commands.
 #
 # The default mode commits the PM environment only. It does not edit
-# config.yaml, systemd units, or profile homes. --sideline-dropins and
-# --rollback move gateway drop-in files and nothing else. No mode prints
+# config.yaml, systemd units, or profile homes. --sideline-dropins moves
+# gateway drop-in files and nothing else. --rollback restores those drop-ins
+# and, when a claim backup exists, the external install stamp. No mode prints
 # credential values.
 #
 # Idempotent. A missing runtime facts.json is gated by a throwaway
@@ -30,7 +31,7 @@
 #   docs/ops/rpi5-vanilla-migration.sh --sideline-dropins
 #   docs/ops/rpi5-vanilla-migration.sh --orphans
 #   docs/ops/rpi5-vanilla-migration.sh --gc            # refused before 2026-10-16 12:41 Taipei
-#   docs/ops/rpi5-vanilla-migration.sh --rollback      # restore sideline'd drop-ins; print the rest
+#   docs/ops/rpi5-vanilla-migration.sh --rollback      # restore sideline'd drop-ins and the external stamp; print the rest
 #
 # --preflight greps hermes/hermex units for EnvironmentFile, ExecStartPre, and
 # Environment=, and runs `hermes gateway migrate --multiplex --dry-run`. The
@@ -158,6 +159,19 @@ helper() {
   "$DRIVER" "$HELPER" "$@"
 }
 
+# publish_launchers leaves updateMechanism external alone, so `pm install python`
+# can succeed while this file is still missing. claim-managed backs the stamp
+# up, rewrites it with write_source_stamp, publishes the launcher, and verifies
+# it. A stamp that is not external is left unchanged; the check below still
+# exits 4 when the launcher is absent.
+ensure_official_launcher() {
+  local launcher="${CHECKOUT}/.hermes/bin/hermes"
+  if [[ -x "$launcher" ]]; then
+    return 0
+  fi
+  helper claim-managed --checkout "$CHECKOUT"
+}
+
 # One hermes-gateway.service.d. Two scopes means the operator has to pass the
 # directory by running the helper; guessing would sideline the wrong unit.
 locate_gateway_dropins() {
@@ -265,6 +279,7 @@ fi
 if [[ "$MODE" == "gc" ]]; then
   helper gc-gate
   helper orphans --facts "$FACTS" --environments "$ENVIRONMENTS"
+  ensure_official_launcher
   LAUNCHER="${CHECKOUT}/.hermes/bin/hermes"
   if [[ ! -x "$LAUNCHER" ]]; then
     echo "official launcher missing: ${LAUNCHER}" >&2
@@ -276,8 +291,16 @@ fi
 
 if [[ "$MODE" == "rollback" ]]; then
   dropin_dir="$(locate_gateway_dropins)" || exit $?
+  set +e
   helper rollback-dropins --dropin-dir "$dropin_dir" --backup "$BACKUP_DROPINS"
-  exit $?
+  dropin_rc=$?
+  helper restore-external-stamp --checkout "$CHECKOUT"
+  stamp_rc=$?
+  set -e
+  if [[ "$dropin_rc" -ne 0 ]]; then
+    exit "$dropin_rc"
+  fi
+  exit "$stamp_rc"
 fi
 
 # Prints three lines: status, interpreter, extras. status is ok | absent | broken.
@@ -361,6 +384,7 @@ if [[ "$MODE" == "check" ]]; then
   exit 1
 fi
 
+ensure_official_launcher
 LAUNCHER="${CHECKOUT}/.hermes/bin/hermes"
 if [[ ! -x "$LAUNCHER" ]]; then
   echo "official launcher missing: ${LAUNCHER}" >&2
