@@ -244,12 +244,12 @@ def test_the_claim_time_record_publishes_no_served_set(tmp_path, monkeypatch):
         hr.clear_record(hr.ROLE_GATEWAY)
 
 
-def test_served_profiles_roster_ignores_config_false_but_honours_an_explicit_argument(monkeypatch):
-    """The dashboard host roster stays the full set when config says false.
-
-    The messaging gateway settles that flag in ``resolve_multiplex_mode`` and republishes its own
-    record. This helper is what ``hermes serve`` publishes; shrinking it on ``false`` would hide
-    profiles ``?profile=`` still serves. The caller's explicit argument still decides."""
+def test_served_profiles_ignores_the_retired_opt_out_but_honours_an_explicit_argument(monkeypatch):
+    """``served_profiles()`` forced ``multiplex=True`` and claimed profiles it would never serve,
+    so it learned to read ``gateway.multiplex_profiles``. That key is now RETIRED as a topology
+    opt-out: reading it here was the last place an explicit ``false`` still narrowed the record,
+    which is why the CLI reported "standalone, serving default" while the runtime multiplexed.
+    The caller's explicit argument — the RUNTIME verdict — still decides."""
     asked: list[bool] = []
 
     def _roster(*, multiplex):

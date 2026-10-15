@@ -2140,18 +2140,27 @@ DEFAULT_CONFIG = {
         # (primary copy: state.db gateway_routing table). True for external tooling and downgrade
         # safety; False stops producing the file.
         "write_sessions_json": True,
-        # One gateway for every profile on this host when the flag is on: the DEFAULT profile's
-        # gateway also connects each named profile's bots (their own .env / config.yaml,
-        # per-profile secret scope) and stamps the profile into session keys. Default is on.
-        # GatewayConfig keeps an unset key as None. resolve_multiplex_mode settles it at boot:
-        # multiplex when the migration preflight is clear, else stay standalone and log the
-        # blocker (a secondary that still runs its own gateway, a duplicate credential, a host
-        # that cannot migrate). An explicit true skips that preflight. An explicit false is
-        # honored: the process stays standalone even when no other gateway is running, and the
-        # boot log names the setting (config.yaml, or GATEWAY_MULTIPLEX_PROFILES when that env
-        # override won). Env wins over config.yaml. The dashboard credential guard does not read
-        # this key (tui_gateway/launch_profile_policy.py): skipping activation there would serve
-        # a second profile with the launch profile's credentials.
+        # One gateway for every profile on this host: the DEFAULT profile's gateway also connects
+        # each named profile's bots (their own .env / config.yaml, per-profile secret scope) and
+        # stamps the profile into session keys. This is the ONLY supported topology — there is no
+        # `false` opt-out any more: an explicit `false` still parses (it is the runtime mode flag
+        # every scoped code path reads) but is warned about and IGNORED for process topology, and
+        # `hermes gateway migrate --multiplex` folds any per-profile fleet that is left.
+        # An UNSET key is a request, not a verdict: at boot the gateway runs the migration
+        # preflight and stays standalone (logging why) while a secondary still runs its own
+        # gateway or a blocker exists, then converges once that is resolved.
+        # TWO things DO change on a host that had pinned `false`, and neither is a process:
+        #   • INGRESS — `/p/<profile>/` on the default listener goes 404 -> served
+        #     (gateway/api_server.py::_resolve_request_profile, gateway/webhook.py). A host that
+        #     opted out GAINS that HTTP surface; it is authenticated exactly like the default
+        #     profile's, but it is new reachable surface, so audit any reverse proxy that assumed
+        #     /p/ was dead.
+        #   • SECRET SCOPE — eager multi-profile activation no longer consults the flag
+        #     (tui_gateway/launch_profile_policy.py), so a host with a leftover servable profile
+        #     dir flips eager=false/reads-open -> eager=true/fail-closed: an UNSCOPED `get_secret`
+        #     now raises UnscopedSecretError, and a key that lives ONLY in the unit's
+        #     `Environment=` (no .env) disappears from file-built scopes. A genuinely
+        #     single-profile host never activates and is byte-identical.
         # Two profiles configuring the same bot token cannot be served together — the duplicate
         # adapter is parked; `hermes profile create --clone` therefore leaves messaging channels
         # behind unless --clone-channels is passed.

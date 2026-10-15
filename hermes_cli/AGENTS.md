@@ -175,10 +175,9 @@ tool registry overlays) key on `hermes_constants.hermes_home_key()`, never a sin
 `gateway.multiplex_profiles` defaults to **on**, but `GatewayConfig` keeps an unset flag `None` and
 `gateway_multiplex_mode.resolve_multiplex_mode` settles it once per boot (called from
 `load_gateway_config_for_runner`): default profile, >= 2 profiles, no standalone secondary gateway,
-no preflight blocker, migratable host → `True`; else `False` + a logged blocker. Explicit `true`
-skips the preflight; explicit `false` (`GATEWAY_MULTIPLEX_PROFILES` wins) stays standalone and the
-log names that setting. `default_gateway_multiplexes` reads the live `served_profiles` record, then
-the explicit flag — never the merged default.
+no preflight blocker, migratable host → `True`; else `False` + a logged reason. Explicit values pass
+through. CLI/dashboard readers use `default_gateway_multiplexes` (live `served_profiles` record, then
+the explicit flag) — never the merged default, which would guess a verdict only the gateway makes.
 Migration from per-profile gateways: `hermes_cli/gateway_migrate.py` (`hermes gateway migrate
 --multiplex`, the only mode — `--standalone` is deleted and a per-profile fleet is not a supported
 target; table-driven `_PREFLIGHT_CHECKS`; manifest `<default>/gateway_migration.json` = UNFINISHED,

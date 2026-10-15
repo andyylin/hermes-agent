@@ -145,13 +145,12 @@ def test_a_named_profile_slot_is_registered_but_never_autostarted(tmp_path: Path
     pytest.param("false", None, id="config-false"),
     pytest.param("true", "false", id="env-false-overrides-config"),
 ])
-def test_container_boot_does_not_start_a_named_slot_when_multiplex_is_false(
+def test_the_retired_opt_out_cannot_boot_a_second_gateway_in_the_container(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config_value: str, env_value: str | None,
 ) -> None:
-    """Container boot does not read ``gateway.multiplex_profiles``.
-
-    It used to, which made the UNSET default boot per-profile slots. The messaging gateway honors
-    an explicit false at startup; this s6 reconcile still leaves the named slot down."""
+    """`gateway.multiplex_profiles: false` (and its env override) is retired as a topology switch.
+    It used to decide whether s6 booted the per-profile slots; reading it here is what shipped the
+    opt-out topology by accident on the UNSET default. The slot stays down either way."""
     scandir = tmp_path / "run-service"
     scandir.mkdir()
     _make_profile(tmp_path, "coder", state="running")

@@ -114,17 +114,15 @@ def test_resolved_default_is_written_once_and_never_on_a_guard(s6_host):
     text = (root / "config.yaml").read_text(encoding="utf-8")
     assert "# my config" in text and "multiplex_profiles: true" in text  # comment-preserving writer
     assert mode.persist_resolved_default(on, root) is False  # already explicit: once
-    # An explicit false is not rewritten, and it does not leave the old rewrite marker.
+    # A retired ``false`` is rewritten in place, never silently: the one-time notice reaches the
+    # gateway start (log_multiplex_decision prints it) and the next ``hermes update`` summary.
     (root / "config.yaml").write_text("# my config\ngateway:\n  multiplex_profiles: false\n", encoding="utf-8")
     from gateway.config import GatewayConfig
     decision = mode.resolve_multiplex_mode(GatewayConfig.from_dict({"gateway": {"multiplex_profiles": False}}))
-    assert decision == mode.MultiplexDecision(False, "config", mode.CONFIG_OPT_OUT_REASON)
+    assert decision.source == "retired-opt-out"
     mode.log_multiplex_decision(decision)
     text = (root / "config.yaml").read_text(encoding="utf-8")
-    assert "# my config" in text and "multiplex_profiles: false" in text
-    assert not (root / mode.REWRITTEN_MARKER_NAME).exists()
-    # A marker left by an older build is still printed once by hermes update.
-    (root / mode.REWRITTEN_MARKER_NAME).write_text("old\n", encoding="utf-8")
+    assert "# my config" in text and "multiplex_profiles: true" in text and "false" not in text
     notice = mode.consume_rewritten_notice(root)
     assert any("rewritten to true" in line for line in notice) and notice[0].startswith("┌")
     assert mode.consume_rewritten_notice(root) == []  # one-time
