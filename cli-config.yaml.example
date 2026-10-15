@@ -2300,6 +2300,8 @@ updates:
 #     enabled: false
 #     access_token_env: BWS_ACCESS_TOKEN   # bootstrap token, sourced from .env
 #     project_id: ""                       # UUID of the BSM project to sync
+#     key_prefix: ""                       # "" = whole project; else only keys with this prefix
+#     strip_prefix: false                  # drop the owner segment (KATIE_MATRIX_* -> MATRIX_*)
 #     server_url: ""                       # "" = US Cloud; EU/self-hosted URL otherwise
 #     cache_ttl_seconds: 300               # 0 disables fresh caching
 #     encrypted_cache:                     # optional encrypted stale fallback

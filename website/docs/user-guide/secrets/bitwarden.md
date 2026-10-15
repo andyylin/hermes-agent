@@ -6,7 +6,7 @@ Pull API keys from [Bitwarden Secrets Manager](https://bitwarden.com/products/se
 
 1. You create a **machine account** in Bitwarden Secrets Manager, give it read access to a project, and generate an **access token**.
 2. Hermes stores that single token in `~/.hermes/.env` as `BWS_ACCESS_TOKEN`.
-3. Every time `hermes` (or the gateway, or a cron job) starts, after `~/.hermes/.env` has loaded, Hermes calls `bws secret list <project_id>` and sets the returned keys into `os.environ`.
+3. Every time `hermes` (or the gateway, or a cron job) starts, after `~/.hermes/.env` has loaded, Hermes calls `bws secret list <project_id>` and sets the returned keys into `os.environ`. `key_prefix` can limit that list to keys that start with a prefix, and `strip_prefix` can rename them before they are exported. With both unset, every secret in the project is loaded under its Bitwarden name.
 4. By default Hermes **overrides** values already in your environment, so Bitwarden is the source of truth — rotate a key once in the web app and every Hermes process picks it up on next start. Flip `override_existing: false` in config if you want `.env` to win instead.
 
 Hermes honors a `bws` executable on `PATH` before checking PM selection.
@@ -72,7 +72,7 @@ From now on, every `hermes` invocation pulls fresh secrets at startup. You'll se
 | `hermes secrets bitwarden setup` | Interactive wizard (install binary, prompt for token, pick project, test fetch) |
 | `hermes secrets bitwarden status` | Show config + binary version + token presence/validation |
 | `hermes secrets bitwarden token` | Rotate the access token: validate the new token against Bitwarden, then store it in `.env` |
-| `hermes secrets bitwarden sync` | Dry-run: pull secrets now and show what would be applied |
+| `hermes secrets bitwarden sync` | Dry-run: pull secrets now and show what would be applied. With `key_prefix` set, the Name column is the exported name and keys outside the prefix are omitted. |
 | `hermes secrets bitwarden sync --apply` | Pull and export into the current shell's environment |
 | `hermes secrets bitwarden install` | Install or repair the PM-pinned `bws` binary. No Bitwarden authentication required. |
 | `hermes secrets bitwarden install --force` | Check and repair the managed copy. Valid entries can be reused without another download. |
@@ -106,6 +106,8 @@ secrets:
     enabled: false
     access_token_env: BWS_ACCESS_TOKEN
     project_id: ""
+    key_prefix: ""
+    strip_prefix: false
     server_url: ""
     cache_ttl_seconds: 300
     encrypted_cache:
@@ -120,6 +122,8 @@ secrets:
 | `enabled` | `false` | Master switch. When false, Bitwarden is never contacted. |
 | `access_token_env` | `BWS_ACCESS_TOKEN` | Env var name that holds the bootstrap token. Change this if you already use `BWS_ACCESS_TOKEN` for something else. |
 | `project_id` | `""` | UUID of the project to sync from. |
+| `key_prefix` | `""` | Load only secrets whose key starts with this string. Empty loads the whole project, which is the previous behavior. `TELEGRAM_BOT_TOKEN` is not loaded when the prefix is `KATIE_` or `KATIE_MATRIX_`. |
+| `strip_prefix` | `false` | When `key_prefix` is set, drop the leading owner segment from the exported name. A one-segment prefix is removed whole, so `key_prefix: KATIE_` exports `KATIE_MATRIX_PASSWORD` as `MATRIX_PASSWORD`. A longer prefix keeps its final segment, so `key_prefix: KATIE_MATRIX_` exports that same key as `MATRIX_PASSWORD` rather than `PASSWORD`. `false` keeps the Bitwarden key unchanged. Ignored when `key_prefix` is empty. |
 | `server_url` | `""` | Bitwarden region or self-hosted endpoint. Empty = `bws` default (US Cloud, `https://vault.bitwarden.com`). Set to `https://vault.bitwarden.eu` for EU Cloud, or your own URL for self-hosted. Plumbed into the `bws` subprocess as `BWS_SERVER_URL`. |
 | `cache_ttl_seconds` | `300` | How long an in-process or disk fetch result is reused. Set to `0` to disable fresh-cache reuse. |
 | `encrypted_cache.enabled` | `false` | Store the last successful fetch in an AES-GCM encrypted cache at `~/.hermes/cache/bws_cache.enc.json`. |

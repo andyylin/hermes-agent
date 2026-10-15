@@ -20,6 +20,9 @@
 #   docs/ops/rpi5-vanilla-migration.sh --preflight-fold
 #       # after gateway.standalone is unset on katie and alice only
 #   docs/ops/rpi5-vanilla-migration.sh --config-edits
+#       # kids share Hermes - Aoba (9d36a60d-2e7e-41c0-a90f-b47b0036e9c2)
+#       # key_prefix KATIE_MATRIX_ / ALICE_MATRIX_, strip_prefix true -> MATRIX_*
+#       # copy dad's BWS_ACCESS_TOKEN into each kid .env; do not print it
 #   docs/ops/rpi5-vanilla-migration.sh --renderer-keys /path/to/render_kid_matrix_env.py
 #   docs/ops/rpi5-vanilla-migration.sh --matrix-probe katie
 #   docs/ops/rpi5-vanilla-migration.sh --alice-mcp-env          # print paths, do not write

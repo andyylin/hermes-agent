@@ -486,11 +486,17 @@ def _kid_credential_plan(profile: str, facts: UnitFacts | None) -> str:
         )
     return (
         f"{profile}: move Matrix credentials to secrets.bitwarden in this profile's "
-        "config.yaml (enabled, access_token_env BWS_ACCESS_TOKEN, project_id whose "
-        "secret names are the MATRIX_* names the renderer writes). Put only "
-        f"BWS_ACCESS_TOKEN in {dest}. Do not merge the rendered env file into {dest}."
+        "config.yaml (enabled, access_token_env BWS_ACCESS_TOKEN, project_id "
+        f"{AOBA_PROJECT_ID} Hermes - Aoba, key_prefix {profile.upper()}_MATRIX_, "
+        "strip_prefix true so those keys export as MATRIX_*). Copy dad's "
+        f"BWS_ACCESS_TOKEN into {dest}. Do not print the token. Do not merge the "
+        f"rendered env file into {dest}."
         f"{renderer}{alice} {_shared_unit_ban()}"
     )
+
+
+# Shared BSM project "Hermes - Aoba". Kids filter with key_prefix; dad does not.
+AOBA_PROJECT_ID = "9d36a60d-2e7e-41c0-a90f-b47b0036e9c2"
 
 
 _PROFILE_PLANS = {
@@ -932,15 +938,19 @@ CONFIG_EDITS = (
     "katie config.yaml: remove gateway.standalone",
     "katie config.yaml: secrets.bitwarden.enabled: true",
     "katie config.yaml: secrets.bitwarden.access_token_env: BWS_ACCESS_TOKEN",
-    "katie config.yaml: secrets.bitwarden.project_id: a project whose secret names are only the MATRIX_* names --renderer-keys prints for Katie",
+    "katie config.yaml: secrets.bitwarden.project_id: 9d36a60d-2e7e-41c0-a90f-b47b0036e9c2 (Hermes - Aoba, the project dad already uses)",
+    "katie config.yaml: secrets.bitwarden.key_prefix: KATIE_MATRIX_",
+    "katie config.yaml: secrets.bitwarden.strip_prefix: true",
     "katie config.yaml: secrets.bitwarden.server_url: the value wife or dad already use, or empty for US Cloud",
-    "katie .env: BWS_ACCESS_TOKEN only. Do not write MATRIX_* values into this file.",
+    "katie .env: BWS_ACCESS_TOKEN only, copied from dad's profile .env. Do not write MATRIX_* values into this file. Do not print the token.",
     "alice config.yaml: remove gateway.standalone",
     "alice config.yaml: secrets.bitwarden.enabled: true",
     "alice config.yaml: secrets.bitwarden.access_token_env: BWS_ACCESS_TOKEN",
-    "alice config.yaml: secrets.bitwarden.project_id: a project whose secret names are only the MATRIX_* names --renderer-keys prints for Alice",
+    "alice config.yaml: secrets.bitwarden.project_id: 9d36a60d-2e7e-41c0-a90f-b47b0036e9c2 (Hermes - Aoba, the project dad already uses)",
+    "alice config.yaml: secrets.bitwarden.key_prefix: ALICE_MATRIX_",
+    "alice config.yaml: secrets.bitwarden.strip_prefix: true",
     "alice config.yaml: secrets.bitwarden.server_url: the value wife or dad already use, or empty for US Cloud",
-    "alice .env: BWS_ACCESS_TOKEN only. Do not write MATRIX_* values into this file.",
+    "alice .env: BWS_ACCESS_TOKEN only, copied from dad's profile .env. Do not write MATRIX_* values into this file. Do not print the token.",
     "alice config.yaml: mcp_servers.game-workshop.env.ALICE_GAMES_ROOT read from her unit (recorded live path /srv/alice-portal/games)",
     "alice config.yaml: mcp_servers.game-workshop.env.ALICE_PROFILE_ROOT read from her unit. Do not hardcode the profile root.",
     "katie config.yaml: do not set kanban.dispatch_in_gateway. The multiplexed dispatcher does not read it.",

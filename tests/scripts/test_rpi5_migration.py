@@ -98,6 +98,10 @@ def test_inventory_lists_directive_names_and_omits_values():
     assert "profiles/dad/.env" in text
     assert "secrets.bitwarden" in text
     assert "render_kid_matrix_env.py is retired" in text
+    assert "9d36a60d-2e7e-41c0-a90f-b47b0036e9c2" in text
+    assert "KATIE_MATRIX_" in text
+    assert "ALICE_MATRIX_" in text
+    assert "Do not print the token" in text
     assert "Do not merge the rendered env file" in text
     assert "_build_safe_env" in text
     assert (
@@ -547,6 +551,13 @@ def test_config_edits_leave_wife_and_dad_standalone_unset():
     assert "ALICE_PROFILE_ROOT read from her unit" in text
     assert "Do not hardcode the profile root" in text
     assert "BWS_ACCESS_TOKEN only" in text
+    assert "copied from dad" in text
+    assert "Do not print the token" in text
+    assert "9d36a60d-2e7e-41c0-a90f-b47b0036e9c2" in text
+    assert "secrets.bitwarden.key_prefix: KATIE_MATRIX_" in text
+    assert "secrets.bitwarden.key_prefix: ALICE_MATRIX_" in text
+    assert "secrets.bitwarden.strip_prefix: true" in text
+    assert "Hermes - Aoba" in text
     assert "/srv/alice-portal/games" in text
 
 

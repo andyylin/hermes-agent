@@ -43,6 +43,8 @@ Two orchestrator-level knobs make one shared vault safe across [profiles](../pro
 
 Both apply to every source — bundled and plugin — because they live in the orchestrator, not the backends.
 
+Bitwarden can narrow a shared project before that aliasing runs. `secrets.bitwarden.key_prefix` loads only keys that start with the prefix, and `strip_prefix: true` drops the leading owner segment. `key_prefix: KATIE_` or `key_prefix: KATIE_MATRIX_` both export `KATIE_MATRIX_PASSWORD` as `MATRIX_PASSWORD`. A profile with no prefix on the same project still receives `KATIE_MATRIX_PASSWORD` under that name. See [Bitwarden](./bitwarden).
+
 ## Secrets in child processes
 
 Terminal commands, `execute_code` sandboxes and [`no_agent` cron scripts](../features/cron.md#giving-a-script-a-credential) run with a sanitized environment: Hermes-managed credentials are stripped, and only variables you declare in `terminal.env_passthrough` (or a loaded skill's `required_environment_variables`) are forwarded. A declared variable is forwarded with the **owning profile's** value — from that profile's `.env` or its secret sources — even when the profile is served by a multi-profile gateway or the Desktop/dashboard backend and its secrets never entered the process environment. A profile's declared value never reaches another profile's children, and the launch profile's `.env` credentials are dropped from children that run for a served profile. Provider credentials cannot be declared; see [Security → Credential scoping](../security.md).

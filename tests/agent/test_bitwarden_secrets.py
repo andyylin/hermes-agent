@@ -6,6 +6,7 @@ are exercised by tests/pm/test_security_consumers.py.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import stat
@@ -399,6 +400,206 @@ def test_stale_fallback_skipped_on_auth_failure(monkeypatch, tmp_path):
             access_token="0.t", project_id="proj-1", binary=fake_binary,
             cache_ttl_seconds=300, home_path=home,
         )
+
+
+# ---------------------------------------------------------------------------
+# key_prefix / strip_prefix — shared Hermes - Aoba project
+# ---------------------------------------------------------------------------
+
+# The 13 names a kid's Matrix adapter reads. Stored in the shared project as
+# KATIE_<name> and ALICE_<name>. Values below are fixtures, not credentials.
+_KID_MATRIX_NAMES = (
+    "MATRIX_ACCESS_TOKEN",
+    "MATRIX_ALLOWED_ROOMS",
+    "MATRIX_ALLOWED_USERS",
+    "MATRIX_AUTO_THREAD",
+    "MATRIX_DEVICE_ID",
+    "MATRIX_ENCRYPTION",
+    "MATRIX_HOME_ROOM",
+    "MATRIX_HOMESERVER",
+    "MATRIX_PASSWORD",
+    "MATRIX_REACTIONS",
+    "MATRIX_RECOVERY_KEY",
+    "MATRIX_REQUIRE_MENTION",
+    "MATRIX_USER_ID",
+)
+_AOBA_PROJECT = "9d36a60d-2e7e-41c0-a90f-b47b0036e9c2"
+
+
+def _matrix_adapter_accepts(names: set[str]) -> bool:
+    """Credential half of check_matrix_requirements: homeserver plus a login."""
+    return "MATRIX_HOMESERVER" in names and (
+        "MATRIX_ACCESS_TOKEN" in names or "MATRIX_PASSWORD" in names
+    )
+
+
+def _shared_project_payload() -> str:
+    items = []
+    for kid in ("KATIE", "ALICE"):
+        for name in _KID_MATRIX_NAMES:
+            items.append({"key": f"{kid}_{name}", "value": f"v-{kid.lower()}-{name}"})
+    items.append({"key": "TELEGRAM_BOT_TOKEN", "value": "v-telegram"})
+    return json.dumps(items)
+
+
+def _fetch_project(tmp_path, monkeypatch, payload: str, **cfg):
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.token")
+    fake = tmp_path / "bws"
+    fake.write_text("")
+    monkeypatch.setattr(bw, "find_bws", lambda **_kw: fake)
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **kw: mock.Mock(returncode=0, stdout=payload, stderr=""),
+    )
+    bw._reset_cache_for_tests(tmp_path)
+    return bw.BitwardenSource().fetch(
+        {
+            "enabled": True,
+            "project_id": _AOBA_PROJECT,
+            "access_token_env": "BWS_ACCESS_TOKEN",
+            "auto_install": False,
+            "cache_ttl_seconds": 0,
+            **cfg,
+        },
+        tmp_path,
+    )
+
+
+def test_prefix_defaults_leave_the_whole_project_loaded():
+    schema = bw.BitwardenSource().config_schema()
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    section = DEFAULT_CONFIG["secrets"]["bitwarden"]
+    assert schema["key_prefix"]["default"] == ""
+    assert schema["strip_prefix"]["default"] is False
+    assert section["key_prefix"] == ""
+    assert section["strip_prefix"] is False
+
+
+@pytest.mark.parametrize(
+    ("profile", "prefix"),
+    [("katie", "KATIE_MATRIX_"), ("alice", "ALICE_MATRIX_")],
+)
+def test_kid_config_exports_exactly_her_matrix_names(tmp_path, monkeypatch, profile, prefix):
+    result = _fetch_project(
+        tmp_path, monkeypatch, _shared_project_payload(),
+        key_prefix=prefix, strip_prefix=True,
+    )
+    assert result.ok
+    assert set(result.secrets) == set(_KID_MATRIX_NAMES)
+    assert len(result.secrets) == 13
+    assert "TELEGRAM_BOT_TOKEN" not in result.secrets
+    assert result.secrets["MATRIX_PASSWORD"] == f"v-{profile}-MATRIX_PASSWORD"
+    assert result.secrets["MATRIX_HOMESERVER"] == f"v-{profile}-MATRIX_HOMESERVER"
+    assert _matrix_adapter_accepts(set(result.secrets))
+    assert not any(name.startswith(("KATIE_", "ALICE_")) for name in result.secrets)
+
+
+def test_unprefixed_profile_keeps_prefixed_names_and_skips_matrix(tmp_path, monkeypatch):
+    result = _fetch_project(tmp_path, monkeypatch, _shared_project_payload())
+    names = set(result.secrets)
+    expected = {f"{kid}_{name}" for kid in ("KATIE", "ALICE") for name in _KID_MATRIX_NAMES}
+    expected.add("TELEGRAM_BOT_TOKEN")
+    assert names == expected
+    assert not any(name in names for name in _KID_MATRIX_NAMES)
+    assert result.secrets["TELEGRAM_BOT_TOKEN"] == "v-telegram"
+    assert result.secrets["KATIE_MATRIX_PASSWORD"] == "v-katie-MATRIX_PASSWORD"
+    assert not _matrix_adapter_accepts(names)
+
+
+def test_katie_prefix_example_strips_owner_and_drops_telegram(tmp_path, monkeypatch):
+    """key_prefix KATIE_ exports KATIE_MATRIX_PASSWORD as MATRIX_PASSWORD."""
+    payload = json.dumps([
+        {"key": "KATIE_MATRIX_PASSWORD", "value": "v-katie-password"},
+        {"key": "TELEGRAM_BOT_TOKEN", "value": "v-telegram"},
+        {"key": "ALICE_MATRIX_PASSWORD", "value": "v-alice-password"},
+    ])
+    result = _fetch_project(
+        tmp_path, monkeypatch, payload, key_prefix="KATIE_", strip_prefix=True,
+    )
+    assert result.secrets == {"MATRIX_PASSWORD": "v-katie-password"}
+    assert "TELEGRAM_BOT_TOKEN" not in result.secrets
+
+
+def test_prefix_without_strip_keeps_bitwarden_key_names(tmp_path, monkeypatch):
+    result = _fetch_project(
+        tmp_path, monkeypatch, _shared_project_payload(),
+        key_prefix="KATIE_MATRIX_", strip_prefix=False,
+    )
+    assert set(result.secrets) == {f"KATIE_{name}" for name in _KID_MATRIX_NAMES}
+    assert "TELEGRAM_BOT_TOKEN" not in result.secrets
+    assert not _matrix_adapter_accepts(set(result.secrets))
+
+
+def test_prefixed_cache_does_not_serve_the_unfiltered_project(tmp_path, monkeypatch):
+    """A kid fetch must not land the rest of the project in cache for the next read."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    payload = _shared_project_payload()
+    fake = tmp_path / "bws"
+    fake.write_text("")
+    calls = {"n": 0}
+
+    def fake_run(*_a, **_kw):
+        calls["n"] += 1
+        return mock.Mock(returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    bw._reset_cache_for_tests(home)
+    common = dict(access_token="0.t", project_id=_AOBA_PROJECT, binary=fake,
+                  cache_ttl_seconds=300, home_path=home)
+    filtered, _ = bw.fetch_bitwarden_secrets(
+        **common, key_prefix="KATIE_MATRIX_", strip_prefix=True,
+    )
+    assert set(filtered) == set(_KID_MATRIX_NAMES)
+    cached = bw._disk_cache_path(home).read_text(encoding="utf-8")
+    assert "v-telegram" not in cached
+    assert "v-alice-" not in cached
+    assert "TELEGRAM_BOT_TOKEN" not in cached
+
+    full, _ = bw.fetch_bitwarden_secrets(**common)
+    assert "TELEGRAM_BOT_TOKEN" in full
+    assert "KATIE_MATRIX_HOMESERVER" in full
+    assert "MATRIX_HOMESERVER" not in full
+    assert calls["n"] == 2
+
+
+def test_sync_dry_run_shows_the_filter(monkeypatch, tmp_path, capsys):
+    payload = _shared_project_payload()
+    fake = tmp_path / "bws"
+    fake.write_text("")
+    monkeypatch.setattr(bw, "find_bws", lambda **_kw: fake)
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **kw: mock.Mock(returncode=0, stdout=payload, stderr=""),
+    )
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.token")
+    for name in (*_KID_MATRIX_NAMES, "TELEGRAM_BOT_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.secrets_cli.load_config",
+        lambda: {"secrets": {"bitwarden": {
+            "enabled": True,
+            "project_id": _AOBA_PROJECT,
+            "access_token_env": "BWS_ACCESS_TOKEN",
+            "key_prefix": "KATIE_MATRIX_",
+            "strip_prefix": True,
+        }}},
+    )
+    from hermes_cli.secrets_cli import cmd_sync
+
+    code = cmd_sync(argparse.Namespace(apply=False))
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "Filter: key_prefix KATIE_MATRIX_" in captured.out
+    assert captured.out.count("would export") == 13
+    for name in _KID_MATRIX_NAMES:
+        assert name in captured.out
+    assert "TELEGRAM_BOT_TOKEN" not in captured.out
+    assert "KATIE_MATRIX_HOMESERVER" not in captured.out
+    assert "ALICE_MATRIX_" not in captured.out
+    assert "v-telegram" not in captured.out
+    assert "v-katie-" not in captured.out
 
 
 

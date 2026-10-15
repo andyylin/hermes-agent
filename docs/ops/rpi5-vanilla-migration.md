@@ -59,7 +59,7 @@ It is the same Python version as the external venv, and it is not that venv.
 | Profile units | `hermes-gateway-wife`, `hermes-gateway-dad`, `hermes-gateway-katie`, `hermes-gateway-alice` |
 | Profile flag | `gateway.standalone: true` is already set on katie and alice only. Wife and dad do not have it |
 | Default drop-ins | `hermes-gateway.service.d/`: `zzz-main-v0217.conf`, `zz-py314-runtime.conf`, `92-canonical-runtime.conf` (old venv Python), `memory-limits.conf` (2G cap) |
-| Kid credentials | Katie and Alice: unit `ExecStartPre` runs `render_kid_matrix_env.py` (Bitwarden) into a runtime env file only that unit loads. That renderer is retired. Matrix keys move to `secrets.bitwarden` in each kid's `config.yaml`, with `BWS_ACCESS_TOKEN` in that profile's `.env` |
+| Kid credentials | Katie and Alice: unit `ExecStartPre` runs `render_kid_matrix_env.py` (Bitwarden) into a runtime env file only that unit loads. That renderer is retired. Matrix keys move to `secrets.bitwarden` in each kid's `config.yaml`, pointed at the shared Hermes - Aoba project with `key_prefix` `KATIE_MATRIX_` / `ALICE_MATRIX_` and `strip_prefix: true`. Each kid's `.env` gets dad's `BWS_ACCESS_TOKEN` and nothing else |
 | Alice MCP | `game-workshop` (`alice_game_workshop.py`) reads `ALICE_GAMES_ROOT` (no fallback) and `ALICE_PROFILE_ROOT` from its own process env. Plain `.env` values are not passed to MCP servers |
 | Wife and dad | profile `.env` has no bot tokens. They already use a Bitwarden secret source in their own `config.yaml` plus `BWS_ACCESS_TOKEN` in that profile's `.env`. Wife and dad units also have `disable-kanban.conf` |
 | Kid unit extras | Katie and Alice prepend `~/.hermes/profiles/<kid>/bin` (tirith) to `PATH`, set their own memory limits, and set `HERMES_KANBAN_DISPATCH_IN_GATEWAY=false` |
@@ -334,46 +334,69 @@ not make the already-running default process re-read config.
    `hermes-gateway.service`.
 
    Wife and dad already have this Bitwarden shape. Do not change their
-   `config.yaml`. Do not copy their project into a kid's config: a bulk
-   source injects every secret in the project (`BitwardenSource.shape` is
-   `bulk`).
+   `config.yaml`. Do not set `key_prefix` on dad or wife. With no prefix, a
+   bulk source injects every secret in the project (`BitwardenSource.shape`
+   is `bulk`), including `KATIE_MATRIX_*` and `ALICE_MATRIX_*` under those
+   names. The Matrix adapter reads `MATRIX_*`, so dad does not gain a Matrix
+   adapter from those keys. `TELEGRAM_BOT_TOKEN` in the same project stays
+   dad's.
 
-   Katie and Alice: retire `render_kid_matrix_env.py`. Do not merge its output
-   into `.env`, and do not add its `ExecStartPre` to the shared unit. Map the
-   names it writes onto Bitwarden secret keys. The secret **key** `bws` returns
-   becomes the env name (`_run_bws_list` keeps a key only when it is a valid
-   env name). Hermes then puts that name in the profile scope.
+   Katie and Alice share that project. The secrets are already stored as
+   `KATIE_MATRIX_*` and `ALICE_MATRIX_*` (13 each) in **Hermes - Aoba**
+   (`9d36a60d-2e7e-41c0-a90f-b47b0036e9c2`). Do not create a new project.
+   `key_prefix` loads only keys that start with the prefix.
+   `strip_prefix: true` drops the leading owner segment and keeps the final
+   segment, so `KATIE_MATRIX_` / `ALICE_MATRIX_` export as `MATRIX_*`.
+   `TELEGRAM_BOT_TOKEN` does not start with either prefix and is not loaded.
+   Retire `render_kid_matrix_env.py`. Do not merge its output into `.env`,
+   and do not add its `ExecStartPre` to the shared unit.
 
    ```bash
    docs/ops/rpi5-vanilla-migration.sh --renderer-keys /path/to/render_kid_matrix_env.py
    ```
 
    That prints `MATRIX_*` names and nothing else. Confirm them against the
-   script on the host (the left-hand side it writes, not the Bitwarden field
-   it reads, when those differ). Do not paste values. Create or reuse one
-   project per kid that contains only those names. `BWS_ACCESS_TOKEN` stays
-   out of the project; Hermes skips it even if it is stored there.
+   script on the host (the left-hand side it writes). Do not paste values.
+   `BWS_ACCESS_TOKEN` stays out of the project; Hermes skips it even if it
+   is stored there.
 
    Copy the `secrets.bitwarden` keys wife or dad already set (`enabled`,
-   `access_token_env`, `server_url`, and the rest of that block) and point
-   `project_id` at that kid's project:
+   `access_token_env`, `server_url`, and the rest of that block), point both
+   kids at Hermes - Aoba, and set each kid's prefix:
 
    ```bash
    hermes -p katie config set secrets.bitwarden.enabled true
    hermes -p katie config set secrets.bitwarden.access_token_env BWS_ACCESS_TOKEN
-   hermes -p katie config set secrets.bitwarden.project_id '<katie-project-uuid>'
+   hermes -p katie config set secrets.bitwarden.project_id 9d36a60d-2e7e-41c0-a90f-b47b0036e9c2
+   hermes -p katie config set secrets.bitwarden.key_prefix KATIE_MATRIX_
+   hermes -p katie config set secrets.bitwarden.strip_prefix true
    hermes -p alice config set secrets.bitwarden.enabled true
    hermes -p alice config set secrets.bitwarden.access_token_env BWS_ACCESS_TOKEN
-   hermes -p alice config set secrets.bitwarden.project_id '<alice-project-uuid>'
+   hermes -p alice config set secrets.bitwarden.project_id 9d36a60d-2e7e-41c0-a90f-b47b0036e9c2
+   hermes -p alice config set secrets.bitwarden.key_prefix ALICE_MATRIX_
+   hermes -p alice config set secrets.bitwarden.strip_prefix true
    ```
 
    Set `secrets.bitwarden.server_url` only when wife or dad set one. Empty
-   means US Cloud. Store the machine-account token with the hidden prompt so
-   it lands in that profile's `.env` and not in the shell history:
+   means US Cloud. Copy dad's `BWS_ACCESS_TOKEN` line into each kid's
+   profile `.env`. Do not run `hermes secrets bitwarden token` (that would
+   mint a new token). Do not print the line, and do not pass the token on a
+   command line:
 
    ```bash
-   hermes -p katie secrets bitwarden token
-   hermes -p alice secrets bitwarden token
+   python3 - <<'PY'
+   from pathlib import Path
+   root = Path.home() / ".hermes"
+   dad = (root / "profiles" / "dad" / ".env").read_text(encoding="utf-8")
+   line = next(item for item in dad.splitlines() if item.startswith("BWS_ACCESS_TOKEN="))
+   for kid in ("katie", "alice"):
+       path = root / "profiles" / kid / ".env"
+       text = path.read_text(encoding="utf-8") if path.exists() else ""
+       kept = [item for item in text.splitlines() if not item.startswith("BWS_ACCESS_TOKEN=")]
+       kept.append(line)
+       path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+       print(f"{kid}: BWS_ACCESS_TOKEN copied")
+   PY
    ```
 
    The profile `.env` gets `BWS_ACCESS_TOKEN` only. Do not write `MATRIX_*`
@@ -438,9 +461,12 @@ not make the already-running default process re-read config.
    hermes -p alice secrets bitwarden sync
    ```
 
-   Status must show Enabled and Token in env. The sync Name column must list
-   every name `--renderer-keys` printed, with action `would export`. Then
-   confirm the adapter's credential gate, which is the same check as
+   Status must show Enabled, Token in env, the Hermes - Aoba project id, and
+   that kid's key prefix with Strip prefix yes. The sync dry-run prints
+   `Filter: key_prefix KATIE_MATRIX_` (or `ALICE_MATRIX_`). The Name column
+   must list every `MATRIX_*` name `--renderer-keys` printed, with action
+   `would export`. It must not list `KATIE_MATRIX_*`, `ALICE_MATRIX_*`, or
+   `TELEGRAM_BOT_TOKEN`. Then confirm the adapter's credential gate, which is the same check as
    `check_matrix_requirements` without installing packages. The probe prints
    `present` or `missing` and exits non-zero when the homeserver or both
    login secrets are absent:
