@@ -57,10 +57,17 @@ It is the same Python version as the external venv, and it is not that venv.
 | Code | `PYTHONPATH=~/.hermes/hermes-agent` |
 | Default unit | `hermes-gateway` |
 | Profile units | `hermes-gateway-wife`, `hermes-gateway-dad`, `hermes-gateway-katie`, `hermes-gateway-alice` |
-| Profile flag | `gateway.standalone: true` on wife, dad, katie, alice |
-| WebUI | a unit whose drop-in is `98-py314-v0217.conf` |
+| Profile flag | `gateway.standalone: true` is already set on katie and alice only. Wife and dad do not have it |
+| Default drop-ins | `hermes-gateway.service.d/`: `zzz-main-v0217.conf`, `zz-py314-runtime.conf`, `92-canonical-runtime.conf` (old venv Python), `memory-limits.conf` (2G cap) |
+| Kid credentials | Katie and Alice: unit `ExecStartPre` runs `render_kid_matrix_env.py` (Bitwarden) into a runtime env file only that unit loads. That renderer is retired. Matrix keys move to `secrets.bitwarden` in each kid's `config.yaml`, pointed at the shared Hermes - Aoba project with `key_prefix` `KATIE_MATRIX_` / `ALICE_MATRIX_` and `strip_prefix: true`. Each kid's `.env` gets dad's `BWS_ACCESS_TOKEN` and nothing else |
+| Alice MCP | `game-workshop` (`alice_game_workshop.py`) reads `ALICE_GAMES_ROOT` (no fallback) and `ALICE_PROFILE_ROOT` from its own process env. Plain `.env` values are not passed to MCP servers |
+| Wife and dad | profile `.env` has no bot tokens. They already use a Bitwarden secret source in their own `config.yaml` plus `BWS_ACCESS_TOKEN` in that profile's `.env`. Wife and dad units also have `disable-kanban.conf` |
+| Kid unit extras | Katie and Alice prepend `~/.hermes/profiles/<kid>/bin` (tirith) to `PATH`, set their own memory limits, and set `HERMES_KANBAN_DISPATCH_IN_GATEWAY=false` |
+| WebUI | separate `hermes-webui` app, `ExecStart` `hermex-webui-start.sh`, not `hermes dashboard`. Drop-in `98-py314-v0217.conf` may pin an interpreter |
+| SMS | enabled on the default profile, port-binding, currently failing (`SMS_WEBHOOK_URL` unset) |
+| Host memory | 16 GB RAM, about 9 GB free. Five gateways plus gbrain use about 3.1 GB RSS |
 | Runtime facts | `~/.hermes/installs/5935b2ebc06c58fa/facts.json` moved aside |
-| Orphan generations | four directories under that install's `environments/`, mtimes 2026-10-15 12:22–12:41, including prefixes `cc8eed33` and `f098ffea` |
+| Generations | directories under that install's `environments/`. Do not treat the 12:22–12:41 window as the orphan list. `cee636e2` is inside that window and stays when the new `facts.json` points at it |
 
 `get_service_name` (`hermes_cli/gateway.py`) is `hermes-gateway` for the default
 home and `hermes-gateway-<profile>` otherwise. Confirm the four names with
@@ -116,28 +123,96 @@ find "${XDG_CONFIG_HOME:-$HOME/.config}/systemd" /etc/systemd/system \
    interpreter. Quick snapshots also omit `memories/`. Copy each profile's
    `memories/` directory aside if you want that in the rollback bundle. The
    migration itself does not rewrite memory files.
-4. Copy every gateway and WebUI unit and drop-in, user and system scope, to a
-   directory outside `~/.hermes` (for example `~/rpi5-unit-backup/`). Include
-   `98-py314-v0217.conf`.
+4. Copy every gateway and WebUI unit and drop-in, user and system scope, to
+   `~/rpi5-unit-backup/` (outside `~/.hermes`). Include `98-py314-v0217.conf`
+   and the four default-unit drop-ins named above. `--sideline-dropins` later
+   moves those four into `~/rpi5-unit-backup/gateway-dropins/`; the copy here
+   is the one you can put back if that directory is wrong.
 5. Leave the moved-aside `facts.json` where it is. Do not move it back.
-6. Read blockers only:
+6. Inventory runtime state, then dry-run. Only katie and alice have
+   `gateway.standalone: true`. Wife and dad do not, so this first pass must
+   already include them:
 
    ```bash
-   hermes gateway migrate --multiplex --dry-run
+   docs/ops/rpi5-vanilla-migration.sh --preflight
    ```
 
-   Dry-run returns before any service action (`hermes_cli/gateway_migrate.py`).
-   Do not run migrate without `--dry-run`. Apply uninstalls secondary units
-   (`action` `uninstall`), which removes boot enablement. This migration
-   disables units and keeps the files so rollback can enable them again.
+   The script greps hermes and hermex unit files and drop-ins under the user
+   and system unit directories for `EnvironmentFile=`, `ExecStartPre=`, and
+   `Environment=`. It prints paths, `ExecStartPre` programs, and `Environment=`
+   names. It does not print values. Save that text; it is the map for the
+   credential section. Katie and Alice should show `render_kid_matrix_env.py`
+   and an `EnvironmentFile`. Alice should show the names `ALICE_GAMES_ROOT`
+   and `ALICE_PROFILE_ROOT` (the values stay in the unit until
+   `--alice-mcp-env`). Katie and Alice should show a profile `bin` on `PATH`,
+   their `MemoryHigh` / `MemoryMax`, and `HERMES_KANBAN_DISPATCH_IN_GATEWAY`.
+   Wife and dad should show `disable-kanban.conf`. The plan tells you to leave
+   their Bitwarden source in place. It does not tell you to render unit files
+   into `.env`.
+
+   It then runs `hermes gateway migrate --multiplex --dry-run` and exits
+   non-zero on blockers. Dry-run itself returns before any service action and
+   exits 0 even when the plan lists blockers (`cmd_migrate` in
+   `hermes_cli/gateway_migrate.py`). The script reads the plan. The raw plan
+   stays in a mode-0600 temp file and is deleted. Do not run migrate without
+   `--dry-run`. Apply uninstalls secondary units (`action` `uninstall`), which
+   removes boot enablement. This migration disables units and keeps the files
+   so rollback can enable them again.
+
+   While `gateway.standalone: true` is set, `profiles_to_serve` omits that
+   profile. On this pass the dry-run should list katie and alice as "left
+   alone" and should already show wife and dad. The script aborts if wife or
+   dad are left alone, and if the plan says only one profile exists. A clean
+   exit here is not a clean bill of health for katie and alice: their
+   credentials and port-binders are not in the plan yet.
 
    Fix anything the dry-run names before the cutover. Duplicate bot credentials
    are reported as profile names and key names, never values
-   (`duplicate_credential_lines`). A port-binding platform (LINE, SMS, webhooks)
-   that has no `/p/<profile>/` ingress is a blocker. The dry-run prints the
-   multiplexed callback URLs. Update the vendor callbacks to those URLs as part
-   of cutover, and keep the old URLs written down for rollback. Do not copy the
-   dry-run output into a ticket if it contains a token.
+   (`duplicate_credential_lines`). A secondary port-binder that does not
+   declare `serves_profile_prefix` is a blocker: the multiplexer would skip
+   that whole profile (`_check_secondary_port_binders`). The dry-run prints
+   multiplexed callback URLs for binders that do have the prefix. Update the
+   vendor callbacks to those URLs as part of cutover, and keep the old URLs
+   written down for rollback. Do not copy the dry-run output into a ticket if
+   it contains a token.
+
+   SMS on the default profile is not that blocker. `sms` is in
+   `PORT_BINDING_PLATFORM_VALUES` (`gateway/config.py`) and
+   `SmsAdapter.serves_profile_prefix` is true
+   (`plugins/platforms/sms/adapter.py`), so a secondary that enables SMS is a
+   notice (callback moves to `/p/<profile>/webhooks/twilio` on the default
+   listener), not a skip-the-profile blocker. The check does not look at the
+   default profile's own SMS; the default profile is the one that binds.
+   `connect()` returns false before `bind_listener` when `SMS_WEBHOOK_URL` is
+   unset and `SMS_INSECURE_NO_SIGNATURE` is not true (`sms_missing_webhook_url`,
+   not retryable). That is the current failure. It does not refuse multiplex.
+   It does leave a fatal adapter in the shared process. Disable it on the
+   default profile before the fold pass, and disable any platform the fold
+   pass names as a blocker:
+
+   ```bash
+   hermes config set platforms.sms.enabled false
+   ```
+
+   Use `hermes -p <name> config set platforms.<platform>.enabled false` when
+   the blocker names a secondary. Re-run the fold pass after each disable.
+   Do not add an ingress in this migration.
+
+7. After the four profile units are stopped and `gateway.standalone` is unset
+   on katie and alice only (both are in [One gateway](#one-gateway)), run the
+   fold pass and do not continue while it exits non-zero:
+
+   ```bash
+   docs/ops/rpi5-vanilla-migration.sh --preflight-fold
+   ```
+
+   This aborts if wife, dad, katie, or alice are still listed as left alone,
+   if the plan says only one profile exists, or if there are blockers. Wife
+   and dad were never standalone; katie and alice must have had the key
+   removed before this pass. Explicit
+   `gateway.multiplex_profiles: true` skips this preflight at boot
+   (`resolve_multiplex_mode`), so this command is the last check that still
+   runs it.
 
 ## Environment
 
@@ -241,7 +316,171 @@ Do these in order. Explicit `true` skips the preflight, so the four profile
 processes must already be stopped before the flag is set. Stopping them does
 not make the already-running default process re-read config.
 
-1. Disable and stop the four profile units. Do not disable `hermes-gateway`.
+1. Edit profile config while the four units are still up, so a failed
+   Bitwarden check does not take the bots down. The authoritative list is:
+
+   ```bash
+   docs/ops/rpi5-vanilla-migration.sh --config-edits
+   ```
+
+   One process, five scopes. `GatewayRunner._profile_runtime_scope`
+   (`gateway/run.py`) builds each scope with `build_profile_secret_scope`
+   (`agent/secret_scope.py`): that profile's `.env`, then
+   `hydrate_profile_secret_sources` (Bitwarden `bws secret list` for
+   `secrets.bitwarden.project_id`, seeded from that profile's `.env`), then
+   the managed env (`/etc/hermes/.env`) last. Managed env is the same map for
+   every profile. With a scope installed, `get_secret` does not read
+   `os.environ` on a miss. Do not put another profile's tokens on
+   `hermes-gateway.service`.
+
+   Wife and dad already have this Bitwarden shape. Do not change their
+   `config.yaml`. Do not set `key_prefix` on dad or wife. With no prefix, a
+   bulk source injects every secret in the project (`BitwardenSource.shape`
+   is `bulk`), including `KATIE_MATRIX_*` and `ALICE_MATRIX_*` under those
+   names. The Matrix adapter reads `MATRIX_*`, so dad does not gain a Matrix
+   adapter from those keys. `TELEGRAM_BOT_TOKEN` in the same project stays
+   dad's.
+
+   Katie and Alice share that project. The secrets are already stored as
+   `KATIE_MATRIX_*` and `ALICE_MATRIX_*` (13 each) in **Hermes - Aoba**
+   (`9d36a60d-2e7e-41c0-a90f-b47b0036e9c2`). Do not create a new project.
+   `key_prefix` loads only keys that start with the prefix.
+   `strip_prefix: true` drops the leading owner segment and keeps the final
+   segment, so `KATIE_MATRIX_` / `ALICE_MATRIX_` export as `MATRIX_*`.
+   `TELEGRAM_BOT_TOKEN` does not start with either prefix and is not loaded.
+   Retire `render_kid_matrix_env.py`. Do not merge its output into `.env`,
+   and do not add its `ExecStartPre` to the shared unit.
+
+   ```bash
+   docs/ops/rpi5-vanilla-migration.sh --renderer-keys /path/to/render_kid_matrix_env.py
+   ```
+
+   That prints `MATRIX_*` names and nothing else. Confirm them against the
+   script on the host (the left-hand side it writes). Do not paste values.
+   `BWS_ACCESS_TOKEN` stays out of the project; Hermes skips it even if it
+   is stored there.
+
+   Copy the `secrets.bitwarden` keys wife or dad already set (`enabled`,
+   `access_token_env`, `server_url`, and the rest of that block), point both
+   kids at Hermes - Aoba, and set each kid's prefix:
+
+   ```bash
+   hermes -p katie config set secrets.bitwarden.enabled true
+   hermes -p katie config set secrets.bitwarden.access_token_env BWS_ACCESS_TOKEN
+   hermes -p katie config set secrets.bitwarden.project_id 9d36a60d-2e7e-41c0-a90f-b47b0036e9c2
+   hermes -p katie config set secrets.bitwarden.key_prefix KATIE_MATRIX_
+   hermes -p katie config set secrets.bitwarden.strip_prefix true
+   hermes -p alice config set secrets.bitwarden.enabled true
+   hermes -p alice config set secrets.bitwarden.access_token_env BWS_ACCESS_TOKEN
+   hermes -p alice config set secrets.bitwarden.project_id 9d36a60d-2e7e-41c0-a90f-b47b0036e9c2
+   hermes -p alice config set secrets.bitwarden.key_prefix ALICE_MATRIX_
+   hermes -p alice config set secrets.bitwarden.strip_prefix true
+   ```
+
+   Set `secrets.bitwarden.server_url` only when wife or dad set one. Empty
+   means US Cloud. Copy dad's `BWS_ACCESS_TOKEN` line into each kid's
+   profile `.env`. Do not run `hermes secrets bitwarden token` (that would
+   mint a new token). Do not print the line, and do not pass the token on a
+   command line:
+
+   ```bash
+   python3 - <<'PY'
+   from pathlib import Path
+   root = Path.home() / ".hermes"
+   dad = (root / "profiles" / "dad" / ".env").read_text(encoding="utf-8")
+   line = next(item for item in dad.splitlines() if item.startswith("BWS_ACCESS_TOKEN="))
+   for kid in ("katie", "alice"):
+       path = root / "profiles" / kid / ".env"
+       text = path.read_text(encoding="utf-8") if path.exists() else ""
+       kept = [item for item in text.splitlines() if not item.startswith("BWS_ACCESS_TOKEN=")]
+       kept.append(line)
+       path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+       print(f"{kid}: BWS_ACCESS_TOKEN copied")
+   PY
+   ```
+
+   The profile `.env` gets `BWS_ACCESS_TOKEN` only. Do not write `MATRIX_*`
+   values into it.
+
+   Alice's MCP server is separate from that scope. `alice_game_workshop.py`
+   reads `ALICE_GAMES_ROOT` (no fallback) and `ALICE_PROFILE_ROOT` from its
+   own environment. `_build_safe_env` (`tools/mcp_tool_config.py`) passes the
+   safe baseline, secret-source names, and the server block's own `env`. It
+   does not pass plain `.env` entries. Putting those two paths in Alice's
+   `.env` does not start the server. Write them on
+   `mcp_servers.game-workshop.env`, taking both values from her unit. The
+   recorded live games root is `/srv/alice-portal/games`. The profile root is
+   not a constant.
+
+   ```bash
+   docs/ops/rpi5-vanilla-migration.sh --alice-mcp-env
+   docs/ops/rpi5-vanilla-migration.sh --alice-mcp-env --write
+   ```
+
+   The first command prints the two paths and does not write. Confirm
+   `ALICE_GAMES_ROOT` is `/srv/alice-portal/games` and
+   `ALICE_PROFILE_ROOT` is the path her unit sets. `--write` refuses when the
+   games root differs, and it refuses when `game-workshop` is missing. It
+   does not print other `Environment=` values.
+
+   Per-unit settings that do not become `config.yaml` keys:
+
+   - PATH. Katie and Alice prepend `~/.hermes/profiles/<kid>/bin` (tirith).
+     The terminal tool already appends `<profile home>/bin` when that
+     directory exists (`_managed_runtime_path_entries` in
+     `tools/environments/local.py`), and under multiplex that home is the
+     served profile. There is no config key to set. Do not put either bin on
+     the shared unit `PATH`. MCP servers do not receive it. Core no longer
+     calls tirith (`security.tirith_*` was removed). A shell command in that
+     profile's terminal session still finds the binary.
+   - Memory. Katie and Alice have their own `MemoryHigh` / `MemoryMax`. One
+     systemd unit is one cgroup. Hermes has no per-profile memory key.
+     `terminal.container_memory` applies to container backends, not this
+     process. The shared `zz-multiplex-memory.conf` (`MemoryHigh=6G`,
+     `MemoryMax=8G`) replaces those caps. One profile can use the whole cap.
+     Do not copy a kid's smaller cap onto `hermes-gateway.service`.
+   - Kanban. Katie and Alice set `HERMES_KANBAN_DISPATCH_IN_GATEWAY=false`.
+     Wife and dad have `disable-kanban.conf`, which sets the same variable.
+     The multiplexed process starts one dispatcher from the default profile's
+     config (`_kanban_dispatcher_boot` in `gateway/kanban_watchers.py`). The
+     env var is process-wide and is checked before config. Copying it onto
+     `hermes-gateway.service` would disable dispatch for every profile,
+     including default. `kanban.dispatch_in_gateway` in a named profile's
+     `config.yaml` is not read at that boot. Do not set it. Retire the env
+     var and `disable-kanban.conf` with the profile units. Leave default's
+     dispatcher on. Leave `kanban.notify_in_gateway` at its default so the
+     one process still delivers notifications.
+
+2. Verify Matrix credentials before any unit is stopped. `sync` prints names
+   and an action, not values. Do not pass `--apply`.
+
+   ```bash
+   hermes -p katie secrets bitwarden status
+   hermes -p katie secrets bitwarden sync
+   hermes -p alice secrets bitwarden status
+   hermes -p alice secrets bitwarden sync
+   ```
+
+   Status must show Enabled, Token in env, the Hermes - Aoba project id, and
+   that kid's key prefix with Strip prefix yes. The sync dry-run prints
+   `Filter: key_prefix KATIE_MATRIX_` (or `ALICE_MATRIX_`). The Name column
+   must list every `MATRIX_*` name `--renderer-keys` printed, with action
+   `would export`. It must not list `KATIE_MATRIX_*`, `ALICE_MATRIX_*`, or
+   `TELEGRAM_BOT_TOKEN`. Then confirm the adapter's credential gate, which is the same check as
+   `check_matrix_requirements` without installing packages. The probe prints
+   `present` or `missing` and exits non-zero when the homeserver or both
+   login secrets are absent:
+
+   ```bash
+   docs/ops/rpi5-vanilla-migration.sh --matrix-probe katie
+   docs/ops/rpi5-vanilla-migration.sh --matrix-probe alice
+   ```
+
+   Do not continue while either probe exits non-zero. The kid units are still
+   running on `render_kid_matrix_env.py` until step 3, so a failed probe is
+   fixed in Bitwarden or in that profile's `.env` token without a cutover.
+
+3. Disable and stop the four profile units. Do not disable `hermes-gateway`.
    Do not delete unit files.
 
    ```bash
@@ -255,17 +494,83 @@ not make the already-running default process re-read config.
    manager. `disable --now` removes boot enablement and stops the process. The
    unit file remains, which is what rollback enables.
 
-2. Clear the shim on the four named profiles. Do not set `gateway.standalone`
-   on the default profile; it is ignored there.
+4. Clear the shim on katie and alice only. They are the profiles that have
+   `gateway.standalone: true`. Wife and dad do not; do not `config unset` a
+   key they do not have. Do not set `gateway.standalone` on the default
+   profile; it is ignored there (`profile_is_standalone`).
 
    ```bash
-   hermes -p wife config unset gateway.standalone
-   hermes -p dad config unset gateway.standalone
    hermes -p katie config unset gateway.standalone
    hermes -p alice config unset gateway.standalone
    ```
 
-3. On the default profile, set the flag explicitly so the next boot does not
+5. Fold preflight. Stop here if it exits non-zero. Do not set
+   `gateway.multiplex_profiles` yet: explicit `true` skips this check at the
+   next boot.
+
+   ```bash
+   docs/ops/rpi5-vanilla-migration.sh --preflight-fold
+   ```
+
+6. Move the default unit's drop-ins aside. `hermes gateway install` rewrites
+   `hermes-gateway.service` when it differs from `generate_systemd_unit` and
+   deletes only `20-replace.conf` (`refresh_systemd_unit_if_needed`). It does
+   not touch the other files in `hermes-gateway.service.d/`. These four survive
+   install and still apply at restart:
+
+   | Drop-in | What it does |
+   |---|---|
+   | `zzz-main-v0217.conf` | forces the external venv's Python |
+   | `zz-py314-runtime.conf` | forces the external venv's Python |
+   | `92-canonical-runtime.conf` | forces the external venv's Python |
+   | `memory-limits.conf` | `MemoryMax` 2G |
+
+   A drop-in `ExecStart=` replaces the unit's `ExecStart`. After install, the
+   unit file can point at the store launcher while these drop-ins still start
+   the old venv. The 2G cap is under the measured ~3.1 GB RSS of the five
+   gateways plus gbrain, so the multiplexed cgroup would be killed.
+
+   ```bash
+   docs/ops/rpi5-vanilla-migration.sh --sideline-dropins
+   ```
+
+   That moves the four files into `~/rpi5-unit-backup/gateway-dropins/` (it
+   does not delete them) and writes `zz-multiplex-memory.conf`:
+
+   ```ini
+   [Service]
+   MemoryHigh=6G
+   MemoryMax=8G
+   ```
+
+   `MemoryHigh=6G` starts reclaim near twice the measured 3.1 GB set, so a
+   normal multiplex plus gbrain children is not throttled. `MemoryMax=8G` is
+   the hard stop. The host has 16 GB and about 9 GB free (about 3.9 GB of
+   current use is outside this workload), so an 8 GB cap leaves about 4 GB for
+   cache and spikes outside the cgroup. If gbrain is a child of this unit it
+   counts against the cap. If it is its own unit, the gateway still has
+   headroom. Do not put the 2G file back while five profiles share this cgroup.
+
+   The command refuses when it finds more than one `hermes-gateway.service.d`,
+   and when any of the four names is missing from both the live directory and
+   the backup. A second run is a no-op once the backup holds the files.
+
+7. Leave `hermes-webui` alone. On this host it is the separate hermes-webui
+   application. `ExecStart` is `hermex-webui-start.sh`. It is not
+   `hermes dashboard`, and `hermes-dashboard.service` (port 9119,
+   `hermes_cli/main_dashboard.py`) is a different program. Do not point this
+   unit at `hermes dashboard`.
+
+   If `98-py314-v0217.conf` sets `VIRTUAL_ENV`, `PYTHONPATH`, `PYTHONHOME`, or
+   a path under `venvs/hermes-py314-v0.21.7`, retarget that interpreter to the
+   committed PM interpreter the script printed
+   (`~/.hermes/installs/5935b2ebc06c58fa/environments/<32-hex>/venv/bin/python`).
+   `--preflight` prints `Interpreter drop-in: retarget` or `leave`. When it
+   says `leave`, the start script is not using Hermes's env; do not edit the
+   drop-in. Do not restart the webui until the gateway restart below has
+   succeeded.
+
+8. On the default profile, set the flag explicitly so the next boot does not
    depend on the retired false value:
 
    ```bash
@@ -275,48 +580,37 @@ not make the already-running default process re-read config.
    Do not set it to `false`. After this revision a false value is rewritten to
    `true` on the next gateway boot when nothing blocks multiplex.
 
-4. Move the WebUI drop-in aside (rename, do not delete), then
-   `systemctl --user daemon-reload` (or `sudo systemctl daemon-reload` for a
-   system unit). The published launcher (`hermes_cli/_launchers.py`
-   `_launcher_script`, run as store Python with `-I`) pops `PYTHONHOME` and
-   `PYTHONPATH`. `-I` ignores every `PYTHON*` variable. It does not pop
-   `VIRTUAL_ENV`, and it does not need to: CPython selects a venv from the
-   interpreter's `pyvenv.cfg`, not from `VIRTUAL_ENV`, and this interpreter is
-   PM's store Python. Dependency selection then follows the committed
-   generation. A drop-in that sets `VIRTUAL_ENV` or `PYTHONPATH` cannot pin the
-   external venv once `ExecStart` is that launcher. A unit whose `ExecStart`
-   is the venv's `python`, or a `PATH` lookup of `hermes`, still honors the
-   drop-in. Point that `ExecStart` at:
-
-   ```text
-   /home/<account>/.hermes/hermes-agent/.hermes/bin/hermes dashboard
-   ```
-
-   Keep a copy of the previous `ExecStart` in the unit backup. The code's unit
-   name is `hermes-dashboard.service`. There is no installer that regenerates
-   it; edit the unit you found by the drop-in name. Do not restart the WebUI
-   until the gateway restart below has succeeded.
-
-5. Refresh only the default gateway unit, after `facts.json` exists:
+9. Refresh only the default gateway unit, after `facts.json` exists and after
+   the memory drop-in in step 6 is in place. Do not add
+   `zz-profile-runtime-env.conf`. The renderer is retired:
 
    ```bash
    hermes gateway install
    ```
 
-   This rewrites `hermes-gateway.service` when it does not match
-   `generate_systemd_unit` and enables it. It does not restart a running
-   process. Do not run `hermes gateway install` under `-p wife` (or dad, katie,
-   alice). That writes or enables the profile unit this migration just disabled.
+   This rewrites `hermes-gateway.service` and enables it. It does not restart a
+   running process, and it does not remove `zz-multiplex-memory.conf` or
+   `zz-profile-runtime-env.conf`. Do not run `hermes gateway install` under
+   `-p wife` (or dad, katie, alice). That writes or enables the profile unit
+   this migration just disabled.
 
-6. Restart the default gateway, then the WebUI:
+   Then `systemctl --user daemon-reload` (or `sudo systemctl daemon-reload`
+   for a system unit). `gateway install` already reloads after a unit rewrite;
+   reload again if the only edits were drop-ins.
+
+10. Restart the default gateway, then the webui unit you already had (the one
+   whose `ExecStart` contains `hermex-webui-start.sh`):
 
    ```bash
    hermes gateway restart
-   systemctl --user restart <webui-unit>.service
+   systemctl --user restart <hermes-webui unit>.service
    ```
 
    `hermes gateway restart` is the official restart. It is the moment the
-   default process leaves the external venv.
+   default process leaves the external venv. Confirm `/proc/<pid>/exe` is the
+   PM interpreter. If it is still the venv under `venvs/hermes-py314-v0.21.7`,
+   a pinning drop-in is still loaded; stop and restore it to the backup before
+   trying again.
 
 ### Restart notices
 
@@ -446,48 +740,73 @@ name only that profile's slugs.
 
 ## Orphan generations
 
-Do this only after verification succeeds.
+Do this only after verification succeeds. Do not decide which directories are
+orphans from a clock window.
 
-The four leftovers are generation directories under
-`~/.hermes/installs/5935b2ebc06c58fa/environments/`, not other install keys.
-Names are `uuid4().hex`. Identify all four by mtime in 2026-10-15 12:22–12:41.
-Two of the prefixes are `cc8eed33` and `f098ffea`. Do not delete by prefix
-guess; list the directory and match mtimes.
+Generation directories live under
+`~/.hermes/installs/5935b2ebc06c58fa/environments/`. Names are `uuid4().hex`.
+The new `facts.json` field `packages.venv.environment` is a path ending in
+`environments/<32-hex>/venv`. That `<32-hex>` is the selected generation.
+Every other directory there is an orphan. `cee636e2` is inside the
+2026-10-15 12:22–12:41 window and is not an orphan when `facts.json` points
+at it. A prefix guess (`cc8eed33`, `f098ffea`, or anything else in that
+window) is not an identification.
+
+```bash
+docs/ops/rpi5-vanilla-migration.sh --orphans
+```
+
+That prints `referenced:` and one `orphan:` line per other directory. It does
+not delete. If `facts.json` has no `packages.venv.environment`, it exits
+non-zero and classifies nothing.
 
 `hermes pm gc` calls `collect_generations` (`hermes_cli/runtime_state.py`). A
 generation is removed only when all of these are true: it is not the selected
-generation (the parent of the `environment` path in the new `facts.json`), it
-contains `.lease-managed`, that marker is at least 86400 seconds old, no live
-lease lock is held, and this process holds the runtime lock. Same-day orphans
-from 12:22–12:41 are kept until the marker is a day old. That is the safe
-behavior. Do not `rm -rf` them.
+generation (the parent of the `environment` path in `facts.json`), it contains
+`.lease-managed`, that marker is at least 86400 seconds old, no live lease
+lock is held, and this process holds the runtime lock. Do not `rm -rf` them.
+
+Do not run gc before 2026-10-16 12:41 Asia/Taipei (UTC+8). Markers written at
+12:41 on the 15th are a day old at that instant, and not before. The script
+refuses earlier, including when the machine clock is naive:
 
 ```bash
-hermes pm gc
+docs/ops/rpi5-vanilla-migration.sh --gc
 ```
 
-Expect a line that removed 0 dependency generations if you run it the same day.
-Run `hermes pm gc` again after 24 hours. Before and after, confirm the
-`environment` path in `facts.json` is not one of those four directories. `gc`
-also sweeps unreferenced tool-store entries and install-state dirs of deleted
-checkouts (`collect_orphan_install_states`). It will not remove
-`5935b2ebc06c58fa` while this checkout is the live tree.
+`--gc` runs the gate, prints the orphan classification, then `hermes pm gc`.
+After the cutoff, gc still keeps a marker younger than a day. Before and
+after, confirm the `environment` path in `facts.json` is the `referenced:`
+line and is not an `orphan:` line. `gc` also sweeps unreferenced tool-store
+entries and install-state dirs of deleted checkouts
+(`collect_orphan_install_states`). It will not remove `5935b2ebc06c58fa`
+while this checkout is the live tree.
 
 ## Rollback
 
 Rollback returns to the external venv and the five separate units. It does not
 depend on `gateway.multiplex_profiles: false`. That value is ignored and gets
-rewritten to `true`. `gateway.standalone: true` on wife, dad, katie, and alice
-is what keeps those profiles off the host gateway.
+rewritten to `true`. `gateway.standalone: true` on wife, dad, katie, and
+alice is what keeps those profiles off the host gateway after the units are
+restored. Only katie and alice had the key before this cutover. Wife and dad
+did not. Rollback sets it on all four so the default gateway does not also
+serve the restored units.
 
-1. Stop the multiplexed gateway and the WebUI so they release tokens and ports:
+Do not display `.env`, unit `Environment=` values, or snapshot contents while
+you do this.
+
+1. Stop the multiplexed gateway and the webui so they release tokens and ports.
+   Stop the webui unit you already had. Do not change its `ExecStart`.
 
    ```bash
    hermes gateway stop
-   systemctl --user stop <webui-unit>.service
+   systemctl --user stop <hermes-webui unit>.service
    ```
 
-2. Put the shim back. This is the opt-out that still works:
+2. Put the shim on all four named profiles. Katie and alice are being restored
+   to the value they had. Wife and dad did not have the key; they need it now
+   because a false `gateway.multiplex_profiles` no longer keeps them off the
+   default gateway:
 
    ```bash
    hermes -p wife config set gateway.standalone true
@@ -499,19 +818,47 @@ is what keeps those profiles off the host gateway.
 3. Move the new `~/.hermes/installs/5935b2ebc06c58fa/facts.json` aside under a
    new name. Do not restore an older committed selection over it. With no
    runtime facts, the official launcher will not select the PM generation.
-   The external venv is what the restored unit files invoke.
+   Leave `~/.hermes/venvs/hermes-py314-v0.21.7` on disk. The restored unit
+   files invoke it.
 
-4. Restore the backed-up unit files and `98-py314-v0217.conf` over the copies
-   `hermes gateway install` rewrote. Restoring only the drop-in is not enough:
-   the main unit's `ExecStart` is now the store-python launcher, which ignores
-   `PYTHONPATH` and does not run the external venv. The pre-migration
-   `ExecStart` has to come back with the drop-in.
+4. Restore the backed-up unit files from `~/rpi5-unit-backup/` over the copies
+   `hermes gateway install` rewrote, including the main unit `ExecStart`.
+   Restoring only a drop-in leaves the store-python launcher in place. The
+   launcher ignores `PYTHONPATH` and does not run the external venv.
 
-5. `systemctl --user daemon-reload` (and the system manager, if you restored
+5. Put the four sideline'd drop-ins back and remove the ones this migration
+   added:
+
+   ```bash
+   docs/ops/rpi5-vanilla-migration.sh --rollback
+   ```
+
+   That restores `zzz-main-v0217.conf`, `zz-py314-runtime.conf`,
+   `92-canonical-runtime.conf`, and `memory-limits.conf` from
+   `~/rpi5-unit-backup/gateway-dropins/`, and removes
+   `zz-multiplex-memory.conf` and `zz-profile-runtime-env.conf`. It then
+   prints the rest of this list. It does not start or stop units. If the
+   backup is missing one of the four files, it exits non-zero before it
+   renames anything. Keep the `~/rpi5-unit-backup/` copy from pre-flight
+   step 4 so you can put a missing file back by hand without printing it.
+
+6. If `98-py314-v0217.conf` was retargeted, restore it from the unit backup.
+   Do not point hermes-webui at `hermes dashboard`. If the preflight said
+   `leave`, there is nothing to restore.
+
+7. Restore katie and alice `config.yaml` from the quick snapshot taken before
+   the Bitwarden block and the `game-workshop` `env` edit. Restore each
+   profile `.env` from that same snapshot, which removes a `BWS_ACCESS_TOKEN`
+   this cutover added and puts the previous file back. The kid units'
+   `ExecStartPre` (`render_kid_matrix_env.py`) loads Matrix credentials again
+   once those units start. The snapshots contain secrets. Copy the files; do
+   not cat them. Do not merge those credentials into `hermes-gateway.service`.
+
+8. `systemctl --user daemon-reload` (and the system manager, if you restored
    system units).
 
-6. Enable and start the four profile units, then the default gateway and the
-   WebUI:
+9. Enable and start the four profile units, then the default gateway and the
+   webui:
 
    ```bash
    systemctl --user enable --now hermes-gateway-wife.service
@@ -519,14 +866,15 @@ is what keeps those profiles off the host gateway.
    systemctl --user enable --now hermes-gateway-katie.service
    systemctl --user enable --now hermes-gateway-alice.service
    hermes gateway start
-   systemctl --user start <webui-unit>.service
+   systemctl --user start <hermes-webui unit>.service
    ```
 
-7. Restore vendor callbacks to the pre-multiplex URLs if you changed them.
-8. Confirm each profile's own gateway is connected and
-   `curl -fsS http://100.64.0.0:8642/health` succeeds on the process that
-   owned that port before. Confirm `VIRTUAL_ENV` is not required reading: the
-   process image should be the external venv interpreter again.
+10. Restore vendor callbacks to the pre-multiplex URLs if you changed them.
+11. Confirm each profile's own gateway is connected and
+    `curl -fsS http://100.64.0.0:8642/health` succeeds on the process that
+    owned that port before. Compare `/proc/<pid>/exe` with the external venv
+    interpreter. Do not dump `/proc/<pid>/environ`.
 
 Do not run `hermes gateway migrate --multiplex` in either direction. Apply
-uninstalls the profile units. Disable and enable preserve them.
+uninstalls the profile units. Disable and enable preserve them. Do not run
+`hermes pm gc` as part of rollback.

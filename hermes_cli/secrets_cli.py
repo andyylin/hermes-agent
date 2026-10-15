@@ -199,9 +199,11 @@ def cmd_setup(args: argparse.Namespace) -> int:
         if project_id is None:
             return 1
     _step(console, 4 if project_given else 5, "Test fetch")
+    key_prefix, strip_prefix = bw.prefix_settings(secrets_cfg)
     try:
         secrets, warnings = bw.fetch_bitwarden_secrets(
-            access_token=token, project_id=project_id, binary=binary, use_cache=False, server_url=server_url)
+            access_token=token, project_id=project_id, binary=binary, use_cache=False, server_url=server_url,
+            key_prefix=key_prefix, strip_prefix=strip_prefix)
     except Exception as exc:
         console.print(f"  [red]✗ Fetch failed: {exc}[/red]")
         return 1
@@ -246,6 +248,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     token_env = bw_cfg.get("access_token_env", _DEFAULT_TOKEN_ENV)
     project_id = bw_cfg.get("project_id", "")
     server_url = cfg_str(bw_cfg, "server_url")
+    key_prefix, strip_prefix = bw.prefix_settings(bw_cfg)
     token = os.environ.get(token_env, "").strip()
     binary = bw.find_bws(install_if_missing=False)
     token_validation, validation_messages = _token_validation_status(
@@ -256,6 +259,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         ("Token in env", _yn(bool(token))),
         ("Token validation", token_validation),
         ("Project ID", project_id or "[dim](unset)[/dim]"),
+        ("Key prefix", key_prefix or "[dim](none — entire project)[/dim]"),
+        ("Strip prefix", _yn(strip_prefix)),
         ("Server URL", server_url or "[dim]default (US Cloud, https://vault.bitwarden.com)[/dim]"),
         ("Override existing", _yn(bool(bw_cfg.get("override_existing", False)))),
         ("Cache TTL (s)", str(bw_cfg.get("cache_ttl_seconds", 300))),
@@ -328,6 +333,27 @@ def cmd_token(args: argparse.Namespace) -> int:
         ))
 
 
+def _print_sync_filter(console: Console, key_prefix: str, strip_prefix: bool) -> None:
+    """Tell a dry-run which names the table will show. Empty prefix prints nothing."""
+    if not key_prefix:
+        return
+    # Names in the table are exported env names, after strip_prefix, not raw BSM keys.
+    stripped = " The owner segment is removed from each name." if strip_prefix else ""
+    console.print(
+        f"Filter: key_prefix {key_prefix}.{stripped} "
+        "Keys that do not start with it are omitted."
+    )
+
+
+def _print_sync_empty(console: Console, key_prefix: str, warnings: list[str]) -> None:
+    if key_prefix:
+        console.print(f"[yellow]No secrets matched key_prefix {key_prefix}.[/yellow]")
+    else:
+        console.print("[yellow]No secrets in project.[/yellow]")
+    for warning in warnings:
+        console.print(f"  [yellow]warning:[/yellow] {warning}")
+
+
 def cmd_sync(args: argparse.Namespace) -> int:
     bw = _load_bw()
     console = Console()
@@ -343,15 +369,18 @@ def cmd_sync(args: argparse.Namespace) -> int:
     if not project_id:
         console.print("[red]No project_id configured.[/red]")
         return 1
+    key_prefix, strip_prefix = bw.prefix_settings(bw_cfg)
+    _print_sync_filter(console, key_prefix, strip_prefix)
     try:
         secrets, warnings = bw.fetch_bitwarden_secrets(
             access_token=token, project_id=project_id, use_cache=False, server_url=cfg_str(bw_cfg, "server_url"),
+            key_prefix=key_prefix, strip_prefix=strip_prefix,
         )
     except Exception as exc:
         console.print(f"[red]Fetch failed: {exc}[/red]")
         return 1
     if not secrets:
-        console.print("[yellow]No secrets in project.[/yellow]")
+        _print_sync_empty(console, key_prefix, warnings)
         return 0
     override = bool(bw_cfg.get("override_existing", False)) or args.apply
     rows = []

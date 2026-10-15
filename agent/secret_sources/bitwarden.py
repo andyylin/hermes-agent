@@ -36,7 +36,11 @@ _BWS_RUN_TIMEOUT = 30
 
 # <hermes_home>/cache/bws_cache.json holds only secret VALUES (never the access
 # token); kept out of .env so users editing .env don't commit BSM-sourced secrets.
-_CacheKey = tuple[str, str, str]  # (access_token_fingerprint, project_id, server_url)
+# (fingerprint, project_id, server_url) plus, when key_prefix is set,
+# (key_prefix, "1"|"0" strip flag). The unprefixed key stays 3-wide so an
+# existing disk entry still hits. A prefixed fetch must not share that slot:
+# the file holds values, and a kid profile must not cache the rest of the project.
+_CacheKey = tuple[str, ...]
 _DISK_CACHE_BASENAME = "bws_cache.json"
 _ENCRYPTED_CACHE_BASENAME = "bws_cache.enc.json"
 _ENCRYPTED_CACHE_VERSION = 1
@@ -188,7 +192,90 @@ def _read_encrypted_disk_cache(*, cache_key: _CacheKey, access_token: str, max_a
         return None
 
 
+# --- Key prefix -------------------------------------------------------------
+
+
+def prefix_settings(cfg: object) -> tuple[str, bool]:
+    """``(key_prefix, strip_prefix)`` from a ``secrets.bitwarden`` mapping.
+
+    Missing or non-string ``key_prefix`` is ``""`` (no filter). ``strip_prefix``
+    is true only for a real boolean true or the strings true/yes/on/1, so the
+    YAML string ``"false"`` does not turn stripping on.
+    """
+    if not isinstance(cfg, dict):
+        return "", False
+    raw = cfg.get("key_prefix", "")
+    prefix = raw.strip() if isinstance(raw, str) else ""
+    flag = cfg.get("strip_prefix", False)
+    if isinstance(flag, str):
+        strip = flag.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        strip = flag is True
+    return prefix, strip
+
+
+def owner_strip_span(key_prefix: str) -> str:
+    """Characters ``strip_prefix`` removes from a key that matched ``key_prefix``.
+
+    A one-segment prefix is removed whole (``KATIE_`` → ``KATIE_MATRIX_PASSWORD``
+    exports as ``MATRIX_PASSWORD``). A longer prefix keeps its final segment, so
+    ``KATIE_MATRIX_`` exports that same key as ``MATRIX_PASSWORD`` rather than
+    ``PASSWORD``. The filter can still be the full ``KATIE_MATRIX_`` and leave
+    ``TELEGRAM_BOT_TOKEN`` and ``ALICE_MATRIX_*`` unloaded.
+    """
+    if not key_prefix:
+        return ""
+    body = key_prefix[:-1] if key_prefix.endswith("_") else key_prefix
+    owner, sep, _kept = body.rpartition("_")
+    if not owner:
+        return key_prefix
+    return owner + sep
+
+
+def select_prefixed_secrets(
+    secrets: dict[str, str], key_prefix: str, strip_prefix: bool,
+) -> tuple[dict[str, str], list[str]]:
+    """Keep keys that start with ``key_prefix`` and optionally rename them.
+
+    An empty prefix returns ``secrets`` unchanged. ``strip_prefix`` without a
+    prefix is a no-op plus a warning, so the default config does not rename.
+    """
+    prefix = key_prefix.strip() if isinstance(key_prefix, str) else ""
+    if not prefix:
+        if strip_prefix:
+            return secrets, ["strip_prefix is set but key_prefix is empty; names are unchanged"]
+        return secrets, []
+    span = owner_strip_span(prefix) if strip_prefix else ""
+    selected: dict[str, str] = {}
+    warnings: list[str] = []
+    matched = False
+    for key in sorted(secrets):
+        if not key.startswith(prefix):
+            continue
+        matched = True
+        export = key[len(span):] if span and key.startswith(span) else key
+        if not _is_valid_env_name(export):
+            warnings.append(f"Skipping secret {key!r}: {export!r} is not a valid env-var name")
+            continue
+        if export in selected:
+            warnings.append(f"Skipping secret {key!r}: export name {export} already taken")
+            continue
+        selected[export] = secrets[key]
+    if not matched:
+        warnings.append(f"key_prefix {prefix!r} matched no secrets")
+    return selected, warnings
+
+
 # --- Secret fetch -----------------------------------------------------------
+
+
+def _cache_key(
+    access_token: str, project_id: str, server_url: str, key_prefix: str, strip_prefix: bool,
+) -> _CacheKey:
+    base = (_token_fingerprint(access_token), project_id, server_url or "")
+    if not key_prefix:
+        return base
+    return (*base, key_prefix, "1" if strip_prefix else "0")
 
 
 def fetch_bitwarden_secrets(
@@ -196,8 +283,17 @@ def fetch_bitwarden_secrets(
     cache_ttl_seconds: float = 300, use_cache: bool = True, server_url: str = "",
     home_path: Optional[Path] = None, encrypted_cache_enabled: bool = False,
     encrypted_cache_max_stale_seconds: float = 0,
+    key_prefix: str = "", strip_prefix: bool = False,
 ) -> tuple[dict[str, str], list[str]]:
     """Pull the secrets for ``project_id`` from BSM → ``(secrets, warnings)``.
+
+    ``key_prefix`` empty (the default) returns every valid env-name in the
+    project. A non-empty prefix keeps only keys that start with it.
+    ``strip_prefix`` renames those keys via :func:`owner_strip_span` before
+    they are cached or returned, so a shared project can export ``MATRIX_*``
+    for one profile and leave the raw ``KATIE_MATRIX_*`` names for another.
+    The cache key includes the prefix, so a filtered entry is never served
+    as the unfiltered project.
 
     ``server_url``: region / self-hosted instance (empty = US Cloud). With
     ``encrypted_cache_enabled`` fresh entries are written AES-GCM encrypted and a
@@ -214,7 +310,8 @@ def fetch_bitwarden_secrets(
     if not project_id:
         raise RuntimeError("Bitwarden project_id is empty")
 
-    cache_key = (_token_fingerprint(access_token), project_id, server_url or "")
+    prefix = key_prefix.strip() if isinstance(key_prefix, str) else ""
+    cache_key = _cache_key(access_token, project_id, server_url, prefix, bool(strip_prefix))
 
     def _read_encrypted(max_age: float) -> Optional[_CachedFetch]:
         return _read_encrypted_disk_cache(cache_key=cache_key, access_token=access_token,
@@ -259,6 +356,8 @@ def fetch_bitwarden_secrets(
                     f"bws live fetch failed ({exc}); falling back to {label} ({int(age)}s old)"
                 ]
         raise
+    secrets, prefix_warnings = select_prefixed_secrets(secrets, prefix, bool(strip_prefix))
+    warnings.extend(prefix_warnings)
     entry = _CachedFetch(secrets=secrets, fetched_at=time.time())
     if use_cache:
         if cache_ttl_seconds > 0:
@@ -326,8 +425,12 @@ def _run_bws_list(bws: Path, access_token: str, project_id: str, server_url: str
 
 
 class BitwardenSource(SecretSource):
-    """Bitwarden Secrets Manager as a registered **bulk** source (injects every
-    secret in the project, so explicit mapped bindings outrank it)."""
+    """Bitwarden Secrets Manager as a registered **bulk** source.
+
+    With no ``key_prefix`` it injects every secret in the project, so explicit
+    mapped bindings outrank it. ``key_prefix`` narrows that set before apply;
+    ``strip_prefix`` renames the matches (see :func:`owner_strip_span`).
+    """
 
     name = "bitwarden"
     label = "Bitwarden Secrets Manager"
@@ -352,6 +455,17 @@ class BitwardenSource(SecretSource):
             "access_token_env": {"description": "Env var holding the machine-account access token",
                                  "default": "BWS_ACCESS_TOKEN"},
             "project_id": {"description": "BSM project UUID", "default": ""},
+            "key_prefix": {
+                "description": "Load only secret keys that start with this prefix. Empty loads the whole project.",
+                "default": "",
+            },
+            "strip_prefix": {
+                "description": (
+                    "When key_prefix is set, drop its leading owner segment from exported names "
+                    "(KATIE_ or KATIE_MATRIX_ both export KATIE_MATRIX_PASSWORD as MATRIX_PASSWORD)."
+                ),
+                "default": False,
+            },
             "cache_ttl_seconds": {"description": "Fresh disk+memory cache TTL; 0 disables fresh-cache reuse",
                                   "default": 300},
             "encrypted_cache": {"description": "Encrypted last-good cache for network/timeout fallback",
@@ -371,6 +485,7 @@ class BitwardenSource(SecretSource):
             return result.fail(f"secrets.bitwarden.enabled is true but {access_token_env} is "
                                "not set.  Run `hermes secrets bitwarden setup`.", ErrorKind.NOT_CONFIGURED)
         project_id = str(cfg.get("project_id") or "")
+        key_prefix, strip_prefix = prefix_settings(cfg)
         if not project_id:
             return result.fail("secrets.bitwarden.project_id is empty.  Run `hermes secrets bitwarden setup`.",
                                ErrorKind.NOT_CONFIGURED)
@@ -392,6 +507,7 @@ class BitwardenSource(SecretSource):
                 server_url=str(cfg.get("server_url", "") or "").strip(), home_path=home_path,
                 encrypted_cache_enabled=bool(encrypted_cfg.get("enabled", False)),
                 encrypted_cache_max_stale_seconds=coerce_float(encrypted_cfg.get("max_stale_seconds", 0), 0.0),
+                key_prefix=key_prefix, strip_prefix=strip_prefix,
             )
         except RuntimeError as exc:
             result.fail(str(exc), _classify_bws_error(str(exc)))

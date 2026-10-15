@@ -2472,6 +2472,13 @@ DEFAULT_CONFIG = {
             # ~/.hermes/.env (or the shell), never in config.yaml.
             "access_token_env": "BWS_ACCESS_TOKEN",
             "project_id": "",  # UUID of the BSM project to sync from.
+            # Empty loads every secret in the project. A prefix loads only keys
+            # that start with it (KATIE_MATRIX_ leaves TELEGRAM_BOT_TOKEN out).
+            "key_prefix": "",
+            # With a prefix, drop the leading owner segment so KATIE_MATRIX_PASSWORD
+            # and a key_prefix of either KATIE_ or KATIE_MATRIX_ both export as
+            # MATRIX_PASSWORD. False keeps the Bitwarden key as the env name.
+            "strip_prefix": False,
             # Seconds to reuse a fresh disk/memory cache entry before contacting Bitwarden again. 0
             # disables fresh-cache reuse.
             "cache_ttl_seconds": 300,

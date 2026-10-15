@@ -848,7 +848,11 @@ def _refresh_secrets_from_bitwarden(env: dict[str, str], needed: set, bitwarden_
                 "credential_source=bitwarden but access-token env or project_id is empty — proxy will fall back to parent env (allow_env_fallback=true).",
             )
             return
-        secrets, warnings = bw.fetch_bitwarden_secrets(access_token=access_token, project_id=project_id, cache_ttl_seconds=0, use_cache=False)
+        key_prefix, strip_prefix = bw.prefix_settings(bitwarden_config)
+        secrets, warnings = bw.fetch_bitwarden_secrets(
+            access_token=access_token, project_id=project_id, cache_ttl_seconds=0, use_cache=False,
+            key_prefix=key_prefix, strip_prefix=strip_prefix,
+        )
     except ImportError as exc:
         # A dependency vanishing between setup and restart must not silently degrade.
         _bitwarden_shortfall(
