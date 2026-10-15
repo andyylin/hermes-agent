@@ -18,7 +18,12 @@
 #   docs/ops/rpi5-vanilla-migration.sh --check         # exit 0 only when committed imports pass
 #   docs/ops/rpi5-vanilla-migration.sh --preflight     # unit inventory + dry-run; abort on blockers
 #   docs/ops/rpi5-vanilla-migration.sh --preflight-fold
-#       # same, after gateway.standalone is unset on wife/dad/katie/alice
+#       # after gateway.standalone is unset on katie and alice only
+#   docs/ops/rpi5-vanilla-migration.sh --config-edits
+#   docs/ops/rpi5-vanilla-migration.sh --renderer-keys /path/to/render_kid_matrix_env.py
+#   docs/ops/rpi5-vanilla-migration.sh --matrix-probe katie
+#   docs/ops/rpi5-vanilla-migration.sh --alice-mcp-env          # print paths, do not write
+#   docs/ops/rpi5-vanilla-migration.sh --alice-mcp-env --write  # write alice config.yaml
 #   docs/ops/rpi5-vanilla-migration.sh --sideline-dropins
 #   docs/ops/rpi5-vanilla-migration.sh --orphans
 #   docs/ops/rpi5-vanilla-migration.sh --gc            # refused before 2026-10-16 12:41 Taipei
@@ -27,8 +32,10 @@
 # --preflight greps hermes/hermex units for EnvironmentFile, ExecStartPre, and
 # Environment=, and runs `hermes gateway migrate --multiplex --dry-run`. The
 # dry-run exits 0 when blockers are present; the helper aborts anyway. Neither
-# mode prints Environment= values or command arguments. --preflight-fold also
-# aborts while wife, dad, katie, or alice are still "left alone".
+# mode prints Environment= values or command arguments. The early pass aborts
+# if wife or dad are "left alone" (they are not standalone) or if only one
+# profile is visible. Katie and alice left alone is expected on that pass.
+# --preflight-fold aborts while wife, dad, katie, or alice are still "left alone".
 #
 # Exit codes:
 #   0  committed interpreter imports the required modules, or the selected mode succeeded
@@ -51,9 +58,13 @@ case "${1:-}" in
   --orphans) MODE="orphans" ;;
   --gc) MODE="gc" ;;
   --rollback) MODE="rollback" ;;
+  --config-edits) MODE="config-edits" ;;
+  --renderer-keys) MODE="renderer-keys" ;;
+  --matrix-probe) MODE="matrix-probe" ;;
+  --alice-mcp-env) MODE="alice-mcp-env" ;;
   "") MODE="apply" ;;
   *)
-    echo "usage: $0 [--check | --preflight | --preflight-fold | --sideline-dropins | --orphans | --gc | --rollback]" >&2
+    echo "usage: $0 [--check | --preflight | --preflight-fold | --config-edits | --renderer-keys PATH | --matrix-probe PROFILE | --alice-mcp-env [--write] | --sideline-dropins | --orphans | --gc | --rollback]" >&2
     exit 4
     ;;
 esac
@@ -184,6 +195,48 @@ run_dry_run_classify() {
   rm -f "$capture"
   return "$class"
 }
+
+if [[ "$MODE" == "config-edits" ]]; then
+  helper config-edits
+  exit $?
+fi
+
+if [[ "$MODE" == "renderer-keys" ]]; then
+  if [[ -z "${2:-}" ]]; then
+    echo "usage: $0 --renderer-keys /path/to/render_kid_matrix_env.py" >&2
+    exit 4
+  fi
+  helper renderer-keys --path "$2"
+  exit $?
+fi
+
+if [[ "$MODE" == "matrix-probe" ]]; then
+  if [[ -z "${2:-}" ]]; then
+    echo "usage: $0 --matrix-probe <profile>" >&2
+    exit 4
+  fi
+  if [[ "$2" == "default" ]]; then
+    probe_home="${HOME}/.hermes"
+  else
+    probe_home="${HOME}/.hermes/profiles/$2"
+  fi
+  helper matrix-probe --home "$probe_home"
+  exit $?
+fi
+
+if [[ "$MODE" == "alice-mcp-env" ]]; then
+  args=()
+  while IFS= read -r root; do
+    args+=(--root "$root")
+  done < <(unit_roots)
+  alice_config="${HOME}/.hermes/profiles/alice/config.yaml"
+  if [[ "${2:-}" == "--write" ]]; then
+    helper alice-mcp-env "${args[@]}" --config "$alice_config"
+  else
+    helper alice-mcp-env "${args[@]}" --config "$alice_config" --dry-run
+  fi
+  exit $?
+fi
 
 if [[ "$MODE" == "preflight" || "$MODE" == "preflight-fold" ]]; then
   run_inventory || exit $?

@@ -96,7 +96,15 @@ def test_inventory_lists_directive_names_and_omits_values():
     assert "profiles/katie/.env" in text
     assert "profiles/wife/.env" in text
     assert "profiles/dad/.env" in text
-    assert "Read ExecStart program /opt/hermes/wife-gateway.sh" in text
+    assert "secrets.bitwarden" in text
+    assert "render_kid_matrix_env.py is retired" in text
+    assert "Do not merge the rendered env file" in text
+    assert "_build_safe_env" in text
+    assert (
+        "ExecStart program /opt/hermes/wife-gateway.sh is not a credential source."
+        in text
+    )
+    assert "Render those values into" not in text
     assert (
         f"Do not add this profile's EnvironmentFile or Environment= to {mig.GATEWAY_UNIT}"
         in text
@@ -159,20 +167,43 @@ def test_dry_run_redacts_assignment_values_in_blocker_lines():
     assert "[redacted]" in findings.blockers[0]
 
 
-def test_require_fold_aborts_while_profiles_are_standalone():
+def test_early_preflight_allows_only_katie_and_alice_left_alone():
     text = (
         "Migration plan (dry run — nothing changed)\n"
         "  Standalone by config (gateway.standalone: true), left alone: "
-        "wife, dad, katie, alice\n"
+        "katie, alice\n"
+        "  wife         -             -\n"
+        "  dad          -             -\n"
+    )
+    findings = mig.parse_dry_run(text, command_exit=0)
+    ok, reasons = mig.evaluate_preflight(findings, require_fold=False)
+    assert ok
+    assert reasons == ()
+    fold_ok, fold_reasons = mig.evaluate_preflight(findings, require_fold=True)
+    assert not fold_ok
+    assert any("katie" in reason and "alice" in reason for reason in fold_reasons)
+
+
+def test_early_preflight_aborts_when_wife_or_dad_are_left_alone():
+    text = (
+        "  Standalone by config (gateway.standalone: true), left alone: wife, katie\n"
+    )
+    findings = mig.parse_dry_run(text, command_exit=0)
+    ok, reasons = mig.evaluate_preflight(findings, require_fold=False)
+    assert not ok
+    assert any("wife and dad are not standalone" in reason for reason in reasons)
+    assert any("wife" in reason for reason in reasons)
+
+
+def test_early_preflight_aborts_when_only_one_profile_is_visible():
+    text = (
+        "  Standalone by config (gateway.standalone: true), left alone: katie, alice\n"
         "  Only one profile exists: nothing to multiplex.\n"
     )
     findings = mig.parse_dry_run(text, command_exit=0)
-    early_ok, _early = mig.evaluate_preflight(findings, require_fold=False)
-    fold_ok, reasons = mig.evaluate_preflight(findings, require_fold=True)
-    assert early_ok
-    assert not fold_ok
-    assert any("still standalone" in reason for reason in reasons)
-    assert any("only one profile" in reason for reason in reasons)
+    ok, reasons = mig.evaluate_preflight(findings, require_fold=False)
+    assert not ok
+    assert any("wife and dad" in reason for reason in reasons)
 
 
 def test_command_failure_aborts_without_a_blocker_section():
@@ -372,3 +403,192 @@ def test_cli_orphans_prints_names_only(
     assert f"referenced: {referenced}" in captured.out
     assert f"orphan: {other}" in captured.out
     assert f"orphan: {referenced}" not in captured.out
+
+
+KID_DROPIN = f"""\
+[Service]
+Environment=PATH=/home/pi/.hermes/profiles/katie/bin:/usr/bin
+Environment={mig._KANBAN_ENV}=false
+Environment=OTHER_TOKEN={SECRET}
+MemoryHigh=1G
+MemoryMax=2G
+"""
+
+ALICE_LIMITS = """\
+[Service]
+Environment=PATH=/home/pi/.hermes/profiles/alice/bin:/usr/bin
+MemoryHigh=1500M
+MemoryMax=2G
+"""
+
+WIFE_KANBAN = """\
+[Service]
+Environment=HERMES_KANBAN_DISPATCH_IN_GATEWAY=false
+"""
+
+RENDERER_SCRIPT = f'''\
+TOKEN = "{SECRET}"
+KEYS = ("MATRIX_HOMESERVER", "MATRIX_ACCESS_TOKEN", "MATRIX_USER_ID")
+os.environ["MATRIX_DEVICE_ID"] = fetched["device"]
+BWS_ACCESS_TOKEN = "{SECRET}"
+'''
+
+ALICE_CONFIG = """\
+mcp_servers:
+  other:
+    command: "python"
+    env:
+      TOKEN: "supersecretvalue"
+  game-workshop:
+    command: "python"
+    args: ["alice_game_workshop.py"]
+    env:
+      KEEP: "yes"
+"""
+
+
+def test_carryover_reports_memory_path_and_kanban_without_secrets():
+    units = mig.scan_units(
+        [
+            ("hermes-gateway-katie.service", KATIE_UNIT),
+            ("hermes-gateway-katie.service", KID_DROPIN, "10-path.conf"),
+            ("hermes-gateway-alice.service", ALICE_UNIT),
+            ("hermes-gateway-alice.service", ALICE_LIMITS, "memory.conf"),
+            ("hermes-gateway-wife.service", WIFE_UNIT),
+            ("hermes-gateway-wife.service", WIFE_KANBAN, "disable-kanban.conf"),
+        ]
+    )
+    text = mig.format_inventory(units)
+    _assert_secret_free(text)
+    assert "katie: unit MemoryHigh=1G MemoryMax=2G is dropped" in text
+    assert "unit PATH includes /home/pi/.hermes/profiles/katie/bin." in text
+    assert "alice: unit PATH includes /home/pi/.hermes/profiles/alice/bin." in text
+    assert "wife: kanban dispatch is off" in text
+    assert "katie: kanban dispatch is off" in text
+    assert "No per-profile memory key" in text
+    assert "is not read" in text
+    assert "disable-kanban.conf" in text
+    assert mig.MEMORY_HIGH in text
+
+
+def test_alice_mcp_env_comes_from_the_unit_and_leaves_other_servers():
+    env = mig.read_named_environment(ALICE_UNIT, mig.ALICE_MCP_ENV_KEYS)
+    assert env == {
+        "ALICE_GAMES_ROOT": ALICE_GAMES,
+        "ALICE_PROFILE_ROOT": ALICE_PROFILE,
+    }
+    assert SECRET not in env.values()
+    patched = mig.patch_mcp_server_env(ALICE_CONFIG, "game-workshop", env)
+    assert f'ALICE_GAMES_ROOT: "{ALICE_GAMES}"' in patched
+    assert f'ALICE_PROFILE_ROOT: "{ALICE_PROFILE}"' in patched
+    assert 'KEEP: "yes"' in patched
+    assert 'TOKEN: "supersecretvalue"' in patched
+    assert patched.index("other:") < patched.index("game-workshop:")
+    with pytest.raises(ValueError, match="no game-workshop"):
+        mig.patch_mcp_server_env("mcp_servers:\n  other: {}\n", "game-workshop", env)
+    inserted = mig.patch_mcp_server_env(
+        'mcp_servers:\n  game-workshop:\n    command: "python"\n',
+        "game-workshop",
+        env,
+    )
+    assert 'command: "python"' in inserted
+    assert f'ALICE_PROFILE_ROOT: "{ALICE_PROFILE}"' in inserted
+    with pytest.raises(ValueError, match="not a block"):
+        mig.patch_mcp_server_env(
+            "mcp_servers:\n  game-workshop: {command: x}\n",
+            "game-workshop",
+            env,
+        )
+
+
+def test_alice_games_root_must_match_the_recorded_live_path():
+    env = {"ALICE_GAMES_ROOT": ALICE_GAMES, "ALICE_PROFILE_ROOT": ALICE_PROFILE}
+    with pytest.raises(ValueError, match=mig.ALICE_GAMES_ROOT_EXPECTED):
+        mig.require_alice_games_root(env, mig.ALICE_GAMES_ROOT_EXPECTED)
+    mig.require_alice_games_root(
+        {"ALICE_GAMES_ROOT": mig.ALICE_GAMES_ROOT_EXPECTED},
+        mig.ALICE_GAMES_ROOT_EXPECTED,
+    )
+
+
+def test_renderer_keys_are_names_only():
+    names = mig.renderer_env_names(RENDERER_SCRIPT)
+    assert names == (
+        "MATRIX_ACCESS_TOKEN",
+        "MATRIX_DEVICE_ID",
+        "MATRIX_HOMESERVER",
+        "MATRIX_USER_ID",
+    )
+    assert SECRET not in names
+    assert "BWS_ACCESS_TOKEN" not in names
+
+
+def test_matrix_probe_matches_the_adapter_gate():
+    assert mig.matrix_adapter_sees_credentials(
+        {"MATRIX_HOMESERVER", "MATRIX_ACCESS_TOKEN"}
+    )
+    assert mig.matrix_adapter_sees_credentials({"MATRIX_HOMESERVER", "MATRIX_PASSWORD"})
+    assert not mig.matrix_adapter_sees_credentials({"MATRIX_ACCESS_TOKEN"})
+    assert not mig.matrix_adapter_sees_credentials({"MATRIX_HOMESERVER"})
+    lines = mig.matrix_probe_lines({"MATRIX_HOMESERVER", "MATRIX_ACCESS_TOKEN"})
+    assert "MATRIX_ACCESS_TOKEN: present" in lines
+    assert "MATRIX_PASSWORD: missing" in lines
+    assert "matrix adapter would accept credentials: yes" in lines
+    assert SECRET not in "\n".join(lines)
+
+
+def test_config_edits_leave_wife_and_dad_standalone_unset():
+    text = "\n".join(mig.CONFIG_EDITS)
+    assert "wife config.yaml: no change" in text
+    assert "dad config.yaml: no change" in text
+    assert "katie config.yaml: remove gateway.standalone" in text
+    assert "alice config.yaml: remove gateway.standalone" in text
+    assert "do not set kanban.dispatch_in_gateway" in text
+    assert "ALICE_PROFILE_ROOT read from her unit" in text
+    assert "Do not hardcode the profile root" in text
+    assert "BWS_ACCESS_TOKEN only" in text
+    assert "/srv/alice-portal/games" in text
+
+
+def test_cli_alice_mcp_dry_run_writes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    unit_dir = tmp_path / "user"
+    unit_dir.mkdir()
+    unit = ALICE_UNIT.replace(ALICE_GAMES, mig.ALICE_GAMES_ROOT_EXPECTED)
+    (unit_dir / "hermes-gateway-alice.service").write_text(unit, encoding="utf-8")
+    config = tmp_path / "config.yaml"
+    config.write_text(ALICE_CONFIG, encoding="utf-8")
+    code = mig.main(
+        [
+            "alice-mcp-env",
+            "--root",
+            str(unit_dir),
+            "--config",
+            str(config),
+            "--dry-run",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert f"ALICE_GAMES_ROOT={mig.ALICE_GAMES_ROOT_EXPECTED}" in captured.out
+    assert f"ALICE_PROFILE_ROOT={ALICE_PROFILE}" in captured.out
+    assert SECRET not in captured.out
+    assert "dry-run: config not written" in captured.out
+    assert config.read_text(encoding="utf-8") == ALICE_CONFIG
+
+
+def test_cli_matrix_probe_prints_presence_only(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        mig,
+        "load_profile_secret_names",
+        lambda _home: {"MATRIX_HOMESERVER", "MATRIX_PASSWORD"},
+    )
+    code = mig.main(["matrix-probe", "--home", "/tmp/does-not-matter"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "MATRIX_PASSWORD: present" in captured.out
+    assert "MATRIX_ACCESS_TOKEN: missing" in captured.out
+    assert SECRET not in captured.out

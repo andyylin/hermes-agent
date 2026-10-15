@@ -57,10 +57,12 @@ It is the same Python version as the external venv, and it is not that venv.
 | Code | `PYTHONPATH=~/.hermes/hermes-agent` |
 | Default unit | `hermes-gateway` |
 | Profile units | `hermes-gateway-wife`, `hermes-gateway-dad`, `hermes-gateway-katie`, `hermes-gateway-alice` |
-| Profile flag | `gateway.standalone: true` is already set on wife, dad, katie, and alice |
+| Profile flag | `gateway.standalone: true` is already set on katie and alice only. Wife and dad do not have it |
 | Default drop-ins | `hermes-gateway.service.d/`: `zzz-main-v0217.conf`, `zz-py314-runtime.conf`, `92-canonical-runtime.conf` (old venv Python), `memory-limits.conf` (2G cap) |
-| Kid credentials | Katie and Alice: unit `ExecStartPre` runs `render_kid_matrix_env.py` (Bitwarden) into a runtime env file only that unit loads. Alice's unit also sets `ALICE_GAMES_ROOT` and `ALICE_PROFILE_ROOT`. Those values are not in the profile `.env` |
-| Wife and dad | profile `.env` has no bot tokens. The unit's `EnvironmentFile` / `ExecStartPre` / `Environment=` is the source; the inventory prints it |
+| Kid credentials | Katie and Alice: unit `ExecStartPre` runs `render_kid_matrix_env.py` (Bitwarden) into a runtime env file only that unit loads. That renderer is retired. Matrix keys move to `secrets.bitwarden` in each kid's `config.yaml`, with `BWS_ACCESS_TOKEN` in that profile's `.env` |
+| Alice MCP | `game-workshop` (`alice_game_workshop.py`) reads `ALICE_GAMES_ROOT` (no fallback) and `ALICE_PROFILE_ROOT` from its own process env. Plain `.env` values are not passed to MCP servers |
+| Wife and dad | profile `.env` has no bot tokens. They already use a Bitwarden secret source in their own `config.yaml` plus `BWS_ACCESS_TOKEN` in that profile's `.env`. Wife and dad units also have `disable-kanban.conf` |
+| Kid unit extras | Katie and Alice prepend `~/.hermes/profiles/<kid>/bin` (tirith) to `PATH`, set their own memory limits, and set `HERMES_KANBAN_DISPATCH_IN_GATEWAY=false` |
 | WebUI | separate `hermes-webui` app, `ExecStart` `hermex-webui-start.sh`, not `hermes dashboard`. Drop-in `98-py314-v0217.conf` may pin an interpreter |
 | SMS | enabled on the default profile, port-binding, currently failing (`SMS_WEBHOOK_URL` unset) |
 | Host memory | 16 GB RAM, about 9 GB free. Five gateways plus gbrain use about 3.1 GB RSS |
@@ -127,8 +129,9 @@ find "${XDG_CONFIG_HOME:-$HOME/.config}/systemd" /etc/systemd/system \
    moves those four into `~/rpi5-unit-backup/gateway-dropins/`; the copy here
    is the one you can put back if that directory is wrong.
 5. Leave the moved-aside `facts.json` where it is. Do not move it back.
-6. Inventory runtime state, then dry-run. Wife, dad, katie, and alice already
-   have `gateway.standalone: true`, so this first pass does not inspect them:
+6. Inventory runtime state, then dry-run. Only katie and alice have
+   `gateway.standalone: true`. Wife and dad do not, so this first pass must
+   already include them:
 
    ```bash
    docs/ops/rpi5-vanilla-migration.sh --preflight
@@ -139,11 +142,13 @@ find "${XDG_CONFIG_HOME:-$HOME/.config}/systemd" /etc/systemd/system \
    `Environment=`. It prints paths, `ExecStartPre` programs, and `Environment=`
    names. It does not print values. Save that text; it is the map for the
    credential section. Katie and Alice should show `render_kid_matrix_env.py`
-   and an `EnvironmentFile`. Alice should show `ALICE_GAMES_ROOT` and
-   `ALICE_PROFILE_ROOT`. Wife and dad should show whatever their units actually
-   load. If a profile's unit has none of those directives, read the `ExecStart`
-   program on the host (the inventory prints the program, not its arguments)
-   before assuming the token is missing.
+   and an `EnvironmentFile`. Alice should show the names `ALICE_GAMES_ROOT`
+   and `ALICE_PROFILE_ROOT` (the values stay in the unit until
+   `--alice-mcp-env`). Katie and Alice should show a profile `bin` on `PATH`,
+   their `MemoryHigh` / `MemoryMax`, and `HERMES_KANBAN_DISPATCH_IN_GATEWAY`.
+   Wife and dad should show `disable-kanban.conf`. The plan tells you to leave
+   their Bitwarden source in place. It does not tell you to render unit files
+   into `.env`.
 
    It then runs `hermes gateway migrate --multiplex --dry-run` and exits
    non-zero on blockers. Dry-run itself returns before any service action and
@@ -155,10 +160,11 @@ find "${XDG_CONFIG_HOME:-$HOME/.config}/systemd" /etc/systemd/system \
    so rollback can enable them again.
 
    While `gateway.standalone: true` is set, `profiles_to_serve` omits that
-   profile. The dry-run lists wife, dad, katie, and alice as "left alone" and
-   can say only one profile exists. That is expected on this pass. Their
-   credentials and port-binders are not in the plan. A clean exit here is not
-   a clean bill of health for those four.
+   profile. On this pass the dry-run should list katie and alice as "left
+   alone" and should already show wife and dad. The script aborts if wife or
+   dad are left alone, and if the plan says only one profile exists. A clean
+   exit here is not a clean bill of health for katie and alice: their
+   credentials and port-binders are not in the plan yet.
 
    Fix anything the dry-run names before the cutover. Duplicate bot credentials
    are reported as profile names and key names, never values
@@ -193,15 +199,17 @@ find "${XDG_CONFIG_HOME:-$HOME/.config}/systemd" /etc/systemd/system \
    Do not add an ingress in this migration.
 
 7. After the four profile units are stopped and `gateway.standalone` is unset
-   (both are in [One gateway](#one-gateway)), run the fold pass and do not
-   continue while it exits non-zero:
+   on katie and alice only (both are in [One gateway](#one-gateway)), run the
+   fold pass and do not continue while it exits non-zero:
 
    ```bash
    docs/ops/rpi5-vanilla-migration.sh --preflight-fold
    ```
 
    This aborts if wife, dad, katie, or alice are still listed as left alone,
-   if the plan says only one profile exists, or if there are blockers. Explicit
+   if the plan says only one profile exists, or if there are blockers. Wife
+   and dad were never standalone; katie and alice must have had the key
+   removed before this pass. Explicit
    `gateway.multiplex_profiles: true` skips this preflight at boot
    (`resolve_multiplex_mode`), so this command is the last check that still
    runs it.
@@ -308,7 +316,145 @@ Do these in order. Explicit `true` skips the preflight, so the four profile
 processes must already be stopped before the flag is set. Stopping them does
 not make the already-running default process re-read config.
 
-1. Disable and stop the four profile units. Do not disable `hermes-gateway`.
+1. Edit profile config while the four units are still up, so a failed
+   Bitwarden check does not take the bots down. The authoritative list is:
+
+   ```bash
+   docs/ops/rpi5-vanilla-migration.sh --config-edits
+   ```
+
+   One process, five scopes. `GatewayRunner._profile_runtime_scope`
+   (`gateway/run.py`) builds each scope with `build_profile_secret_scope`
+   (`agent/secret_scope.py`): that profile's `.env`, then
+   `hydrate_profile_secret_sources` (Bitwarden `bws secret list` for
+   `secrets.bitwarden.project_id`, seeded from that profile's `.env`), then
+   the managed env (`/etc/hermes/.env`) last. Managed env is the same map for
+   every profile. With a scope installed, `get_secret` does not read
+   `os.environ` on a miss. Do not put another profile's tokens on
+   `hermes-gateway.service`.
+
+   Wife and dad already have this Bitwarden shape. Do not change their
+   `config.yaml`. Do not copy their project into a kid's config: a bulk
+   source injects every secret in the project (`BitwardenSource.shape` is
+   `bulk`).
+
+   Katie and Alice: retire `render_kid_matrix_env.py`. Do not merge its output
+   into `.env`, and do not add its `ExecStartPre` to the shared unit. Map the
+   names it writes onto Bitwarden secret keys. The secret **key** `bws` returns
+   becomes the env name (`_run_bws_list` keeps a key only when it is a valid
+   env name). Hermes then puts that name in the profile scope.
+
+   ```bash
+   docs/ops/rpi5-vanilla-migration.sh --renderer-keys /path/to/render_kid_matrix_env.py
+   ```
+
+   That prints `MATRIX_*` names and nothing else. Confirm them against the
+   script on the host (the left-hand side it writes, not the Bitwarden field
+   it reads, when those differ). Do not paste values. Create or reuse one
+   project per kid that contains only those names. `BWS_ACCESS_TOKEN` stays
+   out of the project; Hermes skips it even if it is stored there.
+
+   Copy the `secrets.bitwarden` keys wife or dad already set (`enabled`,
+   `access_token_env`, `server_url`, and the rest of that block) and point
+   `project_id` at that kid's project:
+
+   ```bash
+   hermes -p katie config set secrets.bitwarden.enabled true
+   hermes -p katie config set secrets.bitwarden.access_token_env BWS_ACCESS_TOKEN
+   hermes -p katie config set secrets.bitwarden.project_id '<katie-project-uuid>'
+   hermes -p alice config set secrets.bitwarden.enabled true
+   hermes -p alice config set secrets.bitwarden.access_token_env BWS_ACCESS_TOKEN
+   hermes -p alice config set secrets.bitwarden.project_id '<alice-project-uuid>'
+   ```
+
+   Set `secrets.bitwarden.server_url` only when wife or dad set one. Empty
+   means US Cloud. Store the machine-account token with the hidden prompt so
+   it lands in that profile's `.env` and not in the shell history:
+
+   ```bash
+   hermes -p katie secrets bitwarden token
+   hermes -p alice secrets bitwarden token
+   ```
+
+   The profile `.env` gets `BWS_ACCESS_TOKEN` only. Do not write `MATRIX_*`
+   values into it.
+
+   Alice's MCP server is separate from that scope. `alice_game_workshop.py`
+   reads `ALICE_GAMES_ROOT` (no fallback) and `ALICE_PROFILE_ROOT` from its
+   own environment. `_build_safe_env` (`tools/mcp_tool_config.py`) passes the
+   safe baseline, secret-source names, and the server block's own `env`. It
+   does not pass plain `.env` entries. Putting those two paths in Alice's
+   `.env` does not start the server. Write them on
+   `mcp_servers.game-workshop.env`, taking both values from her unit. The
+   recorded live games root is `/srv/alice-portal/games`. The profile root is
+   not a constant.
+
+   ```bash
+   docs/ops/rpi5-vanilla-migration.sh --alice-mcp-env
+   docs/ops/rpi5-vanilla-migration.sh --alice-mcp-env --write
+   ```
+
+   The first command prints the two paths and does not write. Confirm
+   `ALICE_GAMES_ROOT` is `/srv/alice-portal/games` and
+   `ALICE_PROFILE_ROOT` is the path her unit sets. `--write` refuses when the
+   games root differs, and it refuses when `game-workshop` is missing. It
+   does not print other `Environment=` values.
+
+   Per-unit settings that do not become `config.yaml` keys:
+
+   - PATH. Katie and Alice prepend `~/.hermes/profiles/<kid>/bin` (tirith).
+     The terminal tool already appends `<profile home>/bin` when that
+     directory exists (`_managed_runtime_path_entries` in
+     `tools/environments/local.py`), and under multiplex that home is the
+     served profile. There is no config key to set. Do not put either bin on
+     the shared unit `PATH`. MCP servers do not receive it. Core no longer
+     calls tirith (`security.tirith_*` was removed). A shell command in that
+     profile's terminal session still finds the binary.
+   - Memory. Katie and Alice have their own `MemoryHigh` / `MemoryMax`. One
+     systemd unit is one cgroup. Hermes has no per-profile memory key.
+     `terminal.container_memory` applies to container backends, not this
+     process. The shared `zz-multiplex-memory.conf` (`MemoryHigh=6G`,
+     `MemoryMax=8G`) replaces those caps. One profile can use the whole cap.
+     Do not copy a kid's smaller cap onto `hermes-gateway.service`.
+   - Kanban. Katie and Alice set `HERMES_KANBAN_DISPATCH_IN_GATEWAY=false`.
+     Wife and dad have `disable-kanban.conf`, which sets the same variable.
+     The multiplexed process starts one dispatcher from the default profile's
+     config (`_kanban_dispatcher_boot` in `gateway/kanban_watchers.py`). The
+     env var is process-wide and is checked before config. Copying it onto
+     `hermes-gateway.service` would disable dispatch for every profile,
+     including default. `kanban.dispatch_in_gateway` in a named profile's
+     `config.yaml` is not read at that boot. Do not set it. Retire the env
+     var and `disable-kanban.conf` with the profile units. Leave default's
+     dispatcher on. Leave `kanban.notify_in_gateway` at its default so the
+     one process still delivers notifications.
+
+2. Verify Matrix credentials before any unit is stopped. `sync` prints names
+   and an action, not values. Do not pass `--apply`.
+
+   ```bash
+   hermes -p katie secrets bitwarden status
+   hermes -p katie secrets bitwarden sync
+   hermes -p alice secrets bitwarden status
+   hermes -p alice secrets bitwarden sync
+   ```
+
+   Status must show Enabled and Token in env. The sync Name column must list
+   every name `--renderer-keys` printed, with action `would export`. Then
+   confirm the adapter's credential gate, which is the same check as
+   `check_matrix_requirements` without installing packages. The probe prints
+   `present` or `missing` and exits non-zero when the homeserver or both
+   login secrets are absent:
+
+   ```bash
+   docs/ops/rpi5-vanilla-migration.sh --matrix-probe katie
+   docs/ops/rpi5-vanilla-migration.sh --matrix-probe alice
+   ```
+
+   Do not continue while either probe exits non-zero. The kid units are still
+   running on `render_kid_matrix_env.py` until step 3, so a failed probe is
+   fixed in Bitwarden or in that profile's `.env` token without a cutover.
+
+3. Disable and stop the four profile units. Do not disable `hermes-gateway`.
    Do not delete unit files.
 
    ```bash
@@ -322,18 +468,17 @@ not make the already-running default process re-read config.
    manager. `disable --now` removes boot enablement and stops the process. The
    unit file remains, which is what rollback enables.
 
-2. Clear the shim on the four named profiles. They already have
-   `gateway.standalone: true`. Do not set `gateway.standalone` on the default
+4. Clear the shim on katie and alice only. They are the profiles that have
+   `gateway.standalone: true`. Wife and dad do not; do not `config unset` a
+   key they do not have. Do not set `gateway.standalone` on the default
    profile; it is ignored there (`profile_is_standalone`).
 
    ```bash
-   hermes -p wife config unset gateway.standalone
-   hermes -p dad config unset gateway.standalone
    hermes -p katie config unset gateway.standalone
    hermes -p alice config unset gateway.standalone
    ```
 
-3. Fold preflight. Stop here if it exits non-zero. Do not set
+5. Fold preflight. Stop here if it exits non-zero. Do not set
    `gateway.multiplex_profiles` yet: explicit `true` skips this check at the
    next boot.
 
@@ -341,7 +486,7 @@ not make the already-running default process re-read config.
    docs/ops/rpi5-vanilla-migration.sh --preflight-fold
    ```
 
-4. Move the default unit's drop-ins aside. `hermes gateway install` rewrites
+6. Move the default unit's drop-ins aside. `hermes gateway install` rewrites
    `hermes-gateway.service` when it differs from `generate_systemd_unit` and
    deletes only `20-replace.conf` (`refresh_systemd_unit_if_needed`). It does
    not touch the other files in `hermes-gateway.service.d/`. These four survive
@@ -384,63 +529,7 @@ not make the already-running default process re-read config.
    and when any of the four names is missing from both the live directory and
    the backup. A second run is a no-op once the backup holds the files.
 
-5. Give each profile its own runtime credentials. One process, five scopes.
-   `GatewayRunner._profile_runtime_scope` (`gateway/run.py`) builds the scope
-   with `build_profile_secret_scope` (`agent/secret_scope.py`):
-
-   - `<profile>/.env`
-   - that profile's secret sources, after `hydrate_profile_secret_sources`
-   - the managed env (`/etc/hermes/.env`, or `$HERMES_MANAGED_DIR/.env`) last,
-     and it overrides, and it is the same map for every profile
-
-   With a scope installed, `get_secret` does not read `os.environ` on a miss.
-   A secondary does not see the unit's `Environment=` or `EnvironmentFile=`.
-   Putting Katie's Matrix token on `hermes-gateway.service` would not load it
-   into Katie's scope, and it would sit in the process environment every child
-   can inherit. The messaging gateway does not use `launch_secret_scope` (that
-   helper overlays the frozen launch environment for the TUI / `hermes serve`
-   host). Do not rely on `Environment=` for bot tokens, including the default
-   profile's.
-
-   There is no second per-profile secret file. `.op.env` is only the
-   1Password bootstrap for that home. The file the scope loads for arbitrary
-   keys is that profile's `.env`.
-
-   From the `--preflight` inventory, for each of wife, dad, katie, and alice:
-
-   - Keep the renderer (Katie and Alice: `render_kid_matrix_env.py`, which
-     pulls from Bitwarden). Point its output at that profile's `.env` only
-     (`~/.hermes/.env` is the default profile; named profiles are
-     `~/.hermes/profiles/<name>/.env`). Mode `0600`. Merge keys. Do not
-     truncate the file.
-   - Run it as `ExecStartPre=` in a new drop-in,
-     `zz-profile-runtime-env.conf`, on `hermes-gateway.service` only. One
-     line per profile. `gateway install` rewrites the main unit and would
-     drop an `ExecStartPre=` written there. A drop-in other than
-     `20-replace.conf` survives. Do not prefix the line with `-`; a failed
-     render must abort the start.
-   - Do not add that profile's `EnvironmentFile=` or `Environment=` to the
-     shared unit, and do not append the runtime file the old unit loaded.
-   - Alice's `ALICE_GAMES_ROOT` and `ALICE_PROFILE_ROOT` go into Alice's
-     `.env` as well. Hermes code that calls `get_secret` sees them. Code that
-     reads `os.environ` does not. Do not export them on the shared unit to
-     paper over that. A child that must see them is started with
-     `served_profile_child_env(..., inherit_credentials=True)`
-     (`tools/environments/local.py`), which overlays that profile's scope and
-     no sibling's.
-   - Wife and dad: their `.env` files have no bot tokens. Carry every
-     `EnvironmentFile`, `ExecStartPre`, and `Environment=` name the inventory
-     printed, the same way. If the unit has none, the `ExecStart` program is
-     the next place to look. Do not copy another profile's file in to fill
-     the gap.
-
-   Run each renderer once, successfully, before the restart below, so a
-   Bitwarden failure does not take the gateway down on the cutover start. Leave
-   the `ExecStartPre` lines in place so the next boot refreshes the files.
-   The scope is built when the process enters the profile
-   (`_load_profile_secret_scope`), which is after `ExecStartPre`.
-
-6. Leave `hermes-webui` alone. On this host it is the separate hermes-webui
+7. Leave `hermes-webui` alone. On this host it is the separate hermes-webui
    application. `ExecStart` is `hermex-webui-start.sh`. It is not
    `hermes dashboard`, and `hermes-dashboard.service` (port 9119,
    `hermes_cli/main_dashboard.py`) is a different program. Do not point this
@@ -455,7 +544,7 @@ not make the already-running default process re-read config.
    drop-in. Do not restart the webui until the gateway restart below has
    succeeded.
 
-7. On the default profile, set the flag explicitly so the next boot does not
+8. On the default profile, set the flag explicitly so the next boot does not
    depend on the retired false value:
 
    ```bash
@@ -465,8 +554,9 @@ not make the already-running default process re-read config.
    Do not set it to `false`. After this revision a false value is rewritten to
    `true` on the next gateway boot when nothing blocks multiplex.
 
-8. Refresh only the default gateway unit, after `facts.json` exists and after
-   the drop-ins in steps 4 and 5 are in place:
+9. Refresh only the default gateway unit, after `facts.json` exists and after
+   the memory drop-in in step 6 is in place. Do not add
+   `zz-profile-runtime-env.conf`. The renderer is retired:
 
    ```bash
    hermes gateway install
@@ -482,7 +572,7 @@ not make the already-running default process re-read config.
    for a system unit). `gateway install` already reloads after a unit rewrite;
    reload again if the only edits were drop-ins.
 
-9. Restart the default gateway, then the webui unit you already had (the one
+10. Restart the default gateway, then the webui unit you already had (the one
    whose `ExecStart` contains `hermex-webui-start.sh`):
 
    ```bash
@@ -670,9 +760,11 @@ while this checkout is the live tree.
 
 Rollback returns to the external venv and the five separate units. It does not
 depend on `gateway.multiplex_profiles: false`. That value is ignored and gets
-rewritten to `true`. `gateway.standalone: true` on wife, dad, katie, and alice
-is what keeps those profiles off the host gateway. They had that key before
-this cutover; this puts it back.
+rewritten to `true`. `gateway.standalone: true` on wife, dad, katie, and
+alice is what keeps those profiles off the host gateway after the units are
+restored. Only katie and alice had the key before this cutover. Wife and dad
+did not. Rollback sets it on all four so the default gateway does not also
+serve the restored units.
 
 Do not display `.env`, unit `Environment=` values, or snapshot contents while
 you do this.
@@ -685,7 +777,10 @@ you do this.
    systemctl --user stop <hermes-webui unit>.service
    ```
 
-2. Put the shim back:
+2. Put the shim on all four named profiles. Katie and alice are being restored
+   to the value they had. Wife and dad did not have the key; they need it now
+   because a false `gateway.multiplex_profiles` no longer keeps them off the
+   default gateway:
 
    ```bash
    hermes -p wife config set gateway.standalone true
@@ -725,11 +820,13 @@ you do this.
    Do not point hermes-webui at `hermes dashboard`. If the preflight said
    `leave`, there is nothing to restore.
 
-7. Restore each profile `.env` from the quick snapshot taken before the
-   renderer wrote into it, so Bitwarden material is not left in the profile
-   file when the standalone unit's `ExecStartPre` is what loads it again.
-   The snapshots contain secrets. Copy the files; do not cat them. Do not
-   merge those credentials into `hermes-gateway.service`.
+7. Restore katie and alice `config.yaml` from the quick snapshot taken before
+   the Bitwarden block and the `game-workshop` `env` edit. Restore each
+   profile `.env` from that same snapshot, which removes a `BWS_ACCESS_TOKEN`
+   this cutover added and puts the previous file back. The kid units'
+   `ExecStartPre` (`render_kid_matrix_env.py`) loads Matrix credentials again
+   once those units start. The snapshots contain secrets. Copy the files; do
+   not cat them. Do not merge those credentials into `hermes-gateway.service`.
 
 8. `systemctl --user daemon-reload` (and the system manager, if you restored
    system units).
