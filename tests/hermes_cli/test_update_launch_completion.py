@@ -397,6 +397,54 @@ def test_relaunch_activates_managed_env_before_the_guest_imports(tmp_path):
     assert json.loads(result.stdout) == {"fastapi": "managed"}
 
 
+def test_relaunch_script_imports_a_sibling_package(tmp_path):
+    """``python server.py`` puts the script directory on sys.path. The isolated
+    relaunch has to do the same, or hermes-webui's ``import api`` fails."""
+    app = tmp_path / "hermes-webui"
+    (app / "api").mkdir(parents=True)
+    (app / "api" / "__init__.py").write_text("name = 'api'\n", encoding="utf-8")
+    script = app / "server.py"
+    script.write_text(
+        "import json, sys, api\n"
+        "print(json.dumps({'api': api.name, 'front': sys.path[0]}))\n",
+        encoding="utf-8",
+    )
+    root = tmp_path / "checkout"
+    root.mkdir()
+    command = venv_sync.relaunch_command(
+        Path(sys.executable), root, [str(script)], [sys.executable, str(script)], None,
+    )
+    source = command[command.index("-c") + 1]
+    folder = repr(str(script.parent))
+    assert source.index("activate_dependencies") < source.index(f"sys.path.insert(0, {folder})")
+    assert source.index(f"sys.path.insert(0, {folder})") < source.index("runpy.run_path")
+    result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["api"] == "api"
+    assert Path(payload["front"]) == script.parent.resolve()
+
+
+def test_relaunch_module_does_not_prepend_the_script_directory(tmp_path):
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "entry.py").write_text(
+        "import json, sys\nprint(json.dumps(sys.path[0]))\n",
+        encoding="utf-8",
+    )
+    script = tmp_path / "hermes-webui" / "server.py"
+    command = venv_sync.relaunch_command(
+        Path(sys.executable), root, [str(script), "arg"],
+        [sys.executable, "-m", "entry", "arg"], "entry",
+    )
+    source = command[command.index("-c") + 1]
+    assert "runpy.run_module" in source
+    assert repr(str(script.parent)) not in source
+    result = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=30, check=False)
+    assert result.returncode == 0, result.stderr
+    assert Path(json.loads(result.stdout)) != script.parent
+
+
 def test_relaunch_str_root_reaches_real_activate_dependencies(tmp_path, monkeypatch):
     """The ``-c`` snippet passes a str. ``activate_dependencies`` must accept it.
 
