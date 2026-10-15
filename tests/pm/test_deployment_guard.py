@@ -74,6 +74,13 @@ def _selection(home: Path, enabled, disabled=()) -> Selection:
     })
 
 
+def _as_user_venv(monkeypatch, tmp_path):
+    """The incident's interpreter: a venv PM did not build."""
+    venv = tmp_path / "venvs" / "hermes-py314"
+    monkeypatch.setattr(sys, "prefix", str(venv))
+    monkeypatch.setattr(sys, "base_prefix", "/usr")
+
+
 def _watch_apply(monkeypatch):
     calls = []
 
@@ -90,6 +97,7 @@ def _enabled(home: Path) -> list:
 
 
 def test_plugin_without_python_deps_does_not_sync_even_when_opted_in(tmp_path, monkeypatch):
+    _as_user_venv(monkeypatch, tmp_path)
     core, home = _layout(tmp_path, monkeypatch, opt_in=True)
     _plugin(home, "stdlib-only", pyproject=False)
     calls = _watch_apply(monkeypatch)
@@ -111,6 +119,7 @@ def test_plugin_without_python_deps_does_not_sync_even_when_opted_in(tmp_path, m
 
 
 def test_member_enable_on_external_runtime_refuses_without_opt_in(tmp_path, monkeypatch):
+    _as_user_venv(monkeypatch, tmp_path)
     core, home = _layout(tmp_path, monkeypatch)
     _plugin(home, "needs-sync", pyproject=True)
     calls = _watch_apply(monkeypatch)
@@ -135,6 +144,7 @@ def test_member_enable_on_external_runtime_refuses_without_opt_in(tmp_path, monk
 
 
 def test_member_enable_builds_when_commit_environment_is_set(tmp_path, monkeypatch):
+    _as_user_venv(monkeypatch, tmp_path)
     core, home = _layout(tmp_path, monkeypatch)
     _plugin(home, "needs-sync", pyproject=True)
     calls = _watch_apply(monkeypatch)
@@ -150,6 +160,7 @@ def test_member_enable_builds_when_commit_environment_is_set(tmp_path, monkeypat
 
 
 def test_config_opt_in_allows_member_enable_to_build(tmp_path, monkeypatch):
+    _as_user_venv(monkeypatch, tmp_path)
     core, home = _layout(tmp_path, monkeypatch, opt_in=True)
     _plugin(home, "needs-sync", pyproject=True)
     calls = _watch_apply(monkeypatch)
@@ -161,6 +172,7 @@ def test_config_opt_in_allows_member_enable_to_build(tmp_path, monkeypatch):
 
 
 def test_disabling_a_member_on_external_runtime_publishes_config_only(tmp_path, monkeypatch):
+    _as_user_venv(monkeypatch, tmp_path)
     core, home = _layout(tmp_path, monkeypatch)
     _plugin(home, "needs-sync", pyproject=True)
     (home / "config.yaml").write_text(
@@ -231,6 +243,7 @@ def _fake_generation(monkeypatch, present):
 
 
 def test_commit_refuses_environment_that_drops_an_enabled_platform(tmp_path, monkeypatch):
+    _as_user_venv(monkeypatch, tmp_path)
     core, home = _layout(
         tmp_path, monkeypatch, opt_in=True,
         extras=("telegram", "discord", "matrix"),
@@ -257,6 +270,7 @@ def test_commit_refuses_environment_that_drops_an_enabled_platform(tmp_path, mon
 
 
 def test_commit_records_environment_that_keeps_enabled_platforms(tmp_path, monkeypatch):
+    _as_user_venv(monkeypatch, tmp_path)
     core, home = _layout(
         tmp_path, monkeypatch, opt_in=True,
         extras=("telegram", "discord", "matrix"),
@@ -285,14 +299,20 @@ def test_external_runtime_is_an_interpreter_pm_did_not_build(tmp_path, monkeypat
     from pm.deployment_guard import externally_managed_runtime
     from pm.environments import install_state_dir, runtime_facts_path
 
+    user_venv = tmp_path / "venvs" / "hermes-py314"
+    monkeypatch.setattr(sys, "prefix", str(user_venv))
+    monkeypatch.setattr(sys, "base_prefix", "/usr")
     assert externally_managed_runtime(core) is True
-    original_prefix, original_base = sys.prefix, sys.base_prefix
+    managed = tmp_path / "installs" / "abc" / "test-environment" / "gen" / "venv"
+    monkeypatch.setattr(sys, "prefix", str(managed))
+    monkeypatch.setattr(sys, "base_prefix", str(managed))
+    assert externally_managed_runtime(core) is False
     generation = install_state_dir(core) / "environments" / "built" / "venv"
     monkeypatch.setattr(sys, "prefix", str(generation))
-    monkeypatch.setattr(sys, "base_prefix", str(generation))
+    monkeypatch.setattr(sys, "base_prefix", "/usr")
     assert externally_managed_runtime(core) is False
-    monkeypatch.setattr(sys, "prefix", original_prefix)
-    monkeypatch.setattr(sys, "base_prefix", original_base)
+    monkeypatch.setattr(sys, "prefix", str(user_venv))
+    monkeypatch.setattr(sys, "base_prefix", "/usr")
     facts = runtime_facts_path(core)
     facts.parent.mkdir(parents=True, exist_ok=True)
     facts.write_text("{}\n", encoding="utf-8")
@@ -311,6 +331,47 @@ def test_commit_environment_reader_accepts_only_boolean_true(tmp_path, monkeypat
     ):
         (home / "config.yaml").write_text(text, encoding="utf-8")
         assert commit_environment_opted_in() is expected
+
+
+def test_client_records_the_caller_interpreter(tmp_path, monkeypatch):
+    """The worker must be told about the process that invoked the plugin command."""
+    core, home = _layout(tmp_path, monkeypatch)
+    captured: dict = {}
+
+    def capture(operation, arguments, **kwargs):
+        captured["operation"] = operation
+        captured["arguments"] = dict(arguments)
+        captured["project"] = kwargs.get("project_root")
+
+    monkeypatch.setattr("pm.client._request", capture)
+    from pm.client import sync_venv
+
+    _as_user_venv(monkeypatch, tmp_path)
+    sync_venv(explicit=True, plugins=_selection(home, ["needs-sync"]))
+    assert captured["operation"] == "sync_venv"
+    assert captured["arguments"]["externally_managed"] is True
+    assert captured["project"] is None
+
+    managed = tmp_path / "installs" / "abc" / "pm-runtime" / "generations" / "gen" / "venv"
+    monkeypatch.setattr(sys, "prefix", str(managed))
+    monkeypatch.setattr(sys, "base_prefix", "/usr")
+    sync_venv(explicit=True, plugins=_selection(home, ["needs-sync"]), project_root=core)
+    assert captured["arguments"]["externally_managed"] is False
+    assert captured["project"] == core
+
+
+def test_worker_honors_the_caller_classification(tmp_path, monkeypatch):
+    """A PM worker's own prefix must not turn an opted caller into an external one."""
+    _as_user_venv(monkeypatch, tmp_path)
+    _core, home = _layout(tmp_path, monkeypatch)
+    _plugin(home, "needs-sync", pyproject=True)
+    calls = _watch_apply(monkeypatch)
+    from pm.install import sync_venv
+
+    sync_venv(
+        explicit=True, externally_managed=False,
+        plugins=_selection(home, ["needs-sync"]))
+    assert calls
 
 
 def test_plugin_commands_accept_commit_environment_flag():

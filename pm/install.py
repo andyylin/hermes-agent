@@ -803,13 +803,15 @@ def _commit_selection(package, facts: Facts, change, *, enabled: list[str], stam
 
 
 def _sync_or_publish(package, change, plugins, *, extras, repair: bool, explicit: bool,
-                     shipped, frozen, commit_environment: bool) -> None:
+                     shipped, frozen, commit_environment: bool,
+                     externally_managed: bool | None) -> None:
     """Publish a dep-free or external selection, or build the dependency environment."""
     from pm import receipt
     from pm.deployment_guard import EXTERNAL_COMMIT_CAUSE, EXTERNAL_COMMIT_REMEDY, plugin_sync_action
 
     action = plugin_sync_action(
-        change, project_root=paths.repo_root(), commit_environment=commit_environment)
+        change, project_root=paths.repo_root(), commit_environment=commit_environment,
+        externally_managed=externally_managed)
     if action == "publish":
         _publish_inactive(change, reason="plugin selection published without a dependency sync")
         return
@@ -832,7 +834,8 @@ def _sync_or_publish(package, change, plugins, *, extras, repair: bool, explicit
 def sync_venv(extras: Optional[list[str]] = None, *, explicit: bool = False,
               plugins: PluginInput | None = None, repair: bool = False,
               evict_incompatible_plugins: bool = False,
-              commit_environment: bool = False) -> None:
+              commit_environment: bool = False,
+              externally_managed: bool | None = None) -> None:
     """Make the venv match uv.lock + the enabled extras. Extras union into
     the installed state (one ledger); no-op when the stamp already matches.
     ``repair`` restores the recorded dependency graph into a fresh generation,
@@ -845,6 +848,9 @@ def sync_venv(extras: Optional[list[str]] = None, *, explicit: bool = False,
     keeps the environment from building is disabled instead of failing the sync
     (see pm.plugin_eviction). ``commit_environment`` opts this plugin publication
     into creating ``facts.json`` on an interpreter PM did not build.
+    ``externally_managed`` is that interpreter's classification as seen by the
+    caller. None asks this process. The PM worker passes the client's value:
+    its own prefix is a PM runtime and must not decide the question.
 
     Lazy installs OFF = the frozen feature set: when
     security.allow_lazy_installs is false AND the bundle's
@@ -885,7 +891,8 @@ def sync_venv(extras: Optional[list[str]] = None, *, explicit: bool = False,
             else:
                 _sync_or_publish(
                     package, change, plugins, extras=extras, repair=repair, explicit=explicit,
-                    shipped=shipped, frozen=frozen, commit_environment=commit_environment)
+                    shipped=shipped, frozen=frozen, commit_environment=commit_environment,
+                    externally_managed=externally_managed)
         outcome = "ok"
     except BaseException as exc:
         receipt.record_step("dependency-sync", False, f"{type(exc).__name__}: {exc}")

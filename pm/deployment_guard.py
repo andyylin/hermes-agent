@@ -50,11 +50,19 @@ def _under(path: Path, root: Path) -> bool:
     return True
 
 
+def _pm_built_tree(prefix: Path) -> bool:
+    """True for an interpreter PM staged: a generation, the test env, or the PM runtime."""
+    parts = set(prefix.parts)
+    return "installs" in parts and bool(parts & {"environments", "test-environment", "pm-runtime"})
+
+
 def externally_managed_runtime(project_root: Path) -> bool:
     """True when this process is not on a PM-built interpreter and nothing is committed.
 
     A recorded ``facts.json`` means PM already owns the selection. A prefix inside
-    a dependency generation or the PM store is an interpreter PM built.
+    a dependency generation, the PM test environment, the PM runtime, or the PM
+    store is an interpreter PM built. A user venv such as ``~/.hermes/venvs/...``
+    and a system interpreter are not.
     """
     from pm.environments import install_state_dir, runtime_facts_path, store_root
 
@@ -63,6 +71,8 @@ def externally_managed_runtime(project_root: Path) -> bool:
         return False
     managed = [install_state_dir(root) / "environments", store_root(root)]
     prefixes = [Path(value) for value in (sys.prefix, sys.base_prefix) if value]
+    if any(_pm_built_tree(prefix) for prefix in prefixes):
+        return False
     return not any(_under(prefix, place) for prefix in prefixes for place in managed)
 
 
@@ -98,8 +108,16 @@ def deployment_platform_extras(project_root: Path) -> list[str]:
     declared = {_extra_key(name): name for name in declared_extras(root)}
     wanted: list[str] = []
     seen: set[str] = set()
-    for home in dependency_homes():
-        config = read_home_selection(home) or {}
+    homes = dependency_homes()
+    for index, home in enumerate(homes):
+        try:
+            config = read_home_selection(home) or {}
+        except ValueError:
+            # Member discovery logs and skips a broken secondary profile. The
+            # active home still fails closed so its platforms cannot be dropped.
+            if index == 0:
+                raise
+            continue
         platforms = config.get("platforms")
         if not isinstance(platforms, dict):
             continue
@@ -203,19 +221,35 @@ def _touched_names(change) -> set[str] | None:
     )
 
 
-def _name_is_member(home: Path, name: str) -> bool:
-    from pm.plugin_declarations import read_python_declaration
+def _plugin_dirs(home: Path, name: str) -> list[Path]:
+    from pm.paths import repo_root
 
     leaf = name.split("/")[-1]
-    for path in (home / "plugins" / name, home / "plugins" / leaf):
+    dirs = [home / "plugins" / name, home / "plugins" / leaf, repo_root() / "plugins" / name,
+            repo_root() / "plugins" / leaf]
+    return dirs
+
+
+def _is_nonmember_plugin(home: Path, name: str) -> bool:
+    """True only when a directory for *name* exists and declares no Python dependencies.
+
+    A name that does not resolve stays on the sync path: there is no declaration
+    to trust, and a dependency build is where publication still detects a
+    concurrent config edit.
+    """
+    from pm.plugin_declarations import read_python_declaration
+
+    found = False
+    for path in _plugin_dirs(home, name):
         if not path.is_dir():
             continue
+        found = True
         try:
             if read_python_declaration(path).is_member:
-                return True
+                return False
         except (OSError, ValueError):
-            return True
-    return False
+            return False
+    return found
 
 
 def _nonmember_toggle(change) -> bool:
@@ -227,11 +261,17 @@ def _nonmember_toggle(change) -> bool:
     touched = _touched_names(change)
     if not touched:
         return False
-    return all(not _name_is_member(change.home, name) for name in touched)
+    return all(_is_nonmember_plugin(change.home, name) for name in touched)
 
 
-def plugin_sync_action(change, *, project_root: Path, commit_environment: bool) -> str:
-    """``publish`` (no environment), ``refuse`` (change nothing), or ``sync``."""
+def plugin_sync_action(change, *, project_root: Path, commit_environment: bool,
+                       externally_managed: bool | None = None) -> str:
+    """``publish`` (no environment), ``refuse`` (change nothing), or ``sync``.
+
+    ``externally_managed`` is the calling process. Plugin commands run the
+    sync in the PM worker, whose own prefix is a PM runtime, so the worker
+    must use the classification the client recorded rather than its own.
+    """
     from pm.publication import PluginSelection, StagedPlugin
 
     if isinstance(change, StagedPlugin):
@@ -242,7 +282,9 @@ def plugin_sync_action(change, *, project_root: Path, commit_environment: bool) 
         return "sync"
     if kind == "none" and (isinstance(change, StagedPlugin) or _nonmember_toggle(change)):
         return "publish"
-    external = externally_managed_runtime(project_root)
+    if externally_managed is None:
+        externally_managed = externally_managed_runtime(project_root)
+    external = externally_managed
     opted = commit_environment or commit_environment_opted_in()
     if external and not opted:
         if kind in ("add", "replace"):

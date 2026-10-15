@@ -21,7 +21,9 @@ Plugin install, enable, and disable publish through `sync_venv`, but a plugin
 with no Python declaration does not build an environment. On an interpreter PM
 did not build, with no `facts.json` yet, that publication does not create one
 unless `plugins.commit_dependency_environment` is true or the command passes
-`--commit-environment` (`pm/deployment_guard.py`). A generation that is committed
+`--commit-environment` (`pm/deployment_guard.py`). The check is the caller's
+interpreter: the worker is itself a PM runtime, so the client records the
+classification and the worker honors it. A generation that is committed
 keeps the extras for every platform enabled in config and is not recorded when
 it would drop one of those dependencies.
 Nix's declarative uv2nix builds and unrelated user projects remain independently owned.
