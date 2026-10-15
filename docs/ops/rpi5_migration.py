@@ -5,16 +5,22 @@ paths, and plan lines. ``Environment=`` values and command arguments are not
 printed: a unit file on this host holds Matrix tokens and bot tokens.
 
 This module does not talk to systemd or Bitwarden. It classifies text and
-moves drop-in files the caller points at.
+moves drop-in files the caller points at. It can also claim an external
+checkout as PM-managed: back up ``install-stamp.json``, rewrite it with
+``write_source_stamp`` (the stamp a fresh self-managed checkout publishes),
+publish ``.hermes/bin/hermes``, and restore that backup on rollback.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import re
 import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePath
@@ -1040,6 +1046,261 @@ def rollback_dropins(dropin_dir: Path, backup_dir: Path) -> tuple[str, ...]:
     return tuple(actions)
 
 
+class ClaimError(Exception):
+    """An external checkout was not claimed. A raised claim leaves the stamp as it was."""
+
+
+STAMP_NAME = "install-stamp.json"
+STAMP_BACKUP_NAME = "install-stamp.json.external-backup"
+RECEIPT_NAME = ".hermes-bootstrap-complete"
+RECEIPT_BACKUP_NAME = ".hermes-bootstrap-complete.external-backup"
+CLAIM_RECORD_NAME = "install-stamp.external-claim.json"
+_LAUNCHER_NAMES = ("hermes", "hermes-acp")
+
+
+def claim_external_checkout(root: Path) -> str:
+    """Re-stamp an ``external`` git checkout as PM-managed and publish its launcher.
+
+    ``publish_launchers`` leaves ``updateMechanism: external`` alone, so
+    ``pm install python`` can succeed and still omit ``.hermes/bin/hermes``.
+    This copies the stamp, writes the stamp ``write_source_stamp`` publishes
+    for a fresh self-managed checkout, then calls ``publish_launchers`` the
+    same way ``pm install python`` does (``create=False``). A failed publish
+    puts the backup back. A stamp that is not ``external`` is left unchanged.
+    """
+    root = Path(root)
+    if not _is_git_checkout(root):
+        raise ClaimError(
+            f"refusing to claim {root}: a PM-managed stamp is written only for a git checkout"
+        )
+    stamp_path = root / STAMP_NAME
+    try:
+        original = stamp_path.read_bytes()
+    except OSError as exc:
+        raise ClaimError(f"cannot read {STAMP_NAME}: {exc}") from exc
+    mechanism = _stamp_mechanism(original)
+    if mechanism == "self" and _launcher_ready(root):
+        return f"already managed: {_launcher_path(root)}"
+    if mechanism != "external":
+        return f"not claimed: updateMechanism is {mechanism or 'absent'}"
+    if not _store_python_ready(root):
+        raise ClaimError(
+            "managed interpreter is not installed; run "
+            "`python -m hermes_cli.main pm install python` and re-run"
+        )
+    backup = root / STAMP_BACKUP_NAME
+    _backup_once(backup, original)
+    receipt_backup = _backup_receipt(root)
+    created = _absent_launchers(root)
+    _write_claim_record(root, created)
+    try:
+        _publish_managed_stamp(root)
+        _publish_launcher(root)
+        if not _launcher_ready(root):
+            raise ClaimError(f"official launcher missing: {_launcher_path(root)}")
+    except ClaimError:
+        _abort_claim(root, backup, receipt_backup, created)
+        raise
+    except Exception as exc:  # health: allow BLE001 -- publish_launchers raises InstallError and other pm errors; restore the external stamp
+        _abort_claim(root, backup, receipt_backup, created)
+        raise ClaimError(f"launcher publish failed: {exc}") from exc
+    return f"claimed launcher: {_launcher_path(root)}\nstamp backup: {backup}"
+
+
+def restore_external_stamp(root: Path) -> str:
+    """Put the external stamp backup back and remove launchers this claim created.
+
+    A checkout that was never claimed is unchanged. Drop-in rollback can call
+    this every time.
+    """
+    root = Path(root)
+    backup = root / STAMP_BACKUP_NAME
+    record_path = root / CLAIM_RECORD_NAME
+    receipt_backup = root / RECEIPT_BACKUP_NAME
+    if not backup.is_file() and not record_path.is_file() and not receipt_backup.is_file():
+        return "no external stamp backup; stamp unchanged"
+    lines: list[str] = []
+    created = _created_from_record(record_path)
+    if backup.is_file():
+        _replace_bytes(root / STAMP_NAME, backup.read_bytes())
+        lines.append(f"restored {STAMP_NAME} from {STAMP_BACKUP_NAME}")
+    if receipt_backup.is_file():
+        _replace_bytes(root / RECEIPT_NAME, receipt_backup.read_bytes())
+        lines.append(f"restored {RECEIPT_NAME}")
+    for name in created:
+        if _unlink_launcher(root, name):
+            lines.append(f"removed .hermes/bin/{name}")
+    backup.unlink(missing_ok=True)
+    receipt_backup.unlink(missing_ok=True)
+    record_path.unlink(missing_ok=True)
+    if not lines:
+        return "no external stamp backup; stamp unchanged"
+    return "\n".join(lines)
+
+
+def _is_git_checkout(root: Path) -> bool:
+    return (root / ".git").exists() and (root / "pyproject.toml").is_file()
+
+
+def _stamp_mechanism(payload: bytes) -> str:
+    try:
+        data = json.loads(payload.decode("utf-8-sig"))
+    except (UnicodeError, ValueError) as exc:
+        raise ClaimError(f"{STAMP_NAME} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ClaimError(f"{STAMP_NAME} is not an object")
+    mechanism = data.get("updateMechanism")
+    return mechanism if isinstance(mechanism, str) else ""
+
+
+def _store_python_ready(root: Path) -> bool:
+    from hermes_cli._launchers import resolve_store_python
+
+    return resolve_store_python(root) is not None
+
+
+def _publish_managed_stamp(root: Path) -> None:
+    from hermes_cli.source_stamp import write_source_stamp
+
+    written = write_source_stamp(root)
+    if not written or written.get("updateMechanism") != "self":
+        raise ClaimError("could not write a managed install stamp")
+
+
+def _publish_launcher(root: Path) -> None:
+    from hermes_cli.venv_sync import publish_launchers
+
+    # create=False matches `hermes pm install python`: publish the checkout
+    # launcher, and do not add a new PATH entry.
+    publish_launchers(root, create=False)
+
+
+def _launcher_path(root: Path) -> Path:
+    return root / ".hermes" / "bin" / "hermes"
+
+
+def _launcher_ready(root: Path) -> bool:
+    path = _launcher_path(root)
+    return path.is_file() and os.access(path, os.X_OK)
+
+
+def _absent_launchers(root: Path) -> tuple[str, ...]:
+    bin_dir = root / ".hermes" / "bin"
+    return tuple(name for name in _LAUNCHER_NAMES if not (bin_dir / name).exists())
+
+
+def _backup_receipt(root: Path) -> Path | None:
+    src = root / RECEIPT_NAME
+    if not src.is_file():
+        return None
+    dest = root / RECEIPT_BACKUP_NAME
+    _backup_once(dest, src.read_bytes())
+    return dest
+
+
+def _backup_once(dest: Path, payload: bytes) -> None:
+    if dest.is_file() and dest.read_bytes() == payload:
+        return
+    try:
+        fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        if dest.is_file() and dest.read_bytes() == payload:
+            return
+        raise ClaimError(
+            f"refusing to overwrite {dest.name}; it does not match the current file"
+        ) from None
+    try:
+        _write_all(fd, payload)
+    except (OSError, ClaimError):
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            dest.unlink()
+        raise
+    os.close(fd)
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise ClaimError("could not write the stamp backup")
+        view = view[written:]
+
+
+def _write_claim_record(root: Path, created: tuple[str, ...]) -> None:
+    payload = json.dumps({"created": list(created)}, indent=2) + "\n"
+    _replace_bytes(root / CLAIM_RECORD_NAME, payload.encode("utf-8"))
+
+
+def _replace_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        _write_all(fd, payload)
+        os.close(fd)
+        fd = -1
+        os.replace(tmp_name, path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+
+
+def _abort_claim(
+    root: Path,
+    backup: Path,
+    receipt_backup: Path | None,
+    created: tuple[str, ...],
+) -> None:
+    """Return the checkout to the bytes from before the claim. Keep the backup if restore fails."""
+    try:
+        _replace_bytes(root / STAMP_NAME, backup.read_bytes())
+    except OSError:
+        return
+    if receipt_backup is not None and receipt_backup.is_file():
+        try:
+            _replace_bytes(root / RECEIPT_NAME, receipt_backup.read_bytes())
+        except OSError:
+            return
+        with contextlib.suppress(OSError):
+            receipt_backup.unlink()
+    for name in created:
+        with contextlib.suppress(OSError):
+            _unlink_launcher(root, name)
+    with contextlib.suppress(OSError):
+        backup.unlink()
+    with contextlib.suppress(OSError):
+        (root / CLAIM_RECORD_NAME).unlink()
+
+
+def _unlink_launcher(root: Path, name: str) -> bool:
+    if name not in _LAUNCHER_NAMES:
+        return False
+    path = root / ".hermes" / "bin" / name
+    if path.is_dir():
+        return False
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _created_from_record(path: Path) -> tuple[str, ...]:
+    if not path.is_file():
+        return ()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ()
+    created = data.get("created") if isinstance(data, dict) else None
+    if not isinstance(created, list):
+        return ()
+    return tuple(name for name in created if isinstance(name, str) and name in _LAUNCHER_NAMES)
+
+
 ROLLBACK_CHECKLIST = (
     "Stop the multiplexed gateway with `hermes gateway stop`, then stop the "
     "hermes-webui unit. Leave its ExecStart on hermex-webui-start.sh.",
@@ -1057,6 +1318,9 @@ ROLLBACK_CHECKLIST = (
     "92-canonical-runtime.conf, and memory-limits.conf from "
     "~/rpi5-unit-backup/gateway-dropins, and removes zz-multiplex-memory.conf "
     "and zz-profile-runtime-env.conf.",
+    "Restore install-stamp.json from install-stamp.json.external-backup when "
+    "that file exists, and remove the .hermes/bin/hermes launcher this claim "
+    "created. A missing backup leaves the stamp unchanged.",
     "If 98-py314-v0217.conf was retargeted, restore that file from the unit backup. "
     "Do not point hermes-webui at `hermes dashboard`.",
     "Restore katie and alice config.yaml, and each profile .env, from the quick "
@@ -1227,6 +1491,24 @@ def _cmd_gc_gate(_args: argparse.Namespace) -> int:
     return 1
 
 
+def _cmd_claim(args: argparse.Namespace) -> int:
+    try:
+        print(claim_external_checkout(Path(args.checkout)))
+    except ClaimError as exc:
+        print(str(exc), file=sys.stderr)
+        return 4
+    return 0
+
+
+def _cmd_restore_stamp(args: argparse.Namespace) -> int:
+    try:
+        print(restore_external_stamp(Path(args.checkout)))
+    except (ClaimError, OSError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 4
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rpi5_migration")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1279,6 +1561,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     edits = sub.add_parser("config-edits")
     edits.set_defaults(func=_cmd_config_edits)
+
+    claim = sub.add_parser("claim-managed")
+    claim.add_argument("--checkout", required=True)
+    claim.set_defaults(func=_cmd_claim)
+
+    restore_stamp = sub.add_parser("restore-external-stamp")
+    restore_stamp.add_argument("--checkout", required=True)
+    restore_stamp.set_defaults(func=_cmd_restore_stamp)
     return parser
 
 
