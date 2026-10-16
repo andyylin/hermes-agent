@@ -14,6 +14,7 @@ Usage (the installer renders these into systemd units):
   rpi5_deploy.py serve --home H                  # listener (hermes-deploy.service)
   rpi5_deploy.py drift --home H [--fetch]        # exit 1 on drift (hermes-deploy-drift.timer)
   rpi5_deploy.py status --home H                 # state.json summary
+  rpi5_deploy.py reconcile --home H              # record runtime_sha when live matches deployed
   rpi5_deploy.py notify --url U --sha S --repository R --ref REF   # CI; key in RPI5_DEPLOY_HMAC_KEY
   rpi5_deploy.py init --home H --checkout C      # deploy dir, key, config, state (never overwrites)
   rpi5_deploy.py render-install --home H --checkout C --user U --uid N --out DIR
@@ -48,7 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from rpi5_deploy_engine import (
     DeployConfig, DeployError, Deployer, Host, StateStore, deploy_lock, live_tree_problems,
-    remediate_stale_followers, result_problems, runtime_problems,
+    reconcile_runtime_sha, remediate_stale_followers, result_problems, runtime_problems,
 )
 
 log = logging.getLogger("rpi5-deploy")
@@ -244,9 +245,12 @@ def drift_problems(config: DeployConfig, host: Host, *, fetch: bool) -> list[str
     state = store.load()
     if not state.deployed_sha:
         return ["state.json has no deployed_sha; run rpi5-vanilla-migration.sh --install-deploy-listener"]
+    deployer = Deployer(config, host, store)
     problems = live_tree_problems(host, config, state.deployed_sha) + result_problems(state)
     try:
-        problems += runtime_problems(Deployer(config, host, store), state)
+        reconcile_runtime_sha(deployer)
+        state = store.load()
+        problems += runtime_problems(deployer, state)
         if fetch:
             problems += behind_problems(host, config, state.deployed_sha, state.pending_sha)
     except DeployError as exc:
@@ -363,6 +367,20 @@ def cmd_status(config: DeployConfig) -> int:
     return 0
 
 
+def cmd_reconcile(config: DeployConfig, *, host: Optional[Host] = None) -> int:
+    with deploy_lock(config.deploy_dir, wait=False) as acquired:
+        if not acquired:
+            print(f"deploy in progress ({StateStore(config.deploy_dir).load().phase}); skipped", file=sys.stderr)
+            return 1
+        deployer = Deployer(config, host or Host(config), StateStore(config.deploy_dir))
+        ok, message = reconcile_runtime_sha(deployer)
+    if not ok:
+        print(message, file=sys.stderr)
+        return 1
+    print(message)
+    return 0
+
+
 def cmd_self_test(config: DeployConfig) -> int:
     load_key(config)
     StateStore(config.deploy_dir).load()
@@ -373,7 +391,7 @@ def cmd_self_test(config: DeployConfig) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("serve", "drift", "status", "init", "render-install", "self-test"):
+    for name in ("serve", "drift", "status", "reconcile", "init", "render-install", "self-test"):
         cmd = sub.add_parser(name)
         cmd.add_argument("--home", required=True, type=Path, help="default Hermes home on the host")
         cmd.add_argument("--checkout", type=Path, help="live checkout (default: config.json, then <home>/hermes-agent)")
@@ -404,6 +422,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "serve": lambda: cmd_serve(config),
             "drift": lambda: cmd_drift(config, fetch=args.fetch),
             "status": lambda: cmd_status(config),
+            "reconcile": lambda: cmd_reconcile(config),
             "init": lambda: cmd_init(config),
             "render-install": lambda: cmd_render_install(config, user=args.user, uid=args.uid, out=args.out),
             "self-test": lambda: cmd_self_test(config),
