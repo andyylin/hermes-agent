@@ -924,11 +924,17 @@ class GatewayStartupMixin:
                 logger.info("Active profile: %s", _profile)
         try:
             from gateway.status import write_runtime_status
+            _enabled_platforms = frozenset(
+                platform.value if hasattr(platform, "value") else str(platform)
+                for platform, platform_config in self.config.platforms.items()
+                if platform_config.enabled
+            )
             persisted = await asyncio.to_thread(
                 write_runtime_status,
                 gateway_state="starting",
                 exit_reason=None,
                 clear_profile_platforms=True,
+                enabled_default_platforms=_enabled_platforms,
                 reload_existing=True,
                 wait_timeout=2.0,
             )

@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, UTC
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Optional
+from typing import AbstractSet, Any, Callable, NamedTuple, Optional
 
 from gateway.status_inline_source import (
     command_line_runs_inline_source,
@@ -1107,6 +1107,31 @@ def _coerce_session_store(session_store: Any) -> dict[str, str]:
     return {"status": state if state in {"ok", "unavailable", "retrying"} else "unknown"}
 
 
+def _platform_runtime_entry_owned_by_current(
+    entry: Any, current_record: dict[str, Any],
+) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    return (
+        entry.get("writer_pid") == current_record.get("pid")
+        and entry.get("writer_start_time") == current_record.get("start_time")
+    )
+
+
+def _retain_startup_default_platform_entry(
+    key: str,
+    entry: Any,
+    current_record: dict[str, Any],
+    enabled_platforms: AbstractSet[str],
+) -> bool:
+    """Whether a plain (non profile-prefixed) platform entry survives gateway startup pruning."""
+    if _platform_runtime_entry_owned_by_current(entry, current_record):
+        return True
+    if key not in enabled_platforms:
+        return False
+    return False
+
+
 def _prepare_runtime_status_update(
     *, gateway_state: Any = _UNSET, exit_reason: Any = _UNSET, restart_requested: Any = _UNSET,
     active_agents: Any = _UNSET, active_work: Any = _UNSET, platform: Any = _UNSET, platform_state: Any = _UNSET,
@@ -1116,6 +1141,7 @@ def _prepare_runtime_status_update(
     platform_metrics: Any = _UNSET,
     ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
     drop_profile_platforms: Optional[str] = None,
+    enabled_default_platforms: Optional[AbstractSet[str]] = None,
     load_existing: bool = True, reload_existing: bool = False,
 ) -> tuple[Path, dict[str, Any], dict[str, Any]]:
     """Merge one update into the process-wide canonical status snapshot."""
@@ -1140,6 +1166,12 @@ def _prepare_runtime_status_update(
                 k: v for k, v in payload["platforms"].items()
                 if not isinstance(k, str) or ":" not in k
                 or (drop_prefix is not None and not k.startswith(drop_prefix))
+            }
+        if enabled_default_platforms is not None:
+            payload["platforms"] = {
+                k: v for k, v in payload["platforms"].items()
+                if not isinstance(k, str) or ":" in k
+                or _retain_startup_default_platform_entry(k, v, current_record, enabled_default_platforms)
             }
         payload.update({key: current_record[key] for key in ("kind", "pid", "argv", "start_time")})
         payload["updated_at"] = _utc_now_iso()
