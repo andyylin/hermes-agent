@@ -289,6 +289,47 @@ class TestGatewayRuntimeStatus:
         payload = status.read_runtime_status()
         assert payload["platforms"] == {"telegram": {"state": "connected"}}
 
+    def test_startup_prunes_stale_disabled_platform_and_keeps_current_enabled(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        current_start = status._get_process_start_time(os.getpid())
+        stale_writer_pid = os.getpid() + 10_000
+        (tmp_path / "gateway_state.json").write_text(
+            json.dumps({
+                "platforms": {
+                    "sms": {
+                        "state": "fatal",
+                        "error_message": "old gateway failure",
+                        "writer_pid": stale_writer_pid,
+                        "writer_start_time": 1,
+                    },
+                    "telegram": {
+                        "state": "connected",
+                        "writer_pid": os.getpid(),
+                        "writer_start_time": current_start,
+                    },
+                    "buzz": {
+                        "state": "fatal",
+                        "writer_pid": stale_writer_pid,
+                        "writer_start_time": 1,
+                    },
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        status.write_runtime_status(
+            clear_profile_platforms=True,
+            enabled_default_platforms=frozenset({"telegram"}),
+            reload_existing=True,
+        )
+
+        platforms = status.read_runtime_status()["platforms"]
+        assert "sms" not in platforms
+        assert "buzz" not in platforms
+        assert platforms["telegram"]["state"] == "connected"
+
     def test_clear_profile_platforms_and_write_are_one_atomic_update(
         self, tmp_path, monkeypatch
     ):
