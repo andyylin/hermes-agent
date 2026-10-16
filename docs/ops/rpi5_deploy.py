@@ -48,7 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from rpi5_deploy_engine import (
     DeployConfig, DeployError, Deployer, Host, StateStore, deploy_lock, live_tree_problems,
-    result_problems, runtime_problems,
+    remediate_stale_followers, result_problems, runtime_problems,
 )
 
 log = logging.getLogger("rpi5-deploy")
@@ -259,7 +259,10 @@ def cmd_drift(config: DeployConfig, *, fetch: bool, host: Optional[Host] = None)
         if not acquired:
             print(f"deploy in progress ({StateStore(config.deploy_dir).load().phase}); skipped")
             return 0
-        problems = drift_problems(config, host or Host(config), fetch=fetch)
+        resolved_host = host or Host(config)
+        deployer = Deployer(config, resolved_host, StateStore(config.deploy_dir))
+        remediate_stale_followers(deployer)
+        problems = drift_problems(config, resolved_host, fetch=fetch)
     report = {"checked_at": int(time.time()), "problems": problems}
     (config.deploy_dir / "drift.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     for problem in problems:
@@ -318,15 +321,21 @@ def cmd_init(config: DeployConfig) -> int:
     return 0
 
 
-def sudoers_text(config: DeployConfig, user: str) -> str:
+def sudoers_text(config: DeployConfig, user: str, host: Optional[Host] = None) -> str:
     from rpi5_deploy_engine import SYSTEMCTL
 
     commands = []
-    for unit in config.units:
+    resolved = Deployer(config, host or Host(config), StateStore(config.deploy_dir)).resolved_follower_units()
+    managed = list(dict.fromkeys((*config.units, *resolved)))
+    for unit in managed:
         if not _UNIT_NAME.match(unit.name):
             raise DeployError(f"refusing unit name {unit.name!r}")
         if unit.scope == "system":
-            commands += [f"{SYSTEMCTL} stop {unit.name}", f"{SYSTEMCTL} start {unit.name}"]
+            commands += [
+                f"{SYSTEMCTL} stop {unit.name}",
+                f"{SYSTEMCTL} start {unit.name}",
+                f"{SYSTEMCTL} restart {unit.name}",
+            ]
     if not re.match(r"^[a-z_][a-z0-9_-]*$", user):
         raise DeployError(f"refusing user name {user!r}")
     header = "# Rendered by docs/ops/rpi5_deploy.py render-install. Stop/start only, for the deploy listener.\n"
@@ -343,7 +352,7 @@ def cmd_render_install(config: DeployConfig, *, user: str, uid: int, out: Path) 
             text = text.replace(token, value)
         (out / template.stem).write_text(text, encoding="utf-8")
         print(f"unit={template.stem}")
-    (out / "hermes-deploy.sudoers").write_text(sudoers_text(config, user), encoding="utf-8")
+    (out / "hermes-deploy.sudoers").write_text(sudoers_text(config, user, Host(config)), encoding="utf-8")
     print(f"port={config.port}")
     print(f"https_port={config.https_port}")
     return 0
