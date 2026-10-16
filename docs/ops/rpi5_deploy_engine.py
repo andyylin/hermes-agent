@@ -25,6 +25,7 @@ Order of a restart deploy:
 from __future__ import annotations
 
 import fcntl
+import fnmatch
 import json
 import logging
 import os
@@ -562,6 +563,14 @@ def _homes_args(homes: list) -> list[str]:
     return [arg for home in homes for arg in ("--home", str(home))]
 
 
+_INSTALL_STAMP_EXTERNAL_SIDECAR = "install-stamp*.external*"
+
+
+def _install_stamp_external_sidecar(path: str) -> bool:
+    """Claim sidecars from external→self re-stamp; not deploy drift."""
+    return fnmatch.fnmatch(PurePosixPath(path.strip()).name, _INSTALL_STAMP_EXTERNAL_SIDECAR)
+
+
 def live_tree_problems(host: Host, cfg: DeployConfig, deployed: Optional[str]) -> list[str]:
     """Ways the live checkout differs from the deployed SHA. Paths only, never file content."""
     problems = []
@@ -574,7 +583,11 @@ def live_tree_problems(host: Host, cfg: DeployConfig, deployed: Optional[str]) -
     status = host.run(["git", "status", "--porcelain", "-z", "--untracked-files=normal"], cwd=cfg.checkout)
     if status.returncode != 0:
         return [*problems, f"git status failed: {status.stderr.strip()[:400]}"]
-    dirty = [entry[3:] for entry in status.stdout.split("\0") if len(entry) > 3]
+    dirty = [
+        path for entry in status.stdout.split("\0") if len(entry) > 3
+        for path in [entry[3:]]
+        if not _install_stamp_external_sidecar(path)
+    ]
     if dirty:
         shown = ", ".join(dirty[:20]) + (" ..." if len(dirty) > 20 else "")
         problems.append(f"{len(dirty)} modified or untracked path(s): {shown}")
