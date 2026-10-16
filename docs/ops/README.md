@@ -31,8 +31,8 @@ gateway is idle.
 
    | Diff touches | What happens |
    |---|---|
-   | only `docs/`, `website/`, `tests/`, `.github/`, root `*.md` (not `SOUL.md`), `AGENTS.md` | fast-forward, re-stamp, no restart |
-   | `skills/`, `optional-skills/` (plus the above) | fast-forward, re-stamp, `sync_skills` for every profile home, no restart |
+   | only `docs/`, `website/`, `tests/`, `.github/`, root `*.md` (not `SOUL.md`), `AGENTS.md` | fast-forward, re-stamp, restart follower units, no gateway restart |
+   | `skills/`, `optional-skills/` (plus the above) | fast-forward, re-stamp, `sync_skills`, restart follower units, no gateway restart |
    | anything else | staged release, idle gate, restart, health check, rollback |
    | `pyproject.toml`, `uv.lock`, `pm/lock.json` | not applied; `needs_manual` (the exceptional lane in `ANDY_RUNTIME_PATCHES.md`) |
 
@@ -62,6 +62,16 @@ gateway is idle.
      is no overall timeout.
    - **Swap.** Stop the configured units, clear the marker, fast-forward,
      re-stamp with `write_source_stamp` (as `hermes update` does), start.
+     A gateway drop-in (for example `97-restart-webui.conf`) may restart
+     `hermes-webui.service` with the gateway; the deployer skips a second
+     follower restart when that unit already came up with the gateway.
+   - **Follower units (noop/hot).** After the checkout moves and
+     `state.json` is updated, the worker immediately `systemctl restart`s
+     each configured follower and checks `is-active` (no idle gate; that
+     applies only to gateway restarts). A failed follower restart is logged
+     and recorded in `state.json` but does not roll back the checkout. The
+     hermes-webui process imports `run_agent` in-process and records git HEAD
+     at boot; it must restart whenever HEAD changes without a gateway restart.
    - **Health, 120 s.** Every unit is `is-active`, `GET /health` returns
      `status: ok`, and every live gateway reports `code_sha == target`.
      Otherwise the deploy runs the idle gate again and resets to the previous
@@ -79,7 +89,13 @@ logs `drift: ...` to the journal when any of these is true:
 - a running gateway's `code_sha` is not the last restarted SHA;
 - a deployed diff still needs a restart;
 - the last deploy rolled back, failed, or needs manual work;
+- a follower unit failed to restart on the last deploy;
 - `origin/main` is ahead with nothing pending (a missed notify).
+
+Before reporting, the drift job immediately restarts any follower whose
+`ActiveEnterTimestamp` is earlier than the deployed commit time (covers a
+manual `git pull` on the checkout while the tree still matches
+`deployed_sha`). That remediation does not wait for gateway idle either.
 
 The last report is in `~/.hermes/deploy/drift.json`. Check with
 `systemctl status hermes-deploy-drift.service` or `systemctl --failed`.
@@ -132,12 +148,18 @@ workflow job.
    while a deploy is in flight.
 4. **Check `~/.hermes/deploy/config.json`.** The defaults restart
    `hermes-gateway.service` (system) and check
-   `http://127.0.0.1:8642/health`. Add the WebUI unit if a deploy should
-   restart it too. Use `"scope": "user"` for a `systemctl --user` unit. Set
-   `health_url` to the API server's bind address if it does not listen on
-   loopback. Re-run step 3 after you add a system unit, so that unit gets a
-   sudoers entry. Other keys: `idle_settle_seconds`,
-   `drain_confirm_seconds`, `health_timeout_seconds`, `port`, `https_port`.
+   `http://127.0.0.1:8642/health`. **Follower units** restart on any
+   checkout HEAD change when the gateway did not restart (noop/hot deploys),
+   and are remediated by the drift timer when they booted before the
+   deployed commit. If `follower_units` is omitted, the deployer uses
+   `hermes-webui.service` when that unit is installed; set
+   `"follower_units": []` to disable. Each entry matches `units` (for
+   example `{"name": "hermes-webui.service", "scope": "system"}`). Use
+   `"scope": "user"` for a `systemctl --user` unit. Set `health_url` to the
+   API server's bind address if it does not listen on loopback. Re-run step
+   3 after you add a system follower, so `restart` is allowed in sudoers.
+   Other keys: `idle_settle_seconds`, `drain_confirm_seconds`,
+   `health_timeout_seconds`, `port`, `https_port`.
 5. **Repository secrets and variable** (Settings → Secrets and variables →
    Actions):
 

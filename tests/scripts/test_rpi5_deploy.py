@@ -64,6 +64,14 @@ class FakeHost(eng.Host):
         self.interrupted = False
         self.stopped_at: Optional[float] = None
         self.on_sleep: Optional[Callable[[FakeHost], None]] = None
+        self.listed_units: set[str] = set()
+        self.active_units: set[str] = {"hermes-gateway.service"}
+        self.unit_enter_monotonic: dict[str, float] = {"hermes-gateway.service": 0.0}
+        self.restart_failures: set[str] = set()
+        self.inactive_after_restart: set[str] = set()
+
+    def _is_gateway(self, unit: eng.Unit) -> bool:
+        return unit.name == "hermes-gateway.service"
 
     def probe(self, python, checkout, command, *args, home=None):
         self.events.append(("probe", command, *args))
@@ -85,13 +93,44 @@ class FakeHost(eng.Host):
     def systemctl(self, action, unit):
         self.events.append(("systemctl", action, unit.name))
         if action == "stop":
-            self.interrupted |= self.last_active > 0
-            self.stopped_at = self.clock if self.stopped_at is None else self.stopped_at
-            self.live = False
+            if self._is_gateway(unit):
+                self.interrupted |= self.last_active > 0
+                self.stopped_at = self.clock if self.stopped_at is None else self.stopped_at
+                self.live = False
+            self.active_units.discard(unit.name)
         elif action == "start":
-            self.live = True
-            self.running_sha = self.git("rev-parse", "HEAD")
-        return self.live if action == "is-active" else True
+            self.active_units.add(unit.name)
+            self.unit_enter_monotonic[unit.name] = self.clock
+            if self._is_gateway(unit):
+                self.live = True
+                self.running_sha = self.git("rev-parse", "HEAD")
+                if eng.DEFAULT_FOLLOWER_UNIT in self.listed_units:
+                    self.active_units.add(eng.DEFAULT_FOLLOWER_UNIT)
+                    self.unit_enter_monotonic[eng.DEFAULT_FOLLOWER_UNIT] = self.clock
+        elif action == "restart":
+            if unit.name in self.restart_failures:
+                return False
+            self.active_units.add(unit.name)
+            self.unit_enter_monotonic[unit.name] = self.clock
+            if unit.name in self.inactive_after_restart:
+                self.active_units.discard(unit.name)
+        if action == "is-active":
+            if self._is_gateway(unit):
+                return self.live
+            return unit.name in self.active_units
+        return True
+
+    def unit_listed(self, unit):
+        return unit.name in self.listed_units
+
+    def restart_unit(self, unit):
+        return self.systemctl("restart", unit)
+
+    def unit_active_enter_time(self, unit):
+        entered = self.unit_enter_monotonic.get(unit.name)
+        if entered is None:
+            return None
+        return datetime.fromtimestamp(entered, UTC)
 
     def health(self, url):
         return self.running_sha not in self.bad_health
@@ -134,6 +173,14 @@ def site(tmp_path):
     s.origin, s.base, s.config, s.host, s.store, s.deployer = origin, base, config, host, store, deployer
     s.head = lambda: _git(checkout, "rev-parse", "HEAD")
     return s
+
+
+@pytest.fixture
+def site_with_webui(site):
+    site.host.listed_units.add(eng.DEFAULT_FOLLOWER_UNIT)
+    site.host.active_units.add(eng.DEFAULT_FOLLOWER_UNIT)
+    site.host.unit_enter_monotonic[eng.DEFAULT_FOLLOWER_UNIT] = 0.0
+    return site
 
 
 def _deploy(site, sha: str) -> eng.Result:
@@ -420,6 +467,93 @@ def test_the_probe_drain_marker_suppresses_the_shutdown_broadcast(tmp_path):
 
     _probe(tmp_path, "drain", "off", "--home", str(tmp_path))
     assert not drain_requested(home=tmp_path)
+
+
+def test_noop_deploy_restarts_followers_without_waiting_for_idle(site_with_webui):
+    target = _commit(site_with_webui.origin, {"docs/notes.md": "more notes\n"})
+    site_with_webui.host.activity = lambda host: 3
+
+    result = _deploy(site_with_webui, target)
+
+    assert result.outcome == "deployed" and result.plan_kind == "noop"
+    assert result.follower_restarts == {eng.DEFAULT_FOLLOWER_UNIT: "ok"}
+    assert not any(e[1] in {"stop", "start"} for e in site_with_webui.host.actions())
+    assert ("systemctl", "restart", eng.DEFAULT_FOLLOWER_UNIT) in site_with_webui.host.events
+    assert site_with_webui.host.clock < site_with_webui.config.idle_settle_seconds
+
+
+def test_hot_deploy_restarts_followers_immediately(site_with_webui):
+    target = _commit(site_with_webui.origin, {
+        "skills/demo/SKILL.md": "---\nname: demo\ndescription: hot\n---\n"})
+
+    result = _deploy(site_with_webui, target)
+
+    assert result.plan_kind == "hot"
+    assert result.follower_restarts == {eng.DEFAULT_FOLLOWER_UNIT: "ok"}
+    assert ("systemctl", "restart", eng.DEFAULT_FOLLOWER_UNIT) in site_with_webui.host.events
+
+
+def test_failed_follower_restart_is_recorded_without_rollback(site_with_webui):
+    target = _commit(site_with_webui.origin, {"docs/notes.md": "x\n"})
+    site_with_webui.host.restart_failures.add(eng.DEFAULT_FOLLOWER_UNIT)
+
+    result = _deploy(site_with_webui, target)
+
+    assert result.outcome == "deployed"
+    assert result.follower_restarts[eng.DEFAULT_FOLLOWER_UNIT] == "restart failed"
+    assert site_with_webui.head() == target
+    assert rd.cmd_drift(site_with_webui.config, fetch=False, host=site_with_webui.host) == 1
+
+
+def test_restart_deploy_does_not_restart_webui_when_drop_in_did(site_with_webui):
+    target = _commit(site_with_webui.origin, {"gateway/app.py": "VALUE = 2\n"})
+
+    result = _deploy(site_with_webui, target)
+
+    assert result.outcome == "deployed" and result.plan_kind == "restart"
+    restarts = [e for e in site_with_webui.host.events if e[:2] == ("systemctl", "restart")]
+    assert restarts == []
+
+
+def test_deploy_config_defaults_webui_follower_only_when_unit_exists(site):
+    assert site.deployer.resolved_follower_units() == ()
+    site.host.listed_units.add(eng.DEFAULT_FOLLOWER_UNIT)
+    assert site.deployer.resolved_follower_units() == (eng.Unit(eng.DEFAULT_FOLLOWER_UNIT),)
+
+
+def test_deploy_config_follower_units_from_json(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    checkout = home / "hermes-agent"
+    checkout.mkdir()
+    config_path = home / "deploy" / "config.json"
+    config_path.parent.mkdir()
+    config_path.write_text(json.dumps({
+        "checkout": str(checkout),
+        "follower_units": [{"name": "hermes-webui.service", "scope": "user"}],
+    }), encoding="utf-8")
+    loaded = eng.DeployConfig.load(home)
+    assert loaded.follower_units_configured
+    assert loaded.follower_units == (eng.Unit("hermes-webui.service", "user"),)
+
+
+def test_drift_restarts_webui_when_it_booted_before_deployed_commit(site_with_webui):
+    target = _commit(site_with_webui.origin, {"docs/notes.md": "sync\n"})
+    assert _deploy(site_with_webui, target).follower_restarts[eng.DEFAULT_FOLLOWER_UNIT] == "ok"
+    site_with_webui.host.events.clear()
+    site_with_webui.host.unit_enter_monotonic[eng.DEFAULT_FOLLOWER_UNIT] = 0.0
+
+    assert rd.cmd_drift(site_with_webui.config, fetch=False, host=site_with_webui.host) == 0
+    assert ("systemctl", "restart", eng.DEFAULT_FOLLOWER_UNIT) in site_with_webui.host.events
+
+
+def test_sudoers_includes_follower_restart(tmp_path):
+    config = eng.DeployConfig(
+        checkout=tmp_path, home=tmp_path, follower_units=(eng.Unit("hermes-webui.service"),),
+        follower_units_configured=True)
+    host = eng.Host(config)
+    text = rd.sudoers_text(config, "pi", host)
+    assert "/usr/bin/systemctl restart hermes-webui.service" in text
 
 
 def test_the_probe_lists_every_profile_home_hermes_knows(tmp_path):

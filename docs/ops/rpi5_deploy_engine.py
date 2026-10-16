@@ -77,6 +77,9 @@ class Unit:
     scope: str = "system"
 
 
+DEFAULT_FOLLOWER_UNIT = "hermes-webui.service"
+
+
 @dataclass
 class DeployConfig:
     checkout: Path
@@ -85,6 +88,8 @@ class DeployConfig:
     branch: str = "main"
     remote: str = "origin"
     units: tuple[Unit, ...] = (Unit("hermes-gateway.service"),)
+    follower_units: tuple[Unit, ...] = ()
+    follower_units_configured: bool = False
     health_url: str = "http://127.0.0.1:8642/health"
     listen: str = "127.0.0.1"
     port: int = 9180
@@ -110,12 +115,17 @@ class DeployConfig:
         raw = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
         raw.pop("home", None)
         units = tuple(Unit(**u) for u in raw.pop("units", [])) or cls.units
+        follower_configured = "follower_units" in raw
+        follower_units = tuple(Unit(**u) for u in raw.pop("follower_units", []))
         resolved = Path(raw.pop("checkout", None) or checkout or home / "hermes-agent")
-        known = cls.__dataclass_fields__
+        known = set(cls.__dataclass_fields__) - {"follower_units_configured"}
         unknown = sorted(set(raw) - set(known))
         if unknown:
             raise DeployError(f"unknown config keys in {path}: {', '.join(unknown)}")
-        return cls(checkout=resolved, home=home, units=units, **raw)
+        return cls(
+            checkout=resolved, home=home, units=units, follower_units=follower_units,
+            follower_units_configured=follower_configured, **raw,
+        )
 
 
 @dataclass(frozen=True)
@@ -245,14 +255,52 @@ class Host:
             raise DeployError(f"probe {command} failed: {payload or done.stderr.strip()[-400:]}")
         return payload
 
-    def systemctl(self, action: str, unit: Unit) -> bool:
+    def _systemctl_argv(self, action: str, unit: Unit) -> list[str]:
         if unit.scope == "user":
-            argv = [SYSTEMCTL, "--user", action, unit.name]
-        elif action == "is-active":
-            argv = [SYSTEMCTL, action, unit.name]
+            return [SYSTEMCTL, "--user", action, unit.name]
+        if action == "is-active":
+            return [SYSTEMCTL, action, unit.name]
+        return ["sudo", "-n", SYSTEMCTL, action, unit.name]
+
+    def systemctl(self, action: str, unit: Unit) -> bool:
+        return self.run(self._systemctl_argv(action, unit), timeout=900).returncode == 0
+
+    def unit_listed(self, unit: Unit) -> bool:
+        if unit.scope == "user":
+            argv = [SYSTEMCTL, "--user", "list-unit-files", unit.name, "--no-legend", "--no-pager"]
         else:
-            argv = ["sudo", "-n", SYSTEMCTL, action, unit.name]
-        return self.run(argv, timeout=900).returncode == 0
+            argv = [SYSTEMCTL, "list-unit-files", unit.name, "--no-legend", "--no-pager"]
+        done = self.run(argv, timeout=60)
+        return done.returncode == 0 and unit.name in done.stdout
+
+    def unit_show(self, unit: Unit, property_name: str) -> str:
+        if unit.scope == "user":
+            argv = [SYSTEMCTL, "--user", "show", unit.name, f"-p{property_name}", "--value"]
+        else:
+            argv = [SYSTEMCTL, "show", unit.name, f"-p{property_name}", "--value"]
+        done = self.run(argv, timeout=60)
+        if done.returncode != 0:
+            return ""
+        return done.stdout.strip()
+
+    def unit_active_enter_time(self, unit: Unit) -> Optional[datetime]:
+        raw = self.unit_show(unit, "ActiveEnterTimestamp")
+        if not raw or raw == "n/a":
+            return None
+        try:
+            return datetime.strptime(raw, "%a %Y-%m-%d %H:%M:%S %Z").replace(tzinfo=UTC)
+        except ValueError:
+            try:
+                return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+
+    def restart_unit(self, unit: Unit) -> bool:
+        return self.systemctl("restart", unit)
+
+    def git_commit_time(self, sha: str) -> datetime:
+        stamp = self.git("show", "-s", "--format=%cI", sha)
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
 
     def health(self, url: str) -> bool:
         try:
@@ -276,6 +324,7 @@ class Result:
     detail: str = ""
     plan_kind: str = ""
     self_update: bool = False
+    follower_restarts: dict[str, str] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -348,7 +397,10 @@ class Deployer:
             if plan.sync_skills:
                 self._sync_skills(python)
             self._record_deployed(target, current, plan, restarted=False)
-            return Result("deployed", target, "applied without restart", plan.kind, plan.self_update)
+            followers = self._restart_followers()
+            return Result(
+                "deployed", target, "applied without restart", plan.kind, plan.self_update, followers,
+            )
         self._stage_release(target, plan, python)
         return self._restart_deploy(current, target, plan, python)
 
@@ -363,7 +415,9 @@ class Deployer:
             self._sync_skills(python)
         if self._healthy(python, target):
             self._record_deployed(target, current, plan, restarted=True)
-            return Result("deployed", target, "restarted", plan.kind, plan.self_update)
+            skip = self._followers_restarted_with_gateway()
+            followers = self._restart_followers(skip=skip)
+            return Result("deployed", target, "restarted", plan.kind, plan.self_update, followers)
         return self._rollback(current, target, python)
 
     def _rollback(self, previous: str, failed: str, python: str) -> Result:
@@ -558,6 +612,43 @@ class Deployer:
     def _phase(self, phase: str) -> None:
         self.store.update(phase=phase)
 
+    def resolved_follower_units(self) -> tuple[Unit, ...]:
+        if self.config.follower_units_configured:
+            return self.config.follower_units
+        unit = Unit(DEFAULT_FOLLOWER_UNIT)
+        return (unit,) if self.host.unit_listed(unit) else ()
+
+    def _restart_followers(self, *, skip: frozenset[str] = frozenset()) -> dict[str, str]:
+        results: dict[str, str] = {}
+        followers = [unit for unit in self.resolved_follower_units() if unit.name not in skip]
+        if not followers:
+            return results
+        for unit in followers:
+            if not self.host.restart_unit(unit):
+                log.error("follower restart failed for %s", unit.name)
+                results[unit.name] = "restart failed"
+                continue
+            if not self.host.systemctl("is-active", unit):
+                log.error("follower %s is not active after restart", unit.name)
+                results[unit.name] = "not active after restart"
+                continue
+            results[unit.name] = "ok"
+        return results
+
+    def _followers_restarted_with_gateway(self) -> frozenset[str]:
+        """Follower units whose start time matches a recent gateway restart (e.g. drop-in 97-restart-webui)."""
+        if not self.config.units:
+            return frozenset()
+        gateway_enter = self.host.unit_active_enter_time(self.config.units[0])
+        if gateway_enter is None:
+            return frozenset()
+        restarted = set()
+        for unit in self.resolved_follower_units():
+            entered = self.host.unit_active_enter_time(unit)
+            if entered is not None and entered >= gateway_enter:
+                restarted.add(unit.name)
+        return frozenset(restarted)
+
 
 def _homes_args(homes: list) -> list[str]:
     return [arg for home in homes for arg in ("--home", str(home))]
@@ -617,6 +708,51 @@ def result_problems(state: DeployState) -> list[str]:
     outcome = state.last_result.get("outcome")
     if outcome in {"rolled_back", "rollback_failed", "needs_manual", "error"}:
         problems.append(f"last deploy {outcome}: {state.last_result.get('sha')} {state.last_result.get('detail', '')}")
+    followers = state.last_result.get("follower_restarts") or {}
+    failed = [f"{name}: {detail}" for name, detail in sorted(followers.items()) if detail != "ok"]
+    if failed:
+        problems.append("follower restarts failed: " + "; ".join(failed))
     if state.reinstall_needed:
         problems.append("unit templates changed; re-run rpi5-vanilla-migration.sh --install-deploy-listener")
     return problems
+
+
+def stale_follower_units(host: Host, deployed_sha: str, followers: tuple[Unit, ...]) -> list[Unit]:
+    """Followers that started before the deployed commit (stale agent runtime in-process)."""
+    try:
+        commit_at = host.git_commit_time(deployed_sha)
+    except DeployError:
+        return list(followers)
+    stale = []
+    for unit in followers:
+        entered = host.unit_active_enter_time(unit)
+        if entered is None or entered < commit_at:
+            stale.append(unit)
+    return stale
+
+
+def remediate_stale_followers(deployer: Deployer) -> dict[str, str]:
+    """Restart followers that booted before the live checkout's deployed SHA (manual pull recovery)."""
+    state = deployer.store.load()
+    if not state.deployed_sha:
+        return {}
+    head = deployer.host.git("rev-parse", "HEAD")
+    if head != state.deployed_sha:
+        return {}
+    if live_tree_problems(deployer.host, deployer.config, state.deployed_sha):
+        return {}
+    followers = deployer.resolved_follower_units()
+    stale = stale_follower_units(deployer.host, state.deployed_sha, followers)
+    results: dict[str, str] = {}
+    for unit in stale:
+        if not deployer.host.restart_unit(unit):
+            log.error("drift: follower restart failed for %s", unit.name)
+            results[unit.name] = "restart failed"
+            continue
+        if not deployer.host.systemctl("is-active", unit):
+            log.error("drift: follower %s is not active after restart", unit.name)
+            results[unit.name] = "not active after restart"
+            continue
+        results[unit.name] = "ok"
+        log.info("drift: restarted stale follower %s", unit.name)
+    return results
