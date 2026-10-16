@@ -469,22 +469,20 @@ def test_the_probe_drain_marker_suppresses_the_shutdown_broadcast(tmp_path):
     assert not drain_requested(home=tmp_path)
 
 
-def test_noop_deploy_restarts_followers_after_idle(site_with_webui):
+def test_noop_deploy_restarts_followers_without_waiting_for_idle(site_with_webui):
     target = _commit(site_with_webui.origin, {"docs/notes.md": "more notes\n"})
-    site_with_webui.host.activity = lambda host: 1 if host.clock < 40 else 0
+    site_with_webui.host.activity = lambda host: 3
 
     result = _deploy(site_with_webui, target)
 
     assert result.outcome == "deployed" and result.plan_kind == "noop"
     assert result.follower_restarts == {eng.DEFAULT_FOLLOWER_UNIT: "ok"}
     assert not any(e[1] in {"stop", "start"} for e in site_with_webui.host.actions())
-    restart_at = site_with_webui.host.events.index(
-        ("systemctl", "restart", eng.DEFAULT_FOLLOWER_UNIT))
-    assert site_with_webui.host.clock >= 40 + site_with_webui.config.idle_settle_seconds
-    assert restart_at > 0
+    assert ("systemctl", "restart", eng.DEFAULT_FOLLOWER_UNIT) in site_with_webui.host.events
+    assert site_with_webui.host.clock < site_with_webui.config.idle_settle_seconds
 
 
-def test_hot_deploy_restarts_followers_after_idle(site_with_webui):
+def test_hot_deploy_restarts_followers_immediately(site_with_webui):
     target = _commit(site_with_webui.origin, {
         "skills/demo/SKILL.md": "---\nname: demo\ndescription: hot\n---\n"})
 

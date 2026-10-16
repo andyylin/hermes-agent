@@ -397,7 +397,7 @@ class Deployer:
             if plan.sync_skills:
                 self._sync_skills(python)
             self._record_deployed(target, current, plan, restarted=False)
-            followers = self._restart_followers(python)
+            followers = self._restart_followers()
             return Result(
                 "deployed", target, "applied without restart", plan.kind, plan.self_update, followers,
             )
@@ -416,7 +416,7 @@ class Deployer:
         if self._healthy(python, target):
             self._record_deployed(target, current, plan, restarted=True)
             skip = self._followers_restarted_with_gateway()
-            followers = self._restart_followers(python, skip=skip, wait_idle=False)
+            followers = self._restart_followers(skip=skip)
             return Result("deployed", target, "restarted", plan.kind, plan.self_update, followers)
         return self._rollback(current, target, python)
 
@@ -618,17 +618,11 @@ class Deployer:
         unit = Unit(DEFAULT_FOLLOWER_UNIT)
         return (unit,) if self.host.unit_listed(unit) else ()
 
-    def _restart_followers(
-        self, python: str, *, skip: frozenset[str] = frozenset(), wait_idle: bool = True,
-    ) -> dict[str, str]:
+    def _restart_followers(self, *, skip: frozenset[str] = frozenset()) -> dict[str, str]:
         results: dict[str, str] = {}
         followers = [unit for unit in self.resolved_follower_units() if unit.name not in skip]
         if not followers:
             return results
-        if wait_idle:
-            self._phase("waiting_idle")
-            if self._wait_idle(python, None, strict=True) is None:
-                log.warning("idle wait ended without a home snapshot; restarting followers anyway")
         for unit in followers:
             if not self.host.restart_unit(unit):
                 log.error("follower restart failed for %s", unit.name)

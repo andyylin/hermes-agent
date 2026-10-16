@@ -31,8 +31,8 @@ gateway is idle.
 
    | Diff touches | What happens |
    |---|---|
-   | only `docs/`, `website/`, `tests/`, `.github/`, root `*.md` (not `SOUL.md`), `AGENTS.md` | fast-forward, re-stamp, no gateway restart; follower units after idle |
-   | `skills/`, `optional-skills/` (plus the above) | fast-forward, re-stamp, `sync_skills` for every profile home, no gateway restart; follower units after idle |
+   | only `docs/`, `website/`, `tests/`, `.github/`, root `*.md` (not `SOUL.md`), `AGENTS.md` | fast-forward, re-stamp, restart follower units, no gateway restart |
+   | `skills/`, `optional-skills/` (plus the above) | fast-forward, re-stamp, `sync_skills`, restart follower units, no gateway restart |
    | anything else | staged release, idle gate, restart, health check, rollback |
    | `pyproject.toml`, `uv.lock`, `pm/lock.json` | not applied; `needs_manual` (the exceptional lane in `ANDY_RUNTIME_PATCHES.md`) |
 
@@ -65,13 +65,13 @@ gateway is idle.
      A gateway drop-in (for example `97-restart-webui.conf`) may restart
      `hermes-webui.service` with the gateway; the deployer skips a second
      follower restart when that unit already came up with the gateway.
-   - **Follower units (noop/hot).** After the checkout moves without a
-     gateway restart, the worker waits for the same idle gate as a restart
-     deploy, then `systemctl restart` each configured follower and checks
-     `is-active`. A failed follower restart is logged and recorded in
-     `state.json` but does not roll back the checkout. The hermes-webui
-     process imports `run_agent` in-process and records git HEAD at boot; it
-     must restart whenever HEAD changes without a gateway restart.
+   - **Follower units (noop/hot).** After the checkout moves and
+     `state.json` is updated, the worker immediately `systemctl restart`s
+     each configured follower and checks `is-active` (no idle gate; that
+     applies only to gateway restarts). A failed follower restart is logged
+     and recorded in `state.json` but does not roll back the checkout. The
+     hermes-webui process imports `run_agent` in-process and records git HEAD
+     at boot; it must restart whenever HEAD changes without a gateway restart.
    - **Health, 120 s.** Every unit is `is-active`, `GET /health` returns
      `status: ok`, and every live gateway reports `code_sha == target`.
      Otherwise the deploy runs the idle gate again and resets to the previous
@@ -92,10 +92,10 @@ logs `drift: ...` to the journal when any of these is true:
 - a follower unit failed to restart on the last deploy;
 - `origin/main` is ahead with nothing pending (a missed notify).
 
-Before reporting, the drift job restarts any follower whose
+Before reporting, the drift job immediately restarts any follower whose
 `ActiveEnterTimestamp` is earlier than the deployed commit time (covers a
 manual `git pull` on the checkout while the tree still matches
-`deployed_sha`).
+`deployed_sha`). That remediation does not wait for gateway idle either.
 
 The last report is in `~/.hermes/deploy/drift.json`. Check with
 `systemctl status hermes-deploy-drift.service` or `systemctl --failed`.
