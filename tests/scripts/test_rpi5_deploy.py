@@ -255,6 +255,28 @@ def test_drift_reports_modified_live_files(site):
     assert any("gateway/app.py" in p for p in report["problems"])
 
 
+@pytest.mark.parametrize(
+    ("path", "sidecar"),
+    [
+        ("install-stamp.external-claim.json", True),
+        ("install-stamp.json.external-backup", True),
+        ("subdir/install-stamp.external-claim.json", True),
+        ("install-stamp.json", False),
+        ("gateway/app.py", False),
+    ],
+)
+def test_install_stamp_external_sidecar_paths(path, sidecar):
+    assert eng._install_stamp_external_sidecar(path) is sidecar
+
+
+def test_drift_ignores_install_stamp_external_claim_sidecars(site):
+    checkout = site.config.checkout
+    (checkout / "install-stamp.external-claim.json").write_text("{}\n", encoding="utf-8")
+    (checkout / "install-stamp.json.external-backup").write_text("{}\n", encoding="utf-8")
+
+    assert rd.cmd_drift(site.config, fetch=False, host=site.host) == 0
+
+
 def test_drift_reports_a_merge_that_never_deployed(site):
     _commit(site.origin, {"gateway/app.py": "VALUE = 2\n"})
 
