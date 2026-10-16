@@ -35,6 +35,8 @@
 #   docs/ops/rpi5-vanilla-migration.sh --orphans
 #   docs/ops/rpi5-vanilla-migration.sh --gc            # refused before 2026-10-16 12:41 Taipei
 #   docs/ops/rpi5-vanilla-migration.sh --rollback      # restore sideline'd drop-ins and the external stamp; print the rest
+#   docs/ops/rpi5-vanilla-migration.sh --install-deploy-listener
+#       # push-to-deploy listener, drift timer, sudoers, tailscale serve (docs/ops/README.md)
 #
 # --preflight greps hermes/hermex units for EnvironmentFile, ExecStartPre, and
 # Environment=, and runs `hermes gateway migrate --multiplex --dry-run`. The
@@ -70,9 +72,10 @@ case "${1:-}" in
   --renderer-keys) MODE="renderer-keys" ;;
   --matrix-probe) MODE="matrix-probe" ;;
   --alice-mcp-env) MODE="alice-mcp-env" ;;
+  --install-deploy-listener) MODE="install-deploy-listener" ;;
   "") MODE="apply" ;;
   *)
-    echo "usage: $0 [--check | --preflight | --preflight-fold | --config-edits | --renderer-keys PATH | --matrix-probe PROFILE | --alice-mcp-env [--write] | --sideline-dropins | --install-system-unit | --orphans | --gc | --rollback]" >&2
+    echo "usage: $0 [--check | --preflight | --preflight-fold | --config-edits | --renderer-keys PATH | --matrix-probe PROFILE | --alice-mcp-env [--write] | --sideline-dropins | --install-system-unit | --orphans | --gc | --rollback | --install-deploy-listener]" >&2
     exit 4
     ;;
 esac
@@ -316,6 +319,61 @@ if [[ "$MODE" == "install-system-unit" ]]; then
   mapfile -t chown_cmd <<< "$chown_argv"
   "${chown_cmd[@]}"
   exit $?
+fi
+
+# The listener runs on this system python3 with the standard library only, so a
+# broken release cannot take the deployer down. Renders, then installs as root:
+# the units, a stop/start-only sudoers entry, and `tailscale serve` HTTPS.
+# Re-running is the upgrade path; it refuses while a deploy is in flight.
+if [[ "$MODE" == "install-deploy-listener" ]]; then
+  case "$DRIVER" in
+    "${HOME}/.hermes/venvs/"*)
+      echo "refusing: the deploy listener needs a system python3 >= 3.11, not ${DRIVER}" >&2
+      exit 4
+      ;;
+  esac
+  DEPLOY="${CHECKOUT}/docs/ops/rpi5_deploy.py"
+  deploy_home="${HOME}/.hermes"
+  phase="$("$DRIVER" "$DEPLOY" status --home "$deploy_home" --checkout "$CHECKOUT" \
+    | "$DRIVER" -c 'import json, sys; print(json.load(sys.stdin)["phase"])')"
+  if [[ "$phase" != "idle" ]]; then
+    echo "refusing: a deploy is in phase ${phase}; re-run when it is idle" >&2
+    exit 1
+  fi
+  "$DRIVER" "$DEPLOY" init --home "$deploy_home" --checkout "$CHECKOUT"
+  render="$(mktemp -d)"
+  trap 'rm -rf "$render"' EXIT
+  mapfile -t rendered < <("$DRIVER" "$DEPLOY" render-install --home "$deploy_home" --checkout "$CHECKOUT" \
+    --user "$(id -un)" --uid "$(id -u)" --out "$render")
+  units=()
+  port=""
+  https_port=""
+  for line in "${rendered[@]}"; do
+    case "$line" in
+      unit=*) units+=("${line#unit=}") ;;
+      port=*) port="${line#port=}" ;;
+      https_port=*) https_port="${line#https_port=}" ;;
+    esac
+  done
+  if [[ ${#units[@]} -eq 0 || -z "$port" || -z "$https_port" ]]; then
+    echo "render-install produced no units" >&2
+    exit 1
+  fi
+  sudo visudo -cf "$render/hermes-deploy.sudoers"
+  sudo install -m 440 -o root -g root "$render/hermes-deploy.sudoers" /etc/sudoers.d/hermes-deploy
+  for unit in "${units[@]}"; do
+    sudo install -m 644 -o root -g root "$render/$unit" "/etc/systemd/system/$unit"
+  done
+  sudo systemctl daemon-reload
+  sudo systemd-analyze verify hermes-deploy.service hermes-deploy-drift.service hermes-deploy-drift.timer
+  sudo systemctl enable hermes-deploy.service hermes-deploy-drift.timer
+  sudo systemctl restart hermes-deploy.service
+  sudo systemctl start hermes-deploy-drift.timer
+  sudo tailscale serve --bg --https="$https_port" "http://127.0.0.1:${port}"
+  echo "installed hermes-deploy.service and hermes-deploy-drift.timer"
+  echo "tailscale serve: https port ${https_port} -> 127.0.0.1:${port}"
+  echo "key: ${deploy_home}/deploy/hmac.key (not printed); set it as the RPI5_DEPLOY_HMAC_KEY repo secret"
+  exit 0
 fi
 
 if [[ "$MODE" == "orphans" ]]; then
