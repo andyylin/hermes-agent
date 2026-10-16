@@ -157,6 +157,11 @@ or other security-sensitive runtime contracts.
 5. With separate just-in-time approval, activate Dad → Wife → Default, then
    Dashboard, verifying each before advancing.
 
+On the rpi5 `main` checkout, a merge to `main` is that approval:
+push-to-deploy (`docs/ops/README.md`) applies the merged SHA once every
+gateway is idle, and rolls back on a failed health check. It never applies a
+dependency-manifest change; that stays in the exceptional lane.
+
 Use the **exceptional lane** when there is a rebase conflict or any dependency,
 database/schema, authentication, profile-isolation, systemd/runtime,
 native/generated-asset, security-sensitive, or broad core change. That lane
