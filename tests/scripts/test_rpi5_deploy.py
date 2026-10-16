@@ -482,6 +482,14 @@ def test_noop_deploy_restarts_followers_without_waiting_for_idle(site_with_webui
     assert site_with_webui.host.clock < site_with_webui.config.idle_settle_seconds
 
 
+def test_noop_deploy_records_runtime_sha_when_live_matches_deployed(site):
+    target = _commit(site.origin, {"docs/notes.md": "noop runtime\n"})
+    site.host.running_sha = target
+
+    assert _deploy(site, target).plan_kind == "noop"
+    assert site.store.load().runtime_sha == target
+
+
 def test_hot_deploy_restarts_followers_immediately(site_with_webui):
     target = _commit(site_with_webui.origin, {
         "skills/demo/SKILL.md": "---\nname: demo\ndescription: hot\n---\n"})
@@ -554,6 +562,34 @@ def test_sudoers_includes_follower_restart(tmp_path):
     host = eng.Host(config)
     text = rd.sudoers_text(config, "pi", host)
     assert "/usr/bin/systemctl restart hermes-webui.service" in text
+
+
+def test_drift_reconciles_stale_runtime_when_live_matches_deployed(site):
+    target = _commit(site.origin, {"docs/notes.md": "sync\n"})
+    _deploy(site, target)
+    site.store.update(runtime_sha=site.base)
+    site.host.running_sha = target
+
+    assert rd.cmd_drift(site.config, fetch=False, host=site.host) == 0
+    assert site.store.load().runtime_sha == target
+
+
+def test_reconcile_records_runtime_when_live_matches_deployed(site):
+    target = _commit(site.origin, {"docs/notes.md": "sync\n"})
+    site.store.update(deployed_sha=target, runtime_sha=site.base)
+    site.host.running_sha = target
+
+    assert rd.cmd_reconcile(site.config, host=site.host) == 0
+    assert site.store.load().runtime_sha == target
+
+
+def test_reconcile_refuses_when_live_does_not_match_deployed(site):
+    target = _commit(site.origin, {"docs/notes.md": "sync\n"})
+    site.store.update(deployed_sha=target, runtime_sha=site.base)
+    site.host.running_sha = site.base
+
+    assert rd.cmd_reconcile(site.config, host=site.host) == 1
+    assert site.store.load().runtime_sha == site.base
 
 
 def test_the_probe_lists_every_profile_home_hermes_knows(tmp_path):

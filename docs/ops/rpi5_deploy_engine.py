@@ -396,7 +396,7 @@ class Deployer:
             self._fast_forward(target, python)
             if plan.sync_skills:
                 self._sync_skills(python)
-            self._record_deployed(target, current, plan, restarted=False)
+            self._record_deployed(target, current, plan, restarted=False, python=python)
             followers = self._restart_followers()
             return Result(
                 "deployed", target, "applied without restart", plan.kind, plan.self_update, followers,
@@ -414,7 +414,7 @@ class Deployer:
         if plan.sync_skills:
             self._sync_skills(python)
         if self._healthy(python, target):
-            self._record_deployed(target, current, plan, restarted=True)
+            self._record_deployed(target, current, plan, restarted=True, python=python)
             skip = self._followers_restarted_with_gateway()
             followers = self._restart_followers(skip=skip)
             return Result("deployed", target, "restarted", plan.kind, plan.self_update, followers)
@@ -587,9 +587,12 @@ class Deployer:
         live = [h for h in homes or [] if h.get("live")]
         return bool(live) and all(h.get("code_sha") == sha and h.get("state") in SERVING_STATES for h in live)
 
-    def _record_deployed(self, target: str, current: str, plan: Plan, *, restarted: bool) -> None:
+    def _record_deployed(self, target: str, current: str, plan: Plan, *, restarted: bool, python: str) -> None:
         state = self.store.load()
-        runtime = target if restarted else (state.runtime_sha or current)
+        if restarted or (plan.kind == "noop" and self._health_once(python, target)):
+            runtime = target
+        else:
+            runtime = state.runtime_sha or current
         self.store.update(
             deployed_sha=target, previous_sha=current, runtime_sha=runtime,
             reinstall_needed=state.reinstall_needed or plan.reinstall,
@@ -683,6 +686,21 @@ def live_tree_problems(host: Host, cfg: DeployConfig, deployed: Optional[str]) -
         shown = ", ".join(dirty[:20]) + (" ..." if len(dirty) > 20 else "")
         problems.append(f"{len(dirty)} modified or untracked path(s): {shown}")
     return problems
+
+
+def reconcile_runtime_sha(deployer: Deployer) -> tuple[bool, str]:
+    """Record ``runtime_sha`` when every live gateway serves ``deployed_sha``."""
+    state = deployer.store.load()
+    if not state.deployed_sha:
+        return False, "state.json has no deployed_sha"
+    python = deployer._pm_python()
+    if not deployer._health_once(python, state.deployed_sha):
+        return False, f"gateways are not verifiably serving {state.deployed_sha}"
+    if state.runtime_sha == state.deployed_sha:
+        return True, "runtime_sha already matches deployed_sha"
+    deployer.store.update(runtime_sha=state.deployed_sha)
+    log.info("reconciled runtime_sha to %s", state.deployed_sha)
+    return True, f"recorded runtime_sha {state.deployed_sha}"
 
 
 def runtime_problems(deployer: Deployer, state: DeployState) -> list[str]:
