@@ -291,10 +291,15 @@ def _resolve_async_session_key(parent_agent: Any, origin_ui_session_id: str) -> 
     with _quiet(None):
         from gateway.session_context import get_session_env
         source = get_session_env("HERMES_SESSION_SOURCE", "")
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
         # Refresh from the task-local source when available, else retain the
         # immutable value captured before child construction.
         origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "") or origin_ui_session_id
-        if source == "tui" and agent_session_id:
+        # WebUI sets platform=webui and often leaves source empty. A stale
+        # approval key would deliver the result into another chat.
+        if agent_session_id and (
+            source in {"tui", "webui", "desktop"} or platform in {"tui", "webui", "desktop"}
+        ):
             session_key = agent_session_id
     return session_key or agent_session_id, origin_ui_session_id
 
