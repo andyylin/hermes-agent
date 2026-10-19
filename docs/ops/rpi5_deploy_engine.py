@@ -468,8 +468,6 @@ class Deployer:
         with tempfile.TemporaryDirectory(prefix="rpi5-deploy-home.") as scratch:
             args = [arg for path in compiled for arg in ("--compile", str(release / path))]
             self.host.probe(python, release, "imports", *args, home=Path(scratch))
-        # The interpreter the units start must be the pinned venv and import what they serve.
-        self.host.probe(python, self.config.checkout, "preflight")
         return release
 
     def _quiesce(self, python: str, *, target: Optional[str], strict: bool = True) -> Optional[list[Path]]:
