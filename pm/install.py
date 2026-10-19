@@ -15,11 +15,9 @@ from typing import Optional
 
 from pm import paths
 from pm.downloader import DownloadPaused, ProgressFn
-from pm.environments import pinned_venv
 from pm.filesystem import native, remove_tree, retry_held
 from pm.lock import Facts, Lockfile
 from pm.package import InstallError, Package, Runner, StatePackage, compose_env
-from pm.pinned_venv import pinned_venv_current, sync_pinned_venv
 from pm.plugin_inputs import Candidates, Members, PluginInput, Selection, StagedUpdate
 from pm.registry import get_package, walk
 from pm.store import Store, current_target, merge_tree, tree_digest
@@ -658,8 +656,6 @@ def venv_is_current(*, extras: list[str] | None = None, plugins: Members | Candi
     from pm.packages import Venv
 
     root = paths.repo_root() if project_root is None else Path(project_root).absolute()
-    if pinned_venv(root) is not None:
-        return pinned_venv_current(root, extras)
     package = get_package("venv") if project_root is None else Venv(root)
     fact = Facts(runtime_facts_path(root), strict=True).get("venv")
     if fact is None:
@@ -828,11 +824,6 @@ def sync_venv(extras: Optional[list[str]] = None, *, explicit: bool = False,
             raise ValueError("repair restores the recorded environment; it cannot change features or plugins")
         if evict_incompatible_plugins and (repair or plugins is not None or not explicit):
             raise ValueError("only an explicit sync of the discovered plugin selection may disable plugins")
-        pinned = pinned_venv(paths.repo_root())
-        if pinned is not None:
-            receipt.record_feature_list(_sync_pinned(pinned, extras, plugins, explicit=explicit or repair))
-            outcome = "ok"
-            return
         shipped, frozen = _feature_policy(extras, repair=repair)
         package = get_package("venv")
         from hermes_cli.runtime_state import recover_publication
@@ -866,17 +857,6 @@ def sync_venv(extras: Optional[list[str]] = None, *, explicit: bool = False,
         raise
     finally:
         receipt.finalize(outcome, 0 if outcome == "ok" else 1, token=token)
-
-
-def _sync_pinned(venv: Path, extras: Optional[list[str]], plugins: PluginInput | None, *,
-                 explicit: bool) -> list[str]:
-    """Sync the operator-pinned venv the services run on (``pm.pinned_venv``)."""
-    if plugins is not None:
-        raise InstallError("venv", f"plugin dependency members are not synced into the pinned runtime venv {venv}",
-                           "install the plugin's Python dependencies into that venv, or unpin it")
-    if not explicit and not lazy_installs_allowed():
-        raise _refuse_lazy("venv", str(extras) if extras else "pinned venv out of sync")
-    return sync_pinned_venv(paths.repo_root(), venv, extras, explicit=explicit)
 
 
 def drift(*, include_venv: bool = True) -> dict[str, str]:

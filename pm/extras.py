@@ -283,15 +283,10 @@ def legacy_selection(project_root: Path) -> list[str]:
     not run from it.
     """
     root = Path(project_root)
-    return ["all", *carried_extras(root / "venv", root / ".venv")]
-
-
-def carried_extras(*venvs: Path) -> list[str]:
-    """The opt-in extras whose anchors are installed in any of *venvs* (read, never imported)."""
-    trees = [tree for venv in venvs
+    trees = [tree for venv in (root / "venv", root / ".venv")
              for tree in (*venv.glob("lib/python*/site-packages"), venv / "Lib" / "site-packages")
              if tree.is_dir()]
-    return sorted(
+    carried = sorted(
         # An umbrella extra shares its anchor with one member; carrying it
         # would install every sibling the user never chose.
         extra for extra in ANCHORS if extra not in {"messaging", "voice", "wake"}
@@ -300,3 +295,4 @@ def carried_extras(*venvs: Path) -> list[str]:
         if any(all(_installed_in(tree, anchor) for anchor in _anchors(extra)) for tree in trees)
         and extra_supported(extra, importable=lambda _anchor: False)
     )
+    return ["all", *carried]
