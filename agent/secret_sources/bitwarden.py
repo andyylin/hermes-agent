@@ -15,11 +15,13 @@ import base64
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import time
+from multiprocessing import current_process
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from agent.secret_sources._cache import (
     CachedFetch as _CachedFetch, SecretCache, atomic_write_json, entry_from_payload,
@@ -33,6 +35,14 @@ from agent.secret_sources.base import (
 logger = logging.getLogger(__name__)
 
 _BWS_RUN_TIMEOUT = 30
+DEFAULT_BWS_CACHE_TTL_SECONDS = 600.0
+_BWS_RETRY_BACKOFF = (1.0, 2.0, 4.0)
+_BWS_MAX_RETRIES = 3
+_BWS_RETRY_SLEEP_CAP_SECONDS = 10.0
+_TRY_AGAIN_IN_RE = re.compile(r"try again in\s+(\d+(?:\.\d+)?)\s*s", re.IGNORECASE)
+_STALE_FALLBACK_KINDS = frozenset({
+    ErrorKind.NETWORK, ErrorKind.TIMEOUT, ErrorKind.RATE_LIMITED,
+})
 
 # <hermes_home>/cache/bws_cache.json holds only secret VALUES (never the access
 # token); kept out of .env so users editing .env don't commit BSM-sourced secrets.
@@ -85,10 +95,74 @@ _BWS_ERROR_RULES = (
                              "invalid_client", "invalid_grant", "400 bad request")),
     (ErrorKind.NETWORK, ("network", "connection", "resolve", "download", "dns")),
 )
+_RATE_LIMIT_STATUS_RE = re.compile(
+    r"(?:\[429\b|\b429\s+too\s+many|\b429\b[^\d]{0,40}too many requests)",
+    re.IGNORECASE,
+)
+
+
+def _is_bws_rate_limited_message(message: str) -> bool:
+    """True for HTTP 429 throttling — never bare ``429`` inside UUIDs or request ids."""
+    lowered = message.lower()
+    if "too many requests" in lowered or "slow down" in lowered:
+        return True
+    return _RATE_LIMIT_STATUS_RE.search(message) is not None
 
 
 def _classify_bws_error(message: str) -> ErrorKind:
-    return classify_cli_error(message, _BWS_ERROR_RULES)
+    kind = classify_cli_error(message, _BWS_ERROR_RULES)
+    if kind is not ErrorKind.INTERNAL:
+        return kind
+    if _is_bws_rate_limited_message(message):
+        return ErrorKind.RATE_LIMITED
+    return ErrorKind.INTERNAL
+
+
+def _bws_caller_label() -> str:
+    """Process / unit name for optional bws debug logging (no secret values)."""
+    name = current_process().name
+    profile = os.environ.get("HERMES_PROFILE", "").strip()
+    if profile:
+        return f"{name} profile={profile}"
+    return name
+
+
+def _bws_retry_delay_seconds(retry_index: int, err_message: str) -> float:
+    """Seconds to wait before retry ``retry_index`` (0-based), honoring BWS hints."""
+    step = _BWS_RETRY_BACKOFF[min(retry_index, len(_BWS_RETRY_BACKOFF) - 1)]
+    hinted = _TRY_AGAIN_IN_RE.search(err_message)
+    base = max(float(hinted.group(1)), step) if hinted else step
+    return base + random.uniform(0.0, 0.25 * base)
+
+
+def _stale_cache_fallback(
+    *,
+    exc: RuntimeError,
+    use_cache: bool,
+    cache_key: _CacheKey,
+    encrypted_cache_enabled: bool,
+    encrypted_cache_max_stale_seconds: float,
+    cache_ttl_seconds: float,
+    home_path: Optional[Path],
+    read_encrypted: Callable[[float], Optional[_CachedFetch]],
+) -> Optional[tuple[dict[str, str], list[str]]]:
+    """Serve last-good cache for transport/rate-limit failures; None when unavailable."""
+    if not use_cache or _classify_bws_error(str(exc)) not in _STALE_FALLBACK_KINDS:
+        return None
+    stale = label = None
+    if encrypted_cache_enabled:
+        stale = read_encrypted(encrypted_cache_max_stale_seconds)
+        label = "stale ENCRYPTED disk cache"
+    elif cache_ttl_seconds > 0:
+        stale = _STORE.disk.read(cache_key, float("inf"), home_path)
+        label = "stale disk cache"
+    if stale is None:
+        return None
+    age = max(0.0, time.time() - stale.fetched_at)
+    _STORE.memory[cache_key] = stale
+    return stale.secrets, [
+        f"bws live fetch failed ({exc}); falling back to {label} ({int(age)}s old)"
+    ]
 
 
 # --- Binary discovery + lazy install ----------------------------------------
@@ -280,10 +354,10 @@ def _cache_key(
 
 def fetch_bitwarden_secrets(
     *, access_token: str, project_id: str, binary: Optional[Path] = None,
-    cache_ttl_seconds: float = 300, use_cache: bool = True, server_url: str = "",
-    home_path: Optional[Path] = None, encrypted_cache_enabled: bool = False,
-    encrypted_cache_max_stale_seconds: float = 0,
-    key_prefix: str = "", strip_prefix: bool = False,
+    cache_ttl_seconds: float = DEFAULT_BWS_CACHE_TTL_SECONDS, use_cache: bool = True,
+    server_url: str = "", home_path: Optional[Path] = None,
+    encrypted_cache_enabled: bool = False, encrypted_cache_max_stale_seconds: float = 0,
+    key_prefix: str = "", strip_prefix: bool = False, log_bws_calls: bool = False,
 ) -> tuple[dict[str, str], list[str]]:
     """Pull the secrets for ``project_id`` from BSM → ``(secrets, warnings)``.
 
@@ -300,6 +374,7 @@ def fetch_bitwarden_secrets(
     last-good entry may be served after NETWORK/TIMEOUT failures for up to
     ``encrypted_cache_max_stale_seconds`` — independent of the fresh TTL, so
     ``cache_ttl_seconds: 0`` can coexist with a break-glass offline cache.
+    ``log_bws_calls``: DEBUG-log each ``bws`` subprocess with caller/process name (no values).
     Raises ``RuntimeError`` on fatal conditions (missing binary, auth failure,
     unparseable output); env_loader catches, the setup wizard lets it propagate.
     """
@@ -334,27 +409,24 @@ def fetch_bitwarden_secrets(
                            "`hermes secrets bitwarden setup`.")
 
     try:
-        secrets, warnings = _run_bws_list(bws, access_token, project_id, server_url)
+        secrets, warnings = _run_bws_list_with_retries(
+            bws, access_token, project_id, server_url, log_bws_calls=log_bws_calls,
+        )
     except RuntimeError as exc:
-        # Stale fallback ONLY for transport failures — never AUTH_FAILED / INTERNAL,
-        # where old secrets would mask a real problem (without it a fleet sharing
-        # one project all stops on a network blip). With the encrypted cache on it
-        # is the ONLY fallback (at-rest payload must never be plaintext); else the
+        # Stale fallback ONLY for transport/rate-limit failures — never AUTH_FAILED /
+        # INTERNAL, where old secrets would mask a real problem (without it a fleet
+        # sharing one project all stops on a network blip). With the encrypted cache on
+        # it is the ONLY fallback (at-rest payload must never be plaintext); else the
         # plain DiskCache is read with ttl=inf, but only when the real TTL > 0.
-        if use_cache and _classify_bws_error(str(exc)) in (ErrorKind.NETWORK, ErrorKind.TIMEOUT):
-            stale = label = None
-            if encrypted_cache_enabled:
-                stale = _read_encrypted(encrypted_cache_max_stale_seconds)
-                label = "stale ENCRYPTED disk cache"
-            elif cache_ttl_seconds > 0:
-                stale = _STORE.disk.read(cache_key, float("inf"), home_path)
-                label = "stale disk cache"
-            if stale is not None:
-                age = max(0.0, time.time() - stale.fetched_at)
-                _STORE.memory[cache_key] = stale
-                return stale.secrets, [
-                    f"bws live fetch failed ({exc}); falling back to {label} ({int(age)}s old)"
-                ]
+        fallback = _stale_cache_fallback(
+            exc=exc, use_cache=use_cache, cache_key=cache_key,
+            encrypted_cache_enabled=encrypted_cache_enabled,
+            encrypted_cache_max_stale_seconds=encrypted_cache_max_stale_seconds,
+            cache_ttl_seconds=cache_ttl_seconds, home_path=home_path,
+            read_encrypted=_read_encrypted,
+        )
+        if fallback is not None:
+            return fallback
         raise
     secrets, prefix_warnings = select_prefixed_secrets(secrets, prefix, bool(strip_prefix))
     warnings.extend(prefix_warnings)
@@ -384,7 +456,43 @@ def _summarize_bws_stderr(raw: str) -> str:
     return "; ".join(causes) if causes else text
 
 
-def _run_bws_list(bws: Path, access_token: str, project_id: str, server_url: str = "") -> tuple[dict[str, str], list[str]]:
+def _run_bws_list_with_retries(
+    bws: Path, access_token: str, project_id: str, server_url: str = "",
+    *, log_bws_calls: bool = False,
+) -> tuple[dict[str, str], list[str]]:
+    """Invoke ``bws secret list``, retrying rate limits with capped backoff."""
+    last_exc: Optional[RuntimeError] = None
+    slept = 0.0
+    for attempt in range(_BWS_MAX_RETRIES + 1):
+        try:
+            return _run_bws_list(
+                bws, access_token, project_id, server_url, log_bws_calls=log_bws_calls,
+            )
+        except RuntimeError as exc:
+            last_exc = exc
+            if (_classify_bws_error(str(exc)) != ErrorKind.RATE_LIMITED
+                    or attempt >= _BWS_MAX_RETRIES):
+                raise
+            delay = _bws_retry_delay_seconds(attempt, str(exc))
+            remaining = _BWS_RETRY_SLEEP_CAP_SECONDS - slept
+            if remaining <= 0:
+                raise
+            delay = min(delay, remaining)
+            time.sleep(delay)
+            slept += delay
+    assert last_exc is not None
+    raise last_exc
+
+
+def _run_bws_list(
+    bws: Path, access_token: str, project_id: str, server_url: str = "",
+    *, log_bws_calls: bool = False,
+) -> tuple[dict[str, str], list[str]]:
+    if log_bws_calls:
+        logger.debug(
+            "bws secret list caller=%s pid=%s project_id=%s",
+            _bws_caller_label(), os.getpid(), project_id,
+        )
     cmd = [str(bws), "secret", "list", project_id, "--output", "json"]
     # The bws child intentionally receives the access token; a profile-local
     # fetch must not inherit sibling credentials (source_child_env).
@@ -466,8 +574,14 @@ class BitwardenSource(SecretSource):
                 ),
                 "default": False,
             },
-            "cache_ttl_seconds": {"description": "Fresh disk+memory cache TTL; 0 disables fresh-cache reuse",
-                                  "default": 300},
+            "cache_ttl_seconds": {
+                "description": "Fresh disk+memory cache TTL; 0 disables fresh-cache reuse",
+                "default": int(DEFAULT_BWS_CACHE_TTL_SECONDS),
+            },
+            "log_bws_calls": {
+                "description": "DEBUG-log each bws subprocess (caller/process name only)",
+                "default": False,
+            },
             "encrypted_cache": {"description": "Encrypted last-good cache for network/timeout fallback",
                                 "default": {"enabled": False, "max_stale_seconds": 0}},
             "override_existing": {"description": "BSM values overwrite .env/shell values", "default": True},
@@ -503,11 +617,15 @@ class BitwardenSource(SecretSource):
         try:
             secrets, warnings = fetch_bitwarden_secrets(
                 access_token=access_token, project_id=project_id, binary=binary,
-                cache_ttl_seconds=coerce_float(cfg.get("cache_ttl_seconds", 300), 300.0),
+                cache_ttl_seconds=coerce_float(
+                    cfg.get("cache_ttl_seconds", DEFAULT_BWS_CACHE_TTL_SECONDS),
+                    DEFAULT_BWS_CACHE_TTL_SECONDS,
+                ),
                 server_url=str(cfg.get("server_url", "") or "").strip(), home_path=home_path,
                 encrypted_cache_enabled=bool(encrypted_cfg.get("enabled", False)),
                 encrypted_cache_max_stale_seconds=coerce_float(encrypted_cfg.get("max_stale_seconds", 0), 0.0),
                 key_prefix=key_prefix, strip_prefix=strip_prefix,
+                log_bws_calls=bool(cfg.get("log_bws_calls", False)),
             )
         except RuntimeError as exc:
             result.fail(str(exc), _classify_bws_error(str(exc)))

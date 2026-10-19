@@ -2481,8 +2481,8 @@ DEFAULT_CONFIG = {
             "strip_prefix": False,
             # Seconds to reuse a fresh disk/memory cache entry before contacting Bitwarden again. 0
             # disables fresh-cache reuse.
-            "cache_ttl_seconds": 300,
-            # Last-good fallback for NETWORK/TIMEOUT outages: AES-GCM cache under ~/.hermes/cache/,
+            "cache_ttl_seconds": 600,
+            # Last-good fallback for NETWORK/TIMEOUT/RATE_LIMITED outages: AES-GCM cache under ~/.hermes/cache/,
             # reused up to max_stale_seconds. Auth failures never fall back.
             "encrypted_cache": {"enabled": False, "max_stale_seconds": 0},
             # BSM values overwrite existing env vars, so rotating in Bitwarden takes effect without
