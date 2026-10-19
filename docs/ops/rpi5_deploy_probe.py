@@ -14,8 +14,11 @@ committed PM interpreter with ``sys.path`` pointed at one checkout:
 - ``stamp``: ``write_source_stamp``, what ``hermes update`` publishes after a pull.
 - ``imports``: import the gateway's entry modules from a staged release.
 - ``skills-sync``: ``tools.skills_sync.sync_skills`` for ``$HERMES_HOME``.
-- ``venv-python``: the interpreter ``pm.environments`` committed for a checkout.
-  This one runs on the system Python, before a PM interpreter is known.
+- ``venv-python``: the interpreter the gateway runs on: the pinned runtime venv
+  (``pm.pinned_venv``) when one is recorded, else the one ``pm.environments``
+  committed. This one runs on the system Python, before a PM interpreter is known.
+- ``preflight``: run by that interpreter before a restart; it must be the pinned
+  venv and import aiohttp, httpx2, mcp and the served adapters.
 
 Output is one JSON object on stdout. Nothing here prints a credential.
 """
@@ -25,11 +28,18 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 # The modules a gateway process imports before it serves a turn.
 RELEASE_IMPORTS = ("hermes_cli.main", "gateway.run", "run_agent", "model_tools", "cron.scheduler")
+# The adapters rpi5 serves; their SDKs (aiohttp, httpx2, mcp) are pm.pinned_venv.RUNTIME_IMPORTS.
+PREFLIGHT_IMPORTS = (
+    "gateway.run", "gateway.platforms.api_server", "plugins.platforms.line.adapter",
+    "plugins.platforms.email.adapter", "plugins.platforms.telegram.adapter",
+)
 
 
 def _emit(payload: dict) -> int:
@@ -111,12 +121,34 @@ def cmd_skills_sync(args: argparse.Namespace) -> int:
 
 
 def cmd_venv_python(args: argparse.Namespace) -> int:
-    from pm.environments import committed_venv, venv_python
+    from pm.environments import committed_venv, pinned_venv, venv_python
 
-    venv = committed_venv(Path(args.checkout))
+    checkout = Path(args.checkout)
+    venv = pinned_venv(checkout) or committed_venv(checkout)
     python = venv_python(venv) if venv is not None else None
     ok = python is not None and python.is_file()
     return _emit({"ok": ok, "python": str(python) if ok else None})
+
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    """Run by the interpreter the gateway will start on, before any restart."""
+    from pm.environments import pinned_venv, running_from
+    from pm.pinned_venv import RUNTIME_IMPORTS
+
+    pinned = pinned_venv(Path(args.checkout))
+    failed = []
+    if pinned is not None and not running_from(pinned):
+        failed.append(f"interpreter:{sys.prefix}!={pinned}")
+    # The pin lives under the real home; the imports run against a scratch one so they write nothing there.
+    with tempfile.TemporaryDirectory(prefix="rpi5-preflight-home.") as scratch:
+        os.environ["HERMES_HOME"] = scratch
+        for name in (*RUNTIME_IMPORTS, *PREFLIGHT_IMPORTS):
+            try:
+                importlib.import_module(name)
+            except Exception as exc:  # health: allow BLE001 -- any import failure blocks the restart
+                failed.append(f"{name}:{type(exc).__name__}:{exc}")
+    return _emit({"ok": not failed, "failed": failed, "python": sys.executable, "prefix": sys.prefix,
+                  "pinned": str(pinned) if pinned else None})
 
 
 COMMANDS = {
@@ -127,6 +159,7 @@ COMMANDS = {
     "imports": cmd_imports,
     "skills-sync": cmd_skills_sync,
     "venv-python": cmd_venv_python,
+    "preflight": cmd_preflight,
 }
 
 
@@ -139,7 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
     drain.add_argument("state", choices=("on", "off"))
     drain.add_argument("--home", action="append", default=[])
     sub.add_parser("imports").add_argument("--compile", action="append", default=[])
-    for name in ("homes", "stamp", "skills-sync", "venv-python"):
+    for name in ("homes", "stamp", "skills-sync", "venv-python", "preflight"):
         sub.add_parser(name)
     return parser
 

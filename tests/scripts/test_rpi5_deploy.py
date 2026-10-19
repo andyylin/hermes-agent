@@ -275,6 +275,22 @@ def test_a_dependency_change_is_never_applied_unattended(site):
     assert site.host.actions() == []
 
 
+def test_a_failed_runtime_preflight_stops_the_deploy_before_any_unit_stops(site):
+    target = _commit(site.origin, {"gateway/app.py": "VALUE = 2\n"})
+    fake_probe = site.host.probe
+
+    def probe(python, checkout, command, *args, home=None):
+        if command == "preflight":
+            raise eng.DeployError("probe preflight failed: aiohttp: ModuleNotFoundError")
+        return fake_probe(python, checkout, command, *args, home=home)
+
+    site.host.probe = probe
+
+    assert _deploy(site, target).outcome != "deployed"
+    assert site.host.actions() == []
+    assert site.head() == site.base
+
+
 def test_a_newer_merge_supersedes_one_still_waiting_for_idle(site):
     first = _commit(site.origin, {"gateway/app.py": "VALUE = 2\n"})
     second = _commit(site.origin, {"gateway/app.py": "VALUE = 3\n"})

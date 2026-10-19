@@ -66,9 +66,23 @@ case "$probe" in
   *) echo "refusing: Hermes import did not resolve from $source_dir: $probe" >&2; exit 2 ;;
 esac
 
+venv_dir=$(dirname "$(dirname "$python_path")")
+test -f "$venv_dir/pyvenv.cfg" || { echo "refusing: $python_path is not a venv interpreter" >&2; exit 2; }
+
+# The pre-restart check: this interpreter imports aiohttp, httpx2, mcp and the served adapters.
+preflight() {
+  env -u PYTHONPATH HERMES_HOME=/home/pi/.hermes PYTHONDONTWRITEBYTECODE=1 \
+    "$python_path" -I "$source_dir/docs/ops/rpi5_deploy_probe.py" --checkout "$source_dir" preflight
+}
+preflight_out=$(preflight) || {
+  echo "refusing: $python_path failed the runtime preflight: $preflight_out" >&2
+  echo "run \`$python_path -m hermes_cli.main pm install\` and re-run" >&2
+  exit 2
+}
+
 path="$(dirname "$python_path"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-stage=$(mktemp -d /tmp/hermes-runtime-normalize.XXXXXX)
+stage=$(mktemp -d -t hermes-runtime-normalize.XXXXXX)
 trap 'rm -rf "$stage"' EXIT
 
 emit_gateway() {
@@ -119,6 +133,7 @@ for unit in \
   echo "$unit source=$source_dir interpreter=$python_path resolved_interpreter=$python_real sha=$sha"
 done
 echo "probe=$probe"
+echo "preflight=$preflight_out"
 
 if [ "$write" != true ]; then
   echo "dry-run only; pass --write to install the normalized definitions"
@@ -167,6 +182,15 @@ if ! sudo systemd-analyze verify \
   sudo systemctl daemon-reload
   exit 1
 fi
+
+# Record the venv as this checkout's runtime (pm.pinned_venv): the launcher stops re-execing onto
+# PM's store Python, and `hermes pm install` / `hermes update` sync uv.lock into this venv.
+env -u PYTHONPATH PYTHONPATH="$source_dir" HERMES_HOME=/home/pi/.hermes PYTHONNOUSERSITE=1 \
+  PYTHONDONTWRITEBYTECODE=1 "$python_path" -m pm.pinned_venv --checkout "$source_dir" pin "$venv_dir"
+preflight_out=$(preflight) || {
+  echo "pinned $venv_dir but the preflight now fails: $preflight_out" >&2
+  exit 1
+}
 
 echo "installed normalized definitions; archived superseded runtime drop-ins with stamp $stamp"
 echo "running processes are unchanged"

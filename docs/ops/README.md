@@ -192,7 +192,13 @@ update the secret.
   today.
 - A dependency change (`pyproject.toml`, `uv.lock`, `pm/lock.json`) is left
   for the exceptional lane: `hermes pm install` plus a staged activation.
-  The next push after that deploys normally.
+  The next push after that deploys normally. Run it as
+  `/home/pi/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main pm install`
+  so it syncs the pinned runtime venv (`pm.pinned_venv`), then check that
+  interpreter before any restart:
+  `/home/pi/.hermes/hermes-agent/venv/bin/python -I docs/ops/rpi5_deploy_probe.py --checkout /home/pi/.hermes/hermes-agent preflight`
+  must print `"ok": true`. Every deploy runs the same check before it stops a
+  unit.
 - The web dashboard bundle (`hermes_cli/web_dist`) is gitignored, and
   `hermes dashboard` rebuilds it on launch. The rpi5 WebUI is the separate
   hermex app.
