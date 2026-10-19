@@ -22,13 +22,18 @@ TOKEN = "0.machine-token-never-printed"
 SECRET = "line-secret-never-printed"
 
 
-def _home(tmp_path: Path, name: str, *, bitwarden: bool = True) -> Path:
+RATE_LIMITED = 'echo "Error: 0: [429 Too Many Requests]" >&2\nexit 1\n'
+
+
+def _home(tmp_path: Path, name: str, *, bitwarden: bool = True, encrypted_cache: bool = False) -> Path:
     home = tmp_path / name
     home.mkdir()
     if bitwarden:
+        cache = "    encrypted_cache:\n      enabled: true\n      max_stale_seconds: 604800\n"
         (home / "config.yaml").write_text(
             "secrets:\n  bitwarden:\n    enabled: true\n    project_id: proj-1\n"
-            "    auto_install: false\n    cache_ttl_seconds: 0\n", encoding="utf-8")
+            "    auto_install: false\n    cache_ttl_seconds: 0\n" + (cache if encrypted_cache else ""),
+            encoding="utf-8")
         (home / ".env").write_text(f"BWS_ACCESS_TOKEN={TOKEN}\n", encoding="utf-8")
     return home
 
@@ -71,17 +76,34 @@ def test_an_interpreter_without_the_runtime_packages_fails_the_preflight(tmp_pat
                                  "mcp:ModuleNotFoundError"]
 
 
-def test_a_bws_429_fails_the_preflight_without_printing_the_token(tmp_path):
-    bin_dir = _fake_bws(tmp_path, 'echo "Error: 0: [429 Too Many Requests]" >&2\nexit 1\n')
-    home = _home(tmp_path, "default")
+def test_a_bws_429_without_an_encrypted_cache_fails_the_preflight_without_printing_the_token(tmp_path):
+    bin_dir = _fake_bws(tmp_path, RATE_LIMITED)
+    home = _home(tmp_path, "default", encrypted_cache=True)
 
     code, payload, output = _preflight(tmp_path, home, bin_dir=bin_dir)
 
     assert code == 1 and payload["ok"] is False
-    assert payload["failed"] == [f"secrets:{home}:internal"]
+    assert payload["failed"] == [f"secrets:{home}:rate_limited"]
     (entry,) = payload["secrets"]
     assert entry["secrets"] == 0 and "429" in entry["error"]
+    assert entry["encrypted_cache_present"] is False
     assert TOKEN not in output
+
+
+def test_a_bws_429_is_served_from_a_valid_encrypted_cache(tmp_path):
+    listing = json.dumps([{"key": "LINE_CHANNEL_SECRET", "value": SECRET}])
+    bin_dir = _fake_bws(tmp_path, f"cat <<'EOF'\n{listing}\nEOF\n")
+    home = _home(tmp_path, "default", encrypted_cache=True)
+    code, payload, _ = _preflight(tmp_path, home, bin_dir=bin_dir)
+    assert code == 0 and payload["secrets"][0]["encrypted_cache_present"] is True, payload
+    (bin_dir / "bws").write_text("#!/bin/sh\n" + RATE_LIMITED, encoding="utf-8")
+
+    code, payload, output = _preflight(tmp_path, home, bin_dir=bin_dir)
+
+    assert code == 0 and payload["ok"] is True and payload["failed"] == [], payload
+    (entry,) = payload["secrets"]
+    assert entry["secrets"] == 1 and entry["stale_cache"] is True
+    assert SECRET not in output and TOKEN not in output
 
 
 def test_resolved_secrets_are_counted_never_printed(tmp_path):
