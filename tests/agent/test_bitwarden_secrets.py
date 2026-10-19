@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from agent.secret_sources import bitwarden as bw
+from agent.secret_sources.base import ErrorKind
 
 
 @pytest.fixture(autouse=True)
@@ -377,6 +378,156 @@ def test_stale_disk_cache_returned_when_bws_fails(monkeypatch, tmp_path):
 
 
 
+_BWS_429_STDERR = (
+    "Error: 429 Too Many Requests: Slow down! You are sending requests too quickly. "
+    "Try again in 1s."
+)
+
+
+def test_429_falls_back_to_encrypted_cache(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    calls = {"n": 0}
+
+    def fake_run(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return mock.Mock(
+                returncode=0,
+                stdout=_fake_bws_payload([{"key": "K1", "value": "cached"}]),
+                stderr="",
+            )
+        return mock.Mock(returncode=1, stdout="", stderr=_BWS_429_STDERR)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    bw._reset_cache_for_tests(home)
+
+    first, _ = bw.fetch_bitwarden_secrets(
+        access_token="0.t", project_id="proj-1", binary=fake_binary,
+        cache_ttl_seconds=0, encrypted_cache_enabled=True,
+        encrypted_cache_max_stale_seconds=604800, home_path=home,
+    )
+    assert first == {"K1": "cached"}
+    bw._CACHE.clear()
+
+    second, warnings = bw.fetch_bitwarden_secrets(
+        access_token="0.t", project_id="proj-1", binary=fake_binary,
+        cache_ttl_seconds=0, encrypted_cache_enabled=True,
+        encrypted_cache_max_stale_seconds=604800, home_path=home,
+    )
+    assert second == {"K1": "cached"}
+    # One live fetch, then initial 429 plus three rate-limit retries before cache fallback.
+    assert calls["n"] == 5
+    assert len(warnings) == 1
+    assert "stale ENCRYPTED disk cache" in warnings[0]
+
+
+def test_429_recovers_on_retry(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([{"key": "K1", "value": "live"}])
+    calls = {"n": 0}
+    sleeps = []
+
+    def fake_run(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return mock.Mock(returncode=1, stdout="", stderr=_BWS_429_STDERR)
+        return mock.Mock(returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+    bw._reset_cache_for_tests(home)
+
+    secrets, warnings = bw.fetch_bitwarden_secrets(
+        access_token="0.t", project_id="proj-1", binary=fake_binary,
+        use_cache=False, home_path=home,
+    )
+    assert secrets == {"K1": "live"}
+    assert warnings == []
+    assert calls["n"] == 2
+    assert sleeps and sum(sleeps) <= bw._BWS_RETRY_SLEEP_CAP_SECONDS + 0.01
+
+
+def test_429_without_cache_raises_clearly(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **kw: mock.Mock(returncode=1, stdout="", stderr=_BWS_429_STDERR),
+    )
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    bw._reset_cache_for_tests(home)
+
+    with pytest.raises(RuntimeError, match="429"):
+        bw.fetch_bitwarden_secrets(
+            access_token="0.t", project_id="proj-1", binary=fake_binary,
+            cache_ttl_seconds=0, use_cache=True, home_path=home,
+        )
+
+
+def test_encrypted_cache_older_than_max_stale_not_used_on_429(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    cache_key = bw._cache_key("0.t", "proj-1", "", "", False)
+    bw._write_encrypted_disk_cache(
+        cache_key=cache_key, access_token="0.t",
+        entry=bw._CachedFetch(secrets={"K1": "stale"}, fetched_at=time.time() - 7200),
+        home_path=home,
+    )
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **kw: mock.Mock(returncode=1, stdout="", stderr=_BWS_429_STDERR),
+    )
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    bw._reset_cache_for_tests(home)
+
+    with pytest.raises(RuntimeError, match="429"):
+        bw.fetch_bitwarden_secrets(
+            access_token="0.t", project_id="proj-1", binary=fake_binary,
+            cache_ttl_seconds=0, encrypted_cache_enabled=True,
+            encrypted_cache_max_stale_seconds=3600, home_path=home,
+        )
+
+
+def test_bws_rate_limit_retries_stay_within_sleep_cap(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    sleeps = []
+
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **kw: mock.Mock(
+            returncode=1, stdout="",
+            stderr="429 Too Many Requests; Try again in 8s.",
+        ),
+    )
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+    bw._reset_cache_for_tests(home)
+
+    with pytest.raises(RuntimeError, match="429"):
+        bw.fetch_bitwarden_secrets(
+            access_token="0.t", project_id="proj-1", binary=fake_binary,
+            use_cache=False, home_path=home,
+        )
+    assert sum(sleeps) <= bw._BWS_RETRY_SLEEP_CAP_SECONDS + 0.01
+
+
+def test_classify_bws_429_as_rate_limited():
+    assert bw._classify_bws_error(_BWS_429_STDERR) == ErrorKind.RATE_LIMITED
+
+
 def test_stale_fallback_skipped_on_auth_failure(monkeypatch, tmp_path):
     """An AUTH_FAILED bws error must raise, not serve stale secrets — a bad
     access token indicates a real credential problem the caller needs to
@@ -472,6 +623,8 @@ def test_prefix_defaults_leave_the_whole_project_loaded():
     section = DEFAULT_CONFIG["secrets"]["bitwarden"]
     assert schema["key_prefix"]["default"] == ""
     assert schema["strip_prefix"]["default"] is False
+    assert schema["cache_ttl_seconds"]["default"] == int(bw.DEFAULT_BWS_CACHE_TTL_SECONDS)
+    assert section["cache_ttl_seconds"] == int(bw.DEFAULT_BWS_CACHE_TTL_SECONDS)
     assert section["key_prefix"] == ""
     assert section["strip_prefix"] is False
 

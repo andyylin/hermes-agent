@@ -215,7 +215,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
     for w in warnings:
         console.print(f"  [yellow]warning:[/yellow] {w}")
     secrets_cfg.update(enabled=True, project_id=project_id, server_url=server_url)
-    for key, default in (("access_token_env", token_env), ("cache_ttl_seconds", 300),
+    for key, default in (("access_token_env", token_env),
+                         ("cache_ttl_seconds", int(bw.DEFAULT_BWS_CACHE_TTL_SECONDS)),
                          ("override_existing", True), ("auto_install", True)):
         secrets_cfg.setdefault(key, default)
     save_config(cfg)
@@ -263,7 +264,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         ("Strip prefix", _yn(strip_prefix)),
         ("Server URL", server_url or "[dim]default (US Cloud, https://vault.bitwarden.com)[/dim]"),
         ("Override existing", _yn(bool(bw_cfg.get("override_existing", False)))),
-        ("Cache TTL (s)", str(bw_cfg.get("cache_ttl_seconds", 300))),
+        ("Cache TTL (s)", str(bw_cfg.get("cache_ttl_seconds", bw.DEFAULT_BWS_CACHE_TTL_SECONDS))),
         ("Auto-install", _yn(bool(bw_cfg.get("auto_install", True)))),
         ("bws binary", f"{binary} ({_bws_version(binary)})" if binary else "[yellow]not installed[/yellow]"),
     ))
