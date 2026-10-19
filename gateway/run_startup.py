@@ -1347,22 +1347,6 @@ class GatewayStartupMixin:
                 )
         return connected_count
 
-    def _start_refuse_unprovisioned_runtime(self) -> bool:
-        """Exit 78 when a pinned runtime venv cannot serve the enabled platforms (``runtime_dependency_guard``)."""
-        from gateway.run import _platform_has_bot_credential
-        from gateway.runtime_dependency_guard import pinned_runtime_failures
-        multiplex = self._multiplex_on()
-        failures = pinned_runtime_failures(
-            self.config.platforms,
-            served=lambda platform, config: not multiplex or _platform_has_bot_credential(platform, config),
-        )
-        if not failures:
-            return False
-        reason = "pinned runtime venv cannot serve this gateway: " + "; ".join(failures)
-        logger.critical("Refusing to start: %s. Run `hermes pm install` with the pinned venv, then restart.", reason)
-        self._startup_fail_fatal_config(reason)
-        return True
-
     def _startup_fail_fatal_config(self, reason: str) -> None:
         """Record a fatal-config startup failure (exit 78) and request a clean exit."""
         from gateway.run import _write_runtime_status_quiet
@@ -1631,8 +1615,6 @@ class GatewayStartupMixin:
         if await self._abort_startup_if_shutdown_requested():
             return True
         if self._start_check_access_policy():
-            return True
-        if self._start_refuse_unprovisioned_runtime():
             return True
         await self._start_recover_previous_run()
         # Serialize startup restore against inbound: adapters receive as soon as they connect, so inbound
