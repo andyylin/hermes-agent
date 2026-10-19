@@ -365,6 +365,12 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
             or not (root / ".git").exists()
             or not (root / "pyproject.toml").is_file()):
         return None
+    from pm.environments import pinned_venv, running_from, venv_python
+
+    pinned = pinned_venv(root)
+    if pinned is not None:
+        # The services run on this venv: never adopt, sync or re-exec onto PM's store Python.
+        return None if running_from(pinned) else venv_python(pinned)
     stamp = read_install_stamp(root)
     if not stamp:
         from hermes_cli.post_update import step_adopt_blessed_checkout

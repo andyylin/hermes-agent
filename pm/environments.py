@@ -318,6 +318,40 @@ def _recorded_venv(project_root: Path) -> Path | None:
     return environment
 
 
+def pin_record_path(project_root: Path) -> Path:
+    return install_state_dir(project_root) / "pinned-venv.json"
+
+
+def pinned_venv(project_root: Path | str) -> Path | None:
+    """The operator-pinned runtime venv (``pm.pinned_venv``), ``None`` when nothing is pinned.
+    A broken record raises: a pinned host must not quietly fall back to PM's store Python."""
+    path = pin_record_path(Path(project_root))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"cannot read pinned runtime venv record: {path}") from exc
+    value = data.get("venv") if isinstance(data, dict) else None
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        raise RuntimeError(f"invalid pinned runtime venv record: {path}")
+    venv = Path(value)
+    if not (venv / "pyvenv.cfg").is_file() or not venv_python(venv).is_file():
+        raise RuntimeError(f"pinned runtime venv is missing: {venv} (recorded in {path})")
+    return venv
+
+
+def running_from(venv: Path) -> bool:
+    """Does this process run on *venv*'s interpreter? ``sys.prefix`` names the venv a
+    symlinked interpreter was started through; ``sys.executable`` may already be resolved."""
+    import sys
+
+    try:
+        return Path(sys.prefix).resolve() == Path(venv).resolve()
+    except OSError:
+        return False
+
+
 def venv_bin_dir(venv: Path, *, windows: bool | None = None) -> Path:
     """``Scripts`` on Windows, ``bin`` elsewhere. Returned unconditionally — callers
     differ on whether a missing venv is an error. *windows* lets a POSIX process
@@ -460,6 +494,9 @@ def activate_dependencies(project_root: Path | str) -> None:
     import sys
 
     project_root = Path(project_root)
+    pinned = pinned_venv(project_root)
+    if pinned is not None and running_from(pinned):
+        return  # The pinned venv's own site-packages are this install's dependency set.
     state = install_state_dir(project_root)
     if state.is_dir():
         from hermes_cli.runtime_state import runtime_lock, recover_publication, lease_generation
