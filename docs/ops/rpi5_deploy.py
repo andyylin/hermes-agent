@@ -15,12 +15,14 @@ Usage (the installer renders these into systemd units):
   rpi5_deploy.py drift --home H [--fetch]        # exit 1 on drift (hermes-deploy-drift.timer)
   rpi5_deploy.py status --home H                 # state.json summary
   rpi5_deploy.py reconcile --home H              # record runtime_sha when live matches deployed
+  rpi5_deploy.py record --home H --sha SHA [--dry-run]   # record a hand-deployed SHA once live and healthy
   rpi5_deploy.py notify --url U --sha S --repository R --ref REF   # CI; key in RPI5_DEPLOY_HMAC_KEY
   rpi5_deploy.py init --home H --checkout C      # deploy dir, key, config, state (never overwrites)
   rpi5_deploy.py render-install --home H --checkout C --user U --uid N --out DIR
   rpi5_deploy.py self-test --home H              # can this copy serve? (before a self-restart)
 
-Exit codes: 0 ok; 1 drift, rejected notify, or failed self-test; 2 usage or configuration error.
+Exit codes: 0 ok; 1 drift, rejected notify, failed self-test, or failed record check;
+2 usage or configuration error, or record refused because a deploy is in flight.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import stat
 import subprocess
 import sys
@@ -381,6 +384,55 @@ def cmd_reconcile(config: DeployConfig, *, host: Optional[Host] = None) -> int:
     return 0
 
 
+def record_problems(deployer: Deployer, sha: str) -> list[str]:
+    """Why *sha* cannot be recorded as deployed and running: live tree, units, ``/health``, gateway code_sha."""
+    try:
+        problems = live_tree_problems(deployer.host, deployer.config, sha)
+        if not problems and not deployer._health_once(deployer._pm_python(), sha):
+            problems.append(f"health check failed: units, {deployer.config.health_url} or gateways not serving {sha}")
+    except DeployError as exc:
+        problems = [str(exc)]
+    return problems
+
+
+def backup_state(store: StateStore) -> Path:
+    backup = store.path.with_name(f"{store.path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    if backup.exists():
+        raise DeployError(f"{backup} already exists")
+    shutil.copy2(store.path, backup)
+    return backup
+
+
+def cmd_record(config: DeployConfig, *, sha: str, dry_run: bool = False, host: Optional[Host] = None) -> int:
+    """Record a hand-deployed *sha* as ``deployed_sha`` and ``runtime_sha`` once it is live and healthy."""
+    if not _SHA.match(sha):
+        print(f"record: {sha!r} is not a 40-hex sha", file=sys.stderr)
+        return 2
+    store = StateStore(config.deploy_dir)
+    if not store.path.is_file():
+        print(f"record: {store.path} does not exist; run init", file=sys.stderr)
+        return 2
+    with deploy_lock(config.deploy_dir, wait=False) as acquired:
+        state = store.load()
+        if not acquired or state.phase != "idle" or state.pending_sha:
+            print(f"record: refused, deploy in flight (phase={state.phase}, pending_sha={state.pending_sha})",
+                  file=sys.stderr)
+            return 2
+        problems = record_problems(Deployer(config, host or Host(config), store), sha)
+        for problem in problems:
+            print(f"record: {problem}", file=sys.stderr)
+        if problems:
+            return 1
+        if dry_run:
+            print(f"dry run: would back up {store.path} and record deployed_sha/runtime_sha {sha}")
+            return 0
+        backup = backup_state(store)
+        store.update(deployed_sha=sha, runtime_sha=sha, last_result={})
+    print(f"backed up {backup}")
+    print(f"recorded deployed_sha and runtime_sha {sha}")
+    return 0
+
+
 def cmd_self_test(config: DeployConfig) -> int:
     load_key(config)
     StateStore(config.deploy_dir).load()
@@ -391,12 +443,15 @@ def cmd_self_test(config: DeployConfig) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("serve", "drift", "status", "reconcile", "init", "render-install", "self-test"):
+    for name in ("serve", "drift", "status", "reconcile", "record", "init", "render-install", "self-test"):
         cmd = sub.add_parser(name)
         cmd.add_argument("--home", required=True, type=Path, help="default Hermes home on the host")
         cmd.add_argument("--checkout", type=Path, help="live checkout (default: config.json, then <home>/hermes-agent)")
         if name == "drift":
             cmd.add_argument("--fetch", action="store_true", help="also alert when origin is ahead")
+        if name == "record":
+            cmd.add_argument("--sha", required=True, help="40-hex SHA the live checkout is on")
+            cmd.add_argument("--dry-run", action="store_true", help="run the checks; change nothing")
         if name == "render-install":
             cmd.add_argument("--user", required=True)
             cmd.add_argument("--uid", required=True, type=int)
@@ -423,6 +478,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "drift": lambda: cmd_drift(config, fetch=args.fetch),
             "status": lambda: cmd_status(config),
             "reconcile": lambda: cmd_reconcile(config),
+            "record": lambda: cmd_record(config, sha=args.sha, dry_run=args.dry_run),
             "init": lambda: cmd_init(config),
             "render-install": lambda: cmd_render_install(config, user=args.user, uid=args.uid, out=args.out),
             "self-test": lambda: cmd_self_test(config),

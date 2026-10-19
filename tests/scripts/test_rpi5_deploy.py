@@ -601,3 +601,84 @@ def test_the_probe_lists_every_profile_home_hermes_knows(tmp_path):
     homes = _probe(tmp_path, "homes")["homes"]
 
     assert [Path(h).resolve() for h in homes] == [tmp_path.resolve(), wife.resolve()]
+
+
+def _hand_deploy(site) -> str:
+    """Fast-forward the live checkout outside the listener, as a manual redeploy does."""
+    target = _commit(site.origin, {"gateway/app.py": "VALUE = 2\n"})
+    _git(site.config.checkout, "pull", "-q", "--ff-only")
+    site.host.running_sha = target
+    site.store.update(previous_sha="p" * 40, failed_shas=["f" * 40], reinstall_needed=True,
+                      last_result={"outcome": "rolled_back", "sha": "f" * 40})
+    return target
+
+
+def _backups(site) -> list[Path]:
+    return sorted(site.config.deploy_dir.glob("state.json.bak-*"))
+
+
+def test_record_writes_the_live_healthy_sha_after_a_backup(site, capsys):
+    target = _hand_deploy(site)
+    before = site.store.path.read_text(encoding="utf-8")
+
+    assert rd.cmd_record(site.config, sha=target, host=site.host) == 0
+
+    (backup,) = _backups(site)
+    assert backup.read_text(encoding="utf-8") == before
+    state = site.store.load()
+    assert (state.deployed_sha, state.runtime_sha, state.last_result) == (target, target, {})
+    assert (state.previous_sha, state.failed_shas, state.reinstall_needed) == ("p" * 40, ["f" * 40], True)
+    assert (state.phase, state.pending_sha) == ("idle", None)
+    assert rd.cmd_drift(site.config, fetch=False, host=site.host) == 1  # reinstall_needed is kept
+    assert "recorded" in capsys.readouterr().out
+
+
+def test_record_refuses_when_live_head_is_not_the_sha(site):
+    target = _hand_deploy(site)
+    _git(site.config.checkout, "reset", "-q", "--hard", site.base)
+    before = site.store.path.read_bytes()
+
+    assert rd.cmd_record(site.config, sha=target, host=site.host) == 1
+    assert site.store.path.read_bytes() == before
+    assert _backups(site) == []
+
+
+def test_record_refuses_a_dirty_live_tree(site):
+    target = _hand_deploy(site)
+    (site.config.checkout / "gateway" / "app.py").write_text("VALUE = 99\n", encoding="utf-8")
+    before = site.store.path.read_bytes()
+
+    assert rd.cmd_record(site.config, sha=target, host=site.host) == 1
+    assert site.store.path.read_bytes() == before
+
+
+def test_record_refuses_when_health_fails(site):
+    target = _hand_deploy(site)
+    site.host.bad_health = {target}
+    before = site.store.path.read_bytes()
+
+    assert rd.cmd_record(site.config, sha=target, host=site.host) == 1
+    assert site.store.path.read_bytes() == before
+    assert _backups(site) == []
+
+
+@pytest.mark.parametrize("fields", [{"phase": "draining"}, {"pending_sha": "a" * 40}])
+def test_record_refuses_while_a_deploy_is_in_flight(site, fields):
+    target = _hand_deploy(site)
+    site.store.update(**fields)
+    before = site.store.path.read_bytes()
+
+    assert rd.cmd_record(site.config, sha=target, host=site.host) == 2
+    assert site.store.path.read_bytes() == before
+    assert _backups(site) == []
+
+
+def test_record_dry_run_checks_but_changes_nothing(site):
+    target = _hand_deploy(site)
+    before = site.store.path.read_bytes()
+
+    assert rd.cmd_record(site.config, sha=target, dry_run=True, host=site.host) == 0
+    assert site.store.path.read_bytes() == before
+    assert _backups(site) == []
+    site.host.bad_health = {target}
+    assert rd.cmd_record(site.config, sha=target, dry_run=True, host=site.host) == 1
