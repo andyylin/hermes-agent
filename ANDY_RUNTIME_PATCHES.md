@@ -21,14 +21,14 @@ only for `>=3.14`). `hermes_bootstrap` calls
 `$HERMES_HOME/hermes-agent` is adopted by
 `hermes_cli.post_update.step_adopt_blessed_checkout` with
 `updateMechanism=self`, and the next launch can build a PM environment and
-`execv` into the store Python. That is what broke Default on 2026-10-19: a
-manual `hermes pm install` (httpx2 2.12.0) committed a PM generation, and the
-restarted gateway re-exec'd onto bare system Python 3.14.7 (`-I`) without
-aiohttp, so LINE, Email and the `:8642` API server never came up. KEEP 9 pins
-the venv KEEP 6's units `ExecStart`, so neither the launcher nor activation
-nor `hermes pm install` can move a service off it.
-`HERMES_DISABLE_LAZY_INSTALLS=1` alone was never enough: it does not undo a
-stamp or a committed PM generation written by an earlier unguarded launch.
+`execv` into the store Python. No KEEP file edits `hermes_bootstrap.py`,
+`venv_sync.py`, or `post_update.py`. KEEP 6's pin script still
+`ExecStart`s the shared venv via `python -m hermes_cli.main`, and that entry
+imports `hermes_bootstrap`. `HERMES_DISABLE_LAZY_INSTALLS=1` makes
+`prepare_launch` return before adoption and before `execv`. With no PM
+install state, `pm.environments.activate_dependencies` then keeps a real venv
+(`sys.prefix != sys.base_prefix`). The variable does not undo a stamp or a
+committed PM generation written by an earlier unguarded launch.
 
 Cron memory: take official `skip_memory=False` from this tag. Do not replay
 `fc9cbc87` (skip MEMORY.md in scheduled jobs). Per-job toolset denylist still
@@ -68,9 +68,6 @@ not `gateway.multiplex_profiles`. Shared-process multiplexing stays retired.
 6. **House runtime pin/refresh scripts** — `scripts/maintenance/refresh_andy_runtime.sh`
    and `scripts/maintenance/pin-shared-hermes-runtime.sh`. Ops, not product.
    They keep source SHA and the SQLite-safe interpreter separate.
-   `pin-shared-hermes-runtime.sh` refuses an interpreter that fails the runtime
-   preflight (KEEP 9) and, with `--write`, records that venv as the pinned
-   runtime venv.
 7. **Mattermost `delete_message`** — official `cleanup_progress` only honors
    adapters that override `delete_message` (Telegram/Discord). Joi Mattermost
    posts thinking/tool bubbles, then deletes them after a successful final
@@ -92,19 +89,6 @@ not `gateway.multiplex_profiles`. Shared-process multiplexing stays retired.
    checks `normalized[:SKILL_PROMPT_DESC_LIMIT]`. `notes` and `knot` do not
    count. Edits and patches of existing skills are not checked. Official
    has no exclusion requirement.
-9. **Pinned runtime venv** — `pm/pinned_venv.py` plus the read side in
-   `pm/environments.py` (`pinned_venv`, `running_from`). The record is
-   `$HERMES_HOME/installs/<key>/pinned-venv.json`, shared by every profile.
-   While it exists, `prepare_launch` re-execs onto the pinned venv (never PM's
-   store Python), `activate_dependencies` keeps that venv's own site-packages,
-   and `hermes pm install` / `hermes update` sync `uv.lock` into that venv
-   (additive `uv pip install`, then an import check of aiohttp, httpx2, mcp)
-   instead of committing a generation. Plugin dependency members are refused
-   there. `gateway/runtime_dependency_guard.py` makes a pinned gateway exit 78
-   with one critical log line when it runs on another interpreter, cannot
-   import those SDKs, or an enabled platform fails its requirement check. The
-   deploy probe's `preflight` command is the pre-restart check. Official
-   assumes PM's store Python owns the runtime.
 
 ## UPSTREAM-NOW — do not keep as a fork reason
 
