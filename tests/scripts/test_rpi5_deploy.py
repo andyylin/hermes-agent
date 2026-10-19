@@ -69,6 +69,7 @@ class FakeHost(eng.Host):
         self.unit_enter_monotonic: dict[str, float] = {"hermes-gateway.service": 0.0}
         self.restart_failures: set[str] = set()
         self.inactive_after_restart: set[str] = set()
+        self.failing_launcher_probes: set[str] = set()
 
     def _is_gateway(self, unit: eng.Unit) -> bool:
         return unit.name == "hermes-gateway.service"
@@ -88,6 +89,12 @@ class FakeHost(eng.Host):
         if command == "drain":
             self.draining = args[0] == "on"
             self.drain_count += self.draining
+        return {"ok": True}
+
+    def launcher_probe(self, checkout, command, *args, home=None):
+        self.events.append(("launcher", command, *args))
+        if command in self.failing_launcher_probes:
+            raise eng.DeployError(f"probe {command} failed: secrets:{self.config.home}:internal")
         return {"ok": True}
 
     def systemctl(self, action, unit):
@@ -273,6 +280,18 @@ def test_a_dependency_change_is_never_applied_unattended(site):
     assert result.outcome == "needs_manual"
     assert site.head() == site.base
     assert site.host.actions() == []
+
+
+def test_the_preflight_covers_every_home_and_a_failure_stops_the_deploy_before_any_unit_stops(site):
+    target = _commit(site.origin, {"gateway/app.py": "VALUE = 2\n"})
+    site.host.failing_launcher_probes.add("preflight")
+
+    assert _deploy(site, target).outcome != "deployed"
+
+    assert ("launcher", "preflight", "--home", str(site.config.home)) in site.host.events
+    assert site.host.actions() == []
+    assert not site.host.drain_count
+    assert site.head() == site.base
 
 
 def test_a_newer_merge_supersedes_one_still_waiting_for_idle(site):

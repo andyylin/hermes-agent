@@ -10,6 +10,9 @@ previous SHA, whose worktree is kept.
 
 Order of a restart deploy:
 
+0. Stage and import-check the release, then run the probe's ``preflight``
+   through the live checkout's launcher. A failure ends the deploy before
+   anything is drained or stopped.
 1. Wait until every live gateway reports ``active_agents == 0`` while serving,
    continuously for ``idle_settle_seconds``. Nothing is drained yet.
 2. Write the drain marker (``suppress_notification``). New turns are refused,
@@ -44,6 +47,7 @@ from typing import Any, Iterator, Optional
 log = logging.getLogger("rpi5-deploy")
 
 PROBE = Path(__file__).resolve().with_name("rpi5_deploy_probe.py")
+PROBE_MODULE = "docs.ops.rpi5_deploy_probe"
 SYSTEMCTL = "/usr/bin/systemctl"
 
 # Same files as pm.environments.ACTIVATION_INPUTS. A change to any of them is
@@ -223,6 +227,24 @@ def deploy_lock(deploy_dir: Path, *, wait: bool) -> Iterator[bool]:
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+def _probe_env(home: Optional[Path]) -> dict[str, str]:
+    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
+           "HOME": os.environ.get("HOME", str(Path.home()))}
+    if home is not None:
+        env["HERMES_HOME"] = str(home)
+    return env
+
+
+def _probe_payload(command: str, done: subprocess.CompletedProcess) -> dict[str, Any]:
+    try:
+        payload = json.loads(done.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        payload = {"ok": False}
+    if done.returncode != 0 or not payload.get("ok", False):
+        raise DeployError(f"probe {command} failed: {payload or done.stderr.strip()[-400:]}")
+    return payload
+
+
 class Host:
     """Every side effect outside git. Tests replace systemctl, health, probe, sleep and the clock."""
 
@@ -242,18 +264,17 @@ class Host:
 
     def probe(self, python: str, checkout: Path, command: str, *args: str,
               home: Optional[Path] = None) -> dict[str, Any]:
-        env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
-               "HOME": os.environ.get("HOME", str(Path.home()))}
-        if home is not None:
-            env["HERMES_HOME"] = str(home)
-        done = self.run([python, "-I", str(PROBE), "--checkout", str(checkout), command, *args], env=env)
-        try:
-            payload = json.loads(done.stdout.strip().splitlines()[-1])
-        except (IndexError, ValueError):
-            payload = {"ok": False}
-        if done.returncode != 0 or not payload.get("ok", False):
-            raise DeployError(f"probe {command} failed: {payload or done.stderr.strip()[-400:]}")
-        return payload
+        done = self.run([python, "-I", str(PROBE), "--checkout", str(checkout), command, *args],
+                        env=_probe_env(home))
+        return _probe_payload(command, done)
+
+    def launcher_probe(self, checkout: Path, command: str, *args: str,
+                       home: Optional[Path] = None) -> dict[str, Any]:
+        """Run the probe through the checkout's own launcher: the runtime a restarted unit gets."""
+        launcher = checkout / ".hermes" / "bin" / "hermes"
+        done = self.run([str(launcher), "--run-module", PROBE_MODULE, "--checkout", str(checkout), command, *args],
+                        env=_probe_env(home))
+        return _probe_payload(command, done)
 
     def _systemctl_argv(self, action: str, unit: Unit) -> list[str]:
         if unit.scope == "user":
@@ -468,6 +489,10 @@ class Deployer:
         with tempfile.TemporaryDirectory(prefix="rpi5-deploy-home.") as scratch:
             args = [arg for path in compiled for arg in ("--compile", str(release / path))]
             self.host.probe(python, release, "imports", *args, home=Path(scratch))
+        # Before any unit stops: the launcher's runtime imports the served stack and every home's
+        # Bitwarden secrets resolve (a BWS outage or 429 at startup leaves a gateway without them).
+        homes = self.hermes_homes(python)
+        self.host.launcher_probe(self.config.checkout, "preflight", *_homes_args(homes), home=self.config.home)
         return release
 
     def _quiesce(self, python: str, *, target: Optional[str], strict: bool = True) -> Optional[list[Path]]:

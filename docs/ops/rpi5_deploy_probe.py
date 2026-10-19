@@ -16,6 +16,13 @@ committed PM interpreter with ``sys.path`` pointed at one checkout:
 - ``skills-sync``: ``tools.skills_sync.sync_skills`` for ``$HERMES_HOME``.
 - ``venv-python``: the interpreter ``pm.environments`` committed for a checkout.
   This one runs on the system Python, before a PM interpreter is known.
+- ``preflight``: run through the checkout's own launcher
+  (``.hermes/bin/hermes --run-module docs.ops.rpi5_deploy_probe``), so it gets
+  the interpreter and dependency environment a restarted gateway gets. Imports
+  aiohttp, httpx2, mcp and the API server, LINE, Email and Telegram adapters,
+  then resolves each ``--home``'s Bitwarden secrets the way gateway startup
+  does (fresh cache, live ``bws``, stale encrypted cache on a transport
+  failure). Reports counts and error kinds, never values.
 
 Output is one JSON object on stdout. Nothing here prints a credential.
 """
@@ -25,11 +32,17 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 # The modules a gateway process imports before it serves a turn.
 RELEASE_IMPORTS = ("hermes_cli.main", "gateway.run", "run_agent", "model_tools", "cron.scheduler")
+PREFLIGHT_IMPORTS = (
+    "aiohttp", "httpx2", "mcp", "gateway.platforms.api_server", "plugins.platforms.line.adapter",
+    "plugins.platforms.email.adapter", "plugins.platforms.telegram.adapter",
+)
 
 
 def _emit(payload: dict) -> int:
@@ -119,6 +132,57 @@ def cmd_venv_python(args: argparse.Namespace) -> int:
     return _emit({"ok": ok, "python": str(python) if ok else None})
 
 
+def _preflight_import_failures() -> list[str]:
+    failed = []
+    saved = os.environ.get("HERMES_HOME")
+    # Adapter imports must not write into a live profile home.
+    with tempfile.TemporaryDirectory(prefix="rpi5-preflight-home.") as scratch:
+        os.environ["HERMES_HOME"] = scratch
+        try:
+            for name in PREFLIGHT_IMPORTS:
+                try:
+                    importlib.import_module(name)
+                except Exception as exc:  # health: allow BLE001 -- any import failure blocks the restart
+                    failed.append(f"{name}:{type(exc).__name__}")
+        finally:
+            if saved is None:
+                os.environ.pop("HERMES_HOME", None)
+            else:
+                os.environ["HERMES_HOME"] = saved
+    return failed
+
+
+def _bitwarden_status(home: Path) -> dict:
+    """One home's Bitwarden resolution through ``apply_all``, the call gateway startup makes."""
+    from agent.secret_scope import load_env_file
+    from agent.secret_sources.bitwarden import _encrypted_disk_cache_path
+    from agent.secret_sources.registry import apply_all
+    from hermes_cli.env_loader import _load_secrets_config
+
+    section = (_load_secrets_config(home) or {}).get("bitwarden")
+    if not isinstance(section, dict) or section.get("enabled") is not True:
+        return {"home": str(home), "ok": True, "bitwarden": "disabled"}
+    environ = {**os.environ, **load_env_file(home / ".env"), "HERMES_HOME": str(home)}
+    reports = apply_all({"bitwarden": section}, home, environ=environ).sources
+    if not reports:
+        return {"home": str(home), "ok": False, "bitwarden": "enabled", "kind": "not_registered"}
+    result = reports[0].result
+    return {
+        "home": str(home), "ok": result.ok and bool(result.secrets), "bitwarden": "enabled",
+        "secrets": len(result.secrets), "kind": result.error_kind.value if result.error_kind else None,
+        "error": (result.error or "")[:200] or None,
+        "stale_cache": any("falling back" in warning for warning in result.warnings),
+        "encrypted_cache_present": _encrypted_disk_cache_path(home).is_file(),
+    }
+
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    failed = _preflight_import_failures()
+    secrets = [_bitwarden_status(Path(raw)) for raw in args.home]
+    failed += [f"secrets:{entry['home']}:{entry.get('kind') or 'empty'}" for entry in secrets if not entry["ok"]]
+    return _emit({"ok": not failed, "failed": failed, "python": sys.executable, "secrets": secrets})
+
+
 COMMANDS = {
     "idle": cmd_idle,
     "homes": cmd_homes,
@@ -127,6 +191,7 @@ COMMANDS = {
     "imports": cmd_imports,
     "skills-sync": cmd_skills_sync,
     "venv-python": cmd_venv_python,
+    "preflight": cmd_preflight,
 }
 
 
@@ -139,6 +204,7 @@ def build_parser() -> argparse.ArgumentParser:
     drain.add_argument("state", choices=("on", "off"))
     drain.add_argument("--home", action="append", default=[])
     sub.add_parser("imports").add_argument("--compile", action="append", default=[])
+    sub.add_parser("preflight").add_argument("--home", action="append", default=[])
     for name in ("homes", "stamp", "skills-sync", "venv-python"):
         sub.add_parser(name)
     return parser

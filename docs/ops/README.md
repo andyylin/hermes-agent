@@ -48,6 +48,17 @@ gateway is idle.
      `pm.environments.install_key` hashes the resolved checkout path. The
      swap is a fast-forward of that checkout, not a symlink. The current and
      previous release worktrees are kept.
+   - **Preflight.** Still before anything is drained or stopped, the deploy runs
+     `~/.hermes/hermes-agent/.hermes/bin/hermes --run-module docs.ops.rpi5_deploy_probe
+     --checkout ~/.hermes/hermes-agent preflight --home <each profile home>`.
+     Going through the launcher gives the probe the interpreter and PM
+     environment a restarted gateway gets. It imports aiohttp, httpx2, mcp and
+     the API server, LINE, Email and Telegram adapters, then resolves each
+     home's Bitwarden secrets through `apply_all`, the same call gateway
+     startup makes (fresh cache, live `bws`, then the stale encrypted cache on a
+     transport failure). It prints counts and error kinds, never values. A
+     failure, such as a BWS `429 Too Many Requests`, ends the deploy with every
+     unit still running. Run the same command by hand before a manual restart.
    - **Idle gate.** `rpi5_deploy_probe.py idle` reads each home's
      `gateway_state.json` through `gateway.status` (PID-reuse guard, heartbeat
      staleness). A live gateway counts as idle only when it is `running` or
