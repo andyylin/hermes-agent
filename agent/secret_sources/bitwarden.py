@@ -91,15 +91,31 @@ def _encrypted_disk_cache_path(home_path: Optional[Path] = None) -> Path:
 _BWS_ERROR_RULES = (
     (ErrorKind.TIMEOUT, ("timed out",)),
     (ErrorKind.BINARY_MISSING, ("binary not available", "failed to invoke")),
-    (ErrorKind.RATE_LIMITED, ("429", "too many requests", "slow down")),
     (ErrorKind.AUTH_FAILED, ("unauthorized", "invalid token", "access token", "401", "403",
                              "invalid_client", "invalid_grant", "400 bad request")),
     (ErrorKind.NETWORK, ("network", "connection", "resolve", "download", "dns")),
 )
+_RATE_LIMIT_STATUS_RE = re.compile(
+    r"(?:\[429\b|\b429\s+too\s+many|\b429\b[^\d]{0,40}too many requests)",
+    re.IGNORECASE,
+)
+
+
+def _is_bws_rate_limited_message(message: str) -> bool:
+    """True for HTTP 429 throttling — never bare ``429`` inside UUIDs or request ids."""
+    lowered = message.lower()
+    if "too many requests" in lowered or "slow down" in lowered:
+        return True
+    return _RATE_LIMIT_STATUS_RE.search(message) is not None
 
 
 def _classify_bws_error(message: str) -> ErrorKind:
-    return classify_cli_error(message, _BWS_ERROR_RULES)
+    kind = classify_cli_error(message, _BWS_ERROR_RULES)
+    if kind is not ErrorKind.INTERNAL:
+        return kind
+    if _is_bws_rate_limited_message(message):
+        return ErrorKind.RATE_LIMITED
+    return ErrorKind.INTERNAL
 
 
 def _bws_caller_label() -> str:
@@ -113,11 +129,9 @@ def _bws_caller_label() -> str:
 
 def _bws_retry_delay_seconds(retry_index: int, err_message: str) -> float:
     """Seconds to wait before retry ``retry_index`` (0-based), honoring BWS hints."""
+    step = _BWS_RETRY_BACKOFF[min(retry_index, len(_BWS_RETRY_BACKOFF) - 1)]
     hinted = _TRY_AGAIN_IN_RE.search(err_message)
-    if hinted:
-        base = float(hinted.group(1))
-    else:
-        base = _BWS_RETRY_BACKOFF[min(retry_index, len(_BWS_RETRY_BACKOFF) - 1)]
+    base = max(float(hinted.group(1)), step) if hinted else step
     return base + random.uniform(0.0, 0.25 * base)
 
 
@@ -145,10 +159,6 @@ def _stale_cache_fallback(
     if stale is None:
         return None
     age = max(0.0, time.time() - stale.fetched_at)
-    logger.warning(
-        "bws live fetch failed (%s); falling back to %s (%ds old)",
-        exc, label, int(age),
-    )
     _STORE.memory[cache_key] = stale
     return stale.secrets, [
         f"bws live fetch failed ({exc}); falling back to {label} ({int(age)}s old)"

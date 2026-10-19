@@ -528,6 +528,16 @@ def test_classify_bws_429_as_rate_limited():
     assert bw._classify_bws_error(_BWS_429_STDERR) == ErrorKind.RATE_LIMITED
 
 
+def test_classify_auth_errors_with_429_substrings_are_not_rate_limited():
+    """Bare ``429`` inside a project UUID or request id must not trigger rate-limit handling."""
+    assert bw._classify_bws_error(
+        "Error: 401 Unauthorized for project 7f3a4290-dead-beef-0000-000000000000",
+    ) == ErrorKind.AUTH_FAILED
+    assert bw._classify_bws_error(
+        "[400 Bad Request] invalid_client, request id 18429",
+    ) == ErrorKind.AUTH_FAILED
+
+
 def test_stale_fallback_skipped_on_auth_failure(monkeypatch, tmp_path):
     """An AUTH_FAILED bws error must raise, not serve stale secrets — a bad
     access token indicates a real credential problem the caller needs to
