@@ -9,10 +9,10 @@ Score overlays as `KEEP` / `UPSTREAM-NOW` / `DROP` against the frozen tag
 below. Do not score against newer untagged `main` or `rc.` / `abandoned-rc.`
 tags. Do not replay `DROP` or `UPSTREAM-NOW` behavior on refresh.
 
-Frozen upstream cutoff: `e06df9c2eae6901f4c88f464e0ae6e753c0428b8`
-(`v0.22.0`). Exact-SHA CI and review evidence must name this object. The
-previous cutoff was `71d34bad1045610252eda02ee79549436896e784`
-(`v0.21.7`).
+Frozen upstream cutoff: `d923a5eb487a17c0a68801bba9ef0f56c81040a8`
+(`v0.22.2`). Exact-SHA CI and review evidence must name this object. The
+previous cutoff was `e06df9c2eae6901f4c88f464e0ae6e753c0428b8`
+(`v0.22.0`).
 
 This tag declares Python 3.14 as the only supported runtime (`pyproject.toml`
 marks every core dependency `python_version >= '3.14'`; `uv.lock` resolves
