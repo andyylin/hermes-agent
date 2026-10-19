@@ -57,6 +57,20 @@ def _preflight(tmp_path: Path, *homes: Path, bin_dir: Path | None = None) -> tup
                 tmp_path, bin_dir)
 
 
+def test_an_interpreter_without_the_runtime_packages_fails_the_preflight(tmp_path):
+    import venv
+
+    bare = tmp_path / "bare-venv"
+    venv.create(bare, with_pip=False)
+
+    code, payload, _ = _run([str(bare / "bin" / "python"), "-I", str(eng.PROBE), "--checkout", str(REPO_ROOT),
+                             "preflight"], tmp_path)
+
+    assert code == 1 and payload["ok"] is False
+    assert payload["failed"] == ["aiohttp:ModuleNotFoundError", "httpx2:ModuleNotFoundError",
+                                 "mcp:ModuleNotFoundError"]
+
+
 def test_a_bws_429_fails_the_preflight_without_printing_the_token(tmp_path):
     bin_dir = _fake_bws(tmp_path, 'echo "Error: 0: [429 Too Many Requests]" >&2\nexit 1\n')
     home = _home(tmp_path, "default")

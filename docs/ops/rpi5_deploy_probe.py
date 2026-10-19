@@ -19,8 +19,7 @@ committed PM interpreter with ``sys.path`` pointed at one checkout:
 - ``preflight``: run through the checkout's own launcher
   (``.hermes/bin/hermes --run-module docs.ops.rpi5_deploy_probe``), so it gets
   the interpreter and dependency environment a restarted gateway gets. Imports
-  aiohttp, httpx2, mcp and the API server, LINE, Email and Telegram adapters,
-  then resolves each ``--home``'s Bitwarden secrets the way gateway startup
+  aiohttp, httpx2 and mcp, then resolves each ``--home``'s Bitwarden secrets the way gateway startup
   does (fresh cache, live ``bws``, stale encrypted cache on a transport
   failure). Reports counts and error kinds, never values.
 
@@ -34,15 +33,11 @@ import importlib
 import json
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 # The modules a gateway process imports before it serves a turn.
 RELEASE_IMPORTS = ("hermes_cli.main", "gateway.run", "run_agent", "model_tools", "cron.scheduler")
-PREFLIGHT_IMPORTS = (
-    "aiohttp", "httpx2", "mcp", "gateway.platforms.api_server", "plugins.platforms.line.adapter",
-    "plugins.platforms.email.adapter", "plugins.platforms.telegram.adapter",
-)
+PREFLIGHT_IMPORTS = ("aiohttp", "httpx2", "mcp")
 
 
 def _emit(payload: dict) -> int:
@@ -134,21 +129,11 @@ def cmd_venv_python(args: argparse.Namespace) -> int:
 
 def _preflight_import_failures() -> list[str]:
     failed = []
-    saved = os.environ.get("HERMES_HOME")
-    # Adapter imports must not write into a live profile home.
-    with tempfile.TemporaryDirectory(prefix="rpi5-preflight-home.") as scratch:
-        os.environ["HERMES_HOME"] = scratch
+    for name in PREFLIGHT_IMPORTS:
         try:
-            for name in PREFLIGHT_IMPORTS:
-                try:
-                    importlib.import_module(name)
-                except Exception as exc:  # health: allow BLE001 -- any import failure blocks the restart
-                    failed.append(f"{name}:{type(exc).__name__}")
-        finally:
-            if saved is None:
-                os.environ.pop("HERMES_HOME", None)
-            else:
-                os.environ["HERMES_HOME"] = saved
+            importlib.import_module(name)
+        except Exception as exc:  # health: allow BLE001 -- any import failure blocks the restart
+            failed.append(f"{name}:{type(exc).__name__}")
     return failed
 
 

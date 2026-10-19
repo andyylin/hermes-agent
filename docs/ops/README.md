@@ -52,10 +52,9 @@ gateway is idle.
      `~/.hermes/hermes-agent/.hermes/bin/hermes --run-module docs.ops.rpi5_deploy_probe
      --checkout ~/.hermes/hermes-agent preflight --home <each profile home>`.
      Going through the launcher gives the probe the interpreter and PM
-     environment a restarted gateway gets. It imports aiohttp, httpx2, mcp and
-     the API server, LINE, Email and Telegram adapters, then resolves each
-     home's Bitwarden secrets through `apply_all`, the same call gateway
-     startup makes (fresh cache, live `bws`, then the stale encrypted cache on a
+     environment a restarted gateway gets. It imports aiohttp, httpx2 and mcp,
+     then resolves each home's Bitwarden secrets through `apply_all`, the same
+     call gateway startup makes (fresh cache, live `bws`, then the stale encrypted cache on a
      transport failure). It prints counts and error kinds, never values. A
      failure, such as a BWS `429 Too Many Requests`, ends the deploy with every
      unit still running. Run the same command by hand before a manual restart.
