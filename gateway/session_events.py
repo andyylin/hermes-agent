@@ -1,73 +1,89 @@
-"""Session-scoped realtime events for out-of-band appends (cron delivery, ...).
-
-Standalone by design: importable and safely callable from any process,
-including a plain ``hermes cron run`` with no gateway or ``tui_gateway``
-backend running at all. Publishing is a pure accelerator — a session's REST/
-resume path is always the source of truth for what got durably appended, so
-a failed or skipped publish here must never be treated as a delivery
-failure by the caller.
-"""
-
-from __future__ import annotations
-
+"""Authority-local subscription ordering over the existing bounded transports/replay."""
+from copy import deepcopy
 import logging
-import sys
-import time
-from typing import Any, Optional
+import threading
+import uuid
 
-logger = logging.getLogger(__name__)
-
-SESSION_MESSAGE_CREATED_EVENT = "session.message.created"
+from tui_gateway import event_replay
+from tui_gateway.transport import FanoutTransport
 
 
-def publish_session_message_created(
-    *,
-    session_id: str,
-    message_id: Optional[int],
-    source: str,
-    preview: str,
-    job_id: Optional[Any] = None,
-    job_name: Optional[Any] = None,
-    execution_id: Optional[str] = None,
-) -> bool:
-    """Best-effort publish of a ``session.message.created`` event.
+class SessionEvents:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.fanout = FanoutTransport()
+        # A private lifetime key prevents two profiles (or legacy TUI owners)
+        # with the same persisted ID from reading each other's replay.
+        self._key = uuid.uuid4().hex
+        self.epoch = uuid.uuid4().hex
+        self.sequence = 0
+        self._public_id = None
+        self.execution = {}
+        # Synchronous same-thread recipients (API run projections): unlike fanout peers they
+        # cannot lose a frame to a detach that races the writer thread.
+        self.observers = set()
+        # Set by the authority that attaches transports: retires the subscription of a
+        # peer whose bounded backlog overflowed, so it cannot linger looking subscribed.
+        self.on_overflow = None
 
-    Only does anything when ``tui_gateway.server`` is already imported in
-    THIS process — i.e. the cron ticker is running inside a Desktop-spawned
-    local backend (``HERMES_DESKTOP=1``) or the TUI gateway process itself.
-    A standalone ``hermes cron run`` or a separate gateway process has no
-    live WS/stdio clients to reach here at all; those surfaces pick up the
-    durably-appended row on their next REST/session refresh instead.
+    def watermark(self):
+        with self.lock:
+            if self.sequence and not event_replay.latest_seq(self._key):
+                # The shared bounded cache evicted this session. Never reuse a
+                # sequence in the old epoch, even if publication resumes later.
+                self.epoch = uuid.uuid4().hex
+                self.sequence = 0
+            return self.epoch, self.sequence
 
-    Returns True if a publish attempt was made (not necessarily received by
-    any client), False if this process has no realtime surface to publish
-    through.
-    """
-    module = sys.modules.get("tui_gateway.server")
-    if module is None:
-        return False
+    def publish(self, session_id, payload, *, event_type="message.complete", execution=None):
+        # ``execution`` stamps this frame alone; the shared stamp is read without the lock elsewhere.
+        with self.lock:
+            self.watermark()
+            frame = {'jsonrpc': '2.0', 'method': 'event', 'params': {
+                **(self.execution if execution is None else execution), 'type': event_type, 'session_id': self._key,
+                'payload': deepcopy(payload), 'replay_epoch': self.epoch}}
+            event_replay._stamp_event(frame)
+            if frame['params']['seq'] <= self.sequence:
+                # Another publisher may evict us after watermark's lookup.
+                self.epoch = uuid.uuid4().hex
+                frame['params']['replay_epoch'] = self.epoch
+            # The ring froze the frame under its private lookup key; live recipients see the
+            # canonical ID here and ``since`` restores it on the thawed replay copies.
+            frame['params']['session_id'] = session_id
+            self._public_id = session_id
+            self.sequence = frame['params']['seq']
 
-    broadcaster = getattr(module, "broadcast_stored_session_event", None)
-    if not callable(broadcaster):
-        return False
+            def overflow(transport):
+                # The peer's socket is healthy; only its event subscription ended. Same
+                # shape as the client's own synthetic gap so one consumer handles both.
+                if self.on_overflow is not None:
+                    self.on_overflow(transport)
+                return {'jsonrpc': '2.0', 'method': 'event', 'params': {
+                    'type': 'session.replay_gap', 'session_id': session_id,
+                    'payload': {'replay_epoch': self.epoch, 'latest_seq': self.sequence}}}
+            delivered = self.fanout.write(frame, overflow=overflow)
+            for observer in tuple(self.observers):
+                try:
+                    observer(frame)
+                    delivered = True
+                except Exception:
+                    # A request-owned projection cannot undo committed publication or starve peers.
+                    logging.getLogger(__name__).warning('Session event observer failed for %s', session_id,
+                                                        exc_info=True)
+            # True when a live viewer or observer took the frame; the replay ring alone is not
+            # delivery (a detached finite viewer reads nothing until it reattaches).
+            return delivered
 
-    payload = {
-        "session_id": str(session_id),
-        "message_id": message_id,
-        "source": source,
-        "job_id": job_id,
-        "job_name": job_name,
-        "execution_id": execution_id,
-        "preview": preview,
-        "timestamp": time.time(),
-    }
-
-    try:
-        broadcaster(SESSION_MESSAGE_CREATED_EVENT, str(session_id), payload)
-    except Exception:
-        logger.debug(
-            "session.message.created publish failed for session %s",
-            session_id, exc_info=True,
-        )
-        return False
-    return True
+    def since(self, epoch, sequence):
+        with self.lock:
+            current_epoch, latest = self.watermark()
+            frames = event_replay.events_since(self._key, sequence)
+            missing = (epoch != current_epoch or sequence > latest
+                       or event_replay.is_truncated(self._key, sequence)
+                       or event_replay.latest_seq(self._key) != latest)
+            events = [] if missing else [
+                {**frame, 'session_id': self._public_id} if frame.get('session_id') == self._key else frame
+                for frame in frames]
+            return {'events': events, 'latest_seq': latest, 'last_sequence': latest,
+                    'epoch': current_epoch, 'replay_epoch': current_epoch,
+                    'truncated': missing, 'snapshot_required': missing, 'count': len(events)}

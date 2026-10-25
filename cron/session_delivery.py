@@ -268,7 +268,7 @@ def _publish_session_message_event(
     Desktop's REST/session refresh (or the next reconnect) still reveals the
     durably-appended row.
     """
-    from gateway.session_events import publish_session_message_created
+    from gateway.session_message_events import publish_session_message_created
 
     publish_session_message_created(
         session_id=session_id,
