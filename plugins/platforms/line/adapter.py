@@ -335,7 +335,7 @@ def _csv_set(value: str) -> set[str]:
     return {x.strip() for x in (value or "").split(",") if x.strip()}
 
 
-def _csv_list(value: str) -> List[str]:
+def _csv_list(value: str) -> list[str]:
     return [x.strip() for x in (value or "").split(",") if x.strip()]
 
 
@@ -1092,6 +1092,8 @@ def interactive_setup() -> None:
 def register(ctx) -> None:
     ctx.register_platform(
         name="line", label="LINE", adapter_factory=lambda cfg: LineAdapter(cfg), check_fn=check_requirements,
+        dashboard_description="Use Hermes from LINE via the LINE Messaging API webhook.",
+        docs_url="https://hermes-agent.nousresearch.com/docs/user-guide/messaging/line",
         validate_config=validate_config, is_connected=is_connected,
         required_env=["LINE_CHANNEL_ACCESS_TOKEN", "LINE_CHANNEL_SECRET"], install_hint="pip install aiohttp",
         setup_fn=interactive_setup, env_enablement_fn=_env_enablement, cron_deliver_env_var="LINE_HOME_CHANNEL",

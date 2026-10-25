@@ -171,7 +171,7 @@ def _validate_frontmatter(content: str, *, new_skill: bool = False) -> Optional[
     # The skill index shows this prefix only (extract_skill_description). An
     # exclusion past it never reaches the model; "When to Use" is not indexed.
     index_window = desc.strip().strip("'\"")[:SKILL_PROMPT_DESC_LIMIT]
-    if new_skill and not re.search(r"\bnot\b", index_window, re.I):
+    if new_skill and not re.search(r"\bnot\b", index_window, re.IGNORECASE):
         return (
             f"Description must include a Not exclusion inside the "
             f"{SKILL_PROMPT_DESC_LIMIT}-character index window. "

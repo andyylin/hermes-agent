@@ -299,7 +299,7 @@ def owner_strip_span(key_prefix: str) -> str:
     """
     if not key_prefix:
         return ""
-    body = key_prefix[:-1] if key_prefix.endswith("_") else key_prefix
+    body = key_prefix.removesuffix("_")
     owner, sep, _kept = body.rpartition("_")
     if not owner:
         return key_prefix

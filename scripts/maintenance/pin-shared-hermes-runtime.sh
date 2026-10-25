@@ -68,7 +68,7 @@ esac
 
 path="$(dirname "$python_path"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-stage=$(mktemp -d /tmp/hermes-runtime-normalize.XXXXXX)
+stage=$(mktemp -d -t hermes-runtime-normalize.XXXXXX)
 trap 'rm -rf "$stage"' EXIT
 
 emit_gateway() {

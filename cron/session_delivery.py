@@ -89,7 +89,7 @@ def _transaction():
 
 def _find_prior_delivery(
     job_id: str, execution_id: str, session_id: str
-) -> Optional[Dict[str, Any]]:
+) -> Optional[dict[str, Any]]:
     """Return the prior delivery record for this (job, execution, session)."""
     with _transaction() as conn:
         row = conn.execute(
@@ -121,7 +121,7 @@ def _record_delivery(
 
 
 def deliver_cron_output_to_session(
-    job: Dict[str, Any],
+    job: dict[str, Any],
     content: str,
     session_id: str,
     *,
@@ -255,7 +255,7 @@ def _publish_session_message_event(
     *,
     session_id: str,
     message_id: Optional[int],
-    job: Dict[str, Any],
+    job: dict[str, Any],
     execution_id: Optional[str],
     content: str,
 ) -> None:
@@ -268,7 +268,7 @@ def _publish_session_message_event(
     Desktop's REST/session refresh (or the next reconnect) still reveals the
     durably-appended row.
     """
-    from gateway.session_events import publish_session_message_created
+    from gateway.session_message_events import publish_session_message_created
 
     publish_session_message_created(
         session_id=session_id,

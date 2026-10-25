@@ -34,6 +34,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.config import Platform, PlatformConfig
 from utils import is_truthy_value
 from gateway.platforms._shared import get_scoped_secret as _get_secret, coerce_port, decode_json_list_literal, send_error
+from gateway.platforms.send_targets import StandaloneSendPolicy, regex_stripped_parser
 
 logger = logging.getLogger(__name__)
 
@@ -469,7 +470,7 @@ def _sanitize_email_html(body: str) -> str:
     class _Sanitizer(HTMLParser):
         def __init__(self) -> None:
             super().__init__(convert_charrefs=False)
-            self.output: List[str] = []
+            self.output: list[str] = []
             self.blocked_depth = 0
 
         def handle_starttag(self, tag: str, attrs) -> None:
@@ -487,9 +488,9 @@ def _sanitize_email_html(body: str) -> str:
                     scheme = urlparse(value.strip()).scheme.lower()
                     if scheme in {"", "http", "https", "mailto"}:
                         safe_attrs.append((name, value.strip()))
-                elif tag == "a" and name == "title":
-                    safe_attrs.append((name, value))
-                elif tag in {"td", "th"} and name in {"colspan", "rowspan"} and value.isdigit():
+                elif (tag == "a" and name == "title") or (
+                    tag in {"td", "th"} and name in {"colspan", "rowspan"} and value.isdigit()
+                ):
                     safe_attrs.append((name, value))
             rendered_attrs = "".join(f' {name}="{escape(value, quote=True)}"' for name, value in safe_attrs)
             self.output.append(f"<{tag}{rendered_attrs}>")
@@ -539,7 +540,7 @@ def _standalone_plain_text_to_html(body: str) -> str:
     return f"<html><body><p>{escaped}</p></body></html>"
 
 
-def _render_email_bodies(body: str) -> Tuple[str, str]:
+def _render_email_bodies(body: str) -> tuple[str, str]:
     if _standalone_looks_like_html(body or ""):
         html_body = _sanitize_email_html(body or "")
         return _standalone_html_to_plain_text(html_body), html_body
@@ -561,6 +562,7 @@ def _stable_thread_message_id(key: str, domain: str) -> Optional[str]:
 
 class EmailAdapter(BasePlatformAdapter):
     """Email gateway adapter using IMAP (receive) and SMTP (send)."""
+    serial_receive_loop = True  # the IMAP poll loop awaits each message before dispatching the next
     # One email carries the whole body, so cron delivery hands over the full payload untruncated.
     splits_long_messages = True
 
@@ -1012,7 +1014,7 @@ class EmailAdapter(BasePlatformAdapter):
                 smtp.close()
 
     def _send_email(self, to_addr: str, body: str, reply_to_msg_id: Optional[str] = None,
-                    metadata: Optional[Dict[str, Any]] = None) -> str:
+                    metadata: Optional[dict[str, Any]] = None) -> str:
         """Send an email via SMTP. Runs in executor thread."""
         msg, msg_id, subject = self._new_reply(
             to_addr, body, reply_to_msg_id, attach_empty_body=True, metadata=metadata)
@@ -1085,7 +1087,7 @@ class EmailAdapter(BasePlatformAdapter):
 
     def _send_email_with_attachment(self, to_addr: str, body: str, file_path: str, file_name: Optional[str] = None,
                                     reply_to_msg_id: Optional[str] = None,
-                                    metadata: Optional[Dict[str, Any]] = None) -> str:
+                                    metadata: Optional[dict[str, Any]] = None) -> str:
         """Send an email with a single file attachment via SMTP (raises if unattachable)."""
         return self._send_with_files(
             to_addr, body, [(Path(file_path), file_name or Path(file_path).name)],
@@ -1160,12 +1162,34 @@ def _is_connected(config) -> bool:
     return bool((gateway_mod.get_env_value("EMAIL_ADDRESS") or "").strip())
 
 
+# System-prompt platform hint (PlatformEntry.platform_hint); cached-prompt bytes, keep stable.
+_PLATFORM_HINT = (
+    "You are communicating via email. Write clear, well-structured responses suitable for email. Use "
+    "plain text formatting (no markdown). Keep responses concise but complete. You can send file "
+    "attachments — include MEDIA:/absolute/path/to/file in your response. The subject line is preserved "
+    "for threading. Do not include greetings or sign-offs unless contextually appropriate."
+)
+
+
+_SEND_TARGET_RE = re.compile(r"^\s*[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\s*$")
+
 
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
+    from . import gateway_env  # env -> GatewayConfig bridge (gateway.config_env)
     ctx.register_platform(
+        target_ref_syntax_fn=regex_stripped_parser(_SEND_TARGET_RE),
+        standalone_send=StandaloneSendPolicy(text_direct=True),
         name="email", label="Email", adapter_factory=EmailAdapter, check_fn=check_email_requirements, is_connected=_is_connected,
+        dashboard_description="Talk to Hermes through an IMAP/SMTP mailbox.",
+        docs_url="https://hermes-agent.nousresearch.com/docs/user-guide/messaging/",
+        dashboard_env_vars=("EMAIL_ADDRESS", "EMAIL_PASSWORD", "EMAIL_IMAP_HOST", "EMAIL_SMTP_HOST"),
+        dashboard_required_env=("EMAIL_ADDRESS", "EMAIL_PASSWORD", "EMAIL_IMAP_HOST", "EMAIL_SMTP_HOST"),
         required_env=["EMAIL_ADDRESS", "EMAIL_PASSWORD", "EMAIL_SMTP_HOST"],
-        install_hint="Email uses the Python stdlib (smtplib/imaplib) — no extra deps", allowed_users_env="EMAIL_ALLOWED_USERS",
-        allow_all_env="EMAIL_ALLOW_ALL_USERS", cron_deliver_env_var="EMAIL_HOME_ADDRESS", standalone_sender_fn=_standalone_send,
-        max_message_length=50_000, pii_safe=True, emoji="📧", allow_update_command=True)
+        install_hint="Email uses the Python stdlib (smtplib/imaplib) — no extra deps", cron_deliver_env_var="EMAIL_HOME_ADDRESS", standalone_sender_fn=_standalone_send,
+        max_message_length=50_000, pii_safe=True, emoji="📧", allow_update_command=True,
+        platform_hint=_PLATFORM_HINT,
+        display_tier="minimal",
+        env_overrides=gateway_env.ENV_OVERRIDES,
+        env_enable_credentials=gateway_env.ENV_ENABLE_CREDENTIALS, **gateway_env.AUTHZ,
+    )

@@ -312,7 +312,7 @@ class Host:
             return datetime.strptime(raw, "%a %Y-%m-%d %H:%M:%S %Z").replace(tzinfo=UTC)
         except ValueError:
             try:
-                return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                return datetime.fromisoformat(raw)
             except ValueError:
                 return None
 
@@ -321,7 +321,7 @@ class Host:
 
     def git_commit_time(self, sha: str) -> datetime:
         stamp = self.git("show", "-s", "--format=%cI", sha)
-        return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        return datetime.fromisoformat(stamp)
 
     def health(self, url: str) -> bool:
         try:

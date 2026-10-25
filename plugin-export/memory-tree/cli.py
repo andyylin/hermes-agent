@@ -271,7 +271,7 @@ def cmd_memory_tree(args: Any) -> int:
     if action == "search":
         print(
             memory_tree_search(
-                getattr(args, "query"),
+                args.query,
                 packs=getattr(args, "packs", None),
                 limit=getattr(args, "limit", 5),
                 chars=getattr(args, "chars", 500),
@@ -282,7 +282,7 @@ def cmd_memory_tree(args: Any) -> int:
     if action == "context-preview":
         print(
             memory_tree_context_preview(
-                getattr(args, "query"),
+                args.query,
                 packs=getattr(args, "packs", None),
                 limit=getattr(args, "limit", 3),
                 chars=getattr(args, "chars", 1200),
