@@ -134,7 +134,7 @@ def _parse_iso_datetime(value: Any) -> datetime | None:
     if not text:
         return None
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return datetime.fromisoformat(text)
     except ValueError:
         return None
 
@@ -430,9 +430,7 @@ def _verify_gateway_config_record(record: dict[str, Any], source: dict[str, Any]
             missing.append(profile)
             continue
         value = _get_nested(data, key)
-        if isinstance(value, dict) and value.get("enabled") is True:
-            verified += 1
-        elif value is True:
+        if isinstance(value, dict) and value.get("enabled") is True or value is True:
             verified += 1
         else:
             disabled.append(profile)

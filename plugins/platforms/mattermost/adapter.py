@@ -332,7 +332,7 @@ class MattermostAdapter(BasePlatformAdapter):
     # --- Optional overrides ---
 
     async def send_typing(self, chat_id: str, metadata: _Metadata = None) -> None:
-        payload: Dict[str, Any] = {"channel_id": chat_id}
+        payload: dict[str, Any] = {"channel_id": chat_id}
         parent_id = self._typing_parent_id_from_metadata(metadata)
         if parent_id:
             payload["parent_id"] = parent_id
@@ -359,7 +359,7 @@ class MattermostAdapter(BasePlatformAdapter):
 
         last_delete_error: list[BaseException | None] = [None]
 
-        async def _delete_with_session(session: Any, *, request_kwargs: Optional[Dict[str, Any]] = None) -> bool:
+        async def _delete_with_session(session: Any, *, request_kwargs: Optional[dict[str, Any]] = None) -> bool:
             try:
                 last_delete_error[0] = None
                 async with session.delete(

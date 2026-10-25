@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover
 
 DEFAULT_TZ = "Asia/Taipei"
 DEFAULT_MAX_TEXT_CHARS = 4000
-SECRET_KEY_RE = re.compile(r"(secret|token|password|passwd|api[_-]?key|authorization|auth|credential|cookie)", re.I)
+SECRET_KEY_RE = re.compile(r"(secret|token|password|passwd|api[_-]?key|authorization|auth|credential|cookie)", re.IGNORECASE)
 SECRET_ASSIGNMENT_RE = re.compile(
     r"(?im)\b([A-Z0-9_.-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY)[A-Z0-9_.-]*)\b(\s*[:=]\s*)([^\s`'\"]+|'[^'\n]+'|\"[^\"\n]+\")"
 )

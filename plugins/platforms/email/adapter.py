@@ -470,7 +470,7 @@ def _sanitize_email_html(body: str) -> str:
     class _Sanitizer(HTMLParser):
         def __init__(self) -> None:
             super().__init__(convert_charrefs=False)
-            self.output: List[str] = []
+            self.output: list[str] = []
             self.blocked_depth = 0
 
         def handle_starttag(self, tag: str, attrs) -> None:
@@ -488,9 +488,9 @@ def _sanitize_email_html(body: str) -> str:
                     scheme = urlparse(value.strip()).scheme.lower()
                     if scheme in {"", "http", "https", "mailto"}:
                         safe_attrs.append((name, value.strip()))
-                elif tag == "a" and name == "title":
-                    safe_attrs.append((name, value))
-                elif tag in {"td", "th"} and name in {"colspan", "rowspan"} and value.isdigit():
+                elif (tag == "a" and name == "title") or (
+                    tag in {"td", "th"} and name in {"colspan", "rowspan"} and value.isdigit()
+                ):
                     safe_attrs.append((name, value))
             rendered_attrs = "".join(f' {name}="{escape(value, quote=True)}"' for name, value in safe_attrs)
             self.output.append(f"<{tag}{rendered_attrs}>")
@@ -540,7 +540,7 @@ def _standalone_plain_text_to_html(body: str) -> str:
     return f"<html><body><p>{escaped}</p></body></html>"
 
 
-def _render_email_bodies(body: str) -> Tuple[str, str]:
+def _render_email_bodies(body: str) -> tuple[str, str]:
     if _standalone_looks_like_html(body or ""):
         html_body = _sanitize_email_html(body or "")
         return _standalone_html_to_plain_text(html_body), html_body
@@ -1014,7 +1014,7 @@ class EmailAdapter(BasePlatformAdapter):
                 smtp.close()
 
     def _send_email(self, to_addr: str, body: str, reply_to_msg_id: Optional[str] = None,
-                    metadata: Optional[Dict[str, Any]] = None) -> str:
+                    metadata: Optional[dict[str, Any]] = None) -> str:
         """Send an email via SMTP. Runs in executor thread."""
         msg, msg_id, subject = self._new_reply(
             to_addr, body, reply_to_msg_id, attach_empty_body=True, metadata=metadata)
@@ -1087,7 +1087,7 @@ class EmailAdapter(BasePlatformAdapter):
 
     def _send_email_with_attachment(self, to_addr: str, body: str, file_path: str, file_name: Optional[str] = None,
                                     reply_to_msg_id: Optional[str] = None,
-                                    metadata: Optional[Dict[str, Any]] = None) -> str:
+                                    metadata: Optional[dict[str, Any]] = None) -> str:
         """Send an email with a single file attachment via SMTP (raises if unattachable)."""
         return self._send_with_files(
             to_addr, body, [(Path(file_path), file_name or Path(file_path).name)],

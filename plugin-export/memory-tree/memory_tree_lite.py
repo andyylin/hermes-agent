@@ -45,8 +45,7 @@ def normalize_text(text: str, max_chars: int = 4000) -> str:
     """Normalize record text and cap it with an explicit truncation marker."""
 
     normalized = str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
-    if max_chars < 0:
-        max_chars = 0
+    max_chars = max(max_chars, 0)
     if len(normalized) <= max_chars:
         return normalized
     omitted = len(normalized) - max_chars
@@ -100,8 +99,7 @@ def _score_record(record: SourceRecord, terms: Sequence[str]) -> int:
 
 def _snippet(text: str, terms: Sequence[str], max_chars: int) -> str:
     text = str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
-    if max_chars < 0:
-        max_chars = 0
+    max_chars = max(max_chars, 0)
     lower = text.lower()
     hit_positions = [lower.find(term) for term in terms if term and lower.find(term) >= 0]
     start = 0

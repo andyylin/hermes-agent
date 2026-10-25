@@ -335,7 +335,7 @@ def _csv_set(value: str) -> set[str]:
     return {x.strip() for x in (value or "").split(",") if x.strip()}
 
 
-def _csv_list(value: str) -> List[str]:
+def _csv_list(value: str) -> list[str]:
     return [x.strip() for x in (value or "").split(",") if x.strip()]
 
 

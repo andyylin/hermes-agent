@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -95,7 +95,7 @@ def _parse_dt(value: Any) -> datetime | None:
     if not value:
         return None
     if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        return datetime.fromtimestamp(float(value), tz=UTC)
     if not isinstance(value, str):
         return None
     text = value.strip()
@@ -108,8 +108,8 @@ def _parse_dt(value: Any) -> datetime | None:
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def _record_time(record: dict[str, Any]) -> datetime | None:
@@ -328,7 +328,7 @@ def _scan_ledger_records(
 def scan_attention(*, now: datetime | None = None, stale_days: int = 7, include_stale: bool = True) -> list[AttentionItem]:
     """Return deterministic attention items from local Hermes state."""
 
-    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    now = (now or datetime.now(UTC)).astimezone(UTC)
     ledger_path = _ledger_path()
     ledger = _load_json(ledger_path)
     raw_records = ledger.get("records")
