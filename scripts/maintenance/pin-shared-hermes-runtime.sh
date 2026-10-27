@@ -6,6 +6,9 @@
 set -euo pipefail
 
 source_dir="/home/pi/.hermes/hermes-agent"
+# PM installs: never pin the pre-PM checkout venv. The published launcher re-execs onto
+# the committed generation's interpreter before loading dependencies.
+hermes_launcher="/home/pi/.hermes/hermes-agent/.hermes/bin/hermes"
 python_path="/home/pi/.hermes/hermes-agent/venv/bin/python"
 write=false
 
@@ -19,8 +22,12 @@ while [ $# -gt 0 ]; do
 done
 
 source_dir=$(realpath "$source_dir")
-test -x "$python_path" || { echo "refusing: missing interpreter: $python_path" >&2; exit 2; }
-python_path="$(cd "$(dirname "$python_path")" && pwd -P)/$(basename "$python_path")"
+if [ -x "$hermes_launcher" ]; then
+  python_path="$hermes_launcher"
+else
+  test -x "$python_path" || { echo "refusing: missing interpreter: $python_path" >&2; exit 2; }
+  python_path="$(cd "$(dirname "$python_path")" && pwd -P)/$(basename "$python_path")"
+fi
 python_real=$(realpath -e "$python_path")
 
 git -C "$source_dir" diff --quiet
@@ -86,7 +93,11 @@ emit_gateway() {
     echo "Environment=\"PYTHONDONTWRITEBYTECODE=1\""
     echo "Environment=\"PYTHONNOUSERSITE=1\""
     echo "ExecStart="
-    echo "ExecStart=$python_path -m hermes_cli.main $profile_args gateway run"
+    if [ "$(basename "$python_path")" = "hermes" ]; then
+      echo "ExecStart=$python_path $profile_args gateway run"
+    else
+      echo "ExecStart=$python_path -m hermes_cli.main $profile_args gateway run"
+    fi
   } >"$file"
 }
 

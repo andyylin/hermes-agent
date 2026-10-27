@@ -439,18 +439,15 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
                 _finish_source_update(root, current=current, pending=pending)
         finally:
             lock.release()
-    python = resolve_store_python(root)
-    if python is None:
+    from pm.environments import committed_launch_python, launch_python_needs_reexec
+
+    launch = committed_launch_python(root)
+    if launch is None:
         raise RuntimeError("source update has no managed Python; run `hermes pm install`")
-    # Lexical identity, never resolve(): PM spells the store path through
-    # HERMES_HOME (which may carry '..') while sys.executable arrives
-    # normalized, so a raw compare re-execs every child forever (#122513). A
-    # venv interpreter symlinked to the same binary is still a different
-    # interpreter (its own sys.prefix) and must re-exec once.
-    same = os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable))
-    if not current or not same:
+    reexec = launch_python_needs_reexec(root)
+    if not current or reexec is not None:
         publish_launchers(root)
-        return python
+        return launch if not current else reexec
     if owed_to_cli:
         # Left owed, not dropped: say so (once, in the process that boots) where an
         # operator of the unit will read it.
@@ -473,7 +470,6 @@ def _prepare_borrowed_launch(root: Path, owner: Path, *, current: bool) -> Path 
     import os
     import sys
     import pm
-    from hermes_cli._launchers import resolve_store_python
     from hermes_cli.update_lock import UpdateLock
 
     if not current:
@@ -487,11 +483,14 @@ def _prepare_borrowed_launch(root: Path, owner: Path, *, current: bool) -> Path 
         if not pm.venv_is_current(project_root=root):
             # Relaunching would land back here and sync again, forever.
             raise RuntimeError("dependency sync left this install out of date")
-    python = resolve_store_python(root)
-    if python is None:
+    from pm.environments import committed_launch_python, launch_python_needs_reexec
+
+    launch = committed_launch_python(root)
+    if launch is None:
         raise RuntimeError("source update has no managed Python; run `hermes pm install`")
-    same = os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable))
-    return python if not current or not same else None
+    if not current:
+        return launch
+    return launch_python_needs_reexec(root)
 
 
 def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
