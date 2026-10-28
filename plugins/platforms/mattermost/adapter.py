@@ -25,7 +25,7 @@ from gateway.platforms.helpers import cancel_task
 from gateway.platforms.base import gateway_trust_env, BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms._shared import (
-    apply_yaml_bridge as _apply_yaml_bridge, env_is_connected as _env_is_connected,
+    apply_yaml_bridge as _apply_yaml_bridge,
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
     send_error
 )
@@ -73,10 +73,24 @@ def _url_filename(url: str, fallback: str) -> str:
 
 
 def _url_and_token(config) -> tuple[str, str]:
-    """(server URL, token): ``config`` first, MATTERMOST_URL / MATTERMOST_TOKEN env fallback."""
+    """(server URL, token) this profile owns.
+
+    Named profiles do not inherit canonical ``MATTERMOST_TOKEN`` from a shared
+    vault or leftover ``os.environ``. Default still reads scoped env / config.
+    """
+    from plugins.platforms.mattermost.token_scope import named_profile_home, owned_mattermost_token
+
     extra = getattr(config, "extra", {}) or {}
-    return (extra.get("url") or _get_scoped_secret("MATTERMOST_URL", ""),
-            getattr(config, "token", None) or _get_scoped_secret("MATTERMOST_TOKEN", ""))
+    url = extra.get("url") or _get_scoped_secret("MATTERMOST_URL", "")
+    owned = owned_mattermost_token()
+    configured = (getattr(config, "token", None) or "").strip()
+    if owned:
+        token = owned
+    elif configured and not named_profile_home():
+        token = configured
+    else:
+        token = ""
+    return url, token
 
 
 def check_mattermost_requirements() -> bool:
@@ -270,20 +284,28 @@ class MattermostAdapter(BasePlatformAdapter):
         if not self._base_url or not self._token:
             logger.error("Mattermost: URL or token not configured")
             return False
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), trust_env=gateway_trust_env())
-        self._closing = False
-        me = await self._api_get("users/me")
-        if not me or "id" not in me:
-            logger.error("Mattermost: failed to authenticate — check MATTERMOST_TOKEN and MATTERMOST_URL")
-            await self._session.close()
+        if not self._acquire_platform_lock("mattermost-bot-token", self._token, "Mattermost bot token"):
             return False
-        self._bot_user_id, self._bot_username = me["id"], me.get("username", "")
-        logger.info(
-            "Mattermost: authenticated as @%s (%s) on %s", self._bot_username, self._bot_user_id, self._base_url)
-        self._ws_task = asyncio.create_task(self._ws_loop())
-        self._mark_connected()
-        self._wire_plugin_handlers(None)  # plugin-registered native handlers
-        return True
+        try:
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), trust_env=gateway_trust_env())
+            self._closing = False
+            me = await self._api_get("users/me")
+            if not me or "id" not in me:
+                logger.error("Mattermost: failed to authenticate — check MATTERMOST_TOKEN and MATTERMOST_URL")
+                await self._session.close()
+                self._session = None
+                self._release_platform_lock()
+                return False
+            self._bot_user_id, self._bot_username = me["id"], me.get("username", "")
+            logger.info(
+                "Mattermost: authenticated as @%s (%s) on %s", self._bot_username, self._bot_user_id, self._base_url)
+            self._ws_task = asyncio.create_task(self._ws_loop())
+            self._mark_connected()
+            self._wire_plugin_handlers(None)  # plugin-registered native handlers
+            return True
+        except Exception:
+            self._release_platform_lock()
+            raise
 
     async def disconnect(self) -> None:
         self._closing = True
@@ -295,6 +317,7 @@ class MattermostAdapter(BasePlatformAdapter):
             self._ws = None
         if self._session and not self._session.closed:
             await self._session.close()
+        self._release_platform_lock()
         logger.info("Mattermost: disconnected")
 
     async def _resolve_root_id(self, post_id: str) -> str:
@@ -848,7 +871,11 @@ def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
 
 
 
-_is_connected = _env_is_connected("MATTERMOST_TOKEN", "MATTERMOST_URL")
+def _is_connected(config=None) -> bool:
+    """True when this profile owns both a Mattermost URL and token."""
+    from gateway.config import PlatformConfig
+    url, token = _url_and_token(config if config is not None else PlatformConfig())
+    return bool(str(url).strip() and str(token).strip())
 
 
 # System-prompt platform hint (PlatformEntry.platform_hint); cached-prompt bytes, keep stable.

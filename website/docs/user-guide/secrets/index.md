@@ -39,7 +39,9 @@ Two orchestrator-level knobs make one shared vault safe across [profiles](../pro
     preserve_existing: [FEISHU_APP_SECRET, TELEGRAM_BOT_TOKEN]
   ```
 
-- **Profile aliasing** (on by default, `secrets.profile_alias: false` to disable) — when Hermes runs under a named profile, a vault secret named `FOO_<PROFILE>` (credential-shaped suffixes only: `*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_KEY`, `*_PASSWORD`) also hydrates the canonical `FOO`. Store `TELEGRAM_BOT_TOKEN_MILLA` in the shared project and the `milla` profile's adapters — which read the fixed name `TELEGRAM_BOT_TOKEN` — get the right value automatically. A var the vault supplies directly under its canonical name always beats an alias.
+- **Profile aliasing** (on by default, `secrets.profile_alias: false` to disable) — a vault secret named `FOO_<PROFILE>` (credential-shaped suffixes only: `*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_KEY`, `*_PASSWORD`) also hydrates the canonical `FOO`. Store `TELEGRAM_BOT_TOKEN_MILLA` in the shared project and the `milla` profile's adapters — which read the fixed name `TELEGRAM_BOT_TOKEN` — get the right value automatically. The default home (`~/.hermes`, not `profiles/default`) aliases as `DEFAULT`, so `MATTERMOST_TOKEN_DEFAULT` hydrates `MATTERMOST_TOKEN` there. A var the vault supplies directly under its canonical name always beats an alias.
+
+- **`secrets.default_only`** — canonical names that a *named* profile must not inherit from a shared project. Built-in default is `[MATTERMOST_TOKEN]`: every profile that shares one Bitwarden project still sees `OPENAI_API_KEY` and friends, but only the default profile receives unsuffixed `MATTERMOST_TOKEN`. A named profile that should run its own Mattermost bot stores `MATTERMOST_TOKEN_<PROFILE>` (or puts `MATTERMOST_TOKEN` in that profile's `.env`). Set `default_only: []` to restore the old shared-token behavior. An explicit list replaces the built-in set.
 
 Both apply to every source — bundled and plugin — because they live in the orchestrator, not the backends.
 

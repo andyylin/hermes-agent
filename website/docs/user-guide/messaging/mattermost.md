@@ -325,6 +325,21 @@ mattermost:
 
 Keys are Mattermost channel IDs (find them in the channel URL or via the API). All messages in the matching channel get the prompt injected as an ephemeral system instruction.
 
+## Profiles and a shared Bitwarden project
+
+`MATTERMOST_TOKEN` is **default-profile-only** when it comes from a shared secret source (one Bitwarden project, `override_existing: true`). A named profile (`utility-agent`, and any other home under `~/.hermes/profiles/`) does not receive that unsuffixed key, even if it uses the same `BWS_ACCESS_TOKEN` / `project_id`. Two gateways can no longer log into the same bot by accident; Mattermost also takes a Telegram/Discord-style token lock so a second process that *does* have the same token is refused.
+
+### Migrating an existing shared `MATTERMOST_TOKEN`
+
+Leave the unsuffixed `MATTERMOST_TOKEN` in the shared Bitwarden project. After this change only the default profile hydrates it. You do **not** have to rename the key for Default or for host scripts.
+
+1. **Default profile / host scripts** (`post_mattermost_dm.py`, `mattermost_morning_brief.py`, `invoice_analysis_mattermost_importer.py`, and anything else that reads `MATTERMOST_TOKEN` from the environment) — keep running them under the default home (`~/.hermes`). The unsuffixed key still lands in that process. Optionally add `MATTERMOST_TOKEN_DEFAULT` in the same project (same value); it now aliases to `MATTERMOST_TOKEN` for Default. Do not print or commit the token.
+2. **Named profiles that should not share Default's bot** — no Bitwarden change required. Remove any interim `secrets.preserve_existing: [MATTERMOST_TOKEN]` plus dummy `.env` placeholder once this build is deployed; they were a workaround for the old shared apply.
+3. **A named profile that should own its own Mattermost bot** — store `MATTERMOST_TOKEN_<PROFILE>` in the project (hyphens become underscores: `utility-agent` → `MATTERMOST_TOKEN_UTILITY_AGENT`) or put `MATTERMOST_TOKEN` in that profile's `.env`. Then enable Mattermost in that profile's config as usual.
+4. **Opt out** (restore pre-fix sharing, not recommended) — set `secrets.default_only: []` in that named profile's `config.yaml`.
+
+If two profiles both have a real token and try to connect as the same bot, the second gateway fails with `Mattermost bot token already in use` and names the holding profile.
+
 ## Security
 
 :::warning
