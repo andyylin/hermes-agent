@@ -3,6 +3,10 @@
 Scored against peeled tag **v0.23.0** on branch `candidate/rpi5-v0.23.0`. Ledger authority:
 `ANDY_RUNTIME_PATCHES.md` at fork `main` `771fd573` (frozen cutoff `bf0203a` / v0.22.5).
 
+The pull request conflict was a split history, not a bad port. This branch now merges fork `main`
+(`771fd573`) into the v0.23.0 port. Where both sides edited the same lines, the port won.
+Fork-only files that v0.23.0 does not have (deploy listener, ledger, session delivery) were kept.
+
 Verdicts: **KEEP** (ported on this branch), **UPSTREAM** (official v0.23.0 already has equivalent),
 **CONFLICT** (not ported cleanly; left out).
 
@@ -21,8 +25,9 @@ Verdicts: **KEEP** (ported on this branch), **UPSTREAM** (official v0.23.0 alrea
 
 | Item | Verdict | Reason |
 | --- | --- | --- |
-| Cron origin → stored session delivery (`cron/session_delivery.py`) | CONFLICT | Fork overlay depends on `gateway/session_message_events.py`, absent on v0.23.0; session-delivery hunks were dropped from `cron/scheduler_delivery.py` so email/cron subject KEEP stands alone. |
-| Fork BWS 429 retry / rate-limit stale fallback | UPSTREAM / fork-only | Ledger separates encrypted outage fallback (upstream) from plaintext purge (KEEP 4); full fork BWS retry stack not replayed. |
+| Cron origin → stored session delivery (`cron/session_delivery.py`) | KEEP | Brought back with the main merge. `gateway/session_message_events.py` is on this branch, and `cron/scheduler_delivery.py` calls `deliver_cron_output_to_session`. |
+| Fork BWS 429 retry / rate-limit stale fallback | KEEP | Non-conflicting retry hunks from fork main applied on top of the v0.23.0 purge. Plaintext purge (KEEP 4) is still in `agent/secret_sources/bitwarden.py`. |
+| rpi5 deploy listener and ledger | KEEP | Merge added `docs/ops/rpi5_deploy*.py`, the deploy workflow, and `ANDY_RUNTIME_PATCHES.md`. These exist only on fork main. |
 | UPSTREAM-NOW / DROP ledger entries | UPSTREAM / DROP | Per `ANDY_RUNTIME_PATCHES.md` — not replayed on refresh. |
 
 ## Topology note
