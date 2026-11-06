@@ -850,34 +850,6 @@ _LOCAL_UI_PLATFORM_NAMES = frozenset(
 )
 
 
-def _format_cron_email_subject(job: dict):
-    """Build an optional email subject and stable recurring-thread anchor."""
-    template = job.get("email_subject_template") or job.get("delivery_subject_template")
-    if not template:
-        return None
-    try:
-        from cron import scheduler as _sched_mod
-        now = _sched_mod._hermes_now()
-    except Exception:
-        now = datetime.now()
-    try:
-        subject = str(template).format(
-            date=now.strftime("%Y-%m-%d"),
-            date_compact=now.strftime("%Y%m%d"),
-            job_name=job.get("name", job.get("id", "")),
-            job_id=job.get("id", ""),
-        )
-    except (IndexError, KeyError, ValueError) as exc:
-        logger.warning(
-            "Job '%s': invalid email subject template %r: %s",
-            job.get("id", "?"), template, exc)
-        return None
-    thread_key = str(job.get("email_thread_key") or "").strip()
-    if thread_key:
-        return {"subject": subject, "thread_anchor_key": thread_key}
-    return {"subject": subject, "suppress_threading": True}
-
-
 def _deliver_to_stored_session(
     job: dict, content: str, session_id: str, *, execution_id: Optional[str] = None,
 ) -> Optional[str]:
