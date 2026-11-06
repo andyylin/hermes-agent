@@ -143,8 +143,9 @@ def _validate_category(category: Optional[str]) -> Optional[str]:
     return _check_identifier(category, "Category", invalid)
 
 
-def _validate_frontmatter(content: str) -> Optional[str]:
-    """Validate frontmatter (name + description) and a non-empty body."""
+def _validate_frontmatter(content: str, *, new_skill: bool = False) -> Optional[str]:
+    """Validate frontmatter (name + description) and a non-empty body. ``new_skill`` (create
+    only) also requires a word-boundary Not exclusion inside the skill-index window."""
     if not content.strip():
         return "Content cannot be empty."
     content = content.lstrip("\ufeff")  # tolerate a Windows UTF-8 BOM
@@ -165,6 +166,12 @@ def _validate_frontmatter(content: str) -> Optional[str]:
     desc = str(parsed["description"])
     if len(desc) > MAX_DESCRIPTION_LENGTH:
         return f"Description exceeds {MAX_DESCRIPTION_LENGTH} characters."
+    index_window = desc.strip().strip("'\"")[:SKILL_PROMPT_DESC_LIMIT]
+    if new_skill and not re.search(r"\bnot\b", index_window, re.IGNORECASE):
+        return (
+            f"Description must include a Not exclusion inside the "
+            f"{SKILL_PROMPT_DESC_LIMIT}-character index window. "
+            "When to Use does not stop a false load.")
     if not content[end_match.end() + 3:].strip():
         return "SKILL.md must have content after the frontmatter (instructions, procedures, etc.)."
     return None
@@ -414,8 +421,11 @@ def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label:
         if read_guard := _background_review_read_before_write_guard(name, target, action, label):
             return read_guard
         original = target.read_text(encoding="utf-8-sig")
-    if target == skill_dir / "SKILL.md" and (err := _description_budget_error(content, before=original)):
-        return _err(err)
+    if target == skill_dir / "SKILL.md":
+        if original is None and (err := _validate_frontmatter(content, new_skill=True)):
+            return _err(err)
+        if err := _description_budget_error(content, before=original):
+            return _err(err)
     from hermes_constants import mkdir_under_hermes_home
     mkdir_under_hermes_home(target.parent)
     atomic_write_text(target, content, preserve_mode=True, create_mode=0o644)
@@ -467,7 +477,7 @@ def _clip(text: str, n: int, ellipsis: str) -> str:
 
 def _create_skill(name: str, content: str, category: str | None = None) -> dict[str, Any]:
     if err := (_validate_name(name) or _validate_category(category)
-               or _validate_frontmatter(content) or _validate_content_size(content)):
+               or _validate_frontmatter(content, new_skill=True) or _validate_content_size(content)):
         return _err(err)
     if existing := _find_skill(name):
         return _err(f"A skill named '{name}' already exists at {existing['path']}.")

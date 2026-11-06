@@ -54,6 +54,19 @@ _DISK_CACHE = _STORE.disk
 _disk_cache_path = _DISK_CACHE.path
 
 
+def _purge_plaintext_disk_cache(home_path: Optional[Path] = None) -> None:
+    """Remove the legacy plaintext cache or fail closed."""
+    path = _disk_cache_path(home_path)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise RuntimeError(
+            f"Encrypted Bitwarden cache could not remove legacy plaintext cache: {path}"
+        ) from exc
+
+
 def _encrypted_disk_cache_path(home_path: Optional[Path] = None) -> Path:
     return resolve_cache_home(home_path) / _ENCRYPTED_CACHE_BASENAME
 
@@ -147,6 +160,8 @@ def _write_encrypted_disk_cache(*, cache_key: _CacheKey, access_token: str, entr
         _STORE.disk.clear(home_path)
     except Exception:
         return
+    # Cache persistence is best-effort; plaintext exclusion is not.
+    _purge_plaintext_disk_cache(home_path)
 
 
 def _read_encrypted_disk_cache(*, cache_key: _CacheKey, access_token: str, max_age_seconds: float,
@@ -196,6 +211,8 @@ def fetch_bitwarden_secrets(
     Raises ``RuntimeError`` on fatal conditions (missing binary, auth failure,
     unparseable output); env_loader catches, the setup wizard lets it propagate.
     """
+    if encrypted_cache_enabled:
+        _purge_plaintext_disk_cache(home_path)
     if not access_token:
         raise RuntimeError("Bitwarden access token is empty")
     if not project_id:
@@ -369,6 +386,8 @@ class BitwardenSource(SecretSource):
 
         encrypted_cfg = cfg.get("encrypted_cache")
         encrypted_cfg = encrypted_cfg if isinstance(encrypted_cfg, dict) else {}
+        if bool(encrypted_cfg.get("enabled", False)):
+            _purge_plaintext_disk_cache(home_path)
 
         try:
             secrets, warnings = fetch_bitwarden_secrets(

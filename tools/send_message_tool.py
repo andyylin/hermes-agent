@@ -2,6 +2,7 @@
 react); works in both CLI and gateway contexts."""
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -336,7 +337,6 @@ def _not_configured_error(platform_name, platform, entry):
     from gateway.config import _getenv
     from gateway.config_env import _ENV_ENABLE_CREDENTIALS
     from hermes_constants import get_hermes_home
-    from hermes_cli.config_backend import config_exists
     home = get_hermes_home()
     env_names = list(_ENV_ENABLE_CREDENTIALS.get(platform) or (entry.required_env if entry else ()))
     names = "/".join(env_names) or "credentials"
@@ -350,7 +350,7 @@ def _not_configured_error(platform_name, platform, entry):
         block = user_config.get("platforms", {}).get(platform_name)
     except Exception:
         user_config, block = {}, None
-    if not config_exists(config_path):
+    if not config_path.exists():
         config_state = "missing"
     elif not isinstance(block, dict):
         config_state = f"no platforms.{platform_name} block"
@@ -497,7 +497,6 @@ async def _send_live_adapter_media(adapter, chat_id, message, media_files, *, th
             return {"error": f"Adapter send failed: {_bounded_send_error(last_result.error)}"}
     from gateway.platforms.base import BasePlatformAdapter
     total = len(media_files)
-    unconfirmed = []
     for index, descriptor in enumerate(media_files):
         media_path = descriptor[0] if isinstance(descriptor, (list, tuple)) and descriptor else None
         if not isinstance(media_path, str) or not media_path:
@@ -520,21 +519,12 @@ async def _send_live_adapter_media(adapter, chat_id, message, media_files, *, th
             detail = _bounded_send_error(exc)
         else:
             if last_result.success:
-                raw = last_result.raw_response
-                if isinstance(raw, dict) and raw.get("ambiguous"):
-                    unconfirmed.append(index + 1)
                 continue
             detail = _bounded_send_error(last_result.error or "media send failed")
         return {"error": f"Adapter media send failed after {index}/{total} files: {detail}"}
     if last_result is None:
         return {"error": _NO_DELIVERABLE}
-    result = {"success": True, "message_id": last_result.message_id, "media_delivered": True}
-    if unconfirmed:
-        # Frame sent, ack lost: possibly delivered. A failure here would invite a duplicate re-send.
-        result["delivery_unconfirmed"] = (
-            f"media file(s) {unconfirmed} of {total} were sent but the platform never confirmed "
-            "receipt; they may already be in the chat, so do not resend them")
-    return result
+    return {"success": True, "message_id": last_result.message_id, "media_delivered": True}
 
 
 async def _dispatch_on_gateway_loop(runner, make_coro, log_message):
@@ -554,8 +544,24 @@ async def _dispatch_on_gateway_loop(runner, make_coro, log_message):
     return await asyncio.shield(asyncio.wrap_future(fut))
 
 
+def _filter_standalone_kwargs(sender, kwargs):
+    """Keep only kwargs the plugin standalone sender actually accepts.
+
+    Email takes ``subject``; Mattermost/Discord/Telegram do not. Passing
+    ``subject=`` unconditionally TypeErrors and out-of-process extra-send
+    (specialist finish wake) never lands on those platforms.
+    """
+    try:
+        sig = inspect.signature(sender)
+    except (TypeError, ValueError):
+        return kwargs
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in sig.parameters}
+
+
 async def _send_via_adapter(platform, pconfig, chat_id, chunk, *, thread_id=None, media_files=None,
-                            force_document=False):
+                            force_document=False, subject=None):
     """Live in-process gateway adapter first, else the plugin's ``standalone_sender_fn`` (cron),
     else an error naming both; media uses the adapter's native media APIs under the same rules."""
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
@@ -563,7 +569,10 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk, *, thread_id=None
     if adapter is not None:
         try:
             metadata = {**({"thread_id": thread_id} if thread_id else {}),
-                        **({"publish_topic": chat_id} if platform_name == "ntfy" and chat_id else {})} or None
+                        **({"publish_topic": chat_id} if platform_name == "ntfy" and chat_id else {})}
+            if isinstance(subject, dict):
+                metadata.update(subject)
+            metadata = metadata or None
             if media_files:  # always a dict result, returned as-is below
                 make_coro = lambda: _send_live_adapter_media(
                     adapter, chat_id, chunk, media_files, thread_id=thread_id, metadata=metadata,
@@ -591,8 +600,13 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk, *, thread_id=None
                           f"connected? For out-of-process delivery (e.g. cron in a separate process), the platform "
                           f"plugin must register a standalone_sender_fn on its PlatformEntry.")}
     try:
-        result = await sender(pconfig, chat_id, chunk, thread_id=thread_id, media_files=media_files,
-                              force_document=force_document)
+        call_kw = _filter_standalone_kwargs(sender, {
+            "thread_id": thread_id,
+            "media_files": media_files,
+            "force_document": force_document,
+            "subject": subject,
+        })
+        result = await sender(pconfig, chat_id, chunk, **call_kw)
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -687,7 +701,7 @@ _MEDIA_PLATFORMS_NOTE = "telegram, discord, matrix, weixin, signal, yuanbao, fei
 
 
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None,
-                            force_document=False, mentions=None, args=None):
+                            force_document=False, mentions=None, args=None, subject=None):
     """Route to the platform sender, chunking long text with the adapters' splitter. Order matters:
     Weixin first (its native helper must not be blocked by unrelated optional imports such as
     lark-oapi), Telegram (chunks itself), plugin standalone media, native chunked, generic text."""
@@ -739,8 +753,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             except Exception as e:
                 return {"error": f"Plugin send_message handler failed: {e}"}
         # Plugin platform: live gateway adapter if available, else standalone_sender_fn.
-        send_one = lambda chunk, is_last: _via_adapter_route(
-            platform, pconfig, chat_id, chunk, media_files if is_last else [], thread_id, force_document)
+        send_one = lambda chunk, is_last: _send_via_adapter(
+            platform, pconfig, chat_id, chunk, thread_id=thread_id,
+            media_files=media_files if is_last else [], force_document=force_document, subject=subject)
     last_result = await _send_chunks(chunks, send_one)
     if (warning and isinstance(last_result, dict) and last_result.get("success")
             and not last_result.get("media_delivered")):

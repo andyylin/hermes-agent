@@ -25,7 +25,7 @@ from gateway.platforms.helpers import cancel_task
 from gateway.platforms.base import gateway_trust_env, BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms._shared import (
-    apply_yaml_bridge as _apply_yaml_bridge, env_is_connected as _env_is_connected,
+    apply_yaml_bridge as _apply_yaml_bridge,
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
     send_error
 )
@@ -73,10 +73,24 @@ def _url_filename(url: str, fallback: str) -> str:
 
 
 def _url_and_token(config) -> tuple[str, str]:
-    """(server URL, token): ``config`` first, MATTERMOST_URL / MATTERMOST_TOKEN env fallback."""
+    """(server URL, token) this profile owns.
+
+    Named profiles do not inherit canonical ``MATTERMOST_TOKEN`` from a shared
+    vault or leftover ``os.environ``. Default still reads scoped env / config.
+    """
+    from plugins.platforms.mattermost.token_scope import named_profile_home, owned_mattermost_token
+
     extra = getattr(config, "extra", {}) or {}
-    return (extra.get("url") or _get_scoped_secret("MATTERMOST_URL", ""),
-            getattr(config, "token", None) or _get_scoped_secret("MATTERMOST_TOKEN", ""))
+    url = extra.get("url") or _get_scoped_secret("MATTERMOST_URL", "")
+    owned = owned_mattermost_token()
+    configured = (getattr(config, "token", None) or "").strip()
+    if owned:
+        token = owned
+    elif configured and not named_profile_home():
+        token = configured
+    else:
+        token = ""
+    return url, token
 
 
 def check_mattermost_requirements() -> bool:
@@ -123,16 +137,6 @@ class MattermostAdapter(BasePlatformAdapter):
         self._last_post_status: Optional[int] = None  # POST-only, read by the broken-thread-root fallback
         self._last_post_error: str = ""
         self._dedup = MessageDeduplicator()
-
-    def _is_configured_bot_user(self, user_id: str) -> bool:
-        """Whether an inbound Mattermost sender is an explicitly configured peer bot.
-
-        Mattermost's posted WebSocket event contains only a sender ID, not a bot flag.  Keep the
-        classification opt-in: an unknown account stays a human rather than silently changing its
-        authorization or delivery behavior. ``bot_users`` in config.yaml is read by the base
-        ``build_source``; ``MATTERMOST_BOT_USERS`` is its env spelling.
-        """
-        return str(user_id) in _channel_id_set(_get_scoped_secret("MATTERMOST_BOT_USERS", ""))
 
     # --- HTTP helpers ---
 
@@ -188,6 +192,16 @@ class MattermostAdapter(BasePlatformAdapter):
         return (any(marker in body for marker in ("root_id", "rootid", "root id", "thread", "post"))
                 and any(marker in body for marker in ("invalid", "not found", "does not exist", "missing")))
 
+    def _typing_parent_id_from_metadata(self, metadata: _Metadata) -> Optional[str]:
+        """CRT typing needs parent_id (thread root); channel-only typing is invisible in threads."""
+        if not isinstance(metadata, dict):
+            return None
+        for field in ("thread_id", "root_id", "reply_to"):
+            value = metadata.get(field)
+            if value:
+                return str(value)
+        return None
+
     async def _post_preserving_thread(
         self, chat_id: str, payload: dict[str, Any], metadata: _Metadata) -> dict[str, Any]:
         """Post once, optionally falling back flat for final notify content."""
@@ -202,19 +216,43 @@ class MattermostAdapter(BasePlatformAdapter):
         logger.warning("Mattermost: falling back to flat channel delivery for notify-worthy post in %s", chat_id)
         return await self._api_post("posts", flat_payload)
 
-    async def _post_message(self, chat_id: str, message: str, reply_to: Optional[str], metadata: _Metadata,
-                            file_ids: Optional[list[str]] = None) -> dict[str, Any]:
-        """Build a mentions-disabled post payload (+ optional root_id) and post it."""
+    async def _build_threaded_post_payload(
+        self, chat_id: str, message: str, reply_to: Optional[str], metadata: _Metadata,
+        *, file_ids: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """Build a mentions-disabled post payload (+ optional root_id)."""
         base: dict[str, Any] = {"channel_id": chat_id, "message": message}
         if file_ids is not None:
             base["file_ids"] = file_ids
         payload = _with_mentions_disabled(base)
         if self._reply_mode == "thread":
-            # root_id from reply_to, else metadata["thread_id"]/["root_id"], resolved to the true thread root.
-            candidate = reply_to or (
-                isinstance(metadata, dict) and (metadata.get("thread_id") or metadata.get("root_id")))
-            if candidate:
-                payload["root_id"] = await self._resolve_root_id(str(candidate))
+            # Prefer a still-live root. Progress-bubble cleanup can delete reply_to;
+            # posting that id 400s ("Invalid RootId") and never lands in the thread.
+            candidates: list[str] = []
+            if reply_to:
+                candidates.append(str(reply_to))
+            if isinstance(metadata, dict):
+                for key in ("thread_id", "root_id"):
+                    value = metadata.get(key)
+                    if value:
+                        candidates.append(str(value))
+            seen: set[str] = set()
+            for candidate in candidates:
+                if not candidate or candidate in seen:
+                    continue
+                seen.add(candidate)
+                root_id = await self._resolve_root_id(candidate)
+                if root_id:
+                    payload["root_id"] = root_id
+                    break
+        return payload
+
+    async def _post_message(self, chat_id: str, message: str, reply_to: Optional[str], metadata: _Metadata,
+                            file_ids: Optional[list[str]] = None) -> dict[str, Any]:
+        """Build a mentions-disabled post payload (+ optional root_id) and post it."""
+        payload = await self._build_threaded_post_payload(
+            chat_id, message, reply_to, metadata, file_ids=file_ids,
+        )
         return await self._post_preserving_thread(chat_id, payload, metadata)
 
     async def _post_with_file(self, chat_id: str, file_id: str, caption: Optional[str], reply_to: Optional[str],
@@ -246,20 +284,28 @@ class MattermostAdapter(BasePlatformAdapter):
         if not self._base_url or not self._token:
             logger.error("Mattermost: URL or token not configured")
             return False
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), trust_env=gateway_trust_env())
-        self._closing = False
-        me = await self._api_get("users/me")
-        if not me or "id" not in me:
-            logger.error("Mattermost: failed to authenticate — check MATTERMOST_TOKEN and MATTERMOST_URL")
-            await self._session.close()
+        if not self._acquire_platform_lock("mattermost-bot-token", self._token, "Mattermost bot token"):
             return False
-        self._bot_user_id, self._bot_username = me["id"], me.get("username", "")
-        logger.info(
-            "Mattermost: authenticated as @%s (%s) on %s", self._bot_username, self._bot_user_id, self._base_url)
-        self._ws_task = asyncio.create_task(self._ws_loop())
-        self._mark_connected()
-        self._wire_plugin_handlers(None)  # plugin-registered native handlers
-        return True
+        try:
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), trust_env=gateway_trust_env())
+            self._closing = False
+            me = await self._api_get("users/me")
+            if not me or "id" not in me:
+                logger.error("Mattermost: failed to authenticate — check MATTERMOST_TOKEN and MATTERMOST_URL")
+                await self._session.close()
+                self._session = None
+                self._release_platform_lock()
+                return False
+            self._bot_user_id, self._bot_username = me["id"], me.get("username", "")
+            logger.info(
+                "Mattermost: authenticated as @%s (%s) on %s", self._bot_username, self._bot_user_id, self._base_url)
+            self._ws_task = asyncio.create_task(self._ws_loop())
+            self._mark_connected()
+            self._wire_plugin_handlers(None)  # plugin-registered native handlers
+            return True
+        except Exception:
+            self._release_platform_lock()
+            raise
 
     async def disconnect(self) -> None:
         self._closing = True
@@ -271,14 +317,21 @@ class MattermostAdapter(BasePlatformAdapter):
             self._ws = None
         if self._session and not self._session.closed:
             await self._session.close()
+        self._release_platform_lock()
         logger.info("Mattermost: disconnected")
 
     async def _resolve_root_id(self, post_id: str) -> str:
-        """Resolve a post_id to its thread root_id (a reply's own ID causes "Invalid RootId parameter")."""
+        """Resolve a post_id to its thread root_id (a reply's own ID causes "Invalid RootId parameter").
+
+        A missing/deleted post must not be reused as root_id — that 400s forever.
+        """
         if not post_id:
             return post_id
         data = await self._api_get(f"posts/{post_id}")
-        return data["root_id"] if data and data.get("root_id") else post_id
+        if not data:
+            logger.warning("Mattermost: thread root %s is gone; skipping it", post_id)
+            return ""
+        return data["root_id"] if data.get("root_id") else post_id
 
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: _Metadata = None) -> SendResult:
@@ -302,11 +355,103 @@ class MattermostAdapter(BasePlatformAdapter):
     # --- Optional overrides ---
 
     async def send_typing(self, chat_id: str, metadata: _Metadata = None) -> None:
-        await self._api_post(f"users/{self._bot_user_id}/typing", {"channel_id": chat_id})
+        payload: dict[str, Any] = {"channel_id": chat_id}
+        parent_id = self._typing_parent_id_from_metadata(metadata)
+        if parent_id:
+            payload["parent_id"] = parent_id
+        await self._api_post("users/me/typing", payload)
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
         payload = _with_mentions_disabled({"message": self.format_message(content)})
         return _post_result(await self._api("PUT", f"posts/{message_id}/patch", payload), "Failed to edit post")
+
+    async def _api_delete(self, path: str) -> bool:
+        """DELETE /api/v4/{path}.
+
+        Normal gateway traffic uses the long-lived Mattermost aiohttp session.
+        Progress-bubble cleanup can run very late in a turn, including while a
+        gateway replacement is closing that session.  If the primary connector
+        is already closed, retry with a short-lived session so cleanup is not
+        silently lost after the final response lands.
+        """
+        import aiohttp
+        if ".." in path:
+            logger.error("MM API path traversal blocked: %s", path)
+            return False
+        url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
+
+        last_delete_error: list[BaseException | None] = [None]
+
+        async def _delete_with_session(session: Any, *, request_kwargs: Optional[dict[str, Any]] = None) -> bool:
+            try:
+                last_delete_error[0] = None
+                async with session.delete(
+                    url,
+                    headers=self._headers(),
+                    timeout=aiohttp.ClientTimeout(total=30),
+                    **(request_kwargs or {}),
+                ) as resp:
+                    if resp.status >= 400:
+                        body = await resp.text()
+                        logger.error("MM API DELETE %s → %s: %s", path, resp.status, body[:200])
+                        return False
+                    return True
+            except (aiohttp.ClientError, RuntimeError) as exc:
+                # RuntimeError covers aiohttp's "Session is closed" path; live
+                # logs also showed "Connector is closed" as ClientError.
+                last_delete_error[0] = exc
+                logger.error("MM API DELETE %s network error: %s", path, exc)
+                return False
+
+        session = self._session
+        session_closed = session is None or getattr(session, "closed", False) is True
+        if not session_closed:
+            ok = await _delete_with_session(session)
+            if ok:
+                return True
+            session_closed = getattr(session, "closed", False) is True
+            closed_error = "closed" in str(last_delete_error[0] or "").lower()
+            if not session_closed and not closed_error:
+                return False
+            session_closed = True
+
+        if not self._base_url or not self._token:
+            logger.error("MM API DELETE %s unavailable: Mattermost URL/token not configured", path)
+            return False
+
+        try:
+            from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+
+            proxy = resolve_proxy_url(platform_env_var="MATTERMOST_PROXY")
+            session_kwargs, request_kwargs = proxy_kwargs_for_aiohttp(proxy)
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30),
+                **session_kwargs,
+            ) as transient_session:
+                logger.debug(
+                    "MM API DELETE %s using transient session after primary session closed=%s",
+                    path,
+                    session_closed,
+                )
+                return await _delete_with_session(
+                    transient_session,
+                    request_kwargs=request_kwargs,
+                )
+        except (aiohttp.ClientError, RuntimeError) as exc:
+            logger.error("MM API DELETE %s transient session error: %s", path, exc)
+            return False
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a previously sent Mattermost post.
+
+        Mattermost post IDs are globally unique, so the channel ID is not
+        needed by the REST endpoint.  The gateway only tracks IDs returned from
+        sends it performed itself; Mattermost enforces token permissions server
+        side if a caller ever passes an invalid/unauthorized post ID.
+        """
+        if not message_id:
+            return False
+        return await self._api_delete(f"posts/{message_id}")
 
     async def send_image(self, chat_id: str, image_url: str, caption: Optional[str] = None,
                          reply_to: Optional[str] = None, metadata: _Metadata = None) -> SendResult:
@@ -407,7 +552,8 @@ class MattermostAdapter(BasePlatformAdapter):
         return file_data, _url_filename(image_url, f"image_{index}.png"), ct
 
     async def send_multiple_images(self, chat_id: str, images: list[tuple[str, str]],
-                                   metadata: _Metadata = None, human_delay: float = 0.0) -> SendResult:
+                                   metadata: _Metadata = None, human_delay: float = 0.0,
+                                   reply_to: Optional[str] = None) -> SendResult:
         """Send a batch of images as one post; chunked at Mattermost's 5-``file_ids`` cap, each chunk
         falling back to the base per-image loop on failure."""
         if not images:
@@ -429,17 +575,20 @@ class MattermostAdapter(BasePlatformAdapter):
                     continue
                 logger.info("Mattermost: sending %d image(s) as single post (chunk %d/%d)",
                             len(file_ids), chunk_idx + 1, len(chunks))
-                data = await self._post_message(chat_id, "\n".join(caption_parts), None, metadata, file_ids)
+                data = await self._post_message(
+                    chat_id, "\n".join(caption_parts), reply_to, metadata, file_ids)
                 if data and "id" in data:
                     delivered = True
                 else:
                     logger.warning("Mattermost: multi-image post failed, falling back")
-                    fallback = await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                    fallback = await super().send_multiple_images(
+                        chat_id, chunk, metadata, human_delay=human_delay, reply_to=reply_to)
                     delivered = delivered or fallback.success
             except Exception as e:
                 logger.warning("Mattermost: multi-image send failed (chunk %d/%d), falling back: %s",
                                chunk_idx + 1, len(chunks), e, exc_info=True)
-                fallback = await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                fallback = await super().send_multiple_images(
+                    chat_id, chunk, metadata, human_delay=human_delay, reply_to=reply_to)
                 delivered = delivered or fallback.success
         return SendResult(success=delivered, error=None if delivered else "all images failed to send")
 
@@ -578,7 +727,7 @@ class MattermostAdapter(BasePlatformAdapter):
                 return
         # Thread support: replies use root_id; in thread mode a top-level channel post is itself a valid root.
         thread_id = post.get("root_id") or None
-        if not thread_id and self._reply_mode == "thread" and not is_dm and post_id:
+        if not thread_id and self._reply_mode == "thread" and post_id:
             thread_id = post_id
         if message_text[:1].isspace() and message_text.lstrip().startswith("/"):
             message_text = message_text.lstrip()
@@ -593,10 +742,7 @@ class MattermostAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=channel_id, chat_type=_CHANNEL_TYPE_MAP.get(data.get("channel_type", "O"), "channel"),
             user_id=sender_id, user_name=data.get("sender_name", "").lstrip("@") or sender_id,
-            thread_id=thread_id, message_id=post_id,
-            # A bot account's post carries props.from_bot (a string "true" on the wire).
-            is_bot=str((post.get("props") or {}).get("from_bot", "")).lower() == "true"
-            or self._is_configured_bot_user(sender_id))
+            thread_id=thread_id, message_id=post_id)
         from gateway.platforms.base import resolve_channel_prompt
         await self.handle_message(MessageEvent(
             text=message_text, message_type=msg_type, source=source, raw_message=post, message_id=post_id,
@@ -689,12 +835,8 @@ def interactive_setup() -> None:
     save_env_value("MATTERMOST_TOKEN", token)
     print_success("Mattermost token saved")
     print()
-    info("🔒 Security: Restrict who can use your bot",
-         "   Find your user ID (the profile dialog does not show it):",
-         "   Admins: System Console → User Management → Users → open your user.",
-         "   Anyone: while logged in, open <server>/api/v4/users/me in a browser tab.",
-         "   With the bot token: GET <server>/api/v4/users/username/<your-username>.",
-         "   Copy the \"id\" field. /users/me with the bot token returns the bot's ID.")
+    info("🔒 Security: Restrict who can use your bot", "   To find your user ID: click your avatar → Profile",
+         "   or use the API: GET /api/v4/users/me")
     print()
     allowed_users = prompt("Allowed user IDs (comma-separated, leave empty for open access)")
     if allowed_users:
@@ -729,7 +871,11 @@ def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
 
 
 
-_is_connected = _env_is_connected("MATTERMOST_TOKEN", "MATTERMOST_URL")
+def _is_connected(config=None) -> bool:
+    """True when this profile owns both a Mattermost URL and token."""
+    from gateway.config import PlatformConfig
+    url, token = _url_and_token(config if config is not None else PlatformConfig())
+    return bool(str(url).strip() and str(token).strip())
 
 
 # System-prompt platform hint (PlatformEntry.platform_hint); cached-prompt bytes, keep stable.
