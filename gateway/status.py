@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, UTC
 from pathlib import Path
-from typing import Any, Callable, Iterable, NamedTuple, Optional
+from typing import AbstractSet, Any, Callable, Iterable, NamedTuple, Optional
 from hermes_dir_acl import make_user_dir
 
 from gateway.status_inline_source import (
@@ -798,12 +798,10 @@ def _build_pid_record() -> dict:
 
 def _get_code_identity_fields() -> dict[str, Any]:
     """Code identity of THIS process for ``gateway_state.json`` (restart picked up new code?).
-    Lazy import keeps ``gateway.status`` free of ``hermes_cli`` at import time. Never raises.
-
-    A gateway keeps serving the module versions it imported at startup, so stamping the identity into
-    ``gateway_state.json`` lets `hermes update` (and the dashboard) prove whether a running gateway actually
-    picked up new code after the restart phase — instead of assuming it did (#88654, #69754). Never raises;
-    degrades to absent fields.
+    Lazy import keeps ``gateway.status`` free of ``hermes_cli`` at import time. Never raises;
+    a failure degrades to absent fields. A gateway keeps serving the module versions it imported
+    at startup, so the stamp lets `hermes update` and the dashboard prove a restart picked up new
+    code (#88654, #69754).
     """
     try:
         from hermes_cli.version_info import get_code_identity
@@ -1118,7 +1116,9 @@ def _prepare_runtime_status_update(
     parked_profiles: Any = _UNSET, multiplex_standalone_reason: Any = _UNSET,
     platform_metrics: Any = _UNSET,
     ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
-    drop_profile_platforms: Optional[str] = None, keep_platforms: Iterable[str] = (),
+    drop_profile_platforms: Optional[str] = None,
+    enabled_default_platforms: Optional[AbstractSet[str]] = None,
+    keep_platforms: Iterable[str] = (),
     load_existing: bool = True, reload_existing: bool = False,
 ) -> tuple[Path, dict[str, Any], dict[str, Any]]:
     """Merge one update into the process-wide canonical status snapshot."""

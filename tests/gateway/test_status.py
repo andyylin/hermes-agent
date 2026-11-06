@@ -334,6 +334,35 @@ class TestGatewayRuntimeStatus:
         assert "buzz" not in platforms
         assert platforms["telegram"]["state"] == "connected"
 
+    def test_startup_records_running_state_and_this_process_code_sha(self, tmp_path, monkeypatch):
+        """A start must replace a stopped record that still names the previous SHA.
+
+        /health answers 200 from the process itself. gateway_state.json is a
+        separate write; dropping enabled_default_platforms made that write
+        raise NameError, so the file kept the old SHA and stopped.
+        """
+        from hermes_cli.version_info import get_code_identity
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        old_sha = "771fd573" + "0" * 32
+        (tmp_path / "gateway_state.json").write_text(
+            json.dumps({"gateway_state": "stopped", "code_sha": old_sha, "code_version": "0.22.5"}),
+            encoding="utf-8",
+        )
+
+        status.write_runtime_status(
+            gateway_state="running",
+            enabled_default_platforms=frozenset(),
+            reload_existing=True,
+        )
+
+        payload = status.read_runtime_status()
+        identity = get_code_identity()
+        assert payload["gateway_state"] == "running"
+        assert payload["code_sha"] == identity["sha"]
+        assert payload["code_sha"] != old_sha
+        assert payload["code_version"] == identity["version"]
+
     def test_clear_profile_platforms_and_write_are_one_atomic_update(
         self, tmp_path, monkeypatch
     ):

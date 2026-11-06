@@ -369,6 +369,7 @@ class Deployer:
         self.host = host
         self.store = store
         self.wake = threading.Event()
+        self._last_swap_error: Optional[BaseException] = None
 
     def request(self, sha: str) -> tuple[int, str]:
         """Queue *sha*; the newest request wins. Older, already-deployed and failed SHAs are refused."""
@@ -388,15 +389,24 @@ class Deployer:
 
     def run_pending(self) -> Optional[Result]:
         """Deploy whatever is pending; called by the worker thread and by tests."""
-        sha = self.store.load().pending_sha
+        state = self.store.load()
+        sha = state.pending_sha
         if not sha:
             return None
+        previous = state.deployed_sha
         with deploy_lock(self.config.deploy_dir, wait=True):
             try:
                 result = self.deploy(sha)
             except DeployError as exc:
                 log.error("deploy %s failed: %s", sha, exc)
-                result = Result("error", sha, str(exc))
+                result = self._rollback_if_moved(previous, sha, str(exc))
+            except SystemExit as exc:
+                code = exc.code
+                if code in (0, None):
+                    raise
+                numeric = code if isinstance(code, int) else 1
+                log.error("deploy %s exited %s", sha, numeric)
+                result = self._rollback_if_moved(previous, sha, f"exit {numeric}")
         state = self.store.load()
         pending = None if state.pending_sha == sha else state.pending_sha
         self.store.update(pending_sha=pending, phase="idle", last_result=asdict(result))
@@ -431,7 +441,13 @@ class Deployer:
             return Result("superseded", target, "a newer SHA arrived while waiting for idle", plan.kind)
         self._phase("swapping")
         if not self._swap(target, python, drained):
-            return Result("error", target, "a unit refused to stop; checkout unchanged, units started again")
+            if self._last_swap_error is not None and self._head_sha() not in (None, current):
+                return self._rollback(current, target, python)
+            detail = (
+                str(self._last_swap_error) if self._last_swap_error is not None
+                else "a unit refused to stop; checkout unchanged, units started again"
+            )
+            return Result("error", target, detail)
         if plan.sync_skills:
             self._sync_skills(python)
         if self._healthy(python, target):
@@ -442,15 +458,15 @@ class Deployer:
         return self._rollback(current, target, python)
 
     def _rollback(self, previous: str, failed: str, python: str) -> Result:
-        log.error("health failed for %s; rolling back to %s", failed, previous)
+        log.error("deploy of %s failed; rolling back to %s", failed, previous)
         self._phase("rolling_back")
         state = self.store.load()
         self.store.update(failed_shas=[*state.failed_shas, failed][-20:])
         drained = self._quiesce(python, target=None, strict=False) or []
         if self._swap(previous, python, drained, reset=True) and self._healthy(python, previous):
             self.store.update(runtime_sha=previous)
-            return Result("rolled_back", failed, f"health failed; {previous} restored")
-        return Result("rollback_failed", failed, f"health failed for {failed} and for restored {previous}")
+            return Result("rolled_back", failed, f"deploy failed; {previous} restored")
+        return Result("rollback_failed", failed, f"deploy failed for {failed} and for restored {previous}")
 
     def _current_sha(self) -> str:
         return self.store.load().deployed_sha or self.host.git("rev-parse", "HEAD")
@@ -568,27 +584,57 @@ class Deployer:
     def _swap(self, sha: str, python: str, drained: list[Path], *, reset: bool = False) -> bool:
         """Stop, move the checkout, re-stamp, start. Units are always started again.
 
-        False only when a unit refused to stop, so the checkout was not moved. A failure after the
-        move is left to the health check, which then rolls back."""
+        False when a unit refused to stop, or when git or stamp exited non-zero (every code,
+        including 24). A non-zero exit after the checkout moved is a rollback, not a health pass.
+        """
         units = self.config.units
+        self._last_swap_error = None
         stopped = all([self.host.systemctl("stop", unit) for unit in reversed(units)])
         try:
             if drained:
                 self.host.probe(python, self.config.checkout, "drain", "off", *_homes_args(drained))
             if stopped:
                 self.host.git(*(("reset", "--keep", sha) if reset else ("merge", "--ff-only", sha)))
-                self.host.probe(python, self.config.checkout, "stamp")
+                # Rollback resets onto a tree whose probe may not accept --home.
+                # Migrating there is the forward deploy's job, and only for one profile.
+                self._stamp(python, migrate=not reset)
         except DeployError as exc:
+            self._last_swap_error = exc
             log.error("swap to %s incomplete: %s", sha, exc)
         finally:
             started = [self.host.systemctl("start", unit) for unit in units]
         if not all(started):
             log.error("a unit failed to start on %s", sha)
+        if self._last_swap_error is not None:
+            return False
         return stopped
+
+    def _stamp(self, python: str, *, migrate: bool) -> None:
+        """Publish code identity. ``migrate`` updates the targeted profile and no sibling."""
+        args = ["stamp"]
+        if migrate:
+            args += ["--home", str(self.config.home)]
+        self.host.probe(python, self.config.checkout, *args, home=self.config.home if migrate else None)
 
     def _fast_forward(self, target: str, python: str) -> None:
         self.host.git("merge", "--ff-only", target)
-        self.host.probe(python, self.config.checkout, "stamp")
+        self._stamp(python, migrate=True)
+
+    def _head_sha(self) -> Optional[str]:
+        try:
+            return self.host.git("rev-parse", "HEAD")
+        except DeployError:
+            return None
+
+    def _rollback_if_moved(self, previous: Optional[str], failed: str, detail: str) -> Result:
+        """Any non-zero exit after the checkout moved rolls back, including exit 24."""
+        head = self._head_sha()
+        if previous and head and head != previous:
+            try:
+                return self._rollback(previous, failed, self._pm_python())
+            except DeployError as exc:
+                return Result("rollback_failed", failed, str(exc))
+        return Result("error", failed, detail)
 
     def _sync_skills(self, python: str) -> None:
         for home in self.hermes_homes(python):

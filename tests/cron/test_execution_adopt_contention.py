@@ -24,6 +24,17 @@ def _point_ledger(monkeypatch, tmp_path):
     return executions
 
 
+def test_busy_retry_names_resolve():
+    """The adopt path names these; a squash dropped them and every write raised NameError."""
+    from cron import executions
+
+    assert executions._BUSY_ATTEMPTS == 5
+    assert executions._BUSY_TIMEOUT_MS == 4000
+    assert callable(executions._is_lock_error)
+    assert callable(executions._sleep_busy)
+    executions._is_lock_error(sqlite3.OperationalError("database is locked"))
+
+
 def test_connection_sets_busy_timeout_and_journal_mode(monkeypatch, tmp_path):
     """Every executions.db connection waits on locks and asks for WAL.
 

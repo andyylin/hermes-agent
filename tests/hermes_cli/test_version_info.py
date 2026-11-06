@@ -219,6 +219,66 @@ def test_get_version_info_takes_the_version_a_calver_only_release_shipped(tmp_pa
     assert info.derived_version == f"0.21.4+1.g{git('rev-parse', '--short=7', 'HEAD')}"
 
 
+def test_placeholder_pyproject_version_is_not_a_release(tmp_path, monkeypatch):
+    """A CalVer tag whose pyproject says 0.0.0 must not become the reported version.
+
+    This fork's only tags are v2026.*, and the deploy fetch is --no-tags, so the
+    old resolver published 0.0.0. The placeholder stays unknown; a declared
+    0.23.0 in the working tree is the release.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", *args], cwd=repo, text=True, capture_output=True, check=True,
+            env={"HOME": str(tmp_path), "PATH": __import__("os").environ["PATH"]},
+        )
+        return result.stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.name", "Hermes Test")
+    git("config", "user.email", "hermes@example.invalid")
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "hermes-agent"\nversion = "0.0.0"\n', encoding="utf-8")
+    git("add", "pyproject.toml")
+    git("commit", "-qm", "release")
+    git("tag", "v2026.4.16")
+
+    monkeypatch.setattr("hermes_cli.version_info._resolve_stamp_file", lambda: None)
+    monkeypatch.setattr("hermes_cli.version_info._resolve_repo_dir", lambda: repo)
+    _reset_version_info_cache()
+    assert get_version_info().base_version == "unknown"
+
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "hermes-agent"\nversion = "0.23.0"\n', encoding="utf-8")
+    _reset_version_info_cache()
+    info = get_version_info()
+    assert info.base_version == "0.23.0"
+    assert info.distance == 0
+
+    # The live fork's CalVer tag ships pyproject 0.10.0. A newer declaration wins.
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "hermes-agent"\nversion = "0.10.0"\n', encoding="utf-8")
+    git("add", "pyproject.toml")
+    git("commit", "-qm", "old release")
+    git("tag", "-f", "v2026.4.16")
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "hermes-agent"\nversion = "0.23.0"\n', encoding="utf-8")
+    git("add", "pyproject.toml")
+    git("commit", "-qm", "declare 0.23.0")
+    _reset_version_info_cache()
+    assert get_version_info().base_version == "0.23.0"
+
+
+def test_this_checkout_reports_v0_23_0(monkeypatch):
+    repo = Path(__file__).resolve().parents[2]
+    monkeypatch.setattr("hermes_cli.version_info._resolve_stamp_file", lambda: None)
+    monkeypatch.setattr("hermes_cli.version_info._resolve_repo_dir", lambda: repo)
+    _reset_version_info_cache()
+    assert get_version_info().base_version == "0.23.0"
+
+
 def test_resolve_stamp_file_honors_install_root(tmp_path, monkeypatch):
     """Sealed installs (the Nix wrapper) point HERMES_INSTALL_ROOT at the stamp dir."""
     stamp = {"commit": "e" * 40, "source": "nix", "distribution": "nix", "updateMechanism": "external"}
