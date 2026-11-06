@@ -1,0 +1,52 @@
+name: CodeQL
+
+# Free CodeQL for this public repository. The default-setup API is not
+# reachable with the automation token (HTTP 403), so this advanced-setup
+# workflow is what produces the check run. It analyzes Python only, on
+# ubuntu-latest, and it does not deploy or read secrets.
+# workflow_dispatch accepts an exact SHA, including the v0.23.0 squash.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/codeql.yml"
+      - "**/*.py"
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Exact commit to analyze. Empty analyzes this workflow's SHA.
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+concurrency:
+  group: codeql-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze Python
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.sha || github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: python
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: "/language:python"

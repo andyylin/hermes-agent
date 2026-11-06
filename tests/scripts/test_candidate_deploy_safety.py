@@ -133,11 +133,29 @@ def test_squash_candidate_flags_score_ancestry_without_dropping_the_finding():
     """A one-parent squash is not a descendant of the scored tag; that is a flag."""
     freeze = safety.parse_ledger_freeze(
         (REPO / "ANDY_RUNTIME_PATCHES.md").read_text(encoding="utf-8"))
-    score_sha = safety._resolve(REPO, "2bd378ed")
+    score_sha = safety._commit_for_prefix(REPO, "2bd378ed", "v0.23.0")
     finding = safety._ancestry_finding(
         REPO, "ab2bbde6afc428a85e74a8b39a76754fcac3745b", freeze.sha, score_sha)
     assert finding["status"] == "flag"
     assert finding["check"] == "ancestry"
+
+
+def test_step_summary_records_flags(tmp_path, monkeypatch):
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    safety._print_summary({
+        "sha": "abc123",
+        "findings": [{
+            "area": "ledger",
+            "check": "freeze-versus-score",
+            "status": "flag",
+            "summary": "left for a human",
+        }],
+    })
+    text = summary.read_text(encoding="utf-8")
+    assert "abc123" in text
+    assert "flag" in text
+    assert "manual deploy gate" in text
 
 
 def test_squash_candidate_duplicates_the_cron_subject_helper():

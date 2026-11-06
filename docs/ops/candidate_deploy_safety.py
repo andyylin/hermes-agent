@@ -1,10 +1,10 @@
 """Focused deployment-safety checks for one exceptional-lane candidate SHA.
 
 ``ANDY_RUNTIME_PATCHES.md`` leaves broad GitHub CI optional on the routine
-lane and refuses unattended deploys that touch dependency manifests. The
-rpi5 workflow posts to the host on every push to ``main``, so this runner
-stays local. It does not deploy, activate a profile, or change
-``needs_manual``. Andy authorized these checks for the v0.23.0 candidate.
+lane. The exceptional lane asks for exact-SHA hosted CI and still refuses
+unattended deploys that touch dependency manifests. ``rpi5-deploy.yml`` is
+the only workflow that posts to the host, and only on a push to ``main``.
+This runner does not deploy, activate a profile, or change ``needs_manual``.
 
 A ledger freeze that differs from the PATCH-SCORE target is reported as a
 human flag. The check passes only when the score still cites the ledger
@@ -185,6 +185,17 @@ def _resolve(repo: Path, prefix: str) -> str:
     return done.stdout.strip()
 
 
+def _commit_for_prefix(repo: Path, prefix: str, version: str) -> str:
+    """Resolve a documented short SHA, fetching its release tag on a fresh clone."""
+    done = git(repo, "rev-parse", "--verify", f"{prefix}^{{commit}}", check=False)
+    if done.returncode == 0:
+        return done.stdout.strip()
+    peeled = _peel_tag(repo, version)
+    if peeled.startswith(prefix):
+        return peeled
+    raise RuntimeError(f"{prefix} is not tag {version} ({peeled})")
+
+
 def _ancestor(repo: Path, older: str, newer: str) -> bool:
     return git(repo, "merge-base", "--is-ancestor", older, newer, check=False).returncode == 0
 
@@ -195,8 +206,9 @@ def _peel_tag(repo: Path, version: str) -> str:
         return local.stdout.strip()
     ref = f"refs/deploy-safety/{version}"
     fetched = git(
-        repo, "fetch", "--no-tags", UPSTREAM, f"refs/tags/{version}:{ref}",
-        check=False, timeout=90)
+        repo, "fetch", "--no-tags", "--filter=blob:none", UPSTREAM,
+        f"refs/tags/{version}:{ref}",
+        check=False, timeout=180)
     if fetched.returncode != 0:
         raise RuntimeError(fetched.stderr.strip() or f"could not fetch {version}")
     try:
@@ -228,7 +240,13 @@ def phase_ledger(repo: Path, sha: str) -> list[dict]:
             freeze=freeze.sha, freeze_version=freeze.version,
             cited_prefix=score.cited_prefix, cited_version=score.cited_version,
             score_version=score.version, peel_version=score.peel_version))
-    score_sha = _resolve(repo, score.sha_prefix)
+    try:
+        score_sha = _commit_for_prefix(repo, score.sha_prefix, score.version)
+    except (RuntimeError, subprocess.SubprocessError, OSError) as exc:
+        findings.append(_result(
+            "ledger", "release-tags", "fail",
+            "score target could not be resolved from this clone", error=str(exc)))
+        return findings
     findings.extend(_tag_findings(repo, freeze, score, score_sha))
     findings.append(_divergence(freeze, score_sha))
     findings.append(_marker_finding(repo, ledger_text, freeze.sha))
@@ -334,7 +352,8 @@ def phase_scripts(repo: Path, root: Path) -> list[dict]:
     failures = []
     for path in sorted(root.glob("scripts/maintenance/*.sh")):
         syntax = subprocess.run(
-            ["bash", "-n", str(path)], capture_output=True, text=True, check=False)
+            ["bash", "-n", str(path)], capture_output=True, text=True,
+            check=False, timeout=30)
         if syntax.returncode != 0:
             failures.append(f"{path.name}:bash -n:{syntax.stderr.strip()}")
             continue
@@ -348,7 +367,8 @@ def phase_scripts(repo: Path, root: Path) -> list[dict]:
 def _script_behavior(repo: Path, path: Path) -> list[str]:
     if path.name == "refresh_andy_runtime.sh":
         done = subprocess.run(
-            ["bash", str(path)], cwd=repo, capture_output=True, text=True, check=False)
+            ["bash", str(path)], cwd=repo, capture_output=True, text=True,
+            check=False, timeout=60)
         if done.returncode != 2 or "expected branch andy-runtime" not in done.stderr:
             return [f"refresh exit {done.returncode}: {done.stderr.strip()[:300]}"]
         return []
@@ -356,7 +376,7 @@ def _script_behavior(repo: Path, path: Path) -> list[str]:
         return []
     done = subprocess.run(
         ["bash", str(path), "--source", str(repo)], cwd=repo,
-        capture_output=True, text=True, check=False)
+        capture_output=True, text=True, check=False, timeout=60)
     if "installed normalized definitions" in done.stdout:
         return ["pin installed unit definitions without --write"]
     return []
@@ -391,7 +411,7 @@ def phase_rollback(repo: Path, sha: str, freeze_sha: str) -> list[dict]:
 def _python_version(python: Path) -> tuple[int, int, int]:
     done = subprocess.run(
         [str(python), "-c", "import sys; print('%d.%d.%d' % sys.version_info[:3])"],
-        capture_output=True, text=True, check=False)
+        capture_output=True, text=True, check=False, timeout=30)
     raw = done.stdout.strip().split(".")
     if done.returncode != 0 or len(raw) != 3:
         raise RuntimeError(done.stderr.strip() or "could not read the interpreter version")
@@ -407,8 +427,18 @@ def _lock_id(root: Path) -> str:
     return digest.hexdigest()[:16]
 
 
+_PASSTHROUGH_ENV = (
+    "PATH", "LANG", "LC_ALL", "LC_CTYPE",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    "TMPDIR", "TMP", "TEMP",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy",
+)
+
+
 def _isolated_env(home: Path, runtime: Path, root: Path) -> dict[str, str]:
-    env = os.environ.copy()
+    """Scratch child env. Profile secrets and HERMES_* stay on the parent."""
+    env = {key: os.environ[key] for key in _PASSTHROUGH_ENV if key in os.environ}
     env["HOME"] = str(home.parent)
     env["HERMES_HOME"] = str(home)
     env["HERMES_RUNTIME_DIR"] = str(runtime)
@@ -590,8 +620,24 @@ def _flatten_runtime(items: list[dict]) -> list[dict]:
 
 
 def _print_summary(report: dict) -> None:
+    rows = []
     for item in report["findings"]:
-        print(f"{item['status'].upper():4} {item['area']}:{item['check']} {item['summary']}", file=sys.stderr)
+        line = f"{item['status'].upper():4} {item['area']}:{item['check']} {item['summary']}"
+        print(line, file=sys.stderr)
+        rows.append(item)
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(f"## Deploy safety `{report['sha']}`\n\n")
+        handle.write("| status | check | summary |\n| --- | --- | --- |\n")
+        for item in rows:
+            summary = str(item["summary"]).replace("|", "\\|")
+            handle.write(
+                f"| {item['status']} | `{item['area']}:{item['check']}` | {summary} |\n")
+        handle.write(
+            "\nFlags stay visible for a human and do not fail the job. "
+            "A failure does not relax the manual deploy gate.\n")
 
 
 def main(argv: list[str] | None = None) -> int:

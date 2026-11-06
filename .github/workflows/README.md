@@ -1,6 +1,6 @@
 # GitHub Actions workflows
 
-This directory has 57 workflow files. Most of them are **reusable workflows**
+This directory has 59 workflow files. Most of them are **reusable workflows**
 (`on: workflow_call`). They never start on their own; an entry-point workflow
 calls them. This README covers what starts each workflow, which jobs it skips
 and why, how to run it by hand, and how a regular CI run differs from a
@@ -41,7 +41,7 @@ pull_request / push main
  │                             └─ all-checks-pass  ← the ONLY required branch-protection check
  ├─ docker.yml   (own run; build/test, push :main on main)
  ├─ nix.yml      (own run; nix flake check)
- └─ path-filtered: pm-bundle, termux-verify, plugin-catalog-ci, sandbox-image, windows-bundle-sdk
+ └─ path-filtered: pm-bundle, termux-verify, plugin-catalog-ci, sandbox-image, windows-bundle-sdk, candidate-deploy-safety, codeql
 
 workflow_run CI started  → ci-review-comment.yml (live PR comment)
 PR labeled run-e2e       → label-rerun.yml (reruns CI, Docker, Nix)
@@ -309,6 +309,8 @@ branch protection.
 | `plugin-catalog-ci.yml`, **Plugin Catalog CI** | `pull_request` on `plugin-catalog/**` | `structural` (schema) and `pinned-source-validate` (the pinned SHA is reachable and the plugin passes `hermes plugins validate`; inner steps skip when no entry file changed). | none |
 | `sandbox-image.yml`, **Sandbox desktop image** | `pull_request` on its Dockerfile and smoke script; `release: published`; `workflow_dispatch` (`publish`) | `build`+smoke on the upstream repo only. `publish`/`merge` (push `nousresearch/hermes-sandbox:desktop`) only on `release` or a dispatch with `publish=true`. Never on `main` pushes. | `gh workflow run sandbox-image.yml -f publish=true` |
 | `windows-bundle-sdk.yml`, **Windows bundle SDK** | `pull_request` on the Windows bundle and signing scripts plus their tests; `workflow_dispatch` | Runs the real Windows SDK downloader on cold Windows runners. | `gh workflow run windows-bundle-sdk.yml --ref <branch>` |
+| `candidate-deploy-safety.yml`, **Candidate deploy safety** | `pull_request` on the KEEP/ledger/deploy surfaces and dependency manifests; `workflow_dispatch` (`sha`) | Exact-SHA ledger, KEEP, scratch-install, schema, and rollback checks on `ubuntu-latest`. Not part of `ci.yaml`. Does not deploy and does not change the manual gate. The `ab2bbde6` leg runs only on the evidence branch. Dependency review covers the PR diff, and on that branch or a dispatch it also covers the ledger freeze through the target SHA. | `gh workflow run candidate-deploy-safety.yml -f sha=<commit>` |
+| `codeql.yml`, **CodeQL** | `pull_request` on `*.py` or itself; `workflow_dispatch` (`sha`) | Python analysis on `ubuntu-latest`. Public-repo CodeQL; the default-setup API is not available to the automation token. Does not deploy. | `gh workflow run codeql.yml -f sha=<commit>` |
 
 ---
 
@@ -531,10 +533,12 @@ gh workflow run windows-install-update-e2e.yml --ref <branch> -f strict_acceptan
 | `bootstrap-installer-build.yml` | Bootstrap installer build | dispatch | none |
 | `bootstrap-installer.yml` | Bootstrap installer | R | ci |
 | `canary-release.yml` | Canary Release | cron daily 06:41, dispatch | none |
+| `candidate-deploy-safety.yml` | Candidate deploy safety | PR (paths), dispatch | none |
 | `case-collision-check.yml` | Case Collision Check | R | ci |
 | `catalog-tests.yml` | Catalog tests | R | ci |
 | `ci-review-comment.yml` | CI review comment | workflow_run(CI in_progress) | none |
 | `ci.yaml` | CI | PR, main, dispatch, call | stable |
+| `codeql.yml` | CodeQL | PR (paths), dispatch | none |
 | `contributor-check.yml` | Contributor Attribution Check | R | ci |
 | `deploy-site.yml` | Deploy Site | main (paths), release published, dispatch | skills-index (dispatch) |
 | `desktop-bundled-release.yml` | Desktop Bundled Release | dispatch, call | stable; canary/release.py (dispatch) |
