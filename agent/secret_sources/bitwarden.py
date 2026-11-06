@@ -25,7 +25,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from agent.secret_sources._cache import (
     CachedFetch as _CachedFetch, SecretCache, atomic_write_json, entry_from_payload,
-    fingerprint as _token_fingerprint, resolve_cache_home,
+    current_cache_path, fingerprint as _token_fingerprint, remove_cache_file, resolve_cache_home,
 )
 from agent.secret_sources.base import (
     ErrorKind, FetchResult, SecretSource, classify_cli_error, coerce_float,
@@ -44,7 +44,7 @@ _STALE_FALLBACK_KINDS = frozenset({
     ErrorKind.NETWORK, ErrorKind.TIMEOUT, ErrorKind.RATE_LIMITED,
 })
 
-# <hermes_home>/cache/bws_cache.json holds only secret VALUES (never the access
+# <hermes_home>/bws_cache.json holds only secret VALUES (never the access
 # token); kept out of .env so users editing .env don't commit BSM-sourced secrets.
 # (fingerprint, project_id, server_url) plus, when key_prefix is set,
 # (key_prefix, "1"|"0" strip flag). The unprefixed key stays 3-wide so an
@@ -82,7 +82,11 @@ def _purge_plaintext_disk_cache(home_path: Optional[Path] = None) -> None:
 
 
 def _encrypted_disk_cache_path(home_path: Optional[Path] = None) -> Path:
-    return resolve_cache_home(home_path) / "cache" / _ENCRYPTED_CACHE_BASENAME
+    return resolve_cache_home(home_path) / _ENCRYPTED_CACHE_BASENAME
+
+
+def _current_encrypted_disk_cache_path(home_path: Optional[Path] = None) -> Path:
+    return current_cache_path(resolve_cache_home(home_path), _ENCRYPTED_CACHE_BASENAME)
 
 
 # First matching rule wins. The BSM identity endpoint rejects a revoked /
@@ -230,7 +234,7 @@ def _write_encrypted_disk_cache(*, cache_key: _CacheKey, access_token: str, entr
         ciphertext = AESGCM(key).encrypt(nonce, plaintext, serialized_key.encode("utf-8"))
         payload = {"version": _ENCRYPTED_CACHE_VERSION, "key": serialized_key,
                    "salt": _b64e(salt), "nonce": _b64e(nonce), "ciphertext": _b64e(ciphertext)}
-        atomic_write_json(_encrypted_disk_cache_path(home_path), payload)
+        atomic_write_json(_current_encrypted_disk_cache_path(home_path), payload)
         _STORE.disk.clear(home_path)
     except Exception:
         return
@@ -246,7 +250,7 @@ def _read_encrypted_disk_cache(*, cache_key: _CacheKey, access_token: str, max_a
     try:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-        payload = json.loads(_encrypted_disk_cache_path(home_path).read_text(encoding="utf-8-sig"))
+        payload = json.loads(_current_encrypted_disk_cache_path(home_path).read_text(encoding="utf-8-sig"))
         serialized_key = _cache_key_str(cache_key)
         if (not isinstance(payload, dict)
                 or payload.get("version") != _ENCRYPTED_CACHE_VERSION
@@ -614,6 +618,11 @@ class BitwardenSource(SecretSource):
             return result.fail("bws binary not available and auto-install is disabled.  "
                                "Run `hermes secrets bitwarden setup` to install.", ErrorKind.BINARY_MISSING)
 
+        encrypted_cfg = cfg.get("encrypted_cache")
+        encrypted_cfg = encrypted_cfg if isinstance(encrypted_cfg, dict) else {}
+        if bool(encrypted_cfg.get("enabled", False)):
+            _purge_plaintext_disk_cache(home_path)
+
         try:
             secrets, warnings = fetch_bitwarden_secrets(
                 access_token=access_token, project_id=project_id, binary=binary,
@@ -643,10 +652,7 @@ class BitwardenSource(SecretSource):
 def clear_caches(home_path: Optional[Path] = None) -> None:
     """Drop in-process AND disk caches (plaintext and encrypted), e.g. after a token rotation."""
     _STORE.clear(home_path)
-    try:
-        _encrypted_disk_cache_path(home_path).unlink()
-    except (FileNotFoundError, OSError):
-        pass
+    remove_cache_file(resolve_cache_home(home_path), _ENCRYPTED_CACHE_BASENAME)
 
 
 _reset_cache_for_tests = clear_caches
