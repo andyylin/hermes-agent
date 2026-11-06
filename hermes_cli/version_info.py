@@ -135,11 +135,17 @@ def _release_base(repo_dir: Path) -> tuple[str, int | None]:
         for tag in (tags or "").splitlines()
         if STABLE_TAG_RE.fullmatch(tag)
     ]
+    declared = _checkout_project_version(repo_dir)
     if releases:
         base = max(releases, key=_version_key)
+        # A squash of a newer release does not make that release's tag an
+        # ancestor, so the previous semver tag stays the newest merged one.
+        # The declared pyproject version is that newer release until its tag
+        # is reachable. The checkout SHA is unchanged either way.
+        if declared is not None and _version_key(declared) > _version_key(base):
+            return declared, 0
         distance = _parse_nonnegative(_run_git(repo_dir, "rev-list", "--count", f"v{base}..HEAD"))
         return base, distance
-    declared = _checkout_project_version(repo_dir)
     calver = _calver_release_version(repo_dir)
     if declared is not None and (calver is None or _version_key(declared) > _version_key(calver[0])):
         return declared, 0

@@ -521,7 +521,9 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     reexec = launch_python_needs_reexec(root)
     if not current or reexec is not None:
         publish_launchers(root)
-        return _relaunch_target(root, python, same=same)
+        # same: already on the committed interpreter, so a relaunch that left
+        # the install stale must boot instead of exec'ing forever.
+        return _relaunch_target(root, launch, same=reexec is None)
     if owed_to_cli:
         # Left owed, not dropped: say so (once, in the process that boots) where an
         # operator of the unit will read it.
@@ -731,8 +733,11 @@ def relaunch_command(
             index += 1
     # _hermes_relaunched marks the child this starts (not processes it spawns) for _relaunch_target;
     # a restore re-execs sys.orig_argv and keeps it, which is why that guard re-checks currency.
-    prefix = (f"import sys, runpy; sys.path.insert(0, {str(root)!r}); sys.argv = {argv!r}; "
-              "sys._hermes_relaunched = True; ")
+    prefix = (
+        f"import sys, runpy; sys.path.insert(0, {str(root)!r}); sys.argv = {argv!r}; "
+        "sys._hermes_relaunched = True; "
+        + _activate_before_guest(root)
+    )
     if argv[0] == "-c":
         body = f"exec({original[index + 1]!r})"
     elif module and module != "__main__":

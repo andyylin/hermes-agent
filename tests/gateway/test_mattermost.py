@@ -467,6 +467,54 @@ class TestMattermostWebSocketParsing:
 
         assert self.adapter.handle_message.await_args.args[0].source.is_bot is True
 
+    @pytest.mark.asyncio
+    async def test_from_bot_prop_marks_the_inbound_source(self):
+        """v0.23 marks a post whose props.from_bot is true, even with no bot_users list."""
+        self.adapter._download_attachments = AsyncMock(return_value=([], []))
+        post_data = {
+            "id": "post_from_bot", "user_id": "other_bot", "channel_id": "dm_456",
+            "message": "ping", "props": {"from_bot": "true"},
+        }
+        event = {
+            "event": "posted",
+            "data": {"post": json.dumps(post_data), "channel_type": "D", "sender_name": "@other"},
+        }
+
+        await self.adapter._handle_ws_event(event)
+
+        assert self.adapter.handle_message.await_args.args[0].source.is_bot is True
+
+    @pytest.mark.asyncio
+    async def test_bot_users_env_marks_the_inbound_source(self, monkeypatch):
+        monkeypatch.setenv("MATTERMOST_BOT_USERS", "peer_bot")
+        self.adapter._download_attachments = AsyncMock(return_value=([], []))
+        post_data = {
+            "id": "post_env_bot", "user_id": "peer_bot", "channel_id": "dm_456", "message": "ping",
+        }
+        event = {
+            "event": "posted",
+            "data": {"post": json.dumps(post_data), "channel_type": "D", "sender_name": "@peer"},
+        }
+
+        await self.adapter._handle_ws_event(event)
+
+        assert self.adapter.handle_message.await_args.args[0].source.is_bot is True
+
+    @pytest.mark.asyncio
+    async def test_plain_user_post_is_not_a_bot(self):
+        self.adapter._download_attachments = AsyncMock(return_value=([], []))
+        post_data = {
+            "id": "post_human", "user_id": "user_123", "channel_id": "dm_456", "message": "hi",
+        }
+        event = {
+            "event": "posted",
+            "data": {"post": json.dumps(post_data), "channel_type": "D", "sender_name": "@andy"},
+        }
+
+        await self.adapter._handle_ws_event(event)
+
+        assert self.adapter.handle_message.await_args.args[0].source.is_bot is False
+
 
     @pytest.mark.asyncio
     async def test_ignore_system_posts(self):
