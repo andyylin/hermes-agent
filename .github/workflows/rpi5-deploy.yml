@@ -1,0 +1,49 @@
+name: rpi5 deploy
+
+# Tells the rpi5 host that main moved. The host verifies the HMAC, fetches this
+# exact SHA, and deploys it once every gateway is idle (docs/ops/README.md).
+# Re-running this job re-sends the request; the host ignores SHAs it already has.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rpi5-deploy
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    if: github.repository == 'andyylin/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            docs/ops/rpi5_deploy.py
+            docs/ops/rpi5_deploy_engine.py
+          sparse-checkout-cone-mode: false
+
+      - name: Join the tailnet (ephemeral, tag:ci)
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Notify rpi5
+        env:
+          RPI5_DEPLOY_HMAC_KEY: ${{ secrets.RPI5_DEPLOY_HMAC_KEY }}
+          RPI5_DEPLOY_URL: ${{ vars.RPI5_DEPLOY_URL }}
+        run: |
+          python3 docs/ops/rpi5_deploy.py notify \
+            --url "$RPI5_DEPLOY_URL" \
+            --sha "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --ref "$GITHUB_REF"

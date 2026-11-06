@@ -35,8 +35,8 @@ async def test_every_pass_shares_the_callers_budget(homes, monkeypatch):
 
     seen: list[tuple] = []
 
-    def _fake(*, scope=None, names=None, timeout=15.0):
-        seen.append((scope, timeout))
+    def _fake(*, scope=None, names=None, timeout=15.0, reap_stdio=True):
+        seen.append((scope, timeout, reap_stdio))
 
     monkeypatch.setattr(lifecycle, "shutdown_mcp_servers", _fake)
 
@@ -45,8 +45,9 @@ async def test_every_pass_shares_the_callers_budget(homes, monkeypatch):
     assert len(seen) == 4, f"the wildcard pass did not run: {seen}"
     assert seen[-1][0] is None, "the last pass must be the process-wide wildcard"
     budget_per_pass = 8.0 / 4
-    assert all(t <= budget_per_pass + 0.01 for _scope, t in seen), (
+    assert all(t <= budget_per_pass + 0.01 for _scope, t, _reap in seen), (
         f"a pass could outlive the caller's whole budget: {seen}")
+    assert [reap for _scope, _timeout, reap in seen] == [False, False, False, True]
 
 
 @pytest.mark.asyncio

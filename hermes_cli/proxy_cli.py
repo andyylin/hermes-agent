@@ -549,8 +549,10 @@ def _bitwarden_env_names(console: Console) -> Optional[list[str]]:
         if not access_token:
             console.print(f"  [red]✗ --from-bitwarden requested but {token_env} is not set in the environment.[/red]")
             return None
+        key_prefix, strip_prefix = bw.prefix_settings(bw_cfg)
         secrets, _ = bw.fetch_bitwarden_secrets(
-            access_token=access_token, project_id=bw_cfg.get("project_id", ""), cache_ttl_seconds=0, use_cache=False
+            access_token=access_token, project_id=bw_cfg.get("project_id", ""), cache_ttl_seconds=0, use_cache=False,
+            key_prefix=key_prefix, strip_prefix=strip_prefix,
         )
         names = list(secrets.keys())
         if not names:

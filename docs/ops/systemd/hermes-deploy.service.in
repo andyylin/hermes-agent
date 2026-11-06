@@ -1,0 +1,21 @@
+[Unit]
+Description=Hermes push-to-deploy listener (rpi5)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+# systemctl --user for user-scope units in config.json.
+Environment=XDG_RUNTIME_DIR=/run/user/@UID@
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONNOUSERSITE=1
+ExecStart=@PYTHON@ @CHECKOUT@/docs/ops/rpi5_deploy.py serve --home @HOME@
+# A self-update exits 0 after the new copy passes self-test; always come back.
+Restart=always
+RestartSec=5
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

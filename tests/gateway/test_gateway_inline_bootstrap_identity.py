@@ -67,6 +67,20 @@ def test_bootstrap_launched_gateway_is_a_gateway(form: str, join: str) -> None:
     assert _hermes_holder_subcommand(command_line) == "gateway"
 
 
+def test_webui_relaunch_activates_before_run_path_and_keeps_identity() -> None:
+    script = ROOT / "hermex-webui-start.sh"
+    command = [
+        str(part)
+        for part in venv_sync.relaunch_command(
+            Path(PY), ROOT, [str(script)], [PY, str(script)], None
+        )
+    ]
+    source = command[command.index("-c") + 1]
+    assert source.index("activate_dependencies") < source.index("runpy.run_path")
+    assert inline_bootstrap_argv(command) == [PY, str(script)]
+    assert inline_bootstrap_argv(" ".join(command).split()) == [PY, str(script)]
+
+
 @pytest.mark.parametrize("join", _JOINS)
 def test_bootstrap_argv_is_identity_only_for_the_process_running_it(join: str) -> None:
     store = [str(t) for t in _launchers.runtime_command(ROOT, ["gateway", "run"], python=Path(PY))]

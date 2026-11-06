@@ -96,6 +96,8 @@ secrets:
     enabled: false
     access_token_env: BWS_ACCESS_TOKEN
     project_id: ""
+    key_prefix: ""
+    strip_prefix: false
     server_url: ""
     cache_ttl_seconds: 300
     override_existing: true
@@ -107,6 +109,8 @@ secrets:
 | `enabled` | `false` | 主开关。为 false 时，永不联系 Bitwarden。 |
 | `access_token_env` | `BWS_ACCESS_TOKEN` | 存储引导令牌的环境变量名。如果你已将 `BWS_ACCESS_TOKEN` 用于其他用途，可修改此项。 |
 | `project_id` | `""` | 要同步的项目 UUID。 |
+| `key_prefix` | `""` | 只加载键名以此前缀开头的 secret。空字符串加载整个项目（与以往行为相同）。前缀为 `KATIE_` 或 `KATIE_MATRIX_` 时不会加载 `TELEGRAM_BOT_TOKEN`。 |
+| `strip_prefix` | `false` | 设置了 `key_prefix` 时，导出前去掉前导所有者段。单段前缀整段去掉，因此 `key_prefix: KATIE_` 会把 `KATIE_MATRIX_PASSWORD` 导出为 `MATRIX_PASSWORD`。更长的前缀保留最后一段，因此 `key_prefix: KATIE_MATRIX_` 同样导出为 `MATRIX_PASSWORD`，而不是 `PASSWORD`。`false` 保持 Bitwarden 键名不变。`key_prefix` 为空时忽略。 |
 | `server_url` | `""` | Bitwarden 区域或自托管端点。为空时使用 `bws` 默认值（US Cloud，`https://vault.bitwarden.com`）。欧盟云设为 `https://vault.bitwarden.eu`，自托管则填写自己的 URL。以 `BWS_SERVER_URL` 形式传递给 `bws` 子进程。 |
 | `cache_ttl_seconds` | `300` | 进程内拉取结果的复用时长。设为 `0` 可禁用缓存。缓存按进程隔离；新的 `hermes` 调用从头开始。 |
 | `override_existing` | `true` | 为 true 时，Bitwarden 的值会覆盖环境中已有的任何值（使 Web 应用中的轮换真正生效）。如果希望本地 `.env` / shell 导出优先，设为 `false`。 |

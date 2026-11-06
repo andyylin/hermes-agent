@@ -447,6 +447,74 @@ class NoCommittedEnvironment(RuntimeError):
     """PM's store Python with no committed generation: no retry fixes it, only `hermes pm repair`."""
 
 
+class CommittedInterpreterMismatch(RuntimeError):
+    """The running interpreter cannot load the committed dependency generation's ABI."""
+
+
+def committed_launch_python(project_root: Path) -> Path | None:
+    """The interpreter PM expects for this install, when the tree is store-managed.
+
+    Prefer the committed generation's own ``venv`` interpreter over the bare store
+    Python: they share an ABI, but only the generation's interpreter already carries
+    the correct ``sys.prefix`` for its site-packages.
+    """
+    try:
+        from hermes_cli._launchers import resolve_store_python
+    except ImportError:
+        return None
+    store = resolve_store_python(project_root)
+    if store is None:
+        return None
+    environment = committed_venv(project_root)
+    if environment is None:
+        return store
+    candidate = venv_python(environment)
+    return candidate if candidate.is_file() else store
+
+
+def _running_interpreter_matches(launch: Path) -> bool:
+    import sys
+
+    running = Path(sys.executable)
+    try:
+        if running.resolve() == launch.resolve():
+            return True
+    except OSError:
+        pass
+    return os.path.normcase(os.path.abspath(running)) == os.path.normcase(os.path.abspath(launch))
+
+
+def _assert_committed_interpreter(project_root: Path, environment: Path) -> None:
+    """Refuse to overlay a generation built for another Python (#122183, Linux profile gateways)."""
+    import sys
+
+    expected = venv_python_version(environment)
+    if expected and expected != sys.version_info[:2]:
+        raise CommittedInterpreterMismatch(
+            f"the committed dependency environment requires Python {expected[0]}.{expected[1]}; "
+            f"this process is {sys.version_info.major}.{sys.version_info.minor} ({sys.executable}). "
+            "Start Hermes through the installation launcher (for example "
+            f"{project_root.resolve() / '.hermes' / 'bin' / 'hermes'}) or run "
+            "`hermes gateway install` to refresh the service command."
+        )
+
+
+def launch_python_needs_reexec(project_root: Path) -> Path | None:
+    """Return the interpreter this process should re-exec onto, or ``None`` if already correct."""
+    import sys
+
+    launch = committed_launch_python(project_root)
+    if launch is None or _running_interpreter_matches(launch):
+        return None
+    environment = committed_venv(project_root)
+    if environment is None:
+        return launch
+    expected = venv_python_version(environment)
+    if expected and expected != sys.version_info[:2]:
+        return launch
+    return None
+
+
 def _require_own_dependencies(project_root: Path) -> None:
     """With nothing committed, an interpreter keeps the packages it booted with.
 
@@ -461,14 +529,20 @@ def _require_own_dependencies(project_root: Path) -> None:
         raise NoCommittedEnvironment("no dependency environment is committed for this install")
 
 
-def activate_dependencies(project_root: Path) -> None:
+def activate_dependencies(project_root: Path | str) -> None:
     """Select the committed tree at process boot, before third-party imports.
+
+    ``project_root`` may be a string. The store-interpreter relaunch passes one:
+    its ``-c`` snippet has no ``Path`` binding, and ``project_root.resolve()``
+    on that string raises ``AttributeError``. Callers that already hold a Path
+    are unchanged.
 
     A process with no extension selection keeps its original launch contract.
     Already-running processes are never switched after a dependency install.
     """
     import sys
 
+    project_root = Path(project_root)
     state = install_state_dir(project_root)
     if state.is_dir():
         from hermes_cli.runtime_state import runtime_lock, recover_publication, lease_generation
@@ -501,6 +575,7 @@ def activate_dependencies(project_root: Path) -> None:
             return  # External/Nix interpreter owns its original sys.path.
     if not selected.is_dir():
         raise RuntimeError(f"dependency environment has no site-packages: {selected}")
+    _assert_committed_interpreter(project_root, environment)
     import site
 
     sys.path[:] = [entry for entry in sys.path

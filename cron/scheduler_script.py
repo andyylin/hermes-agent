@@ -139,25 +139,33 @@ exec(code, main.__dict__)
 
 
 def _posix_cron_script_argv(script: Path) -> tuple[list[str], dict[str, str]]:
-    """POSIX managed-store installs run cron ``.py`` scripts on the selected dependency venv's
-    interpreter: the store Python has the repo and managed site-packages only on its in-process
-    ``sys.path``, so its children import neither (#123044). No ``PYTHONPATH``: everything the
-    script spawns would inherit it and a foreign interpreter would load the store's compiled
-    extensions (#123440). The venv resolves Hermes from its generation's workspace snapshot,
-    rebuilt only on a dependency change, so the bootstrap puts the live checkout first.
-    Lazy installs are off for the script's process tree: a script importing ``hermes_bootstrap``
-    could otherwise complete a source update and ``execv`` itself onto the bare store Python."""
+    """Run a POSIX cron ``.py`` script on the gateway interpreter, unless PM has committed
+    a dependency environment for this install.
+
+    A committed generation (or a sealed payload's own environment) uses that tree's
+    interpreter: the store Python carries the repo and managed site-packages only
+    in-process, so its children import neither (#123044). No ``PYTHONPATH`` — a child
+    would inherit it and a foreign interpreter would load the store's compiled
+    extensions (#123440). The bootstrap puts the live checkout ahead of the
+    generation's workspace snapshot. Lazy installs stay off so a script cannot
+    ``execv`` itself onto the bare store Python.
+
+    Nothing committed is not a selection. ``selected_venv`` / ``project_python`` would
+    answer the leftover pre-PM ``<repo>/venv``, often a different Python than the
+    process running the gateway (a 3.11 checkout venv beside a 3.14 gateway). The
+    script runs on ``sys.executable`` instead."""
     from hermes_cli._launchers import resolve_store_python
-    from pm.environments import project_python
+    from pm.environments import committed_venv, venv_python
 
     repo = Path(__file__).resolve().parents[1]
-    if resolve_store_python(repo) is None:
+    # committed_venv, not selected_venv: the latter falls back to <repo>/venv.
+    environment = committed_venv(repo) if resolve_store_python(repo) is not None else None
+    if environment is None:
         return [sys.executable, str(script)], {}
-    # project_python, not committed_venv as on Windows: a pre-PM venv selected before the first
-    # commit runs on its OWN interpreter here, so there is no ABI mix (#122183).
-    python = project_python(repo)
+    python = venv_python(environment)
     if not python.is_file():
-        # The caller's interpreter is the bare store Python here — the #123044 failure mode.
+        # A half-deleted generation still has pyvenv.cfg. The caller's interpreter
+        # is the bare store Python here — the #123044 failure mode.
         raise RuntimeError(f"dependency environment interpreter is missing: {python}")
     return ([str(python), "-c", _POSIX_SCRIPT_BOOTSTRAP, str(repo), str(script)],
             {"HERMES_DISABLE_LAZY_INSTALLS": "1"})

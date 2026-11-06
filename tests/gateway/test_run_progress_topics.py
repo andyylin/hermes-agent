@@ -583,12 +583,17 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
 
     assert result["final_response"] == "done"
     assert adapter.sent
-    expected_metadata = {
+    expected_thread = {
         "thread_id": "1234567890.000001",
         "message_id": "1234567890.000001",
     }
-    assert adapter.sent[0]["metadata"] == expected_metadata
-    assert all(call["metadata"] == expected_metadata for call in adapter.typing)
+    sent_meta = adapter.sent[0]["metadata"]
+    assert {key: sent_meta[key] for key in expected_thread} == expected_thread
+    assert sent_meta.get("_interim_send") is True
+    assert all(
+        {key: call["metadata"][key] for key in expected_thread} == expected_thread
+        for call in adapter.typing
+    )
 
 
 @pytest.mark.asyncio

@@ -524,17 +524,16 @@ DEFAULT_CONFIG = {
     # the larger bound lets slow cold-start servers (npx, uvx, remote HTTP) land. Reachable servers
     # still only wait their real handshake time.
     "mcp_single_query_discovery_timeout": 15.0,
-    "mcp": {  # MCP runtime behavior (distinct from mcp_servers: definitions and auxiliary.mcp).
-        # Auto-reload MCP connections when config.yaml's mcp_servers changes (CLI watcher). Every
-        # reload rebuilds the tool surface and INVALIDATES the provider prompt cache (next message
-        # re-sends the full prefix) — costly on long-context models. When false the watcher still
-        # detects the change and prints /reload-mcp guidance.
+    "mcp": {  # Runtime behavior (not mcp_servers definitions, not auxiliary.mcp).
+        # False: the watcher still notices mcp_servers edits and prints /reload-mcp,
+        # but does not rebuild the tool surface (that drops the prompt cache).
         "auto_reload_on_config_change": True,
-        # Max MCP servers connected (and their stdio child trees spawned) at once per discovery
-        # pass — at boot, on /reload-mcp and on the config watcher's reconcile. Unbounded, a config
-        # with N servers spawns N process trees in the same instant (RAM/CPU spike, 429 fan-out on
-        # multi-profile fleets). 0 = unlimited.
+        # Max servers connected at once per discovery pass. 0 = unlimited.
         "discovery_concurrency": 4,
+        # Seconds after SIGTERM before SIGKILL of a stdio MCP process group on
+        # shutdown. 0 = SIGKILL immediately. Stops npx/node (n8n) from holding
+        # gateway stop until systemd TimeoutStopSec.
+        "stdio_shutdown_grace_seconds": 4.0,
     },
     # Tool-output truncation. max_bytes: terminal_tool output cap in chars (head+tail kept; 50_000 ≈
     # 12-15K tokens). max_lines: max `limit` one read_file call may request before clamping.
@@ -2461,10 +2460,17 @@ DEFAULT_CONFIG = {
             # ~/.hermes/.env (or the shell), never in config.yaml.
             "access_token_env": "BWS_ACCESS_TOKEN",
             "project_id": "",  # UUID of the BSM project to sync from.
+            # Empty loads every secret in the project. A prefix loads only keys
+            # that start with it (KATIE_MATRIX_ leaves TELEGRAM_BOT_TOKEN out).
+            "key_prefix": "",
+            # With a prefix, drop the leading owner segment so KATIE_MATRIX_PASSWORD
+            # and a key_prefix of either KATIE_ or KATIE_MATRIX_ both export as
+            # MATRIX_PASSWORD. False keeps the Bitwarden key as the env name.
+            "strip_prefix": False,
             # Seconds to reuse a fresh disk/memory cache entry before contacting Bitwarden again. 0
             # disables fresh-cache reuse.
-            "cache_ttl_seconds": 300,
-            # Last-good fallback for NETWORK/TIMEOUT outages: AES-GCM cache under ~/.hermes/cache/,
+            "cache_ttl_seconds": 600,
+            # Last-good fallback for NETWORK/TIMEOUT/RATE_LIMITED outages: AES-GCM cache under ~/.hermes/cache/,
             # reused up to max_stale_seconds. Auth failures never fall back.
             "encrypted_cache": {"enabled": False, "max_stale_seconds": 0},
             # BSM values overwrite existing env vars, so rotating in Bitwarden takes effect without

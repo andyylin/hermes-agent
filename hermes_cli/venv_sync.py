@@ -513,16 +513,13 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
                 _finish_source_update(root, current=current, pending=pending)
         finally:
             lock.release()
-    python = resolve_store_python(root)
-    if python is None:
+    from pm.environments import committed_launch_python, launch_python_needs_reexec
+
+    launch = committed_launch_python(root)
+    if launch is None:
         raise RuntimeError("source update has no managed Python; run `hermes pm install`")
-    # Lexical identity, never resolve(): PM spells the store path through
-    # HERMES_HOME (which may carry '..') while sys.executable arrives
-    # normalized, so a raw compare re-execs every child forever (#122513). A
-    # venv interpreter symlinked to the same binary is still a different
-    # interpreter (its own sys.prefix) and must re-exec once.
-    same = os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable))
-    if not current or not same:
+    reexec = launch_python_needs_reexec(root)
+    if not current or reexec is not None:
         publish_launchers(root)
         return _relaunch_target(root, python, same=same)
     if owed_to_cli:
@@ -547,7 +544,6 @@ def _prepare_borrowed_launch(root: Path, owner: Path, *, current: bool) -> Path 
     import os
     import sys
     import pm
-    from hermes_cli._launchers import resolve_store_python
     from hermes_cli.update_lock import UpdateLock
 
     if not current:
@@ -561,11 +557,14 @@ def _prepare_borrowed_launch(root: Path, owner: Path, *, current: bool) -> Path 
         if not pm.venv_is_current(project_root=root):
             # Relaunching would land back here and sync again, forever.
             raise RuntimeError("dependency sync left this install out of date")
-    python = resolve_store_python(root)
-    if python is None:
+    from pm.environments import committed_launch_python, launch_python_needs_reexec
+
+    launch = committed_launch_python(root)
+    if launch is None:
         raise RuntimeError("source update has no managed Python; run `hermes pm install`")
-    same = os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable))
-    return python if not current or not same else None
+    if not current:
+        return launch
+    return launch_python_needs_reexec(root)
 
 
 def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
@@ -683,6 +682,27 @@ def _sync_source_dependencies(root: Path, *, arm: bool, borrowed_from: Path | No
         (root / name).unlink(missing_ok=True)
 
 
+def _activate_before_guest(root: Path) -> str:
+    """Select the committed environment before the guest script imports.
+
+    ``-I`` drops the caller's venv. The re-exec runs the guest from the top,
+    and ``run_agent`` only activates after that script's own imports. A process
+    that imports third-party modules first (hermes-webui imports fastapi, then
+    ``run_agent``) would otherwise see the bare store interpreter. A root that
+    is not a Hermes checkout has no ``pm.environments`` and skips this.
+    """
+    root_lit = repr(str(root))
+    # find_spec('pm.environments') imports the parent and raises when this root
+    # is not a Hermes checkout. A missing top-level pm is a skipped activation.
+    return (
+        "import importlib.util; "
+        "_spec = importlib.util.find_spec('pm.environments') "
+        "if importlib.util.find_spec('pm') else None; "
+        "(_spec and __import__('pm.environments', fromlist=['activate_dependencies'])"
+        f".activate_dependencies({root_lit})); "
+    )
+
+
 def relaunch_command(
     python: Path, root: Path, argv: list[str], original: list[str], module: str | None,
 ) -> list[str]:
@@ -690,6 +710,12 @@ def relaunch_command(
 
     An old venv may use a different Python ABI. Do not add the new generation
     to that interpreter, and do not depend on its obsolete editable finder.
+    The ``-c`` snippet activates the committed environment before ``runpy``
+    so the guest imports that generation, not the bare store interpreter.
+    A script file also gets its own directory at the front of ``sys.path``,
+    which ``python script.py`` does and ``-I`` plus ``runpy.run_path`` do not.
+    ``-m`` targets are left alone: their search path is the checkout, not a
+    script folder.
     """
     # Preserve interpreter options, not application flags with the same names.
     options: list[str] = []
@@ -714,7 +740,13 @@ def relaunch_command(
     else:
         # distlib .exe launchers are executable zip files with __main__, not
         # importable modules named '__main__'. run_path handles both shapes.
-        body = f"runpy.run_path({str(Path(argv[0]).absolute())!r}, run_name='__main__')"
+        # Insert after activation: that call rewrites sys.path and would bury
+        # the script directory behind the checkout.
+        script = Path(argv[0]).absolute()
+        body = (
+            f"sys.path.insert(0, {str(script.parent)!r}); "
+            f"runpy.run_path({str(script)!r}, run_name='__main__')"
+        )
     return [str(python), *options, "-I", "-c", prefix + body]
 
 

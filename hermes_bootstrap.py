@@ -581,22 +581,28 @@ from hermes_cli._parser import command_argv
 
 # Repair needs only stdlib. Do not activate the damaged tree to reach it.
 _pm_repair = command_argv(sys.argv[1:])[:2] == ["pm", "repair"]
-if not _pm_repair:
+def _relaunch_onto_managed_python(project_root: Path) -> None:
     from hermes_cli.venv_sync import prepare_launch, relaunch_command
+    from pm.environments import launch_python_needs_reexec
 
+    launch_python = prepare_launch(project_root, sys.argv[1:]) or launch_python_needs_reexec(project_root)
+    if launch_python is None:
+        return
+    _main_spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+    command = relaunch_command(
+        launch_python, project_root, sys.argv, sys.orig_argv,
+        getattr(_main_spec, "name", None),
+    )
+    if os.name == "nt":
+        import subprocess
+
+        raise RelaunchExit(subprocess.call(command))
+    os.execv(str(launch_python), command)
+
+
+if not _pm_repair:
     try:
-        _launch_python = prepare_launch(_root, sys.argv[1:])
-        if _launch_python is not None:
-            _main_spec = getattr(sys.modules.get("__main__"), "__spec__", None)
-            _command = relaunch_command(
-                _launch_python, _root, sys.argv, sys.orig_argv,
-                getattr(_main_spec, "name", None),
-            )
-            if os.name == "nt":
-                import subprocess
-
-                raise RelaunchExit(subprocess.call(_command))
-            os.execv(str(_launch_python), _command)
+        _relaunch_onto_managed_python(_root)
     except Exception as exc:
         if isinstance(exc, PermissionError) and (message := install_state_permission_message(_root, exc)):
             print(f"hermes: {message}", file=sys.stderr)

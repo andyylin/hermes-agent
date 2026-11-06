@@ -264,6 +264,156 @@ class TestMattermostSend:
 
 
 # ---------------------------------------------------------------------------
+# Interim progress — persistent posts with ids so tool_progress: all can edit
+# ---------------------------------------------------------------------------
+
+class TestMattermostInterimProgress:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._reply_mode = "thread"
+
+    @pytest.mark.asyncio
+    async def test_interim_send_uses_persistent_post_and_returns_id(self):
+        self.adapter._api_post = AsyncMock(return_value={"id": "progress_post"})
+        self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
+
+        result = await self.adapter.send(
+            "channel_1",
+            "⚙️ terminal...",
+            reply_to="root_post",
+            metadata={"_interim_send": True, "thread_id": "root_post"},
+        )
+
+        assert result.success is True
+        assert result.message_id == "progress_post"
+        self.adapter._api_post.assert_called_once()
+        path, payload = self.adapter._api_post.call_args[0]
+        assert path == "posts"
+        assert "user_id" not in payload
+        assert payload["channel_id"] == "channel_1"
+        assert payload["message"] == "⚙️ terminal..."
+        assert payload["root_id"] == "root_post"
+        assert payload["props"]["disable_mentions"] is True
+
+    @pytest.mark.asyncio
+    async def test_final_send_still_uses_persistent_posts(self):
+        self.adapter._api_post = AsyncMock(return_value={"id": "final_post"})
+        self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
+
+        result = await self.adapter.send(
+            "channel_1",
+            "Final answer body",
+            reply_to="root_post",
+            metadata={"notify": True},
+        )
+
+        assert result.success is True
+        assert result.message_id == "final_post"
+        path, payload = self.adapter._api_post.call_args[0]
+        assert path == "posts"
+        assert "user_id" not in payload
+
+    @pytest.mark.asyncio
+    async def test_approval_prompt_stays_persistent_even_with_interim_marker(self):
+        self.adapter._api_post = AsyncMock(return_value={"id": "approval_post"})
+        self.adapter._api_get = AsyncMock(return_value={"id": "root_post", "root_id": ""})
+
+        result = await self.adapter.send(
+            "channel_1",
+            "Approve this command?",
+            reply_to="root_post",
+            metadata={"_interim_send": True, "is_approval_prompt": True, "inbound_user_id": "user_andy"},
+        )
+
+        assert result.success is True
+        assert result.message_id == "approval_post"
+        assert self.adapter._api_post.call_args[0][0] == "posts"
+
+
+# ---------------------------------------------------------------------------
+# Typing — CRT threads need parent_id on users/me/typing
+# ---------------------------------------------------------------------------
+
+class TestMattermostTyping:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+
+    @pytest.mark.asyncio
+    async def test_send_typing_includes_parent_id_for_crt_thread(self):
+        self.adapter._api_post = AsyncMock(return_value={})
+
+        await self.adapter.send_typing(
+            "channel_1",
+            metadata={"thread_id": "root_post", "inbound_user_id": "user_andy"},
+        )
+
+        self.adapter._api_post.assert_called_once_with(
+            "users/me/typing",
+            {"channel_id": "channel_1", "parent_id": "root_post"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_typing_channel_only_without_thread_metadata(self):
+        self.adapter._api_post = AsyncMock(return_value={})
+
+        await self.adapter.send_typing("channel_1")
+
+        self.adapter._api_post.assert_called_once_with(
+            "users/me/typing",
+            {"channel_id": "channel_1"},
+        )
+
+
+# ---------------------------------------------------------------------------
+# delete_message — required by display.platforms.mattermost.cleanup_progress
+# ---------------------------------------------------------------------------
+
+class TestMattermostDeleteMessage:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._session = MagicMock()
+        self.adapter._session.closed = False
+
+    def _delete_resp(self, status=200, body=""):
+        mock_resp = AsyncMock()
+        mock_resp.status = status
+        mock_resp.text = AsyncMock(return_value=body)
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+        return mock_resp
+
+    @pytest.mark.asyncio
+    async def test_empty_id_does_not_call_api(self):
+        assert await self.adapter.delete_message("channel_1", "") is False
+        self.adapter._session.delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_success(self):
+        self.adapter._session.delete = MagicMock(return_value=self._delete_resp(200))
+        assert await self.adapter.delete_message("channel_1", "post123") is True
+        url = self.adapter._session.delete.call_args[0][0]
+        assert url.endswith("/api/v4/posts/post123")
+
+    @pytest.mark.asyncio
+    async def test_delete_http_error(self):
+        self.adapter._session.delete = MagicMock(return_value=self._delete_resp(403, "forbidden"))
+        assert await self.adapter.delete_message("channel_1", "post123") is False
+
+    @pytest.mark.asyncio
+    async def test_closed_session_retries_transient(self):
+        self.adapter._session.closed = True
+        transient = MagicMock()
+        transient.delete = MagicMock(return_value=self._delete_resp(200))
+        transient_cm = AsyncMock()
+        transient_cm.__aenter__ = AsyncMock(return_value=transient)
+        transient_cm.__aexit__ = AsyncMock(return_value=False)
+        with patch("aiohttp.ClientSession", return_value=transient_cm):
+            assert await self.adapter.delete_message("channel_1", "post123") is True
+        transient.delete.assert_called_once()
+        self.adapter._session.delete.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # WebSocket event parsing
 # ---------------------------------------------------------------------------
 
@@ -579,6 +729,87 @@ class TestMattermostMediaTypes:
         msg = self.adapter.handle_message.call_args[0][0]
         assert msg.media_types == ["image/png"]
         assert msg.media_types[0].startswith("image/")
+
+
+class TestMattermostMediaThreading:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._reply_mode = "thread"
+        self.adapter._api_get = AsyncMock(return_value={"id": "trigger_post", "root_id": "crt_root"})
+        self.adapter._api_post = AsyncMock(return_value={"id": "img_post"})
+        self.adapter._upload_file = AsyncMock(return_value="file_1")
+
+    @pytest.mark.asyncio
+    async def test_send_multiple_images_threads_via_reply_to(self, tmp_path):
+        img = tmp_path / "tray.png"
+        img.write_bytes(b"\x89PNG" + b"\x00" * 8)
+        result = await self.adapter.send_multiple_images(
+            "dm_chan",
+            [(f"file://{img}", "caption")],
+            metadata={"thread_id": "crt_root"},
+            reply_to="trigger_post",
+        )
+        assert result.success
+        payload = self.adapter._api_post.await_args.args[1]
+        assert payload["root_id"] == "crt_root"
+        assert payload["file_ids"] == ["file_1"]
+
+    @pytest.mark.asyncio
+    async def test_send_multiple_images_empty_caption_still_threads(self, tmp_path):
+        img = tmp_path / "views.png"
+        img.write_bytes(b"\x89PNG" + b"\x00" * 8)
+        await self.adapter.send_multiple_images(
+            "dm_chan",
+            [(f"file://{img}", "")],
+            metadata={"thread_id": "crt_root"},
+            reply_to="trigger_post",
+        )
+        payload = self.adapter._api_post.await_args.args[1]
+        assert payload["root_id"] == "crt_root"
+        assert payload["message"] == ""
+        assert payload["file_ids"] == ["file_1"]
+
+    @pytest.mark.asyncio
+    async def test_send_multiple_images_flat_when_reply_mode_off(self, tmp_path):
+        self.adapter._reply_mode = "off"
+        img = tmp_path / "flat.png"
+        img.write_bytes(b"\x89PNG" + b"\x00" * 8)
+        await self.adapter.send_multiple_images(
+            "dm_chan",
+            [(f"file://{img}", "")],
+            metadata={"thread_id": "crt_root"},
+            reply_to="trigger_post",
+        )
+        payload = self.adapter._api_post.await_args.args[1]
+        assert "root_id" not in payload
+
+
+@pytest.mark.asyncio
+async def test_mattermost_top_level_dm_post_is_thread_root():
+    adapter = _make_adapter()
+    adapter._reply_mode = "thread"
+    adapter._bot_user_id = "bot_user_id"
+    adapter.handle_message = AsyncMock()
+    post_data = {
+        "id": "dm_top_123",
+        "user_id": "user_123",
+        "channel_id": "dm_chan",
+        "message": "draw a tray",
+        "root_id": "",
+    }
+    event = {
+        "event": "posted",
+        "data": {
+            "post": json.dumps(post_data),
+            "channel_type": "D",
+            "sender_name": "@andy",
+        },
+    }
+
+    await adapter._handle_ws_event(event)
+
+    msg_event = adapter.handle_message.call_args[0][0]
+    assert msg_event.source.thread_id == "dm_top_123"
 
 
 @pytest.mark.asyncio

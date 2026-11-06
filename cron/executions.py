@@ -3,6 +3,11 @@
 The ledger records what is known about each attempt; it is not a retry queue. Interrupted attempts
 become ``unknown`` only after their owner process is proved gone — a start-time reading that fails
 to match the claim-time fingerprint is not proof of death. Terminal states are immutable.
+
+The gateway and every restart-safe worker open this one file at the same minute. Connections ask
+for WAL and a busy timeout. Writes are ``BEGIN IMMEDIATE`` and retry ``SQLITE_BUSY``; process
+liveness and config reads stay outside the transaction, because a rollback journal holds its write
+lock until commit and a deferred read-then-write upgrade returns "database is locked" immediately.
 """
 
 from __future__ import annotations
@@ -10,6 +15,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import random
 import sqlite3
 import threading
 import time
@@ -56,7 +62,24 @@ def _connect() -> sqlite3.Connection:
 
     path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
     _ensure_cron_dir(path.parent)
-    return open_db(path, db_label="cron/executions.db", synchronous_full=True, initialize=_initialize_schema)
+    # wal=True still passes through the WAL-reset gate: a vulnerable library keeps DELETE rather
+    # than corrupt the file. Journal-mode changes ignore busy_timeout and ``_set_journal_mode_no_wait``
+    # zeros it, so the pragma is retried and the timeout is put back on the connection we return.
+    conn = open_db(
+        path,
+        db_label="cron/executions.db",
+        busy_timeout_ms=_BUSY_TIMEOUT_MS,
+        wal=True,
+        synchronous_full=True,
+        wal_lock_retries=_BUSY_ATTEMPTS,
+        initialize=_initialize_schema,
+    )
+    try:
+        conn.execute(f"PRAGMA busy_timeout={int(_BUSY_TIMEOUT_MS)}")
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -134,11 +157,28 @@ def _widen_status_check(conn: sqlite3.Connection) -> None:
 
 
 @contextmanager
-def _transaction() -> Iterator[sqlite3.Connection]:
+def _transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
     from hermes_cli.sqlite_util import transaction
 
-    with _lock, transaction(_connect()) as conn:
+    with _lock, transaction(_connect(), immediate=immediate) as conn:
         yield conn
+
+
+def _write(fn):
+    """Run ``fn(conn)`` in a short ``BEGIN IMMEDIATE`` transaction, retrying lock errors.
+
+    The callback is the whole transaction: a busy failure rolls it back, and the callback runs
+    again. Callers must not have committed a side effect before ``fn`` returns.
+    """
+    for attempt in range(_BUSY_ATTEMPTS):
+        try:
+            with _transaction(immediate=True) as conn:
+                return fn(conn)
+        except sqlite3.OperationalError as exc:
+            if not _is_lock_error(exc) or attempt + 1 == _BUSY_ATTEMPTS:
+                raise
+            _sleep_busy(attempt)
+    raise RuntimeError("executions.db write retries exhausted")  # pragma: no cover
 
 
 def _fetch(conn: sqlite3.Connection, execution_id: str) -> Optional[dict[str, Any]]:
@@ -224,13 +264,16 @@ def touch_execution_progress(execution_id: str) -> bool:
     """Stamp ``progress_at`` on a running attempt this process owns. Returns False when the row
     is no longer ours or no longer running (the caller treats that as informational only)."""
     now = _hermes_now().isoformat()
-    with _transaction() as conn:
+
+    def _op(conn: sqlite3.Connection) -> bool:
         cur = conn.execute(
             """UPDATE executions SET progress_at=?
                WHERE id=? AND status IN ('claimed','running') AND process_id=? AND pid=?""",
             (now, execution_id, _PROCESS_ID, os.getpid()),
         )
         return cur.rowcount == 1
+
+    return _write(_op)
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
@@ -254,48 +297,64 @@ def create_execution(
     now = _hermes_now().isoformat()
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
-    with _transaction() as conn:
+    started_at = _process_start_time(pid)
+    instant = canonical_instant(scheduled_instant)
+
+    def _op(conn: sqlite3.Connection) -> dict[str, Any]:
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
                 status, claimed_at, scheduled_instant)
                VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now, canonical_instant(scheduled_instant)),
+             started_at, now, instant),
         )
-        record = _fetch(conn, execution_id)
+        return _fetch(conn, execution_id)  # type: ignore[return-value]
+
+    record = _write(_op)
     _emit_execution_state(record)
-    return record  # type: ignore[return-value]
+    return record
 
 
 def set_execution_occurrence(execution_id: str, instant: Optional[str]) -> None:
     """Bind the store-claimed snapshot before a provider hands it to a worker."""
     from cron.occurrences import scheduled_instant
 
-    with _transaction() as conn:
+    bound = scheduled_instant(instant)
+    pid = os.getpid()
+
+    def _op(conn: sqlite3.Connection) -> None:
         cur = conn.execute(
             "UPDATE executions SET scheduled_instant=? WHERE id=? AND status='claimed' "
             "AND handoff_pending=0 AND process_id=? AND pid=?",
-            (scheduled_instant(instant), execution_id, _PROCESS_ID, os.getpid()),
+            (bound, execution_id, _PROCESS_ID, pid),
         )
         if cur.rowcount != 1:
             raise RuntimeError("Cron occurrence could not be bound before dispatch")
 
+    _write(_op)
+
 
 def mark_execution_handoff_pending(execution_id: str) -> Optional[dict[str, Any]]:
     """Fence restart recovery while an external worker is adopting a claim."""
-    with _transaction() as conn:
+    started = time.time()
+    pid = os.getpid()
+
+    def _op(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
         cur = conn.execute(
             """UPDATE executions
                SET handoff_pending=1, handoff_started_at=?
                WHERE id=? AND status='claimed'
                  AND process_id=? AND pid=?""",
-            (time.time(), execution_id, _PROCESS_ID, os.getpid()),
+            (started, execution_id, _PROCESS_ID, pid),
         )
         if cur.rowcount != 1:
             return None
-        record = _fetch(conn, execution_id)
-    _emit_execution_state(record)
+        return _fetch(conn, execution_id)
+
+    record = _write(_op)
+    if record is not None:
+        _emit_execution_state(record)
     return record
 
 
@@ -309,7 +368,8 @@ def adopt_claimed_execution(execution_id: str) -> Optional[dict[str, Any]]:
     pid = os.getpid()
     process_started_at = _process_start_time(pid)
     now = _hermes_now().isoformat()
-    with _transaction() as conn:
+
+    def _op(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
         cur = conn.execute(
             """UPDATE executions
                SET process_id=?, pid=?, process_started_at=?,
@@ -320,27 +380,36 @@ def adopt_claimed_execution(execution_id: str) -> Optional[dict[str, Any]]:
         )
         if cur.rowcount != 1:
             return None
-        record = _fetch(conn, execution_id)
-    _emit_execution_state(record)
+        return _fetch(conn, execution_id)
+
+    # Lock errors used to kill the worker here, before it could write the ownership ack.
+    record = _write(_op)
+    if record is not None:
+        _emit_execution_state(record)
     return record
 
 
 def mark_execution_running(execution_id: str) -> Optional[dict[str, Any]]:
     """Transition one claimed attempt to running exactly once."""
     now = _hermes_now().isoformat()
-    with _transaction() as conn:
+    pid = os.getpid()
+
+    def _op(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
         cur = conn.execute(
             """UPDATE executions
                SET status='running', started_at=?, handoff_pending=0,
                    handoff_started_at=NULL
                WHERE id=? AND status='claimed' AND handoff_pending=0
                  AND process_id=? AND pid=?""",
-            (now, execution_id, _PROCESS_ID, os.getpid()),
+            (now, execution_id, _PROCESS_ID, pid),
         )
         if cur.rowcount != 1:
             return None
-        record = _fetch(conn, execution_id)
-    _emit_execution_state(record)
+        return _fetch(conn, execution_id)
+
+    record = _write(_op)
+    if record is not None:
+        _emit_execution_state(record)
     return record
 
 
@@ -356,8 +425,9 @@ def finish_execution(
     now = _hermes_now().isoformat()
     status = "cancelled" if cancelled else ("completed" if success else "failed")
     detail = None if success else (str(error) if error else "unknown failure")
-    with _transaction() as conn:
-        owner = (_PROCESS_ID, os.getpid())
+    owner = (_PROCESS_ID, os.getpid())
+
+    def _op(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
@@ -369,7 +439,11 @@ def finish_execution(
         if cur.rowcount != 1:
             return None
         _prune_unlocked(conn)
-        record = _fetch(conn, execution_id)
+        return _fetch(conn, execution_id)
+
+    record = _write(_op)
+    if record is None:
+        return None
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     record_cron_finish(record, delivery_outcome)
     return record
@@ -407,20 +481,33 @@ def recover_receipted_execution(execution_id, job_id, *, success, error=None, de
     """Settle a verified canonical receipt after owner loss, including its unknown audit row.
 
     Terminal verdicts stay immutable. A live firer still owns its bookkeeping
-    (``execution_owner_live``).
+    (``execution_owner_live``). Liveness runs with no ledger lock held; the write is a CAS on
+    the judged owner snapshot.
     """
     now = _hermes_now().isoformat()
     with _transaction() as conn:
         row = _recoverable_row(conn, execution_id, job_id)
-        if row is None or _row_owner_live(row):
-            return None
-        conn.execute(
+        snapshot = dict(row) if row is not None else None
+    if snapshot is None or _row_owner_live(snapshot):
+        return None
+
+    def _op(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
+        cur = conn.execute(
             """UPDATE executions SET status=?, finished_at=?, error=?, handoff_pending=0,
-               handoff_started_at=NULL, delivery_outcome=? WHERE id=?""",
-            ('completed' if success else 'failed', now, None if success else (str(error) if error else 'unknown failure'),
-             delivery_outcome, execution_id))
+               handoff_started_at=NULL, delivery_outcome=?
+               WHERE id=? AND status=? AND process_id=? AND pid=?""",
+            ('completed' if success else 'failed', now,
+             None if success else (str(error) if error else 'unknown failure'),
+             delivery_outcome, execution_id, snapshot['status'], snapshot['process_id'],
+             snapshot['pid']))
+        if cur.rowcount != 1:
+            return None
         _prune_unlocked(conn)
-        record = _fetch(conn, execution_id)
+        return _fetch(conn, execution_id)
+
+    record = _write(_op)
+    if record is None:
+        return None
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     record_cron_finish(record, delivery_outcome)
     return record
@@ -446,7 +533,8 @@ def execution_owner_live(execution_id: str, job_id: str) -> bool:
     recovery must not act for it: no output re-save, no job mark, no ledger write."""
     with _transaction() as conn:
         row = _recoverable_row(conn, execution_id, job_id)
-    return row is not None and _row_owner_live(row)
+        snapshot = dict(row) if row is not None else None
+    return snapshot is not None and _row_owner_live(snapshot)
 
 
 def settle_delivery_outcome(execution_id: str, outcome: str) -> bool:
@@ -455,14 +543,17 @@ def settle_delivery_outcome(execution_id: str, outcome: str) -> bool:
     The only post-terminal rewrite the ledger allows: the attempt's status is untouched and
     only a ``queued`` handoff can settle, so a replay or a late caller is a no-op.
     """
-    with _transaction() as conn:
+
+    def _op(conn: sqlite3.Connection) -> bool:
         cur = conn.execute(
             """UPDATE executions SET delivery_outcome=?
                WHERE id=? AND delivery_outcome='queued'
                  AND status IN ('completed','failed','unknown')""",
             (outcome, execution_id),
         )
-    return cur.rowcount == 1
+        return cur.rowcount == 1
+
+    return _write(_op)
 
 
 _OWNER_GONE_REASON = (
@@ -486,17 +577,8 @@ def settle_unstarted_execution(execution_id: str, job_id: str, error: str) -> No
                      job_id, execution_id, error, record_err)
 
 
-def recover_interrupted_executions() -> int:
-    """Mark abandoned attempts unknown without scheduling retries: rows whose owner is provably
-    dead, plus rows whose live owner holds a claim older than the derived stale bound (the
-    process is not killed)."""
-    now = _hermes_now().isoformat()
-    changed = 0
-    recovered: list[dict[str, Any]] = []
-    # Derived on the first live-owned row only: the bound reads config, and the idle gateway
-    # tick must stay config-free (tests/cron/test_idle_tick_config_skip.py).
-    stale_after: Optional[float] = None
-    stale_after_resolved = False
+def _read_inflight_executions() -> list[dict[str, Any]]:
+    """Snapshot claimed/running rows and close the connection before any liveness work."""
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT id, status, process_id, pid, process_started_at,
@@ -504,62 +586,90 @@ def recover_interrupted_executions() -> int:
                FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
-        for row in rows:
-            if row["process_id"] == _PROCESS_ID:
-                continue
-            reason = _OWNER_GONE_REASON
-            if _owner_is_live(int(row["pid"]), row["process_started_at"]):
-                # A live owner is normally a legitimately running job. A worker permanently
-                # deadlocked (e.g. futex_wait behind a route/proxy flip, #115692) also passes
-                # this check, so a claim SILENT for longer than the derived bound is treated
-                # as wedged and released — the external-worker wait loop polls this ledger
-                # for a terminal status, so the job can fire again. Silence is measured from
-                # the owner's last ``progress_at`` stamp (the run monitor refreshes it while
-                # the agent is active), so a healthy multi-hour run is never reclaimed while
-                # it is still working. The wedged worker PROCESS is NOT terminated here
-                # (leaked until host restart); rows owned by this process (process_id ==
-                # _PROCESS_ID, in-process runs) are skipped above and remain out of scope.
-                if not stale_after_resolved:
-                    stale_after = _live_owner_stale_after_seconds()
-                    stale_after_resolved = True
-                if (
-                    stale_after is None
-                    or _stale_age_seconds(row["claimed_at"], row["progress_at"]) <= stale_after
-                ):
-                    continue
-                reason = _OWNER_WEDGED_REASON
-            handoff_started_at = row["handoff_started_at"]
+        return [dict(row) for row in rows]
+
+
+def _rows_to_abandon(rows: list[dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
+    """Decide which inflight rows are abandoned. No executions.db connection is held.
+
+    A live owner is normally a legitimately running job. A worker permanently deadlocked
+    (e.g. futex_wait behind a route/proxy flip, #115692) also passes the liveness check, so a
+    claim SILENT for longer than the derived bound is treated as wedged and released — the
+    external-worker wait loop polls this ledger for a terminal status, so the job can fire
+    again. Silence is measured from the owner's last ``progress_at`` stamp, so a healthy
+    multi-hour run is never reclaimed while it is still working. The wedged worker PROCESS is
+    NOT terminated here (leaked until host restart); rows owned by this process are skipped
+    and remain out of scope.
+
+    The stale bound is derived on the first live-owned row only: it reads config, and the idle
+    gateway tick must stay config-free (tests/cron/test_idle_tick_config_skip.py).
+    """
+    stale_after: Optional[float] = None
+    stale_after_resolved = False
+    planned: list[tuple[dict[str, Any], str]] = []
+    for row in rows:
+        if row["process_id"] == _PROCESS_ID:
+            continue
+        reason = _OWNER_GONE_REASON
+        if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+            if not stale_after_resolved:
+                stale_after = _live_owner_stale_after_seconds()
+                stale_after_resolved = True
             if (
-                row["handoff_pending"]
-                and handoff_started_at is not None
-                and time.time() - float(handoff_started_at)
-                < HANDOFF_ADOPTION_GRACE_SECONDS
+                stale_after is None
+                or _stale_age_seconds(row["claimed_at"], row["progress_at"]) <= stale_after
             ):
                 continue
-            # The SELECT ran outside a write transaction and the liveness probe takes time: the
-            # owner may have stamped progress since, so act only on the snapshot that was judged.
-            cur = conn.execute(
-                """UPDATE executions
-                   SET status='unknown', finished_at=?, error=?,
-                       handoff_pending=0, handoff_started_at=NULL
-                   WHERE id=? AND status=? AND process_id=? AND pid=?
-                     AND handoff_pending=?
-                     AND handoff_started_at IS ?
-                     AND claimed_at=? AND progress_at IS ?""",
-                (now, reason, row["id"], row["status"], row["process_id"], row["pid"],
-                 row["handoff_pending"], row["handoff_started_at"],
-                 row["claimed_at"], row["progress_at"]),
-            )
-            changed += cur.rowcount
-            if cur.rowcount:
-                record = _fetch(conn, row["id"])
-                if record is not None:
-                    recovered.append(record)
-        if changed:
-            _prune_unlocked(conn)
+            reason = _OWNER_WEDGED_REASON
+        handoff_started_at = row["handoff_started_at"]
+        if (
+            row["handoff_pending"]
+            and handoff_started_at is not None
+            and time.time() - float(handoff_started_at) < HANDOFF_ADOPTION_GRACE_SECONDS
+        ):
+            continue
+        planned.append((row, reason))
+    return planned
+
+
+def _abandon_execution(row: dict[str, Any], reason: str, now: str) -> Optional[dict[str, Any]]:
+    """CAS one snapshotted row to ``unknown``. A concurrent adopt changes the owner and misses."""
+
+    def _op(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
+        cur = conn.execute(
+            """UPDATE executions
+               SET status='unknown', finished_at=?, error=?,
+                   handoff_pending=0, handoff_started_at=NULL
+               WHERE id=? AND status=? AND process_id=? AND pid=?
+                 AND handoff_pending=?
+                 AND handoff_started_at IS ?
+                 AND claimed_at=? AND progress_at IS ?""",
+            (now, reason, row["id"], row["status"], row["process_id"], row["pid"],
+             row["handoff_pending"], row["handoff_started_at"],
+             row["claimed_at"], row["progress_at"]),
+        )
+        if cur.rowcount != 1:
+            return None
+        return _fetch(conn, row["id"])
+
+    return _write(_op)
+
+
+def recover_interrupted_executions() -> int:
+    """Mark abandoned attempts unknown without scheduling retries: rows whose owner is provably
+    dead, plus rows whose live owner holds a claim older than the derived stale bound (the
+    process is not killed)."""
+    now = _hermes_now().isoformat()
+    recovered: list[dict[str, Any]] = []
+    for row, reason in _rows_to_abandon(_read_inflight_executions()):
+        record = _abandon_execution(row, reason, now)
+        if record is not None:
+            recovered.append(record)
+    if recovered:
+        _write(_prune_unlocked)
     for record in recovered:
         _emit_execution_state(record)
-    return changed
+    return len(recovered)
 
 
 def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
@@ -589,32 +699,46 @@ def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
                FROM executions WHERE id=?""",
             (execution_id,),
         ).fetchone()
-        if row is None or row["status"] not in ("claimed", "running"):
-            return False
-        if row["process_id"] == _PROCESS_ID:
-            return False
-        if _owner_is_live(int(row["pid"]), row["process_started_at"]):
-            return False
-        handoff_started_at = row["handoff_started_at"]
-        if (
-            row["handoff_pending"]
-            and handoff_started_at is not None
-            and time.time() - float(handoff_started_at) < HANDOFF_ADOPTION_GRACE_SECONDS
-        ):
-            return False
+        snapshot = dict(row) if row is not None else None
+    if _terminalize_refused(snapshot):
+        return False
+
+    def _op(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
         cur = conn.execute(
             """UPDATE executions
                SET status='unknown', finished_at=?, error=?,
                    handoff_pending=0, handoff_started_at=NULL
                WHERE id=? AND status=? AND process_id=? AND pid=?""",
-            (now, reason, row["id"], row["status"], row["process_id"], row["pid"]),
+            (now, reason, snapshot["id"], snapshot["status"], snapshot["process_id"],
+             snapshot["pid"]),
         )
         if cur.rowcount != 1:
-            return False
+            return None
         record = _fetch(conn, execution_id)
         _prune_unlocked(conn)
+        return record
+
+    record = _write(_op)
+    if record is None:
+        return False
     _emit_execution_state(record)
     return True
+
+
+def _terminalize_refused(row: Optional[dict[str, Any]]) -> bool:
+    """True when ``row`` must not be marked unknown. Liveness runs with no ledger lock held."""
+    if row is None or row["status"] not in ("claimed", "running"):
+        return True
+    if row["process_id"] == _PROCESS_ID:
+        return True
+    if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+        return True
+    handoff_started_at = row["handoff_started_at"]
+    return bool(
+        row["handoff_pending"]
+        and handoff_started_at is not None
+        and time.time() - float(handoff_started_at) < HANDOFF_ADOPTION_GRACE_SECONDS
+    )
 
 
 def give_up_execution(execution_id: str, *, reason: str) -> bool:
@@ -623,16 +747,23 @@ def give_up_execution(execution_id: str, *, reason: str) -> bool:
     restart's dead-owner sweep. Receipt recovery never acts for a same-process running row, so
     the owner's later terminal receipt can settle it only once it is marked given up."""
     now = _hermes_now().isoformat()
-    with _transaction() as conn:
+    owner = (_PROCESS_ID, os.getpid())
+
+    def _op(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
         cur = conn.execute(
             """UPDATE executions SET status='unknown', finished_at=?, error=?,
                    handoff_pending=0, handoff_started_at=NULL
                WHERE id=? AND status IN ('claimed','running') AND process_id=? AND pid=?""",
-            (now, reason, str(execution_id), _PROCESS_ID, os.getpid()))
+            (now, reason, str(execution_id), *owner))
         if cur.rowcount != 1:
-            return False
+            return None
         record = _fetch(conn, str(execution_id))
         _prune_unlocked(conn)
+        return record
+
+    record = _write(_op)
+    if record is None:
+        return False
     _emit_execution_state(record)
     return True
 

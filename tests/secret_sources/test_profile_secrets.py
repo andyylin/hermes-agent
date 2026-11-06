@@ -121,6 +121,55 @@ def test_hyphenated_profile_name_matches_underscore_suffix():
     assert env["SLACK_APP_TOKEN"] == "xapp-1"
 
 
+def test_default_profile_hydrates_default_suffix():
+    """Default home is not under profiles/, so FOO_DEFAULT must still alias."""
+    report, env = _apply(
+        {"MATTERMOST_TOKEN_DEFAULT": "mm-default-tok"},
+        home=Path("/home/u/.hermes"),
+    )
+    assert env["MATTERMOST_TOKEN_DEFAULT"] == "mm-default-tok"
+    assert env["MATTERMOST_TOKEN"] == "mm-default-tok"
+    assert "MATTERMOST_TOKEN" in report.provenance
+
+
+def test_named_profile_does_not_inherit_canonical_mattermost_token():
+    """Shared-vault MATTERMOST_TOKEN is default-only; a named profile must not receive it."""
+    _, env = _apply(
+        {"MATTERMOST_TOKEN": "shared-default-token", "OPENAI_API_KEY": "fresh-key"},
+        home=Path("/home/u/.hermes/profiles/utility-agent"),
+    )
+    assert "MATTERMOST_TOKEN" not in env
+    assert env["OPENAI_API_KEY"] == "fresh-key"
+
+
+def test_default_profile_still_receives_canonical_mattermost_token():
+    _, env = _apply(
+        {"MATTERMOST_TOKEN": "shared-default-token"},
+        home=Path("/home/u/.hermes"),
+    )
+    assert env["MATTERMOST_TOKEN"] == "shared-default-token"
+
+
+def test_named_profile_suffixed_mattermost_token_still_aliases():
+    """A profile that owns MATTERMOST_TOKEN_<PROFILE> still hydrates the canonical name."""
+    _, env = _apply(
+        {"MATTERMOST_TOKEN": "shared-default-token",
+         "MATTERMOST_TOKEN_UTILITY_AGENT": "utility-own-token"},
+        home=Path("/home/u/.hermes/profiles/utility-agent"),
+    )
+    assert env["MATTERMOST_TOKEN_UTILITY_AGENT"] == "utility-own-token"
+    assert env["MATTERMOST_TOKEN"] == "utility-own-token"
+
+
+def test_explicit_default_only_empty_restores_shared_canonical():
+    _, env = _apply(
+        {"MATTERMOST_TOKEN": "shared-default-token"},
+        cfg_extra={"default_only": []},
+        home=Path("/home/u/.hermes/profiles/utility-agent"),
+    )
+    assert env["MATTERMOST_TOKEN"] == "shared-default-token"
+
+
 def test_source_fetch_reads_injected_environment_without_global_mutation(
     monkeypatch, tmp_path
 ):

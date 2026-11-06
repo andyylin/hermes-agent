@@ -83,6 +83,7 @@ async def test_base_adapter_routes_voice_tagged_telegram_ogg_media_tag_to_voice_
     adapter.send_voice.assert_awaited_once_with(
         chat_id="chat-1",
         audio_path=str(media_file),
+        reply_to="msg-1",
         metadata={"notify": True},
         is_voice=True,
     )

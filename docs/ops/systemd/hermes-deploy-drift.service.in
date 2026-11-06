@@ -1,0 +1,9 @@
+[Unit]
+Description=Hermes deploy drift check (rpi5): live files and running code against the deployed SHA
+
+[Service]
+Type=oneshot
+User=@USER@
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONNOUSERSITE=1
+ExecStart=@PYTHON@ @CHECKOUT@/docs/ops/rpi5_deploy.py drift --home @HOME@ --fetch

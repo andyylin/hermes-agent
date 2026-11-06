@@ -659,7 +659,7 @@ def test_connecting_a_stdio_server_registers_its_real_process_group():
     child = subprocess.Popen(_VICTIM, start_new_session=True)
     try:
         with _stdio_connection(child.pid, fake) as server:
-            asyncio.run(server.start({"command": "echo", "args": ["hi"]}))
+            asyncio.run(server.start({"command": "/bin/echo", "args": ["hi"]}))
 
         assert f"register {os.getpgid(child.pid)}" in fake.lines(), (
             "connecting a stdio server did not hand its process group to the "
@@ -679,7 +679,7 @@ def test_a_server_that_exited_is_released_on_teardown():
         with _stdio_connection(child.pid, fake) as server:
 
             async def _connect_then_lose_the_child():
-                await server.start({"command": "echo", "args": ["hi"]})
+                await server.start({"command": "/bin/echo", "args": ["hi"]})
                 nonlocal pgid
                 pgid = os.getpgid(child.pid)
                 # The server exits while connected. Reap it here so the
@@ -699,17 +699,20 @@ def test_a_server_that_exited_is_released_on_teardown():
         _kill(child.pid)
 
 
+@pytest.mark.live_system_guard_bypass
 @pytest.mark.skipif(not mcp_tool._MCP_AVAILABLE, reason="MCP SDK not installed")
 def test_a_server_that_survived_teardown_stays_registered():
     # The case the supervisor exists for: teardown did not manage to kill it.
     # Releasing it here would hand the orphan back to nobody.
+    monkeypatch.setattr(
+        "tools.mcp_tool_stdio_shutdown.reap_stdio_servers", lambda *args, **kwargs: None)
     fake = _FakeSupervisor()
     child = subprocess.Popen(_VICTIM, start_new_session=True)
     try:
         with _stdio_connection(child.pid, fake) as server:
 
             async def _connect_then_shutdown():
-                await server.start({"command": "echo", "args": ["hi"]})
+                await server.start({"command": "/bin/echo", "args": ["hi"]})
                 await server.shutdown()
 
             asyncio.run(_connect_then_shutdown())

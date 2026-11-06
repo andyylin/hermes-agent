@@ -308,9 +308,36 @@ def _active_profile_name(home_path: Optional[Path]) -> str:
     return ""
 
 
+def _alias_profile_name(home_path: Optional[Path]) -> str:
+    """Name used for ``FOO_<PROFILE>`` aliasing.
+
+    ``_active_profile_name`` is empty for the default home (``~/.hermes``, not
+    ``profiles/default``), so ``MATTERMOST_TOKEN_DEFAULT`` never hydrated. Treat
+    that home as ``default`` here only — named-profile detection stays empty-string.
+    """
+    return _active_profile_name(home_path) or "default"
+
+
 # Only credential-shaped names get auto-aliased — a random profile-suffixed
 # var should not silently hydrate an unsuffixed name.
 _ALIAS_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_KEY", "_PASSWORD")
+
+# Canonical names a named profile must not inherit from a shared vault. Absent
+# ``secrets.default_only`` keeps this set; an explicit list (including empty)
+# replaces it. Default home still receives these keys under their real names.
+_DEFAULT_ONLY_UNSET = object()
+_BUILTIN_DEFAULT_ONLY = frozenset({"MATTERMOST_TOKEN"})
+
+
+def _default_only_names(secrets_cfg: dict) -> frozenset:
+    """Canonical env names that stay on the default profile unless this home owns them."""
+    raw = secrets_cfg.get("default_only", _DEFAULT_ONLY_UNSET)
+    if raw is _DEFAULT_ONLY_UNSET:
+        return _BUILTIN_DEFAULT_ONLY
+    if not isinstance(raw, list):
+        logger.warning("secrets.default_only must be a list of env-var names; ignoring %s", type(raw).__name__)
+        return _BUILTIN_DEFAULT_ONLY
+    return frozenset(n.strip() for n in raw if isinstance(n, str) and n.strip())
 
 
 def _profile_alias_target(var: str, profile: str) -> Optional[str]:
@@ -331,7 +358,8 @@ class _Applier:
         self.claimed: dict[str, str] = {}  # var → source name that won it
 
     def apply_source(self, source: SecretSource, cfg: dict, result: FetchResult,
-                     profile: str, supplied_directly: set) -> None:
+                     profile: str, supplied_directly: set,
+                     default_only: frozenset = frozenset()) -> None:
         sr = SourceReport(name=source.name, label=source.label or source.name, result=result)
         self.report.sources.append(sr)
         if not result.ok:
@@ -343,6 +371,15 @@ class _Applier:
 
         for var, value in result.secrets.items():
             if not isinstance(var, str) or not isinstance(value, str):
+                continue
+            if var in default_only:
+                # Named profile: do not inherit the default profile's shared-vault token.
+                # A FOO_<PROFILE> key still applies below and may alias to FOO.
+                logger.info(
+                    "Not applying shared %s to named profile %r; store %s_%s in the vault "
+                    "or put %s in this profile's .env",
+                    var, profile, var, profile.replace("-", "_").upper(), var,
+                )
                 continue
             if not self._try_apply(sr, source, override, var, value) or not profile:
                 continue
@@ -391,9 +428,14 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     var gets ``skipped_claimed`` plus a conflict warning — never a silent clobber,
     and ``override_existing`` never applies across sources.
 
-    Profile aliasing: under a named profile an applied ``FOO_<PROFILE>``
-    (credential-shaped suffixes only) also hydrates canonical ``FOO``, under the
-    same guards; disabled with ``secrets.profile_alias: false``.
+    Profile aliasing: an applied ``FOO_<PROFILE>`` (credential-shaped suffixes
+    only) also hydrates canonical ``FOO``, including ``FOO_DEFAULT`` for the
+    default home; disabled with ``secrets.profile_alias: false``.
+
+    ``secrets.default_only`` (built-in: ``MATTERMOST_TOKEN``) is not applied to
+    a named profile under the canonical name. That profile needs the value in
+    its own ``.env`` or a ``FOO_<PROFILE>`` vault key. The default home still
+    receives the unsuffixed name, so host scripts running there keep working.
 
     1. 2. 3. 4. See #58073.
     See #51447.
@@ -408,7 +450,10 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     preserve_raw = secrets_cfg.get("preserve_existing")
     preserve = frozenset(n.strip() for n in preserve_raw if isinstance(n, str) and n.strip()
                          ) if isinstance(preserve_raw, list) else frozenset()
-    profile = _active_profile_name(home_path) if secrets_cfg.get("profile_alias", True) else ""
+    alias_on = bool(secrets_cfg.get("profile_alias", True))
+    profile = _alias_profile_name(home_path) if alias_on else ""
+    named_profile = bool(_active_profile_name(home_path))
+    default_only = _default_only_names(secrets_cfg) if named_profile else frozenset()
 
     # Mapped outranks bulk regardless of list order.
     ordered = [s for s in enabled if s.shape == "mapped"] + [s for s in enabled if s.shape == "bulk"]
@@ -426,9 +471,12 @@ def apply_all(secrets_cfg: dict, home_path: Path,
             pass
 
     # An alias never shadows a var some source supplies by its real name.
+    # Canonical default-only names are not "supplied" to a named profile, so a
+    # FOO_<PROFILE> key can still hydrate FOO there.
     supplied_directly = {v for _, _, r in fetches if r.ok for v in r.secrets if isinstance(v, str)}
+    supplied_directly -= default_only
 
     applier = _Applier(env, report, protected, preserve)
     for source, cfg, result in fetches:
-        applier.apply_source(source, cfg, result, profile, supplied_directly)
+        applier.apply_source(source, cfg, result, profile, supplied_directly, default_only=default_only)
     return report

@@ -105,7 +105,7 @@ async def test_memory_and_skills_review_commands_use_routed_profile_from_dispatc
             summary="routed-skill-reject", origin="foreground")
         skill_approve = wa.stage_write(
             wa.SKILLS, {"action": "create", "name": "routed-approved-skill",
-                        "content": "---\nname: routed-approved-skill\ndescription: Use when testing routed approval.\n---\n\nVerify the routed profile.\n"},
+                        "content": "---\nname: routed-approved-skill\ndescription: Use when testing routed approval, not live.\n---\n\nVerify the routed profile.\n"},
             summary="routed-skill-approve", origin="foreground")
 
     with _profile_runtime_scope(default_home):
