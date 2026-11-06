@@ -93,6 +93,61 @@ def _parse_nonnegative(value: str | None) -> int | None:
     return parsed if parsed >= 0 else None
 
 
+# pyproject ``0.0.0`` is the inert placeholder source trees shipped before a release
+# was declared. It matches STABLE_TAG_RE, so a CalVer-only clone (tags ``v2026.*``,
+# no ``v0.x``, and a deploy fetch of ``--no-tags``) used to report package version 0.0.0.
+_PLACEHOLDER_VERSION = "0.0.0"
+
+
+def _stable_release(version: object) -> str | None:
+    if not isinstance(version, str) or version == _PLACEHOLDER_VERSION:
+        return None
+    if not STABLE_TAG_RE.fullmatch(f"v{version}"):
+        return None
+    return version
+
+
+def _checkout_project_version(repo_dir: Path) -> str | None:
+    """The release declared in this checkout's pyproject, when it is not the placeholder."""
+    try:
+        text = (repo_dir / "pyproject.toml").read_text(encoding="utf-8-sig")
+        project = tomllib.loads(text).get("project", {})
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    return _stable_release(project.get("version"))
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
+def _release_base(repo_dir: Path) -> tuple[str, int | None]:
+    """Semver tag, else a newer declared pyproject version, else the CalVer tag's.
+
+    A placeholder ``0.0.0`` is not a release. The nearest CalVer tag on this
+    fork still says ``0.10.0``, and a ``--no-tags`` deploy sees no tag at all
+    and used to publish the placeholder. A pyproject version newer than that
+    tag is this checkout's release, at distance 0, until a semver tag exists.
+    """
+    tags = _run_git(repo_dir, "tag", "--merged", "HEAD", "--list", "v[0-9]*")
+    releases = [
+        tag[1:]
+        for tag in (tags or "").splitlines()
+        if STABLE_TAG_RE.fullmatch(tag)
+    ]
+    if releases:
+        base = max(releases, key=_version_key)
+        distance = _parse_nonnegative(_run_git(repo_dir, "rev-list", "--count", f"v{base}..HEAD"))
+        return base, distance
+    declared = _checkout_project_version(repo_dir)
+    calver = _calver_release_version(repo_dir)
+    if declared is not None and (calver is None or _version_key(declared) > _version_key(calver[0])):
+        return declared, 0
+    if calver is not None:
+        return calver
+    return "unknown", None
+
+
 def _calver_release_version(repo_dir: Path) -> tuple[str, int] | None:
     """The version the nearest CalVer release shipped, and the commits since it.
 
@@ -110,8 +165,8 @@ def _calver_release_version(repo_dir: Path) -> tuple[str, int] | None:
         project = tomllib.loads(_run_git(repo_dir, "show", f"{tag}:pyproject.toml") or "").get("project", {})
     except tomllib.TOMLDecodeError:
         return None
-    version = project.get("version")
-    if distance is None or not isinstance(version, str) or not STABLE_TAG_RE.fullmatch(f"v{version}"):
+    version = _stable_release(project.get("version"))
+    if distance is None or version is None:
         return None
     return version, distance
 
@@ -237,21 +292,7 @@ def _git_version_info(repo_dir: Path, *, include_untracked: bool = False) -> Ver
     except (OSError, subprocess.SubprocessError):
         dirty = False
 
-    tags = _run_git(repo_dir, "tag", "--merged", "HEAD", "--list", "v[0-9]*")
-    releases = [
-        tag[1:]
-        for tag in (tags or "").splitlines()
-        if STABLE_TAG_RE.fullmatch(tag)
-    ]
-    base_version = (
-        max(releases, key=lambda value: tuple(int(part) for part in value.split(".")))
-        if releases else "unknown"
-    )
-    distance = _parse_nonnegative(
-        _run_git(repo_dir, "rev-list", "--count", f"v{base_version}..HEAD")
-    ) if releases else None
-    if not releases:
-        base_version, distance = _calver_release_version(repo_dir) or ("unknown", None)
+    base_version, distance = _release_base(repo_dir)
     short_commit = _run_git(repo_dir, "rev-parse", "--short=7", "HEAD")
     if base_version == "unknown" and short_commit:
         display_version = f"git.{short_commit}{'.dirty' if dirty else ''}"

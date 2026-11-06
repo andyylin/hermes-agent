@@ -349,8 +349,8 @@ def _read_project_version() -> str | None:
 def _checkout_version() -> str | None:
     """The checkout's runtime identity, computed exactly as ``write_source_stamp`` publishes it.
 
-    pyproject.toml is an inert 0.0.0 on source checkouts; the release a checkout
-    runs is derived from its reachable tags.
+    ``0.0.0`` in pyproject.toml is an inert placeholder, not a release. A declared
+    version is the identity when no semver tag is reachable.
     """
     from hermes_cli.update_cmd import _m
     from hermes_cli.version_info import _git_version_info

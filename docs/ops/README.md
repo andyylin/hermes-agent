@@ -5,6 +5,8 @@ host's runtime changes only through merged repo code.
 
 - [`rpi5-vanilla-migration.md`](rpi5-vanilla-migration.md): the one-gateway
   vanilla cutover (`rpi5-vanilla-migration.sh`, `rpi5_migration.py`).
+- [`schema52_sibling_recovery.md`](schema52_sibling_recovery.md): sibling
+  profiles already stamped schema 52 while the code is still v0.22.5.
 - Push-to-deploy, below (`rpi5_deploy.py`, `rpi5_deploy_engine.py`,
   `rpi5_deploy_probe.py`, `systemd/`, `.github/workflows/rpi5-deploy.yml`).
 
@@ -71,7 +73,12 @@ gateway is idle.
      marker and goes back to waiting. Nothing is ever interrupted, and there
      is no overall timeout.
    - **Swap.** Stop the configured units, clear the marker, fast-forward,
-     re-stamp with `write_source_stamp` (as `hermes update` does), start.
+     re-stamp with `write_source_stamp` (as `hermes update` does), and migrate
+     only the deploy target (`stamp --home` of that one profile, after
+     `config.yaml` is copied aside). Sibling profiles are not opened. Then
+     start. A non-zero exit from that stamp, including 24, rolls the checkout
+     back; the rollback stamp itself does not migrate, so a tree from the
+     previous release can still answer it.
      A gateway drop-in (for example `97-restart-webui.conf`) may restart
      `hermes-webui.service` with the gateway; the deployer skips a second
      follower restart when that unit already came up with the gateway.
@@ -85,7 +92,9 @@ gateway is idle.
    - **Health, 120 s.** Every unit is `is-active`, `GET /health` returns
      `status: ok`, and every live gateway reports `code_sha == target`.
      Otherwise the deploy runs the idle gate again and resets to the previous
-     SHA, restarts, and re-checks. The failed SHA is refused from then on.
+     SHA, restarts, and re-checks. The same rollback runs for every other
+     non-zero exit after the checkout has moved, including exit 24. The
+     failed SHA is refused from then on.
 5. **Self-update.** When a deploy changes the deployer's own files, the
    listener runs `self-test` from the new copy, then exits so systemd starts
    it. A changed `docs/ops/systemd/*.in` sets `reinstall_needed`. The drift

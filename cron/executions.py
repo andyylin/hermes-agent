@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
+from hermes_state_errors import is_sqlite_lock_error
 from hermes_time import now as _hermes_now
 from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM
 from hermes_cli.observability.shared_metrics_gateway import record_cron_finish
@@ -40,6 +41,12 @@ MAX_TERMINAL_EXECUTIONS = 1000
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 # Floor for the live-owner stale-claim bound (#115692); see _live_owner_stale_after_seconds.
 LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
+# Adopt must publish its ownership ack inside the handoff grace. Five 4s busy waits plus the
+# jitter below stay under that 30s, so a stampede retries instead of exiting before the ack.
+_BUSY_TIMEOUT_MS = 4000
+_BUSY_ATTEMPTS = 5
+_BUSY_RETRY_MIN_S = 0.020
+_BUSY_RETRY_MAX_S = 0.150
 # ``cancelled``: an operator stopped the run (``hermes cron cancel``, removing the job mid-run).
 # ``missed``: never started — one row books every occurrence the scheduler skipped past.
 _TERMINAL_STATES = ("completed", "failed", "unknown", "cancelled", "missed")
@@ -162,6 +169,20 @@ def _transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
 
     with _lock, transaction(_connect(), immediate=immediate) as conn:
         yield conn
+
+
+def _is_lock_error(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and is_sqlite_lock_error(exc)
+
+
+def _sleep_busy(attempt: int) -> None:
+    """Jittered pause so stampeding workers do not retry in lockstep.
+
+    SQLite's own busy handler backs off deterministically; several adopters that time out
+    together otherwise collide again on the next attempt. ``attempt`` is 0-based.
+    """
+    ceiling = min(_BUSY_RETRY_MAX_S, _BUSY_RETRY_MIN_S * (2 ** attempt))
+    time.sleep(random.uniform(_BUSY_RETRY_MIN_S, max(_BUSY_RETRY_MIN_S, ceiling)))
 
 
 def _write(fn):

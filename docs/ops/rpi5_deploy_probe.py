@@ -84,12 +84,64 @@ def cmd_drain(args: argparse.Namespace) -> int:
     return _emit({"ok": True})
 
 
+def migrate_targeted_home(home: Path) -> dict:
+    """Migrate one profile home, and no other.
+
+    A deploy of the default profile used to run the fleet update, which stamped
+    every sibling (wife, dad, alice, …) from schema 51 to 52 with no backup.
+    The deploy names the one home it is allowed to touch. The config file is
+    copied aside before any write; a failed migration puts that copy back.
+    """
+    # Imports stay inside the command: main() puts the checkout on sys.path first,
+    # and the system-python venv-python command must load this module without Hermes.
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.config import check_config_version, get_config_path, get_env_path, migrate_config
+    from hermes_cli.post_update import _backup_existing, _restore_backups
+
+    home = Path(home)
+    token = set_hermes_home_override(home)
+    try:
+        current, latest = check_config_version(raise_on_parse_error=True)
+        if current >= latest:
+            return {"ok": True, "skipped": "up-to-date", "home": str(home)}
+        config_path = get_config_path()
+        backups = _backup_existing((config_path, get_env_path()))
+        if config_path.is_file() and config_path not in backups:
+            raise RuntimeError(f"refusing to migrate {home} without a config backup")
+        try:
+            migrate_config(interactive=False, quiet=True)
+        except Exception:
+            _restore_backups(backups)
+            raise
+        after, _latest = check_config_version(raise_on_parse_error=True)
+        if after < latest:
+            _restore_backups(backups)
+            raise RuntimeError(f"migration of {home} left config at {after}, want {latest}")
+        return {
+            "ok": True, "home": str(home), "from": current, "to": after,
+            "backups": [str(path) for path in backups.values()],
+        }
+    finally:
+        reset_hermes_home_override(token)
+
+
 def cmd_stamp(args: argparse.Namespace) -> int:
     from hermes_cli.source_stamp import write_source_stamp
 
     stamp = write_source_stamp(Path(args.checkout))
     commit = (stamp or {}).get("commit")
-    return _emit({"ok": bool(commit), "commit": commit})
+    # No --home: identity only. An already-running listener from the previous
+    # release calls stamp with no arguments; requiring a home would fail that call.
+    homes = [Path(raw) for raw in (args.home or [])]
+    if len(homes) > 1:
+        return _emit({"ok": False, "commit": commit, "error": "stamp migrates exactly one profile"})
+    if not homes:
+        return _emit({"ok": bool(commit), "commit": commit})
+    try:
+        migrated = migrate_targeted_home(homes[0])
+    except Exception as exc:  # health: allow BLE001 -- the deployer rolls back on any stamp failure
+        return _emit({"ok": False, "commit": commit, "error": f"{type(exc).__name__}: {exc}"})
+    return _emit({"ok": bool(commit) and migrated.get("ok", False), "commit": commit, "migrated": migrated})
 
 
 def cmd_imports(args: argparse.Namespace) -> int:
@@ -190,7 +242,9 @@ def build_parser() -> argparse.ArgumentParser:
     drain.add_argument("--home", action="append", default=[])
     sub.add_parser("imports").add_argument("--compile", action="append", default=[])
     sub.add_parser("preflight").add_argument("--home", action="append", default=[])
-    for name in ("homes", "stamp", "skills-sync", "venv-python"):
+    stamp = sub.add_parser("stamp")
+    stamp.add_argument("--home", action="append", default=[], help="the one profile this deploy may migrate")
+    for name in ("homes", "skills-sync", "venv-python"):
         sub.add_parser(name)
     return parser
 

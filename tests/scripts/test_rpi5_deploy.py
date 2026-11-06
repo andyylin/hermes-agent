@@ -31,7 +31,8 @@ REPOSITORY = "andyylin/hermes-agent"
 
 def _git(cwd: Path, *args: str) -> str:
     done = subprocess.run(
-        ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "init.defaultBranch=main", *args],
+        ["git", "-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+         "-c", "init.defaultBranch=main", *args],
         cwd=cwd, capture_output=True, text=True, check=True)
     return done.stdout.strip()
 
@@ -232,6 +233,58 @@ def test_a_stale_heartbeat_counts_as_busy(site):
     assert _deploy(site, target).outcome == "deployed"
 
     assert site.host.stopped_at >= 100 + site.config.idle_settle_seconds
+
+
+def test_stamp_names_only_the_deploy_target(site):
+    target = _commit(site.origin, {"gateway/app.py": "VALUE = 3\n"})
+
+    assert _deploy(site, target).outcome == "deployed"
+
+    stamps = [event for event in site.host.events if event[:2] == ("probe", "stamp")]
+    assert stamps == [("probe", "stamp", "--home", str(site.config.home))]
+
+
+def test_stamp_exit_24_rolls_the_checkout_back(site):
+    """A non-zero stamp (24 included) is a failed deploy even when /health would pass."""
+    target = _commit(site.origin, {"gateway/app.py": "VALUE = 4\n"})
+    real = site.host.probe
+
+    def probe(python, checkout, command, *args, home=None):
+        # The forward stamp is the one that migrates. The rollback stamp has no
+        # --home, so a tree from the previous release can still answer it.
+        if command == "stamp" and "--home" in args:
+            raise eng.DeployError("probe stamp failed: exit 24")
+        return real(python, checkout, command, *args, home=home)
+
+    site.host.probe = probe
+    result = _deploy(site, target)
+
+    assert result.outcome == "rolled_back"
+    assert site.head() == site.base
+    assert target in site.store.load().failed_shas
+
+
+@pytest.mark.parametrize("code", [1, 24])
+def test_rollback_trap_covers_every_nonzero_exit(site, monkeypatch, code):
+    target = _commit(site.origin, {"gateway/app.py": f"VALUE = exit-{code}\n"})
+
+    def boom(sha):
+        site.host.git("fetch", "origin", "main")
+        site.host.git("merge", "--ff-only", sha)
+        raise SystemExit(code)
+
+    monkeypatch.setattr(site.deployer, "deploy", boom)
+    result = _deploy(site, target)
+
+    assert result.outcome == "rolled_back"
+    assert site.head() == site.base
+
+
+def test_probe_exit_24_is_not_success():
+    done = subprocess.CompletedProcess(
+        args=["stamp"], returncode=24, stdout='{"ok": true}\n', stderr="")
+    with pytest.raises(eng.DeployError, match="exit 24|stamp"):
+        eng._probe_payload("stamp", done)
 
 
 def test_failed_health_rolls_back_and_refuses_the_same_sha_again(site):
