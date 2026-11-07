@@ -6,10 +6,9 @@ name: Candidate deploy safety
 # run the full suite, and does not push to main, so rpi5-deploy.yml is not
 # involved. It never edits needs_manual or the manual-lane classification.
 #
-# pull_request checks the PR head. workflow_dispatch checks the sha input, so
-# the v0.23.0 squash ab2bbde6 can be re-run. That squash is also checked on
-# the evidence branch below; other PRs skip it because its duplicate helper
-# is a known historical failure.
+# pull_request checks the PR head. workflow_dispatch checks the sha input.
+# The historical squash ab2bbde6 is a separate job, skipped unless the
+# evidence branch is the head. A skipped job is not a green safety result.
 
 on:
   pull_request:
@@ -52,23 +51,11 @@ concurrency:
 
 jobs:
   safety:
-    name: deploy safety (${{ matrix.label }})
-    # matrix is not a job-level context. A job `if` that names it makes
-    # GitHub reject the file at push (0 jobs, "Unrecognized named-value").
-    # The historical squash is skipped per step instead.
+    name: deploy safety (head)
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: head
-            sha: ""
-          - label: ab2bbde6
-            sha: ab2bbde6afc428a85e74a8b39a76754fcac3745b
     steps:
       - name: Checkout
-        if: matrix.label == 'head' || (github.event_name == 'pull_request' && github.head_ref == 'cursor/v0230-deploy-safety-7fa2')
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
           persist-credentials: false
@@ -77,7 +64,6 @@ jobs:
 
       - name: Setup Python
         id: python
-        if: matrix.label == 'head' || (github.event_name == 'pull_request' && github.head_ref == 'cursor/v0230-deploy-safety-7fa2')
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14"
@@ -88,25 +74,21 @@ jobs:
             pm/lock.json
 
       - name: Restore uv cache
-        if: matrix.label == 'head' || (github.event_name == 'pull_request' && github.head_ref == 'cursor/v0230-deploy-safety-7fa2')
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/candidate-deploy-safety/uv-cache
           key: deploy-safety-uv-${{ hashFiles('pyproject.toml', 'uv.lock', 'pm/lock.json') }}
 
       - name: Run exact-SHA deploy-safety checks
-        if: matrix.label == 'head' || (github.event_name == 'pull_request' && github.head_ref == 'cursor/v0230-deploy-safety-7fa2')
+        id: safety
         env:
-          MATRIX_SHA: ${{ matrix.sha }}
           INPUT_SHA: ${{ inputs.sha }}
           PR_SHA: ${{ github.event.pull_request.head.sha }}
           CHECK_PYTHON: ${{ steps.python.outputs.python-path }}
           SAFETY_SCRATCH: ${{ runner.temp }}/candidate-deploy-safety
         run: |
           set -euo pipefail
-          if [ -n "$MATRIX_SHA" ]; then
-            target="$MATRIX_SHA"
-          elif [ -n "$INPUT_SHA" ]; then
+          if [ -n "$INPUT_SHA" ]; then
             target="$INPUT_SHA"
           elif [ -n "$PR_SHA" ]; then
             target="$PR_SHA"
@@ -116,6 +98,7 @@ jobs:
           case "$target" in
             *[!0-9a-fA-F]*) echo "refusing non-hex sha" >&2; exit 2 ;;
           esac
+          echo "exact-SHA deploy-safety target: $target" >> "$GITHUB_STEP_SUMMARY"
           git cat-file -e "${target}^{commit}" 2>/dev/null || git fetch --filter=blob:none --no-tags origin "$target"
           python "$GITHUB_WORKSPACE/docs/ops/candidate_deploy_safety.py" \
             --repo "$GITHUB_WORKSPACE" \
@@ -125,7 +108,7 @@ jobs:
             --live-config-version 51
 
       - name: Save uv cache
-        if: matrix.label == 'head' && success()
+        if: success()
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -133,7 +116,69 @@ jobs:
           key: deploy-safety-uv-${{ hashFiles('pyproject.toml', 'uv.lock', 'pm/lock.json') }}
 
       - name: Focused regression tests
-        if: (success() || failure()) && (matrix.label == 'head' || (github.event_name == 'pull_request' && github.head_ref == 'cursor/v0230-deploy-safety-7fa2'))
+        if: success() || failure()
+        env:
+          HERMES_PYTHON: ${{ runner.temp }}/candidate-deploy-safety/venv/bin/python
+        run: |
+          set -euo pipefail
+          if [ ! -x "$HERMES_PYTHON" ]; then
+            echo "scratch interpreter missing; safety install did not finish" >&2
+            exit 1
+          fi
+          scripts/run_tests.sh tests/scripts/test_candidate_deploy_safety.py
+
+      - name: Current-head exact-SHA check completed
+        if: always()
+        run: |
+          set -euo pipefail
+          outcome="${{ steps.safety.outcome }}"
+          echo "exact-SHA deploy-safety outcome: $outcome" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$outcome" != "success" ]; then
+            echo "current-head exact-SHA check did not succeed (outcome: $outcome)" >&2
+            exit 1
+          fi
+
+  safety-historical:
+    name: deploy safety (ab2bbde6)
+    if: github.event_name == 'pull_request' && github.head_ref == 'cursor/v0230-deploy-safety-7fa2'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Setup Python
+        id: python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            uv.lock
+            pm/lock.json
+
+      - name: Run exact-SHA deploy-safety checks
+        env:
+          CHECK_PYTHON: ${{ steps.python.outputs.python-path }}
+          SAFETY_SCRATCH: ${{ runner.temp }}/candidate-deploy-safety
+        run: |
+          set -euo pipefail
+          target="ab2bbde6afc428a85e74a8b39a76754fcac3745b"
+          git cat-file -e "${target}^{commit}" 2>/dev/null || git fetch --filter=blob:none --no-tags origin "$target"
+          python "$GITHUB_WORKSPACE/docs/ops/candidate_deploy_safety.py" \
+            --repo "$GITHUB_WORKSPACE" \
+            --sha "$target" \
+            --scratch "$SAFETY_SCRATCH" \
+            --python "$CHECK_PYTHON" \
+            --live-config-version 51
+
+      - name: Focused regression tests
+        if: success() || failure()
         env:
           HERMES_PYTHON: ${{ runner.temp }}/candidate-deploy-safety/venv/bin/python
         run: |

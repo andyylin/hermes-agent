@@ -159,13 +159,13 @@ jobs:
           - arch: amd64
             runner: blacksmith-32vcpu-ubuntu-2404
             platform: linux/amd64
-          # arm64 builds on the native arm64 larger runner. A build of
-          # linux/arm64 on an x64 host uses emulation.
+          # Native arm64. This fork uses the free public standard runner
+          # ubuntu-24.04-arm. ubuntu-24.04 is x64 and would emulate linux/arm64.
           - arch: arm64
             runner: blacksmith-32vcpu-ubuntu-2404-arm
             platform: linux/arm64
 
-    runs-on: "${{ github.repository_owner == 'NousResearch' && matrix.runner || (contains(matrix.runner, 'windows') && 'windows-latest' || (contains(matrix.runner, 'macos') && 'macos-latest' || 'ubuntu-24.04')) }}"
+    runs-on: "${{ github.repository_owner == 'NousResearch' && matrix.runner || (contains(matrix.runner, 'windows') && 'windows-latest' || (contains(matrix.runner, 'macos') && 'macos-latest' || (contains(matrix.runner, '-arm') && 'ubuntu-24.04-arm' || 'ubuntu-24.04'))) }}"
     timeout-minutes: 45
     steps:
       - name: Checkout code
@@ -350,11 +350,12 @@ jobs:
           - arch: amd64
             runner: blacksmith-32vcpu-ubuntu-2404
             platform: linux/amd64
-          # Native arm64 for the same reason as the build matrix above.
+          # Same native arm64 runner as the build matrix. Publishing
+          # linux/arm64 from ubuntu-24.04 would cross-build on x64.
           - arch: arm64
             runner: blacksmith-32vcpu-ubuntu-2404-arm
             platform: linux/arm64
-    runs-on: "${{ github.repository_owner == 'NousResearch' && matrix.runner || (contains(matrix.runner, 'windows') && 'windows-latest' || (contains(matrix.runner, 'macos') && 'macos-latest' || 'ubuntu-24.04')) }}"
+    runs-on: "${{ github.repository_owner == 'NousResearch' && matrix.runner || (contains(matrix.runner, 'windows') && 'windows-latest' || (contains(matrix.runner, 'macos') && 'macos-latest' || (contains(matrix.runner, '-arm') && 'ubuntu-24.04-arm' || 'ubuntu-24.04'))) }}"
     timeout-minutes: 30
     steps:
       - name: Checkout trusted source

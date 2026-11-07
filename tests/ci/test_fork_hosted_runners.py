@@ -20,7 +20,9 @@ _WORKFLOWS = _REPO / ".github" / "workflows"
 _FREE = frozenset({
     "ubuntu-latest",
     "ubuntu-24.04",
+    "ubuntu-24.04-arm",
     "ubuntu-22.04",
+    "ubuntu-22.04-arm",
     "windows-latest",
     "macos-latest",
     "macos-15",
@@ -103,6 +105,38 @@ def test_dependency_review_stays_when_the_graph_exists():
     script = probe["run"]
     assert 'code" = "404"' in script or '[ "$code" = "404" ]' in script
     assert "exit 1" in script
+
+
+def test_fork_docker_arm64_builds_on_native_arm():
+    """linux/arm64 on this fork uses the free standard arm64 runner, not x64 ubuntu-24.04."""
+    doc = _yaml(_WORKFLOWS / "docker.yml")
+    for job_name in ("build", "publish"):
+        job = doc["jobs"][job_name]
+        rows = job["strategy"]["matrix"]["include"]
+        arm = next(row for row in rows if row["arch"] == "arm64")
+        amd = next(row for row in rows if row["arch"] == "amd64")
+        assert arm["platform"] == "linux/arm64"
+        assert gha.render(job["runs-on"], _context("andyylin", arm["runner"])) == "ubuntu-24.04-arm"
+        assert gha.render(job["runs-on"], _context("NousResearch", arm["runner"])) == arm["runner"]
+        assert gha.render(job["runs-on"], _context("andyylin", amd["runner"])) == "ubuntu-24.04"
+
+
+def test_current_head_safety_job_runs_the_exact_sha_check():
+    """The head job always runs the exact-SHA check. The historical row is a skipped job."""
+    jobs = _yaml(_WORKFLOWS / "candidate-deploy-safety.yml")["jobs"]
+    head = jobs["safety"]
+    assert head["name"] == "deploy safety (head)"
+    assert "strategy" not in head
+    check = next(step for step in head["steps"] if step["name"] == "Run exact-SHA deploy-safety checks")
+    assert "if" not in check
+    guard = next(step for step in head["steps"] if step["name"] == "Current-head exact-SHA check completed")
+    assert "steps.safety.outcome" in guard["run"]
+    historical = jobs["safety-historical"]
+    assert "matrix." not in historical["if"]
+    ordinary = {"github": {"event_name": "pull_request", "head_ref": "cursor/v023-release-identity-2bae"}}
+    evidence = {"github": {"event_name": "pull_request", "head_ref": "cursor/v0230-deploy-safety-7fa2"}}
+    assert gha.condition(historical["if"], ordinary) is False
+    assert gha.condition(historical["if"], evidence) is True
 
 
 def test_job_level_if_does_not_read_matrix():
