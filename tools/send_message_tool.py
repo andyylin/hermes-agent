@@ -9,6 +9,7 @@ import os
 import re
 
 from agent.secret_scope import get_secret
+from hermes_cli.config_backend import config_exists
 
 logger = logging.getLogger(__name__)
 
@@ -350,7 +351,7 @@ def _not_configured_error(platform_name, platform, entry):
         block = user_config.get("platforms", {}).get(platform_name)
     except Exception:
         user_config, block = {}, None
-    if not config_path.exists():
+    if not config_exists(config_path):
         config_state = "missing"
     elif not isinstance(block, dict):
         config_state = f"no platforms.{platform_name} block"

@@ -75,7 +75,7 @@ def test_boot_reexecs_onto_the_committed_generation_in_a_fresh_process(tmp_path,
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     repo = tmp_path / "repo"
     repo.mkdir()
-    generation = _write_generation(repo, major=sys.version_info.major, minor=sys.version_info.minor)
+    _write_generation(repo, major=sys.version_info.major, minor=sys.version_info.minor)
     other = tmp_path / "other"
     subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(other)], check=True, timeout=60)
     code = (
