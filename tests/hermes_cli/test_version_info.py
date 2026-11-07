@@ -272,6 +272,32 @@ def test_placeholder_pyproject_version_is_not_a_release(tmp_path, monkeypatch):
     assert get_version_info().base_version == "0.23.0"
 
 
+def test_newer_patch_keeps_the_fetched_calver_release(tmp_path, monkeypatch):
+    """A patch bump in pyproject stays the fetched CalVer tag's version.
+
+    ``0.21.1`` tagged ``v2026.9.7``, then a commit declaring ``0.21.5``, is still
+    ``0.21.1`` plus distance until the later CalVer tag is fetched. Publishing
+    the working-tree patch at distance 0 hides that refresh.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "hermes-agent"\nversion = "0.21.1"\n', encoding="utf-8")
+    _git(repo, tmp_path, "init", "-q", "-b", "main")
+    _git(repo, tmp_path, "add", "pyproject.toml")
+    _git(repo, tmp_path, "commit", "-qm", "release")
+    _git(repo, tmp_path, "tag", "v2026.9.7")
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "hermes-agent"\nversion = "0.21.5"\n', encoding="utf-8")
+    _git(repo, tmp_path, "commit", "-qam", "patch")
+
+    _bind_repo(monkeypatch, repo)
+    info = get_version_info()
+
+    assert info.base_version == "0.21.1"
+    assert info.distance == 1
+
+
 def test_this_checkout_reports_v0_23_0(monkeypatch):
     repo = Path(__file__).resolve().parents[2]
     monkeypatch.setattr("hermes_cli.version_info._resolve_stamp_file", lambda: None)
