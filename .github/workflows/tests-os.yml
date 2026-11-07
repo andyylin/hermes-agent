@@ -76,7 +76,7 @@ concurrency:
 jobs:
   os-tests:
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: "${{ github.repository_owner == 'NousResearch' && matrix.runner || (contains(matrix.runner, 'windows') && 'windows-latest' || (contains(matrix.runner, 'macos') && 'macos-latest' || 'ubuntu-24.04')) }}"
     timeout-minutes: ${{ matrix.timeout || 30 }}
     strategy:
       fail-fast: false
@@ -254,7 +254,7 @@ jobs:
     # 32-core like os-tests' Windows row: seven files run in parallel and each spawns
     # process trees; on the 4-vCPU image the suite step took 153-171 s (job 4.7-5.6 min),
     # here 124 s (job 3.1 min), with headroom against scheduling-starved timeouts.
-    runs-on: blacksmith-32vcpu-windows-2025
+    runs-on: "${{ github.repository_owner == 'NousResearch' && 'blacksmith-32vcpu-windows-2025' || 'windows-latest' }}"
     timeout-minutes: 25
     steps:
       - name: Checkout code

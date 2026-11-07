@@ -71,7 +71,7 @@ jobs:
   # the parent stable-release workflow, which passes the candidate commit.
   mode:
     name: Resolve release phase
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository_owner == 'NousResearch' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}"
     timeout-minutes: 5
     outputs:
       phase: ${{ steps.resolve.outputs.phase }}
@@ -100,7 +100,7 @@ jobs:
     name: Detect affected areas
     needs: [mode]
     if: needs.mode.outputs.release != 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository_owner == 'NousResearch' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}"
     timeout-minutes: 10
     outputs:
       build: ${{ steps.gate.outputs.build }}
@@ -165,7 +165,7 @@ jobs:
             runner: blacksmith-32vcpu-ubuntu-2404-arm
             platform: linux/arm64
 
-    runs-on: ${{ matrix.runner }}
+    runs-on: "${{ github.repository_owner == 'NousResearch' && matrix.runner || (contains(matrix.runner, 'windows') && 'windows-latest' || (contains(matrix.runner, 'macos') && 'macos-latest' || 'ubuntu-24.04')) }}"
     timeout-minutes: 45
     steps:
       - name: Checkout code
@@ -354,7 +354,7 @@ jobs:
           - arch: arm64
             runner: blacksmith-32vcpu-ubuntu-2404-arm
             platform: linux/arm64
-    runs-on: ${{ matrix.runner }}
+    runs-on: "${{ github.repository_owner == 'NousResearch' && matrix.runner || (contains(matrix.runner, 'windows') && 'windows-latest' || (contains(matrix.runner, 'macos') && 'macos-latest' || 'ubuntu-24.04')) }}"
     timeout-minutes: 30
     steps:
       - name: Checkout trusted source
@@ -540,7 +540,7 @@ jobs:
       matrix:
         arch: [amd64, arm64]
         variant: [slim, desktop]
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: "${{ github.repository_owner == 'NousResearch' && 'blacksmith-32vcpu-ubuntu-2404' || 'ubuntu-24.04' }}"
     timeout-minutes: 45
     env:
       ARCH: ${{ matrix.arch }}
@@ -766,7 +766,7 @@ jobs:
     name: Docker phase requirements met
     if: always() && inputs.release-phase != ''
     needs: [mode, build, release-publish, release-publish-manifest]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: "${{ github.repository_owner == 'NousResearch' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}"
     timeout-minutes: 5
     steps:
       - name: Validate phase job results
