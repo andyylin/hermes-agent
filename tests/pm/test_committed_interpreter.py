@@ -71,6 +71,39 @@ def test_launch_python_needs_reexec_when_abi_differs(tmp_path, monkeypatch):
     assert target == store_python
 
 
+def test_current_store_launch_still_reexecs_when_the_committed_abi_differs(tmp_path, monkeypatch):
+    """ABI re-exec runs when ``prepare_launch`` returns None, not inside it.
+
+    ``hermes_bootstrap._relaunch_onto_managed_python`` uses
+    ``prepare_launch(...) or launch_python_needs_reexec(...)``. A process
+    already on the store spelling, with a current install, still re-execs
+    onto the generation interpreter when that generation's ABI differs.
+    """
+    import pm
+    from hermes_cli import _launchers
+    from hermes_cli.venv_sync import prepare_launch
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "pyproject.toml").write_text("[project]\nname='example'\n", encoding="utf-8")
+    (repo / "install-stamp.json").write_text('{"updateMechanism": "self"}', encoding="utf-8")
+    foreign = (3, 11) if sys.version_info[:2] != (3, 11) else (3, 12)
+    generation = _write_generation(repo, major=foreign[0], minor=foreign[1])
+    store_python = tmp_path / "store" / "bin" / "python3"
+    store_python.parent.mkdir(parents=True)
+    store_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(pm, "venv_is_current", lambda **_kw: True)
+    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _root: store_python)
+    monkeypatch.setattr(sys, "executable", str(store_python))
+
+    assert prepare_launch(repo, []) is None
+    assert launch_python_needs_reexec(repo) == venv_python(generation)
+    decision = prepare_launch(repo, []) or launch_python_needs_reexec(repo)
+    assert decision == venv_python(generation)
+
+
 def test_boot_reexecs_onto_the_committed_generation_in_a_fresh_process(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     repo = tmp_path / "repo"

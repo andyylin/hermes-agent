@@ -8,6 +8,7 @@ following symlinks would treat a venv interpreter as the store interpreter.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -95,3 +96,41 @@ def test_stale_relaunch_targets_the_store_interpreter(launch, monkeypatch):
     target, published = run(store_spelling=store_python, executable=store_python)
     assert target == store_python
     assert published == [(tmp_path / "checkout").resolve()]
+
+
+@pytest.mark.platforms("posix")
+def test_symlinked_home_converges_on_the_executed_store_spelling(launch):
+    """A symlinked HERMES_HOME relaunches onto that spelling once, then stops.
+
+    ``sys.executable`` on Linux is the path passed to exec, including a
+    directory symlink, not ``realpath``. The child that reports the path
+    ``prepare_launch`` just exec'd is current. Resolving the binary would
+    also hide a venv interpreter symlinked at that same file.
+    """
+    tmp_path, _store_python, run = launch
+    real_home = tmp_path / "real-home"
+    link_home = tmp_path / "link-home"
+    real_bin = real_home / "tools" / "python-test" / "bin"
+    real_bin.mkdir(parents=True)
+    link_home.symlink_to(real_home)
+    (real_bin / "python3").symlink_to(sys.executable)
+    spelled = link_home / "tools" / "python-test" / "bin" / "python3"
+    resolved_home = real_home / "tools" / "python-test" / "bin" / "python3"
+
+    child = subprocess.run(
+        [str(spelled), "-c", "import sys; print(sys.executable)"],
+        check=True, capture_output=True, text=True, timeout=30,
+    )
+    reported = child.stdout.strip()
+    assert reported == str(spelled)
+    assert reported != str(resolved_home)
+
+    # Started through the resolved home: one relaunch onto the symlink spelling.
+    first, published = run(store_spelling=spelled, executable=resolved_home)
+    assert first == spelled
+    assert published == [(tmp_path / "checkout").resolve()]
+
+    # The child reports the path we exec'd, so the next launch stays there.
+    second, published_again = run(store_spelling=spelled, executable=Path(reported))
+    assert second is None
+    assert published_again == [(tmp_path / "checkout").resolve()]

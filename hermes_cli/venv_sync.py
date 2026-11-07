@@ -520,9 +520,10 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     # HERMES_HOME (which may carry '..') while sys.executable arrives
     # normalized, so a raw compare re-execs every child forever (#122513). A
     # venv interpreter symlinked to the same binary is still a different
-    # interpreter (its own sys.prefix) and must re-exec once. The committed
-    # generation venv is not this spelling: ABI re-exec is
-    # launch_python_needs_reexec, and this return is the store interpreter.
+    # interpreter (its own sys.prefix) and must re-exec once. This return is
+    # only the store spelling. A committed-generation ABI re-exec is the
+    # bootstrap fallback when this returns None: ``prepare_launch(...) or
+    # launch_python_needs_reexec(...)`` in ``_relaunch_onto_managed_python``.
     same = os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable))
     if not current or not same:
         publish_launchers(root)
