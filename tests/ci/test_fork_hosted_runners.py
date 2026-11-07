@@ -94,6 +94,17 @@ def _context(owner: str, label: str) -> dict:
     }
 
 
+def test_dependency_review_stays_when_the_graph_exists():
+    """A missing dependency graph skips the action. Any other probe result still fails."""
+    job = _yaml(_WORKFLOWS / "candidate-deploy-safety.yml")["jobs"]["dependency-review"]
+    review = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/dependency-review-action@"))
+    assert review["if"] == "steps.graph.outputs.available == 'true'"
+    probe = next(step for step in job["steps"] if step.get("id") == "graph")
+    script = probe["run"]
+    assert 'code" = "404"' in script or '[ "$code" = "404" ]' in script
+    assert "exit 1" in script
+
+
 def test_job_level_if_does_not_read_matrix():
     """GitHub rejects the workflow file when a job ``if`` names ``matrix``."""
     offenders = []

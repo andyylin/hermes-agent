@@ -156,7 +156,30 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
+      - name: Dependency graph enabled
+        id: graph
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          code="$(curl -sS -o "$RUNNER_TEMP/dependency-graph.json" -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/dependency-graph/sbom")"
+          if [ "$code" = "200" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          elif [ "$code" = "404" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Dependency graph is not enabled for ${GITHUB_REPOSITORY}." >> "$GITHUB_STEP_SUMMARY"
+            echo "actions/dependency-review-action cannot run until it is. The action stays in this job." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "dependency graph probe returned HTTP $code" >&2
+            cat "$RUNNER_TEMP/dependency-graph.json" >&2
+            exit 1
+          fi
+
       - name: Review pull request dependencies
+        if: steps.graph.outputs.available == 'true'
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
 
   candidate-dependency-review:

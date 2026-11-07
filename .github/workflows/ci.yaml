@@ -54,7 +54,11 @@ permissions:
 # cancelled: its group is github.run_id. PRs collapse per-PR; pushes use the
 # ref as before.
 concurrency:
-  group: ci-${{ inputs.release == true && github.run_id || (github.event_name == 'pull_request' && github.event.pull_request.number || github.ref) }}
+  # The group name changed with the free-runner fallback. A previous run can
+  # sit queued forever on a Blacksmith label this fork does not have, and a
+  # queued run is not "in progress", so cancel-in-progress never clears it.
+  # Sharing that group pins every later CI run in pending.
+  group: ci-hosted-${{ inputs.release == true && github.run_id || (github.event_name == 'pull_request' && github.event.pull_request.number || github.ref) }}
   cancel-in-progress: ${{ inputs.release != true && github.event_name == 'pull_request' }}
 
 jobs:
