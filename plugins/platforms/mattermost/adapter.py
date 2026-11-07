@@ -138,6 +138,15 @@ class MattermostAdapter(BasePlatformAdapter):
         self._last_post_error: str = ""
         self._dedup = MessageDeduplicator()
 
+    def _is_configured_bot_user(self, user_id: str) -> bool:
+        """Whether an inbound sender is listed in ``MATTERMOST_BOT_USERS``.
+
+        ``bot_users`` in config is read by ``build_source``. Mattermost's posted
+        event has no bot flag unless ``props.from_bot`` is set, so the env list
+        is the other opt-in that marks a peer bot (#137027).
+        """
+        return str(user_id) in _channel_id_set(_get_scoped_secret("MATTERMOST_BOT_USERS", ""))
+
     # --- HTTP helpers ---
 
     def _headers(self) -> dict[str, str]:
@@ -742,7 +751,9 @@ class MattermostAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=channel_id, chat_type=_CHANNEL_TYPE_MAP.get(data.get("channel_type", "O"), "channel"),
             user_id=sender_id, user_name=data.get("sender_name", "").lstrip("@") or sender_id,
-            thread_id=thread_id, message_id=post_id)
+            thread_id=thread_id, message_id=post_id,
+            is_bot=str((post.get("props") or {}).get("from_bot", "")).lower() == "true"
+            or self._is_configured_bot_user(sender_id))
         from gateway.platforms.base import resolve_channel_prompt
         await self.handle_message(MessageEvent(
             text=message_text, message_type=msg_type, source=source, raw_message=post, message_id=post_id,

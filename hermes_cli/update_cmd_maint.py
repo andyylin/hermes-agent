@@ -350,7 +350,8 @@ def _checkout_version() -> str | None:
     """The checkout's runtime identity, computed exactly as ``write_source_stamp`` publishes it.
 
     ``0.0.0`` in pyproject.toml is an inert placeholder, not a release. A declared
-    version is the identity when no semver tag is reachable.
+    version newer than every reachable semver tag is the identity: a squash does
+    not make the new release tag an ancestor, so the previous tag stays reachable.
     """
     from hermes_cli.update_cmd import _m
     from hermes_cli.version_info import _git_version_info

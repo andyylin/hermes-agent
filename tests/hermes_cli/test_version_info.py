@@ -12,6 +12,7 @@ from hermes_cli.version_info import (
     _reset_version_info_cache,
     _resolve_stamp_file,
     _stamp_version_info,
+    get_code_identity,
     get_version_info,
 )
 
@@ -271,12 +272,140 @@ def test_placeholder_pyproject_version_is_not_a_release(tmp_path, monkeypatch):
     assert get_version_info().base_version == "0.23.0"
 
 
+def test_newer_patch_keeps_the_fetched_calver_release(tmp_path, monkeypatch):
+    """A patch bump in pyproject stays the fetched CalVer tag's version.
+
+    ``0.21.1`` tagged ``v2026.9.7``, then a commit declaring ``0.21.5``, is still
+    ``0.21.1`` plus distance until the later CalVer tag is fetched. Publishing
+    the working-tree patch at distance 0 hides that refresh.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "hermes-agent"\nversion = "0.21.1"\n', encoding="utf-8")
+    _git(repo, tmp_path, "init", "-q", "-b", "main")
+    _git(repo, tmp_path, "add", "pyproject.toml")
+    _git(repo, tmp_path, "commit", "-qm", "release")
+    _git(repo, tmp_path, "tag", "v2026.9.7")
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "hermes-agent"\nversion = "0.21.5"\n', encoding="utf-8")
+    _git(repo, tmp_path, "commit", "-qam", "patch")
+
+    _bind_repo(monkeypatch, repo)
+    info = get_version_info()
+
+    assert info.base_version == "0.21.1"
+    assert info.distance == 1
+
+
 def test_this_checkout_reports_v0_23_0(monkeypatch):
     repo = Path(__file__).resolve().parents[2]
     monkeypatch.setattr("hermes_cli.version_info._resolve_stamp_file", lambda: None)
     monkeypatch.setattr("hermes_cli.version_info._resolve_repo_dir", lambda: repo)
     _reset_version_info_cache()
     assert get_version_info().base_version == "0.23.0"
+
+
+def _git(repo: Path, home: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args], cwd=repo, text=True, capture_output=True, check=True,
+        env={
+            "HOME": str(home), "PATH": os.environ["PATH"],
+            "GIT_AUTHOR_NAME": "Hermes Test", "GIT_AUTHOR_EMAIL": "hermes@example.invalid",
+            "GIT_COMMITTER_NAME": "Hermes Test", "GIT_COMMITTER_EMAIL": "hermes@example.invalid",
+        },
+    )
+    return result.stdout.strip()
+
+
+def _init_version_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, tmp_path, "init", "-q", "-b", "main")
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "hermes-agent"\nversion = "0.22.5"\n', encoding="utf-8")
+    _git(repo, tmp_path, "add", "pyproject.toml")
+    _git(repo, tmp_path, "commit", "-qm", "v0.22.5")
+    _git(repo, tmp_path, "tag", "v0.22.5")
+    return repo
+
+
+def _bind_repo(monkeypatch, repo: Path) -> None:
+    monkeypatch.setattr("hermes_cli.version_info._resolve_stamp_file", lambda: None)
+    monkeypatch.setattr("hermes_cli.version_info._resolve_repo_dir", lambda: repo)
+    _reset_version_info_cache()
+
+
+def test_squashed_newer_release_ignores_an_unmerged_tag_and_keeps_head_sha(tmp_path, monkeypatch):
+    """The new release tag is not an ancestor after a squash, so it must not be required.
+
+    The previous semver tag stays merged. A newer pyproject declaration is the
+    release, at distance 0. ``code_sha`` remains this checkout's HEAD.
+    """
+    repo = _init_version_repo(tmp_path)
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "hermes-agent"\nversion = "0.23.0"\n', encoding="utf-8")
+    _git(repo, tmp_path, "commit", "-qam", "squash v0.23.0")
+    _git(repo, tmp_path, "checkout", "-q", "-b", "side", "HEAD~1")
+    (repo / "side.txt").write_text("not on main\n", encoding="utf-8")
+    _git(repo, tmp_path, "add", "side.txt")
+    _git(repo, tmp_path, "commit", "-qm", "official tip not merged")
+    _git(repo, tmp_path, "tag", "v0.23.0")
+    _git(repo, tmp_path, "checkout", "-q", "main")
+    (repo / "overlay.txt").write_text("andy\n", encoding="utf-8")
+    _git(repo, tmp_path, "add", "overlay.txt")
+    _git(repo, tmp_path, "commit", "-qm", "andy patch")
+
+    _bind_repo(monkeypatch, repo)
+    info = get_version_info()
+    head = _git(repo, tmp_path, "rev-parse", "HEAD")
+    tag = _git(repo, tmp_path, "rev-parse", "v0.23.0^{}")
+
+    assert info.base_version == "0.23.0"
+    assert info.distance == 0
+    assert info.commit == head
+    assert head != tag
+    identity = get_code_identity()
+    assert identity["sha"] == head
+    assert identity["version"] == "0.23.0"
+
+
+def test_reachable_release_tag_still_counts_distance(tmp_path, monkeypatch):
+    """Once the release tag is an ancestor, later commits stay that release plus distance."""
+    repo = _init_version_repo(tmp_path)
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "hermes-agent"\nversion = "0.23.0"\n', encoding="utf-8")
+    _git(repo, tmp_path, "commit", "-qam", "declare 0.23.0")
+    _git(repo, tmp_path, "tag", "v0.23.0")
+    (repo / "later.txt").write_text("later\n", encoding="utf-8")
+    _git(repo, tmp_path, "add", "later.txt")
+    _git(repo, tmp_path, "commit", "-qm", "after the tag")
+
+    _bind_repo(monkeypatch, repo)
+    info = get_version_info()
+
+    assert info.base_version == "0.23.0"
+    assert info.distance == 1
+    assert info.commit == _git(repo, tmp_path, "rev-parse", "HEAD")
+    assert info.commit != _git(repo, tmp_path, "rev-parse", "v0.23.0^{}")
+
+
+def test_older_pyproject_does_not_downgrade_a_merged_tag(tmp_path, monkeypatch):
+    repo = _init_version_repo(tmp_path)
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "hermes-agent"\nversion = "0.0.0"\n', encoding="utf-8")
+    _git(repo, tmp_path, "commit", "-qam", "placeholder")
+    _bind_repo(monkeypatch, repo)
+    assert get_version_info().base_version == "0.22.5"
+
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "hermes-agent"\nversion = "0.22.0"\n', encoding="utf-8")
+    _git(repo, tmp_path, "commit", "-qam", "older declaration")
+    _reset_version_info_cache()
+    info = get_version_info()
+    assert info.base_version == "0.22.5"
+    assert info.distance == 2
+    assert info.commit == _git(repo, tmp_path, "rev-parse", "HEAD")
 
 
 def test_resolve_stamp_file_honors_install_root(tmp_path, monkeypatch):

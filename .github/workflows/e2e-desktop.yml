@@ -26,7 +26,7 @@ jobs:
     # This job builds the renderer and the electron bundle, then drives a real
     # Electron app under xvfb. vite, tsc and the Playwright workers all scale
     # with the core count.
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: "${{ github.repository_owner == 'NousResearch' && 'blacksmith-32vcpu-ubuntu-2404' || 'ubuntu-24.04' }}"
     timeout-minutes: 20
     outputs:
       review_status: ${{ steps.review-status.outputs.review_status }}

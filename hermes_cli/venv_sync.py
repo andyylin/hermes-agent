@@ -513,13 +513,19 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
                 _finish_source_update(root, current=current, pending=pending)
         finally:
             lock.release()
-    from pm.environments import committed_launch_python, launch_python_needs_reexec
-
-    launch = committed_launch_python(root)
-    if launch is None:
+    python = resolve_store_python(root)
+    if python is None:
         raise RuntimeError("source update has no managed Python; run `hermes pm install`")
-    reexec = launch_python_needs_reexec(root)
-    if not current or reexec is not None:
+    # Lexical identity, never resolve(): PM spells the store path through
+    # HERMES_HOME (which may carry '..') while sys.executable arrives
+    # normalized, so a raw compare re-execs every child forever (#122513). A
+    # venv interpreter symlinked to the same binary is still a different
+    # interpreter (its own sys.prefix) and must re-exec once. This return is
+    # only the store spelling. A committed-generation ABI re-exec is the
+    # bootstrap fallback when this returns None: ``prepare_launch(...) or
+    # launch_python_needs_reexec(...)`` in ``_relaunch_onto_managed_python``.
+    same = os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable))
+    if not current or not same:
         publish_launchers(root)
         return _relaunch_target(root, python, same=same)
     if owed_to_cli:
@@ -544,6 +550,7 @@ def _prepare_borrowed_launch(root: Path, owner: Path, *, current: bool) -> Path 
     import os
     import sys
     import pm
+    from hermes_cli._launchers import resolve_store_python
     from hermes_cli.update_lock import UpdateLock
 
     if not current:
@@ -557,14 +564,11 @@ def _prepare_borrowed_launch(root: Path, owner: Path, *, current: bool) -> Path 
         if not pm.venv_is_current(project_root=root):
             # Relaunching would land back here and sync again, forever.
             raise RuntimeError("dependency sync left this install out of date")
-    from pm.environments import committed_launch_python, launch_python_needs_reexec
-
-    launch = committed_launch_python(root)
-    if launch is None:
+    python = resolve_store_python(root)
+    if python is None:
         raise RuntimeError("source update has no managed Python; run `hermes pm install`")
-    if not current:
-        return launch
-    return launch_python_needs_reexec(root)
+    same = os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable))
+    return python if not current or not same else None
 
 
 def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
@@ -731,8 +735,11 @@ def relaunch_command(
             index += 1
     # _hermes_relaunched marks the child this starts (not processes it spawns) for _relaunch_target;
     # a restore re-execs sys.orig_argv and keeps it, which is why that guard re-checks currency.
-    prefix = (f"import sys, runpy; sys.path.insert(0, {str(root)!r}); sys.argv = {argv!r}; "
-              "sys._hermes_relaunched = True; ")
+    prefix = (
+        f"import sys, runpy; sys.path.insert(0, {str(root)!r}); sys.argv = {argv!r}; "
+        "sys._hermes_relaunched = True; "
+        + _activate_before_guest(root)
+    )
     if argv[0] == "-c":
         body = f"exec({original[index + 1]!r})"
     elif module and module != "__main__":

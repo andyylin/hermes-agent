@@ -126,8 +126,10 @@ def _release_base(repo_dir: Path) -> tuple[str, int | None]:
 
     A placeholder ``0.0.0`` is not a release. The nearest CalVer tag on this
     fork still says ``0.10.0``, and a ``--no-tags`` deploy sees no tag at all
-    and used to publish the placeholder. A pyproject version newer than that
-    tag is this checkout's release, at distance 0, until a semver tag exists.
+    and used to publish the placeholder. A pyproject version on a newer
+    release line than that tag is this checkout's release, at distance 0,
+    until a semver tag exists. A patch bump on the tag's own line stays the
+    tag: fetching the next CalVer tag is what moves that identity.
     """
     tags = _run_git(repo_dir, "tag", "--merged", "HEAD", "--list", "v[0-9]*")
     releases = [
@@ -135,17 +137,34 @@ def _release_base(repo_dir: Path) -> tuple[str, int | None]:
         for tag in (tags or "").splitlines()
         if STABLE_TAG_RE.fullmatch(tag)
     ]
+    declared = _checkout_project_version(repo_dir)
     if releases:
         base = max(releases, key=_version_key)
+        # A squash of a newer release does not make that release's tag an
+        # ancestor, so the previous semver tag stays the newest merged one.
+        # The declared pyproject version is that newer release until its tag
+        # is reachable. The checkout SHA is unchanged either way.
+        if declared is not None and _version_key(declared) > _version_key(base):
+            return declared, 0
         distance = _parse_nonnegative(_run_git(repo_dir, "rev-list", "--count", f"v{base}..HEAD"))
         return base, distance
-    declared = _checkout_project_version(repo_dir)
     calver = _calver_release_version(repo_dir)
-    if declared is not None and (calver is None or _version_key(declared) > _version_key(calver[0])):
-        return declared, 0
     if calver is not None:
+        if (
+            declared is not None
+            and _version_key(declared) > _version_key(calver[0])
+            and not _same_release_line(declared, calver[0])
+        ):
+            return declared, 0
         return calver
+    if declared is not None:
+        return declared, 0
     return "unknown", None
+
+
+def _same_release_line(left: str, right: str) -> bool:
+    """True when both versions share a major.minor line (a patch stays that release)."""
+    return _version_key(left)[:2] == _version_key(right)[:2]
 
 
 def _calver_release_version(repo_dir: Path) -> tuple[str, int] | None:
