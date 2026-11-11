@@ -42,3 +42,35 @@ def test_xvnc_never_sends_the_holders_clipboard_to_watchers(tmp_path):
     from tools.bot_desktop.rfb_filter import _MAX_CUT_TEXT
     assert int(argv[argv.index("-MaxCutText") + 1]) == _MAX_CUT_TEXT, argv
     assert not os.path.exists(tmp_path / "rfb.sock")  # stub never bound it; nothing leaked
+
+
+def test_setuid_xvnc_is_skipped_for_xtigervnc(tmp_path):
+    """RealVNC's setuid Xvnc rejects -rfbport. The launcher must drive Xtigervnc instead."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    stolen = tmp_path / "realvnc-called"
+    argv_log = tmp_path / "xtiger-argv"
+    (bindir / "Xvnc").write_text(
+        f'#!/bin/sh\nprintf called > "{stolen}"\nexit 1\n', encoding="utf-8")
+    (bindir / "Xtigervnc").write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "$@" > "{argv_log}"\nexec sleep 3\n', encoding="utf-8")
+    for stub in ("xdpyinfo", "setxkbmap", "xsetroot", "xset", "dbus-run-session", "xauth"):
+        (bindir / stub).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    for exe in bindir.iterdir():
+        exe.chmod(0o755)
+    os.chmod(bindir / "Xvnc", 0o4755)
+    for tool in ("mkdir", "sed", "cat", "printf", "dirname", "bash", "sh", "rm", "ln", "touch", "chmod", "xauth", "od", "tr", "awk", "grep", "seq", "sleep", "kill"):
+        real = shutil.which(tool)
+        if real and not (bindir / tool).exists():
+            (bindir / tool).symlink_to(real)
+    env = {
+        "PATH": str(bindir), "HOME": str(tmp_path),
+        "HERMES_BD_PROFILE": "t", "HERMES_BD_DISPLAY_NUM": "99",
+        "HERMES_BD_SOCKET": str(tmp_path / "rfb.sock"), "HERMES_BD_XAUTH": str(tmp_path / "Xauthority"),
+        "HERMES_BD_ENV_FILE": str(tmp_path / "env"), "HERMES_BD_CONFIG_HOME": str(tmp_path / "xdg"),
+    }
+    subprocess.run(["bash", str(LAUNCHER)], env=env, check=True, stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+    assert not stolen.exists()
+    argv = argv_log.read_text(encoding="utf-8-sig").split("\n")
+    assert "-rfbport" in argv, argv
+    assert argv[argv.index("-rfbport") + 1] == "-1"
