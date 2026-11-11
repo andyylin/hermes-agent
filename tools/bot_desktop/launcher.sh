@@ -257,7 +257,25 @@ fi
 # -SendCutText=0: watchers must never receive the holder's clipboard; -AcceptCutText stays on so
 # paste INTO the screen keeps working. -MaxCutText caps a client cut-text at 256 KiB — the same bound
 # the bridge enforces (tools/bot_desktop/rfb_filter.py _MAX_CUT_TEXT); keep the two in sync.
-Xvnc "$DISPLAY" -geometry "$GEOM" -depth "$DEPTH" -dpi 96 \
+# RealVNC (Pi Connect) drops a setuid binary on /usr/bin/Xvnc and hides TigerVNC's alternatives
+# link. That binary rejects -rfbport. TigerVNC's own name is Xtigervnc, and it is not setuid.
+# A non-setuid Xvnc (the alternatives link, or a stub earlier on PATH) stays first.
+pick_xvnc() {
+  local xvnc xtiger
+  xvnc=$(command -v Xvnc 2>/dev/null || true)
+  if [[ -n "$xvnc" && ! -u "$xvnc" ]]; then
+    printf '%s\n' "$xvnc"
+    return
+  fi
+  xtiger=$(command -v Xtigervnc 2>/dev/null || true)
+  if [[ -n "$xtiger" && ! -u "$xtiger" ]]; then
+    printf '%s\n' "$xtiger"
+    return
+  fi
+  printf '%s\n' "${xvnc:-Xvnc}"
+}
+XVNC_BIN=$(pick_xvnc)
+"$XVNC_BIN" "$DISPLAY" -geometry "$GEOM" -depth "$DEPTH" -dpi 96 \
   -rfbport -1 -rfbunixpath "$HERMES_BD_SOCKET" -rfbunixmode 0600 \
   -SecurityTypes None -AlwaysShared -AcceptSetDesktopSize -FrameRate 30 -SendCutText=0 -MaxCutText 262144 \
   -desktop "hermes:$HERMES_BD_PROFILE" -auth "$XAUTHORITY" -nolisten tcp \
