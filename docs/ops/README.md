@@ -36,7 +36,7 @@ gateway is idle.
    | only `docs/`, `website/`, `tests/`, `.github/`, root `*.md` (not `SOUL.md`), `AGENTS.md` | fast-forward, re-stamp, restart follower units, no gateway restart |
    | `skills/`, `optional-skills/` (plus the above) | fast-forward, re-stamp, `sync_skills`, restart follower units, no gateway restart |
    | anything else | staged release, idle gate, restart, health check, rollback |
-   | `pyproject.toml`, `uv.lock`, `pm/lock.json` | not applied; `needs_manual` (the exceptional lane in `ANDY_RUNTIME_PATCHES.md`) |
+   | `pyproject.toml`, `uv.lock`, `setup.py`, `pm/lock.json` | not applied; `needs_manual` (the exceptional lane in `ANDY_RUNTIME_PATCHES.md`) |
 
    The skills path works because the skills prompt cache keys on the skill
    files' manifest (`agent/prompt_builder.py`, #92313). New sessions see the
@@ -209,7 +209,7 @@ update the secret.
   (`agent/prompt_builder.py`) and goes through the restart path. Reloading
   config without a restart would need gateway support that does not exist
   today.
-- A dependency change (`pyproject.toml`, `uv.lock`, `pm/lock.json`) is left
+- A dependency change (`pyproject.toml`, `uv.lock`, `setup.py`, `pm/lock.json`) is left
   for the exceptional lane: `hermes pm install` plus a staged activation.
   The next push after that deploys normally.
 - The web dashboard bundle (`hermes_cli/web_dist`) is gitignored, and

@@ -52,7 +52,7 @@ SYSTEMCTL = "/usr/bin/systemctl"
 
 # Same files as pm.environments.ACTIVATION_INPUTS. A change to any of them is
 # the exceptional lane in ANDY_RUNTIME_PATCHES.md: never applied unattended.
-DEPENDENCY_INPUTS = ("uv.lock", "pyproject.toml", "pm/lock.json")
+DEPENDENCY_INPUTS = ("uv.lock", "pyproject.toml", "setup.py", "pm/lock.json")
 # Never imported by a running gateway.
 NOOP_PREFIXES = ("docs/", "website/", "tests/", "tests-js/", ".github/", "contributors/", "plugin-catalog/")
 NOOP_ROOT_SUFFIXES = (".md",)
