@@ -33,6 +33,22 @@ def test_checkout_score_cites_the_ledger_freeze():
     assert safety.citation_ok(safety.parse_ledger_freeze(ledger), safety.parse_score(score))
 
 
+def test_cutoff_parentheses_reject_a_trailing_note():
+    """The version line must open with (`vX.Y.Z`). A note inside the parentheses misses `_FREEZE_RE`."""
+    sha = "a" * 40
+    accepted = safety.parse_ledger_freeze(
+        f"Frozen upstream cutoff: `{sha}`\n(`v0.23.1`). The annotated tag is `{'b' * 40}`.\n")
+    assert accepted == safety.Freeze(sha, "v0.23.1")
+    drifted = f"Frozen upstream cutoff: `{sha}`\n(`v0.23.1`, annotated tag `{'b' * 40}`).\n"
+    try:
+        safety.parse_ledger_freeze(drifted)
+    except ValueError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("a note inside the version parentheses was accepted")
+    assert "(`vX.Y.Z`)" in message
+
+
 def test_a_score_that_misquotes_the_freeze_fails_citation():
     freeze = safety.Freeze("a" * 40, "v0.22.5")
     score = safety.Score("v0.23.0", "b" * 12, "v0.23.0", "c" * 12, "v0.22.5")
@@ -130,12 +146,15 @@ def test_schema_version_reads_the_default_config_stamp():
 
 
 def test_squash_candidate_flags_score_ancestry_without_dropping_the_finding():
-    """A one-parent squash is not a descendant of the scored tag; that is a flag."""
-    freeze = safety.parse_ledger_freeze(
-        (REPO / "ANDY_RUNTIME_PATCHES.md").read_text(encoding="utf-8"))
+    """A one-parent squash is not a descendant of the scored tag; that is a flag.
+
+    The freeze is the v0.22.5 peel this squash contains. The live ledger cutoff
+    moves forward and is not an ancestor of this historical candidate.
+    """
+    freeze_sha = "bf0203a794a07aac3ff764972ab9087baa4e4f4e"
     score_sha = safety._commit_for_prefix(REPO, "2bd378ed", "v0.23.0")
     finding = safety._ancestry_finding(
-        REPO, "ab2bbde6afc428a85e74a8b39a76754fcac3745b", freeze.sha, score_sha)
+        REPO, "ab2bbde6afc428a85e74a8b39a76754fcac3745b", freeze_sha, score_sha)
     assert finding["status"] == "flag"
     assert finding["check"] == "ancestry"
 
