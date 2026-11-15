@@ -33,6 +33,22 @@ def test_checkout_score_cites_the_ledger_freeze():
     assert safety.citation_ok(safety.parse_ledger_freeze(ledger), safety.parse_score(score))
 
 
+def test_cutoff_parentheses_reject_a_trailing_note():
+    """The version line must open with (`vX.Y.Z`). A note inside the parentheses misses `_FREEZE_RE`."""
+    sha = "a" * 40
+    accepted = safety.parse_ledger_freeze(
+        f"Frozen upstream cutoff: `{sha}`\n(`v0.23.1`). The annotated tag is `{'b' * 40}`.\n")
+    assert accepted == safety.Freeze(sha, "v0.23.1")
+    drifted = f"Frozen upstream cutoff: `{sha}`\n(`v0.23.1`, annotated tag `{'b' * 40}`).\n"
+    try:
+        safety.parse_ledger_freeze(drifted)
+    except ValueError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("a note inside the version parentheses was accepted")
+    assert "(`vX.Y.Z`)" in message
+
+
 def test_a_score_that_misquotes_the_freeze_fails_citation():
     freeze = safety.Freeze("a" * 40, "v0.22.5")
     score = safety.Score("v0.23.0", "b" * 12, "v0.23.0", "c" * 12, "v0.22.5")

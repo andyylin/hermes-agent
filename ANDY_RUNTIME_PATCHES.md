@@ -10,7 +10,7 @@ below. Do not score against newer untagged `main` or `rc.` / `abandoned-rc.`
 tags. Do not replay `DROP` or `UPSTREAM-NOW` behavior on refresh.
 
 Frozen upstream cutoff: `3b421578588243f920886e6fe79a6faa87ea026e`
-(`v0.23.1`, annotated tag `b65acf3fdc1d43bd889211ea8e37032974b395a5`).
+(`v0.23.1`). The annotated tag is `b65acf3fdc1d43bd889211ea8e37032974b395a5`.
 Exact-SHA CI and review evidence must name the peeled commit. The
 previous cutoff was `bf0203a794a07aac3ff764972ab9087baa4e4f4e`
 (`v0.22.5`). Scored against this tag on 2026-11-15: none of the eight

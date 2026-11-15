@@ -79,7 +79,11 @@ def git(repo: Path, *args: str, check: bool = True, timeout: float = 120) -> sub
 def parse_ledger_freeze(text: str) -> Freeze:
     match = _FREEZE_RE.search(text)
     if match is None:
-        raise ValueError("ledger has no frozen upstream cutoff")
+        raise ValueError(
+            "ledger has no frozen upstream cutoff. Expected "
+            "`Frozen upstream cutoff: `<40 hex>`` and the next line to start "
+            "with (`vX.Y.Z`). Anything else inside those parentheses, including "
+            "an annotated-tag note, does not match.")
     return Freeze(match.group(1), match.group(2))
 
 

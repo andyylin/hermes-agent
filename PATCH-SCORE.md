@@ -1,7 +1,8 @@
 # Andy runtime patch score — v0.23.0 (`2bd378ed`)
 
 Scored against peeled tag **v0.23.0** on branch `candidate/rpi5-v0.23.0`. Ledger authority:
-`ANDY_RUNTIME_PATCHES.md` at fork `main` `771fd573` (frozen cutoff `bf0203a` / v0.22.5).
+`ANDY_RUNTIME_PATCHES.md` (frozen cutoff `3b421578` / v0.23.1).
+This score was written when fork `main` was `771fd573` and the cutoff was the v0.22.5 peel.
 
 The pull request conflict was a split history, not a bad port. This branch now merges fork `main`
 (`771fd573`) into the v0.23.0 port. Where both sides edited the same lines, the port won.
