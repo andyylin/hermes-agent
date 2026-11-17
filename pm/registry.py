@@ -7,7 +7,7 @@ import importlib.util
 from pathlib import Path
 import sys
 from types import ModuleType
-from typing import Any
+from typing import Any, NoReturn
 
 from pm.package import InstallError, Package, StatePackage
 
@@ -61,9 +61,66 @@ def source_install_packages(names: list[str]) -> list[str]:
             and get_package(name).missing_reason(target) is None]
 
 
+def _refuse_empty_tool_set() -> NoReturn:
+    """An empty publish reports success and leaves the previous tools in place.
+
+    ``pm install --extra`` used to reach ``tool_roots([])`` that way, so a lock
+    bump never landed. Refuse it instead of publishing nothing.
+    """
+    raise InstallError(
+        "tools",
+        "refusing to publish an empty tool set",
+        "previously published tools were left in place; "
+        "name packages or run `hermes pm install` for the locked default closure",
+    )
+
+
+def _installable_packages(names: list[str]) -> list[str]:
+    """Known packages among ``names`` that this machine can install, venv excluded."""
+    # Deferred like source_install_packages: importing the store stays off the registry's import.
+    from pm.store import current_target
+
+    target = current_target()
+    chosen: list[str] = []
+    for name in dict.fromkeys(names):
+        try:
+            package = get_package(name)
+        except KeyError:
+            continue
+        if isinstance(package, StatePackage) or package.missing_reason(target) is not None:
+            continue
+        chosen.append(name)
+    return chosen
+
+
 def tool_roots(names: list[str]) -> list[str]:
-    """Packages to publish before a venv sync. The venv is not one of them."""
-    return [name for name in source_install_packages(names) if not isinstance(get_package(name), StatePackage)]
+    """Packages to publish before a venv sync. The venv is not one of them.
+
+    An empty request, or one that filters down to nothing, is refused.
+    Returning ``[]`` let an install report success without publishing tools.
+    """
+    roots = [name for name in source_install_packages(names) if not isinstance(get_package(name), StatePackage)]
+    if not roots:
+        _refuse_empty_tool_set()
+    return roots
+
+
+def publish_names(explicit: list[str], extras: list[str], locked: list[str]) -> list[str]:
+    """Packages an install publishes.
+
+    No explicit names means the lock's tool roots. ``--extra`` adds installable
+    packages on top of that base, or on top of the explicit names. A Python
+    extra that is not a package stays a venv extra. The base is never replaced
+    with an empty list.
+    """
+    base = list(explicit) if explicit else tool_roots(locked)
+    names = list(base)
+    for name in _installable_packages(extras):
+        if name not in names:
+            names.append(name)
+    if not names:
+        _refuse_empty_tool_set()
+    return names
 
 
 def package_definitions(names: list[str] | None = None) -> list[dict[str, Any]]:
