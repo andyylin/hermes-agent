@@ -37,7 +37,7 @@ from agent.skill_utils import (
 def _skill_dir(tmp_path):
     """Patch both SKILLS_DIR and get_all_skills_dirs so _find_skill searches
     only the temp directory — not the real ~/.hermes/skills/."""
-    with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path), \
+    with patch("tools.skills_tool.SKILLS_DIR", tmp_path), \
          patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]):
         yield
 
@@ -248,7 +248,7 @@ class TestCreateSkill:
         skills_dir = tmp_path / "skills"
         skills_dir.mkdir()
 
-        with patch("tools.skill_manager_tool.SKILLS_DIR", skills_dir), \
+        with patch("tools.skills_tool.SKILLS_DIR", skills_dir), \
              patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_dir]):
             result = _create_skill("my-skill", VALID_SKILL_CONTENT, category="../escape")
 
@@ -938,6 +938,16 @@ class TestSecurityScanGate:
 
         assert result is not None
 
+    def test_scan_failure_blocks_when_flag_on(self, tmp_path):
+        """A scanner crash must not let the skill through once the guard is enabled."""
+        from tools.skill_manager_tool import _security_scan_skill
+
+        with patch("tools.skill_manager_tool._guard_agent_created_enabled", return_value=True), \
+             patch("tools.skill_manager_tool.scan_skill", side_effect=UnicodeError("boom")):
+            result = _security_scan_skill(tmp_path)
+
+        assert result is not None and "boom" in result
+
     def test_guard_flag_handles_config_error(self):
         """If load_config raises, _guard_agent_created_enabled defaults to False (fail-safe off)."""
         from tools.skill_manager_tool import _guard_agent_created_enabled
@@ -965,7 +975,7 @@ class TestSecurityScanGate:
 def _two_roots(local_dir: Path, external_dir: Path):
     """Patch the skill manager so local SKILLS_DIR = local_dir and
     get_all_skills_dirs() returns [local_dir, external_dir] in order."""
-    with patch("tools.skill_manager_tool.SKILLS_DIR", local_dir), \
+    with patch("tools.skills_tool.SKILLS_DIR", local_dir), \
          patch("agent.skill_utils.get_all_skills_dirs",
                return_value=[local_dir, external_dir]):
         yield
@@ -1224,7 +1234,7 @@ class TestDeleteSkillRmtreeGuard:
         evil = skills / "evil-skill"
         evil.symlink_to(victim, target_is_directory=True)
         try:
-            with patch("tools.skill_manager_tool.SKILLS_DIR", skills), \
+            with patch("tools.skills_tool.SKILLS_DIR", skills), \
                  patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills]), \
                  patch("tools.skill_manager_tool._find_skill",
                        return_value={"path": evil}):
@@ -1244,7 +1254,7 @@ class TestDeleteSkillRmtreeGuard:
         outside = tmp_path / "outside_skill"
         outside.mkdir()
         (outside / "SKILL.md").write_text("x")
-        with patch("tools.skill_manager_tool.SKILLS_DIR", skills), \
+        with patch("tools.skills_tool.SKILLS_DIR", skills), \
              patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills]), \
              patch("tools.skill_manager_tool._find_skill",
                    return_value={"path": outside}):
@@ -1281,8 +1291,7 @@ def _curator_pass(tmp_path, *, monkeypatch):
     skills_root = hermes_home / "skills"
     skills_root.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    with patch("tools.skill_manager_tool.SKILLS_DIR", skills_root), \
-         patch("tools.skills_tool.SKILLS_DIR", skills_root), \
+    with patch("tools.skills_tool.SKILLS_DIR", skills_root), \
          patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_root]), \
          patch("tools.skill_usage._is_curator_managed_record", return_value=True), \
          patch("tools.skill_provenance.is_background_review", return_value=True):
@@ -1556,7 +1565,7 @@ class TestLockedGuard:
             d = self._make(skills, "locked-skill")
             assert skill_usage.set_locked("locked-skill", True)
             fresh = self._bg(d, action="create", name="brand-new", content=VALID_SKILL_CONTENT)
-            shadow = self._bg(d, action="create", name="locked-skill", content=VALID_SKILL_CONTENT_2)
+            shadow = self._bg(d, action="create", name="locked-skill", content=VALID_SKILL_CONTENT)
         assert fresh["success"] is True, fresh
         assert shadow["success"] is False and "already exists" in shadow["error"], shadow
         assert "Do the thing." in (d / "SKILL.md").read_text()

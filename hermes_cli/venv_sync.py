@@ -739,6 +739,10 @@ def relaunch_command(
         "sys._hermes_relaunched = True; "
         + _activate_before_guest(root)
     )
+    if argv[0] == "-m" and original[index:index + 1] == ["-m"]:
+        # Python is still locating the module (a package's __init__ imported the bootstrap):
+        # argv[0] is "-m" and __main__ has no spec yet, so the module name is on the command line.
+        module = original[index + 1]
     if argv[0] == "-c":
         body = f"exec({original[index + 1]!r})"
     elif module and module != "__main__":

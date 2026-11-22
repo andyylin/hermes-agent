@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
 from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli._startup_fast import project_root_str
 
 if TYPE_CHECKING:
     from cron.cancellation import _CancelEventLike
@@ -94,6 +95,19 @@ def _get_media_send_timeout() -> int:
     return _DEFAULT_MEDIA_SEND_TIMEOUT if resolved is None else resolved
 
 
+def _media_scaled_timeout(base: float, media_files) -> float:
+    """``base`` widened for the on-disk ``(path, is_voice)`` attachments the way the gateway's own
+    upload deadline grows (``gateway.platforms.helpers.scaled_upload_deadline``): a platform answers
+    an upload only once the file arrived, so a fixed cap reported a delivered file as failed."""
+    from gateway.platforms.helpers import media_upload_seconds, scaled_upload_deadline
+    return scaled_upload_deadline(base, media_upload_seconds(path for path, _voice in media_files or ()))
+
+
+def _media_send_timeout_for(media_path) -> float:
+    """``_get_media_send_timeout()`` for one attachment, widened by its upload time."""
+    return _media_scaled_timeout(_get_media_send_timeout(), [(media_path, False)])
+
+
 def _get_session_db_timeout() -> float:
     """Bound on run_job's SessionDB init: HERMES_CRON_SESSION_DB_TIMEOUT env, then
     ``cron.session_db_timeout_seconds`` (in DEFAULT_CONFIG), then 10s. Unlike sibling timeouts,
@@ -139,33 +153,25 @@ exec(code, main.__dict__)
 
 
 def _posix_cron_script_argv(script: Path) -> tuple[list[str], dict[str, str]]:
-    """Run a POSIX cron ``.py`` script on the gateway interpreter, unless PM has committed
-    a dependency environment for this install.
-
-    A committed generation (or a sealed payload's own environment) uses that tree's
-    interpreter: the store Python carries the repo and managed site-packages only
-    in-process, so its children import neither (#123044). No ``PYTHONPATH`` — a child
-    would inherit it and a foreign interpreter would load the store's compiled
-    extensions (#123440). The bootstrap puts the live checkout ahead of the
-    generation's workspace snapshot. Lazy installs stay off so a script cannot
-    ``execv`` itself onto the bare store Python.
-
-    Nothing committed is not a selection. ``selected_venv`` / ``project_python`` would
-    answer the leftover pre-PM ``<repo>/venv``, often a different Python than the
-    process running the gateway (a 3.11 checkout venv beside a 3.14 gateway). The
-    script runs on ``sys.executable`` instead."""
+    """POSIX managed-store installs run cron ``.py`` scripts on the selected dependency venv's
+    interpreter: the store Python has the repo and managed site-packages only on its in-process
+    ``sys.path``, so its children import neither (#123044). No ``PYTHONPATH``: everything the
+    script spawns would inherit it and a foreign interpreter would load the store's compiled
+    extensions (#123440). The venv resolves Hermes from its generation's workspace snapshot,
+    rebuilt only on a dependency change, so the bootstrap puts the live checkout first.
+    Lazy installs are off for the script's process tree: a script importing ``hermes_bootstrap``
+    could otherwise complete a source update and ``execv`` itself onto the bare store Python."""
     from hermes_cli._launchers import resolve_store_python
-    from pm.environments import committed_venv, venv_python
+    from pm.environments import project_python
 
-    repo = Path(__file__).resolve().parents[1]
-    # committed_venv, not selected_venv: the latter falls back to <repo>/venv.
-    environment = committed_venv(repo) if resolve_store_python(repo) is not None else None
-    if environment is None:
+    repo = Path(project_root_str())
+    if resolve_store_python(repo) is None:
         return [sys.executable, str(script)], {}
-    python = venv_python(environment)
+    # project_python, not committed_venv as on Windows: a pre-PM venv selected before the first
+    # commit runs on its OWN interpreter here, so there is no ABI mix (#122183).
+    python = project_python(repo)
     if not python.is_file():
-        # A half-deleted generation still has pyvenv.cfg. The caller's interpreter
-        # is the bare store Python here — the #123044 failure mode.
+        # The caller's interpreter is the bare store Python here — the #123044 failure mode.
         raise RuntimeError(f"dependency environment interpreter is missing: {python}")
     return ([str(python), "-c", _POSIX_SCRIPT_BOOTSTRAP, str(repo), str(script)],
             {"HERMES_DISABLE_LAZY_INSTALLS": "1"})
@@ -190,7 +196,7 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     from hermes_cli._launchers import resolve_store_python
     from pm.environments import committed_venv, site_packages as dependency_site
 
-    repo = Path(__file__).resolve().parents[1]
+    repo = Path(project_root_str())
     managed_python = resolve_store_python(repo)
     if managed_python is not None:
         # Only the committed generation may overlay the store Python: ``selected_venv``
@@ -211,7 +217,7 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
             interpreter = base_python
             env_overlay["VIRTUAL_ENV"] = str(venv_dir)
             pythonpath_entries = [
-                str(_sched.Path(__file__).resolve().parents[1]), str(site_packages)]
+                project_root_str(), str(site_packages)]
             existing_pythonpath = os.environ.get("PYTHONPATH", "")
             if existing_pythonpath:
                 pythonpath_entries.append(existing_pythonpath)
@@ -452,6 +458,9 @@ def _run_job_script(
     instead of the scripts-dir parent. See #69396. interpreter: the job's optional Python for
     ``.py`` scripts (#8714).
     """
+    from tools.hosted_tool_policy import host_feature_refusal
+    if refusal := host_feature_refusal("cron_scripts", "A cron script"):
+        return False, refusal
     path, err = _resolve_script_path(script_path)
     if path is None:
         return False, err
