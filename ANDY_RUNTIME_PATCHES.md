@@ -14,8 +14,8 @@ Frozen upstream cutoff: `caafe5389ae585ef77387a962aee05b1bcf17029`
 `2861fe3744f8134b782659438961a4f69ab5d495`. Exact-SHA CI and review
 evidence must name the peeled commit. This refresh is a `--no-ff` merge
 of that peeled commit onto pre-merge `main`
-`ff91cdcce3db4d3e3f9d0f1856df83a8bb5277fd`. The after SHA is the merge
-commit that contains this ledger (branch head of that merge). The
+`ff91cdcce3db4d3e3f9d0f1856df83a8bb5277fd`. The merge commit is
+`99b84708d5dd69de082a362b2c5e35efb677b760`. The
 previous cutoff was `3b421578588243f920886e6fe79a6faa87ea026e`
 (`v0.23.1`, annotated tag `b65acf3fdc1d43bd889211ea8e37032974b395a5`).
 Scored against `v0.23.3` on 2026-11-22.
