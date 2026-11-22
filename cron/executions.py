@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
-from hermes_state_errors import is_sqlite_lock_error
+from storage_errors import is_sqlite_lock_error
 from hermes_time import now as _hermes_now
 from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM
 from hermes_cli.observability.shared_metrics_gateway import record_cron_finish
@@ -446,6 +446,10 @@ def finish_execution(
     now = _hermes_now().isoformat()
     status = "cancelled" if cancelled else ("completed" if success else "failed")
     detail = None if success else (str(error) if error else "unknown failure")
+    if detail is not None:
+        # executions.db is durable like jobs.json: scrub raw error text before it lands on disk.
+        from cron.jobs_error_text import sanitize_persisted_error
+        detail = sanitize_persisted_error(detail)
     owner = (_PROCESS_ID, os.getpid())
 
     def _op(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
@@ -505,7 +509,10 @@ def recover_receipted_execution(execution_id, job_id, *, success, error=None, de
     (``execution_owner_live``). Liveness runs with no ledger lock held; the write is a CAS on
     the judged owner snapshot.
     """
+    from cron.jobs_error_text import sanitize_persisted_error
+
     now = _hermes_now().isoformat()
+    detail = None if success else sanitize_persisted_error(str(error) if error else 'unknown failure')
     with _transaction() as conn:
         row = _recoverable_row(conn, execution_id, job_id)
         snapshot = dict(row) if row is not None else None
@@ -517,8 +524,7 @@ def recover_receipted_execution(execution_id, job_id, *, success, error=None, de
             """UPDATE executions SET status=?, finished_at=?, error=?, handoff_pending=0,
                handoff_started_at=NULL, delivery_outcome=?
                WHERE id=? AND status=? AND process_id=? AND pid=?""",
-            ('completed' if success else 'failed', now,
-             None if success else (str(error) if error else 'unknown failure'),
+            ('completed' if success else 'failed', now, detail,
              delivery_outcome, execution_id, snapshot['status'], snapshot['process_id'],
              snapshot['pid']))
         if cur.rowcount != 1:

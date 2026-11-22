@@ -9,14 +9,31 @@ Score overlays as `KEEP` / `UPSTREAM-NOW` / `DROP` against the frozen tag
 below. Do not score against newer untagged `main` or `rc.` / `abandoned-rc.`
 tags. Do not replay `DROP` or `UPSTREAM-NOW` behavior on refresh.
 
-Frozen upstream cutoff: `3b421578588243f920886e6fe79a6faa87ea026e`
-(`v0.23.1`). The annotated tag is `b65acf3fdc1d43bd889211ea8e37032974b395a5`.
-Exact-SHA CI and review evidence must name the peeled commit. The
-previous cutoff was `bf0203a794a07aac3ff764972ab9087baa4e4f4e`
-(`v0.22.5`). Scored against this tag on 2026-11-15: none of the eight
-KEEP items below are in the `v0.23.1` tree. `v0.23.0`
-(`2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19`) was not an ancestor of the
-pre-merge `main`; the refresh records that ancestry without rewriting it.
+Frozen upstream cutoff: `caafe5389ae585ef77387a962aee05b1bcf17029`
+(`v0.23.3`). The annotated tag object is
+`2861fe3744f8134b782659438961a4f69ab5d495`. Exact-SHA CI and review
+evidence must name the peeled commit. This refresh is a `--no-ff` merge
+of that peeled commit onto pre-merge `main`
+`ff91cdcce3db4d3e3f9d0f1856df83a8bb5277fd`. The merge commit is
+`99b84708d5dd69de082a362b2c5e35efb677b760`. The
+previous cutoff was `3b421578588243f920886e6fe79a6faa87ea026e`
+(`v0.23.1`, annotated tag `b65acf3fdc1d43bd889211ea8e37032974b395a5`).
+Scored against `v0.23.3` on 2026-11-22.
+
+KEEP scorecard for this merge:
+
+1. LINE group collection — merged cleanly (allow, read-only archive, archive-and-dispatch, prefix-required).
+2. Email notifications — conflict-resolved preserving KEEP. Multi-attachment sends still pass `metadata=` for subject and RFC threading. Cron standalone delivery still forwards `email_subject_template` / `email_thread_key`. Upstream `hash_for_log` on the log line is kept.
+3. Cron delivery integrity — conflict-resolved preserving KEEP. In-flight standalone timeouts still set `standalone_in_flight` and are not queued for a second send. Session delivery and local-UI skips stay. Upstream room delivery and per-file media routing stay.
+4. Bitwarden plaintext-cache purge — conflict-resolved preserving KEEP. `_purge_plaintext_disk_cache` still runs before validation, read, and fetch. The 429 retry and `key_prefix` / `strip_prefix` cache key stay. Upstream UUID / `server_url` validation and the `--` argv terminator coexist with those.
+5. Memory Tree manual retrieval — merged cleanly. Core overlay files stay out of this tree; the user plugin remains the install path.
+6. House runtime pin/refresh scripts — merged cleanly. `scripts/maintenance/refresh_andy_runtime.sh` and `pin-shared-hermes-runtime.sh` are unchanged by this resolution. Do not run the refresh script for this merge; it rebases onto floating upstream `main`.
+7. Mattermost `delete_message` and CRT media — conflict-resolved preserving KEEP. `delete_message` stays. Batch image fallback still sends the chunk with `reply_to`. `is_bot` still includes `from_bot` and configured bot users. Gateway batch images still take `reply_to`.
+8. New-skill description Not exclusion — conflict-resolved preserving KEEP. `_validate_frontmatter(..., new_skill=True)` still requires a word-boundary `not` inside the index window and still rejects a new description over that budget (`system-prompt budget`). Upstream `_scan_baseline` runs after that check.
+
+DROP and UPSTREAM-NOW items in this file were not replayed.
+
+Schema: `_config_version` moves from 53 to 54. Migration `_migrate_to_54` rewrites only a template-seeded `prompt_caching.cache_ttl: "5m"` to the new `"auto"` default. This merge does not set `prompt_caching.cache_ttl` in any host or profile config. `pyproject.toml`, `uv.lock`, and `pm/lock.json` change with the tag; deployers treat that as `needs_manual`. The tag's own `pyproject.toml` version is the `0.0.0` placeholder. This checkout declares `0.23.3` so a tagless deploy reports this release.
 
 This tag declares Python 3.14 as the only supported runtime (`pyproject.toml`
 marks every core dependency `python_version >= '3.14'`; `uv.lock` resolves

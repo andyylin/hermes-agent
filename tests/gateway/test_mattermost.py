@@ -626,7 +626,12 @@ class TestMattermostFileUpload:
         # Mock the download (GET)
         mock_dl_resp = AsyncMock()
         mock_dl_resp.status = 200
-        mock_dl_resp.read = AsyncMock(return_value=b"\x89PNG\x00fake-image-data")
+        mock_dl_resp.headers = {}
+
+        async def _body(_size):
+            yield b"\x89PNG\x00fake-image-data"
+
+        mock_dl_resp.content = MagicMock(iter_chunked=_body)
         mock_dl_resp.content_type = "image/png"
         mock_dl_resp.__aenter__ = AsyncMock(return_value=mock_dl_resp)
         mock_dl_resp.__aexit__ = AsyncMock(return_value=False)
@@ -739,6 +744,7 @@ class TestMattermostMediaTypes:
         self.adapter = _make_adapter()
         self.adapter._bot_user_id = "bot_user_id"
         self.adapter.handle_message = AsyncMock()
+        self.adapter.set_authorization_check(lambda *args, **kwargs: True)
 
     def _make_event(self, file_ids):
         post_data = {
@@ -763,9 +769,14 @@ class TestMattermostMediaTypes:
         file_info = {"name": "photo.png", "mime_type": "image/png"}
         self.adapter._api_get = AsyncMock(return_value=file_info)
 
+        async def chunks(_size):
+            yield b"\x89PNG fake"
+
         mock_resp = AsyncMock()
         mock_resp.status = 200
-        mock_resp.read = AsyncMock(return_value=b"\x89PNG fake")
+        mock_resp.headers = {}
+        mock_resp.content = MagicMock()
+        mock_resp.content.iter_chunked = chunks
         mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
         mock_resp.__aexit__ = AsyncMock(return_value=False)
         self.adapter._session = MagicMock()
@@ -777,6 +788,16 @@ class TestMattermostMediaTypes:
         msg = self.adapter.handle_message.call_args[0][0]
         assert msg.media_types == ["image/png"]
         assert msg.media_types[0].startswith("image/")
+
+    @pytest.mark.asyncio
+    async def test_unwired_authorization_check_downloads_nothing(self):
+        self.adapter.set_authorization_check(None)
+        self.adapter._download_attachments = AsyncMock(return_value=(["/tmp/photo.png"], ["image/png"]))
+
+        await self.adapter._handle_ws_event(self._make_event(["file1"]))
+
+        self.adapter._download_attachments.assert_not_awaited()
+        assert self.adapter.handle_message.call_args[0][0].media_urls == []
 
 
 class TestMattermostMediaThreading:
@@ -830,6 +851,31 @@ class TestMattermostMediaThreading:
         )
         payload = self.adapter._api_post.await_args.args[1]
         assert "root_id" not in payload
+
+    @pytest.mark.asyncio
+    async def test_batch_fallback_keeps_chunk_and_reply_to(self, tmp_path):
+        """A failed bundled post still sends the whole chunk in the CRT thread."""
+        img = tmp_path / "tray.png"
+        img.write_bytes(b"\x89PNG" + b"\x00" * 8)
+        self.adapter._api_post = AsyncMock(return_value={})
+        seen = {}
+
+        async def fake_send_image_file(chat_id, image_path, caption=None, reply_to=None, **kwargs):
+            seen["reply_to"] = reply_to
+            seen["chat_id"] = chat_id
+            from gateway.platforms.base import SendResult
+            return SendResult(success=True, message_id="fb")
+
+        self.adapter.send_image_file = fake_send_image_file
+        result = await self.adapter.send_multiple_images(
+            "dm_chan",
+            [(f"file://{img}", "caption")],
+            metadata={"thread_id": "crt_root"},
+            reply_to="trigger_post",
+        )
+        assert result.success
+        assert seen["chat_id"] == "dm_chan"
+        assert seen["reply_to"] == "trigger_post"
 
 
 @pytest.mark.asyncio

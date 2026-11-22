@@ -298,12 +298,12 @@ def test_newer_patch_keeps_the_fetched_calver_release(tmp_path, monkeypatch):
     assert info.distance == 1
 
 
-def test_this_checkout_reports_v0_23_1(monkeypatch):
+def test_this_checkout_reports_v0_23_3(monkeypatch):
     repo = Path(__file__).resolve().parents[2]
     monkeypatch.setattr("hermes_cli.version_info._resolve_stamp_file", lambda: None)
     monkeypatch.setattr("hermes_cli.version_info._resolve_repo_dir", lambda: repo)
     _reset_version_info_cache()
-    assert get_version_info().base_version == "0.23.1"
+    assert get_version_info().base_version == "0.23.3"
 
 
 def _git(repo: Path, home: Path, *args: str) -> str:

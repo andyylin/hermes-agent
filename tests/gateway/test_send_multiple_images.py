@@ -71,6 +71,29 @@ class _StubAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=str(len(self.sent_files)))
 
 
+def test_image_batch_forwards_reply_to(tmp_path):
+    """Batch image delivery keeps an explicit reply anchor on adapters that accept it."""
+    from gateway.platforms.base import SendResult
+
+    class _BatchAdapter(_StubAdapter):
+        def __init__(self):
+            super().__init__()
+            self.batch_reply_to = None
+
+        async def send_multiple_images(self, chat_id, images, metadata=None, human_delay=0.0, reply_to=None):
+            self.batch_reply_to = reply_to
+            return SendResult(success=True, message_id="batch")
+
+    adapter = _BatchAdapter()
+    event = types.SimpleNamespace(source=types.SimpleNamespace(chat_id="chan"))
+    recorded = []
+    _run(adapter._send_image_batch(
+        event, [("https://x.com/a.png", "alt")], {}, 0, recorded.append, reply_to="root-1",
+    ))
+    assert adapter.batch_reply_to == "root-1"
+    assert recorded and recorded[0].success is True
+
+
 class TestBaseDefaultLoop:
     def test_loops_per_image_by_default(self, tmp_path):
         local = tmp_path / "foo.png"

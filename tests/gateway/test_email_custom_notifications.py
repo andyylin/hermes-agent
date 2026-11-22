@@ -300,6 +300,45 @@ def test_standalone_email_sends_media_only_attachment_with_notification_headers(
     assert attachments[0].get_filename() == "daily-report.pdf"
 
 
+def test_standalone_cron_email_send_forwards_subject(monkeypatch):
+    """The out-of-process cron lane must pass the formatted subject into email send."""
+    from cron import scheduler
+    from cron import scheduler_delivery as sd
+    from cron.scheduler_delivery_standalone import _standalone_send
+
+    captured = {}
+
+    async def fake_send(platform, pconfig, chat_id, content, **kwargs):
+        captured.update(kwargs)
+        captured["content"] = content
+        return {"success": True, "message_id": "m1"}
+
+    monkeypatch.setattr("gateway.outbound.send._send_to_platform", fake_send)
+    monkeypatch.setattr(scheduler, "_hermes_now", lambda: datetime(2026, 8, 2, 9, 0))
+    fields = {name: None for name in sd._TargetDelivery.__dataclass_fields__}
+    fields.update(
+        job={
+            "id": "brief-job",
+            "name": "Morning briefing",
+            "email_subject_template": "{job_name} — {date}",
+            "email_thread_key": "morning-brief",
+        },
+        platform_name="email",
+        chat_id="andy@example.net",
+        notify_delivery=False,
+        force_document=False,
+        pconfig=object(),
+    )
+    result, err = _standalone_send(sd._TargetDelivery(**fields), "hello", [])
+    assert err is None
+    assert result == {"success": True, "message_id": "m1"}
+    assert captured["content"] == "hello"
+    assert captured["subject"] == {
+        "subject": "Morning briefing — 2026-08-02",
+        "thread_anchor_key": "morning-brief",
+    }
+
+
 def test_cron_email_subject_template_and_thread_payload(monkeypatch):
     from cron import scheduler
 
