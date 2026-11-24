@@ -9,16 +9,22 @@ Score overlays as `KEEP` / `UPSTREAM-NOW` / `DROP` against the frozen tag
 below. Do not score against newer untagged `main` or `rc.` / `abandoned-rc.`
 tags. Do not replay `DROP` or `UPSTREAM-NOW` behavior on refresh.
 
-Frozen upstream cutoff: `caafe5389ae585ef77387a962aee05b1bcf17029`
-(`v0.23.3`). The annotated tag object is
-`2861fe3744f8134b782659438961a4f69ab5d495`. Exact-SHA CI and review
+Frozen upstream cutoff: `8fc0374447313e276f6b9a2764bfc750190c966a`
+(`v0.23.4`). The annotated tag object is
+`3ac54e1012be1784e00a0f23bdfdce46b769675d`. Exact-SHA CI and review
 evidence must name the peeled commit. This refresh is a `--no-ff` merge
 of that peeled commit onto pre-merge `main`
-`ff91cdcce3db4d3e3f9d0f1856df83a8bb5277fd`. The merge commit is
-`99b84708d5dd69de082a362b2c5e35efb677b760`. The
-previous cutoff was `3b421578588243f920886e6fe79a6faa87ea026e`
-(`v0.23.1`, annotated tag `b65acf3fdc1d43bd889211ea8e37032974b395a5`).
-Scored against `v0.23.3` on 2026-11-22.
+`7078282ada742c4de1c104b5343960e84401f87b`. The merge commit is
+`c07e59f9c1af028010b14f8dff087cf7c6903542`. The
+previous cutoff was `caafe5389ae585ef77387a962aee05b1bcf17029`
+(`v0.23.3`, annotated tag `2861fe3744f8134b782659438961a4f69ab5d495`).
+Scored against `v0.23.4` on 2026-11-25. The merge had no conflicts, and
+the fork overlay diff against the tag (146 files) is line-for-line the
+same as it was against `v0.23.3`, so every KEEP item below carries over
+unchanged. `v0.23.4` adds no `_config_version` migration and changes no
+upstream dependency input. `pyproject.toml` / `uv.lock` change only for
+the fork's declared version `0.23.4`, so push-to-deploy returns
+`needs_manual` (exceptional lane, staged shared-gateway cutover).
 
 KEEP scorecard for this merge:
 
@@ -33,7 +39,7 @@ KEEP scorecard for this merge:
 
 DROP and UPSTREAM-NOW items in this file were not replayed.
 
-Schema: `_config_version` moves from 53 to 54. Migration `_migrate_to_54` rewrites only a template-seeded `prompt_caching.cache_ttl: "5m"` to the new `"auto"` default. This merge does not set `prompt_caching.cache_ttl` in any host or profile config. `pyproject.toml`, `uv.lock`, and `pm/lock.json` change with the tag; deployers treat that as `needs_manual`. The tag's own `pyproject.toml` version is the `0.0.0` placeholder. This checkout declares `0.23.3` so a tagless deploy reports this release.
+Schema: `_config_version` moves from 53 to 54. Migration `_migrate_to_54` rewrites only a template-seeded `prompt_caching.cache_ttl: "5m"` to the new `"auto"` default. This merge does not set `prompt_caching.cache_ttl` in any host or profile config. `pyproject.toml`, `uv.lock`, and `pm/lock.json` change with the tag; deployers treat that as `needs_manual`. The tag's own `pyproject.toml` version is the `0.0.0` placeholder. This checkout declares `0.23.4` so a tagless deploy reports this release.
 
 This tag declares Python 3.14 as the only supported runtime (`pyproject.toml`
 marks every core dependency `python_version >= '3.14'`; `uv.lock` resolves
