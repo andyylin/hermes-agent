@@ -16,7 +16,7 @@ from pm.install import _facts, _lockfile, _reclaim_set_aside, _store, ensure, st
 from pm.operations import lock_project
 from pm.package import InstallError
 from pm.paths import repo_root
-from pm.registry import get_package, source_install_packages, tool_roots
+from pm.registry import get_package, publish_names
 from pm.store import ALL_TARGETS, current_target, hash_url
 from pm.update import Resolved, resolve_package, reuse_index_responses
 
@@ -224,6 +224,12 @@ def _live_progress(name: str):
 def _install_names(names: list[str], target: str | None = None, *, verify: bool = True) -> int:
     from pm.install import _install_operation
 
+    if not names:
+        # Publishing nothing used to return success. That leaves the previous
+        # tool set in place while a lock bump (a new pnpm) never lands.
+        print("✗ refusing to publish an empty tool set; previously published tools were left in place",
+              flush=True)
+        return 1
     failed = 0
     with _install_operation() as operation:
         for name in names:
@@ -342,6 +348,20 @@ def _install_python_environments(extras: list[str], *, sync: bool, test_environm
     return failed
 
 
+def _publish_names(explicit: list[str], extras: list[str], *, test_environment) -> list[str] | None:
+    """Tool names this install publishes. None means the closure was empty."""
+    from pm.testenv import developer_tools
+
+    try:
+        names = publish_names(explicit, extras, _lockfile().names())
+    except InstallError as exc:
+        print(f"✗ {exc}", flush=True)
+        return None
+    if test_environment is not None:
+        names.extend(name for name in developer_tools(_lockfile().names()) if name not in names)
+    return names
+
+
 def cmd_install(args) -> int:
     from pm.defaults import canonical_default_name
 
@@ -359,7 +379,6 @@ def cmd_install(args) -> int:
     if error:
         print(f"✗ {error}")
         return 1
-    names = args.names if args.names or extras else source_install_packages(_lockfile().names())
     without = list(dict.fromkeys(getattr(args, "without", None) or ()))
     if without:
         from pm.defaults import record_declined
@@ -385,11 +404,11 @@ def cmd_install(args) -> int:
     # Tools before the venv. A bare `pm install` used to install tools and
     # sync the venv in one breath, so a native build (Windows ARM64 source
     # wheels) resolved compilers and git from the host PATH. Publish every
-    # tool first and put it on PATH; sync only after that.
-    from pm.testenv import developer_tools
-
-    tool_names = [*(names if args.names else tool_roots(names)),
-                  *(developer_tools(_lockfile().names()) if test_environment is not None else ())]
+    # tool first and put it on PATH; sync only after that. `--extra` adds to
+    # that closure: it must not replace the lock's tools with an empty list.
+    tool_names = _publish_names(list(args.names), extras, test_environment=test_environment)
+    if tool_names is None:
+        return 1
     if _install_names(tool_names, target=cross_target, verify=not trust_recorded):
         return 1
     if args.names and not cross_target:
@@ -1021,7 +1040,8 @@ def main(argv=None) -> int:
     p = sub.add_parser("install", help="install packages (default: all required + optional defaults)")
     p.add_argument("names", nargs="*")
     p.add_argument("--extra", action="append", default=[], metavar="NAME",
-                   help="enable a declared dependency extra in the venv (repeatable)")
+                   help="enable a declared dependency extra in the venv on top of the "
+                        "default tool closure (repeatable)")
     p.add_argument("--without", action="append", default=[], metavar="NAME",
                    help="leave an optional default package (chromium, cua-driver) or a recorded extra outside "
                         "[all] (matrix, ...) out of this and every later default install and update; "

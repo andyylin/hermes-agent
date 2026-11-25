@@ -46,7 +46,13 @@ def install_spy(monkeypatch):
 
 
 def test_default_closure_includes_the_boot_interpreter(install_spy):
+    from pm.defaults import default_packages
+    from pm.registry import tool_roots
+
     assert pm.cli.cmd_install(argparse.Namespace(names=None, tools_only=False)) == 0
+    locked = pm.cli._lockfile().names()
+    roots = tool_roots(locked)
+    assert install_spy["names"] == [*roots, *default_packages(locked)]
     assert "python" in install_spy["names"]
     assert "venv" not in install_spy["names"]
     assert all(not pm.cli.get_package(name).internal for name in install_spy["names"])
