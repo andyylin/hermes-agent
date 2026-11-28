@@ -9,21 +9,27 @@ Score overlays as `KEEP` / `UPSTREAM-NOW` / `DROP` against the frozen tag
 below. Do not score against newer untagged `main` or `rc.` / `abandoned-rc.`
 tags. Do not replay `DROP` or `UPSTREAM-NOW` behavior on refresh.
 
-Frozen upstream cutoff: `8fc0374447313e276f6b9a2764bfc750190c966a`
-(`v0.23.4`). The annotated tag object is
-`3ac54e1012be1784e00a0f23bdfdce46b769675d`. Exact-SHA CI and review
+Frozen upstream cutoff: `a428f5344f777ccafe389c79d5b09384abef1437`
+(`v0.23.5`). The annotated tag object is
+`bdd68e2233fe0c62552221558be6aab7b72f1e71`. Exact-SHA CI and review
 evidence must name the peeled commit. This refresh is a `--no-ff` merge
 of that peeled commit onto pre-merge `main`
-`7078282ada742c4de1c104b5343960e84401f87b`. The merge commit is
-`c07e59f9c1af028010b14f8dff087cf7c6903542`. The
-previous cutoff was `caafe5389ae585ef77387a962aee05b1bcf17029`
-(`v0.23.3`, annotated tag `2861fe3744f8134b782659438961a4f69ab5d495`).
-Scored against `v0.23.4` on 2026-11-25. The merge had no conflicts, and
-the fork overlay diff against the tag (146 files) is line-for-line the
-same as it was against `v0.23.3`, so every KEEP item below carries over
-unchanged. `v0.23.4` adds no `_config_version` migration and changes no
-upstream dependency input. `pyproject.toml` / `uv.lock` change only for
-the fork's declared version `0.23.4`, so push-to-deploy returns
+`bac2f6a799b772ba124fcdb9c97695f6c7835911`. The merge commit is
+`598f798f3829d52fc90496cac1aad6ebdf9b0faa`. The
+previous cutoff was `8fc0374447313e276f6b9a2764bfc750190c966a`
+(`v0.23.4`, annotated tag `3ac54e1012be1784e00a0f23bdfdce46b769675d`).
+Scored against `v0.23.5` on 2026-11-28. The merge conflicted only in
+12 `.github/workflows/*.yml` files, where upstream changed Blacksmith
+runner labels on lines the fork guards with
+`github.repository_owner == 'NousResearch'`. Each was resolved by
+keeping the fork guard around upstream's new label. Apart from those
+runner labels, the fork overlay diff against the tag (146 files) is
+line-for-line the same as it was against `v0.23.4`, so every KEEP item
+below carries over unchanged. `v0.23.5` adds no `_config_version`
+migration and changes no upstream dependency input (`pyproject.toml`,
+`uv.lock`, `pm/lock.json`, `setup.py`, every `package.json` and lockfile
+are unchanged between the two tags). `pyproject.toml` / `uv.lock` change
+only for the fork's declared version `0.23.5`, so push-to-deploy returns
 `needs_manual` (exceptional lane, staged shared-gateway cutover).
 
 KEEP scorecard for this merge:
